@@ -1,0 +1,8 @@
+# Force-include <cstdint> when compiling bundled C/C++ (RocksDB).
+#
+# RocksDB 8.x headers relied on a transitive <cstdint> include that newer
+# libstdc++ (GCC 13+) no longer provides, so `uint64_t` fails to resolve. This
+# is a C++-only toolchain shim (a C `-include` would break the C sys-crates'
+# assembly files); cc-rs appends it to every bundled C++ compile.
+[env]
+CXXFLAGS = "-include cstdint"
