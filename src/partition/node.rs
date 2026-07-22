@@ -111,6 +111,15 @@ impl PartitionNode {
             .map_err(|e| Error::Raft(format!("initialize: {e}")))
     }
 
+    /// Whether this partition has an initial membership committed. Lets the
+    /// bootstrap driver skip re-initializing a group that already exists.
+    pub async fn is_initialized(&self) -> Result<bool> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|e| Error::Raft(format!("is_initialized: {e}")))
+    }
+
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
         match self.raft.client_write(req).await {

@@ -100,6 +100,50 @@ impl MetaNode {
             .map_err(|e| Error::Raft(format!("initialize: {e}")))
     }
 
+    /// Whether this group has an initial membership committed (used to make the
+    /// bootstrap driver resumable — never re-initialize a live group).
+    pub async fn is_initialized(&self) -> Result<bool> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|e| Error::Raft(format!("is_initialized: {e}")))
+    }
+
+    /// Admit `id` as a non-voting learner and block until it has caught up
+    /// (DESIGN §7.2 — learner-first membership change). The caller is
+    /// responsible for the durable admission record on the joining node.
+    pub async fn add_learner(&self, id: NodeId) -> Result<()> {
+        self.raft
+            .add_learner(id, Node::default(), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("add_learner: {e}")))
+    }
+
+    /// Replace the voter set (openraft `ReplaceAllVoters`); removed voters are
+    /// dropped, not retained. Meta-specific policy (replacement or single-voter
+    /// removal, floor of three) is enforced by the meta state machine plan
+    /// record; this is the mechanical membership change.
+    pub async fn change_voters(&self, voters: &[NodeId]) -> Result<()> {
+        let set: std::collections::BTreeSet<NodeId> = voters.iter().copied().collect();
+        self.raft
+            .change_membership(set, false)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("change_membership: {e}")))
+    }
+
+    /// The committed voter set this node currently believes is in effect.
+    pub fn voters(&self) -> Vec<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
     /// Submit a meta command through the group's serving gate.
     pub async fn propose(&self, cmd: MetaCommand) -> Result<ProposeOutcome> {
         match self.raft.client_write(cmd).await {
