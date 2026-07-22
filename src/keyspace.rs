@@ -46,6 +46,39 @@ pub fn seq_key(client_id: u128) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Meta-group state-CF record keys (DESIGN §5, M5). All carry [`TAG_META`] so
+// they share the meta group's `cf_state` without colliding with any other tag.
+// ---------------------------------------------------------------------------
+
+/// The single immutable cluster-configuration record.
+pub fn meta_cluster_key() -> Vec<u8> {
+    vec![TAG_META, b'C']
+}
+
+/// One node-directory entry, keyed by node id.
+pub fn meta_node_key(node_id: crate::types::NodeId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 8);
+    k.push(TAG_META);
+    k.push(b'N');
+    k.extend_from_slice(&node_id.to_be_bytes());
+    k
+}
+
+/// The scan prefix covering every node-directory entry.
+pub fn meta_node_prefix() -> [u8; 2] {
+    [TAG_META, b'N']
+}
+
+/// One partition/meta placement record, keyed by group token.
+pub fn meta_placement_key(group: GroupId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + group.token().len());
+    k.push(TAG_META);
+    k.push(b'P');
+    k.extend_from_slice(group.token().as_bytes());
+    k
+}
+
+// ---------------------------------------------------------------------------
 // Node-local default-CF record keys (DESIGN §6). These survive snapshot install
 // and CF reclamation because they never live in a group's CFs.
 // ---------------------------------------------------------------------------

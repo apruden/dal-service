@@ -4,12 +4,16 @@
 //! milestone plan. Modules are introduced milestone by milestone; this is the
 //! M1 foundation (types, config, storage).
 
+pub mod api;
 pub mod codec;
 pub mod config;
 pub mod error;
 pub mod keyspace;
+pub mod meta;
 pub mod partition;
+pub mod placement;
 pub mod storage;
+pub mod transport;
 pub mod types;
 
 pub use error::{Error, Result};

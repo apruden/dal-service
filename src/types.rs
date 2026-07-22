@@ -261,6 +261,14 @@ pub enum MetaCommand {
         control_addr: String,
         bulk_addr: String,
     },
+    /// Seed one group's initial voter configuration during bootstrap (DESIGN
+    /// §3.1 step 4). Peer-control only; accepted once per group, then only on a
+    /// byte-identical retry. Never authorises serving — that is the group's own
+    /// Raft state (§7.4).
+    SeedPlacement {
+        group: GroupId,
+        voters: Vec<NodeId>,
+    },
     SetNodeState {
         node_id: NodeId,
         state: NodeState,
