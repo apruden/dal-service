@@ -135,7 +135,7 @@ struct Cluster {
     nodes: Vec<Arc<PartitionNode>>,
     switch: InProcess<ClientGateway>,
     routing: Arc<StaticRouting>,
-    registry: Registry,
+    registry: Registry<dal::partition::TypeConfig>,
 }
 
 impl Cluster {

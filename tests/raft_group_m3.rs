@@ -23,7 +23,7 @@ const VOTERS: [u64; 3] = [1, 2, 3];
 
 struct Harness {
     dirs: Vec<TempDir>,
-    registry: Registry,
+    registry: Registry<dal::partition::TypeConfig>,
     faults: Faults,
 }
 

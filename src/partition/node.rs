@@ -15,7 +15,7 @@ use openraft::Config;
 use crate::error::{Error, Result};
 use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
-use crate::partition::raft_types::{Node, NodeId, Raft};
+use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
 use crate::partition::sm::RocksStateMachine;
 use crate::partition::state_machine::{ApplyResult, DataStateMachine};
 use crate::storage::Storage;
@@ -51,7 +51,7 @@ impl PartitionNode {
         node_id: NodeId,
         group: GroupId,
         storage: Arc<Storage>,
-        registry: Registry,
+        registry: Registry<TypeConfig>,
         faults: Faults,
     ) -> Result<PartitionNode> {
         storage.ensure_group(group)?;

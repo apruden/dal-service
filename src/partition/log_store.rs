@@ -2,6 +2,11 @@
 //!
 //! Every append and vote save is fsync-durable before it is acknowledged; the
 //! leader only counts durable follower replies toward commit (DESIGN §2).
+//!
+//! The store is generic over the openraft type config `C` (blanket impls below),
+//! so the data groups and the meta group (M5) share one log implementation —
+//! only the command/response types they carry differ. `NodeId`/`Node`/entry
+//! encoding are identical for every group.
 
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
@@ -11,14 +16,21 @@ use openraft::storage::LogFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use openraft::BasicNode;
 use openraft::OptionalSend;
+use openraft::RaftTypeConfig;
 use openraft::StorageError;
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
 use crate::codec;
-use crate::partition::raft_types::{read_err, write_err, Entry, LogId, NodeId, TypeConfig, Vote};
+use crate::partition::raft_types::{read_err, write_err};
 use crate::storage::Storage;
 use crate::types::GroupId;
+
+/// The one node-id type every group shares.
+type Nid = u64;
+type LogId = openraft::LogId<Nid>;
+type Vote = openraft::Vote<Nid>;
 
 const KEY_VOTE: [u8; 2] = [0x00, b'v'];
 const KEY_PURGED: [u8; 2] = [0x00, b'p'];
@@ -42,6 +54,18 @@ fn entry_index(key: &[u8]) -> Option<u64> {
     }
 }
 
+/// Bounds shared by both trait impls: `C` carries `u64` node ids, `BasicNode`
+/// nodes, the default `Entry<C>`, and that entry must (de)serialize.
+trait GroupConfig:
+    RaftTypeConfig<NodeId = Nid, Node = BasicNode, Entry = openraft::Entry<Self>>
+{
+}
+
+impl<C> GroupConfig for C where
+    C: RaftTypeConfig<NodeId = Nid, Node = BasicNode, Entry = openraft::Entry<Self>>
+{
+}
+
 #[derive(Clone)]
 pub struct RocksLogStore {
     storage: Arc<Storage>,
@@ -62,7 +86,7 @@ impl RocksLogStore {
     fn read_log_singleton<T: serde::de::DeserializeOwned>(
         &self,
         key: &[u8],
-    ) -> Result<Option<T>, StorageError<NodeId>> {
+    ) -> Result<Option<T>, StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(read_err)?;
         let raw = self
             .storage
@@ -75,7 +99,11 @@ impl RocksLogStore {
         }
     }
 
-    fn last_entry_id(&self) -> Result<Option<LogId>, StorageError<NodeId>> {
+    fn last_entry_id<C>(&self) -> Result<Option<LogId>, StorageError<Nid>>
+    where
+        C: GroupConfig,
+        openraft::Entry<C>: serde::de::DeserializeOwned,
+    {
         let cf = self.storage.log_cf(self.group).map_err(read_err)?;
         // Seek just past the entry range and step backwards to the highest entry.
         let mut iter = self.storage.db().iterator_cf(
@@ -85,7 +113,7 @@ impl RocksLogStore {
         if let Some(item) = iter.next() {
             let (k, v) = item.map_err(|e| read_err(e.into()))?;
             if entry_index(&k).is_some() {
-                let entry: Entry = codec::decode(&v).map_err(read_err)?;
+                let entry: openraft::Entry<C> = codec::decode(&v).map_err(read_err)?;
                 return Ok(Some(entry.log_id));
             }
         }
@@ -93,11 +121,15 @@ impl RocksLogStore {
     }
 }
 
-impl RaftLogReader<TypeConfig> for RocksLogStore {
+impl<C> RaftLogReader<C> for RocksLogStore
+where
+    C: GroupConfig,
+    openraft::Entry<C>: serde::Serialize + serde::de::DeserializeOwned,
+{
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry>, StorageError<NodeId>> {
+    ) -> Result<Vec<openraft::Entry<C>>, StorageError<Nid>> {
         let start = match range.start_bound() {
             Bound::Included(i) => *i,
             Bound::Excluded(i) => i + 1,
@@ -119,7 +151,7 @@ impl RaftLogReader<TypeConfig> for RocksLogStore {
             let (k, v) = item.map_err(|e| read_err(e.into()))?;
             match entry_index(&k) {
                 Some(idx) if idx < end => {
-                    out.push(codec::decode::<Entry>(&v).map_err(read_err)?);
+                    out.push(codec::decode::<openraft::Entry<C>>(&v).map_err(read_err)?);
                 }
                 // Past the entry range or the requested end: stop.
                 _ => break,
@@ -129,12 +161,16 @@ impl RaftLogReader<TypeConfig> for RocksLogStore {
     }
 }
 
-impl RaftLogStorage<TypeConfig> for RocksLogStore {
+impl<C> RaftLogStorage<C> for RocksLogStore
+where
+    C: GroupConfig,
+    openraft::Entry<C>: serde::Serialize + serde::de::DeserializeOwned,
+{
     type LogReader = RocksLogStore;
 
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<Nid>> {
         let last_purged: Option<LogId> = self.read_log_singleton(&KEY_PURGED)?;
-        let last = self.last_entry_id()?;
+        let last = self.last_entry_id::<C>()?;
         let last_log_id = last.or(last_purged);
         Ok(LogState {
             last_purged_log_id: last_purged,
@@ -146,7 +182,7 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
         self.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<NodeId>> {
+    async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         self.storage
             .db()
@@ -155,14 +191,14 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError<NodeId>> {
+    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError<Nid>> {
         self.read_log_singleton(&KEY_VOTE)
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    ) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         self.storage
             .db()
@@ -171,7 +207,7 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
         Ok(())
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError<NodeId>> {
+    async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError<Nid>> {
         // Stored as Option<LogId>; flatten the double-Option.
         Ok(self
             .read_log_singleton::<Option<LogId>>(&KEY_COMMITTED)?
@@ -181,10 +217,10 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<TypeConfig>,
-    ) -> Result<(), StorageError<NodeId>>
+        callback: LogFlushed<C>,
+    ) -> Result<(), StorageError<Nid>>
     where
-        I: IntoIterator<Item = Entry> + OptionalSend,
+        I: IntoIterator<Item = openraft::Entry<C>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
@@ -201,7 +237,7 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
         Ok(())
     }
 
-    async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError<NodeId>> {
+    async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
         // Delete all entries with index >= log_id.index.
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         self.storage
@@ -216,7 +252,7 @@ impl RaftLogStorage<TypeConfig> for RocksLogStore {
         Ok(())
     }
 
-    async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<NodeId>> {
+    async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         // Record the purge point first so recovery never re-reads purged logs.
         self.storage

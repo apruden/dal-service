@@ -5,6 +5,10 @@
 //! Every multi-node correctness test runs on this network; ZMQ (M4) is tested
 //! separately for transport concerns only. Faults are seeded and directional so
 //! a test can isolate one node (partition) deterministically.
+//!
+//! Generic over the openraft type config `C` so both the data groups and the
+//! meta group (M5) reuse it — each group keeps its own [`Registry`] of live
+//! handles.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,48 +19,66 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use openraft::{BasicNode, RaftTypeConfig};
 
-use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
+type Nid = u64;
+type Node = BasicNode;
 
 /// Shared directory of live `Raft` handles, keyed by node id.
-#[derive(Clone, Default)]
-pub struct Registry {
-    inner: Arc<Mutex<HashMap<NodeId, Raft>>>,
+pub struct Registry<C: RaftTypeConfig> {
+    inner: Arc<Mutex<HashMap<Nid, openraft::Raft<C>>>>,
 }
 
-impl Registry {
-    pub fn register(&self, id: NodeId, raft: Raft) {
+impl<C: RaftTypeConfig> Clone for Registry<C> {
+    fn clone(&self) -> Self {
+        Registry {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig> Default for Registry<C> {
+    fn default() -> Self {
+        Registry {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig<NodeId = Nid>> Registry<C> {
+    pub fn register(&self, id: Nid, raft: openraft::Raft<C>) {
         self.inner.lock().unwrap().insert(id, raft);
     }
 
-    pub fn get(&self, id: NodeId) -> Option<Raft> {
+    pub fn get(&self, id: Nid) -> Option<openraft::Raft<C>> {
         self.inner.lock().unwrap().get(&id).cloned()
     }
 
     /// Remove a node's handle, e.g. to model a crash before restart.
-    pub fn remove(&self, id: NodeId) {
+    pub fn remove(&self, id: Nid) {
         self.inner.lock().unwrap().remove(&id);
     }
 }
 
 /// Directional link faults. A blocked `(from, to)` drops all RPCs, modelling a
-/// one-way partition; block both directions for a full partition.
+/// one-way partition; block both directions for a full partition. Type-agnostic
+/// — one `Faults` can gate several groups.
 #[derive(Clone, Default)]
 pub struct Faults {
-    blocked: Arc<Mutex<HashSet<(NodeId, NodeId)>>>,
+    blocked: Arc<Mutex<HashSet<(Nid, Nid)>>>,
 }
 
 impl Faults {
-    pub fn block(&self, from: NodeId, to: NodeId) {
+    pub fn block(&self, from: Nid, to: Nid) {
         self.blocked.lock().unwrap().insert((from, to));
     }
 
-    pub fn unblock(&self, from: NodeId, to: NodeId) {
+    pub fn unblock(&self, from: Nid, to: Nid) {
         self.blocked.lock().unwrap().remove(&(from, to));
     }
 
     /// Fully isolate a node in both directions.
-    pub fn isolate(&self, node: NodeId, peers: &[NodeId]) {
+    pub fn isolate(&self, node: Nid, peers: &[Nid]) {
         for &p in peers {
             self.block(node, p);
             self.block(p, node);
@@ -67,20 +89,29 @@ impl Faults {
         self.blocked.lock().unwrap().clear();
     }
 
-    fn is_blocked(&self, from: NodeId, to: NodeId) -> bool {
+    fn is_blocked(&self, from: Nid, to: Nid) -> bool {
         self.blocked.lock().unwrap().contains(&(from, to))
     }
 }
 
-#[derive(Clone)]
-pub struct ChannelNetworkFactory {
-    local: NodeId,
-    registry: Registry,
+pub struct ChannelNetworkFactory<C: RaftTypeConfig> {
+    local: Nid,
+    registry: Registry<C>,
     faults: Faults,
 }
 
-impl ChannelNetworkFactory {
-    pub fn new(local: NodeId, registry: Registry, faults: Faults) -> Self {
+impl<C: RaftTypeConfig> Clone for ChannelNetworkFactory<C> {
+    fn clone(&self) -> Self {
+        ChannelNetworkFactory {
+            local: self.local,
+            registry: self.registry.clone(),
+            faults: self.faults.clone(),
+        }
+    }
+}
+
+impl<C: RaftTypeConfig<NodeId = Nid>> ChannelNetworkFactory<C> {
+    pub fn new(local: Nid, registry: Registry<C>, faults: Faults) -> Self {
         ChannelNetworkFactory {
             local,
             registry,
@@ -89,10 +120,12 @@ impl ChannelNetworkFactory {
     }
 }
 
-impl RaftNetworkFactory<TypeConfig> for ChannelNetworkFactory {
-    type Network = ChannelNetwork;
+impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetworkFactory<C>
+    for ChannelNetworkFactory<C>
+{
+    type Network = ChannelNetwork<C>;
 
-    async fn new_client(&mut self, target: NodeId, _node: &Node) -> Self::Network {
+    async fn new_client(&mut self, target: Nid, _node: &Node) -> Self::Network {
         ChannelNetwork {
             local: self.local,
             target,
@@ -102,15 +135,15 @@ impl RaftNetworkFactory<TypeConfig> for ChannelNetworkFactory {
     }
 }
 
-pub struct ChannelNetwork {
-    local: NodeId,
-    target: NodeId,
-    registry: Registry,
+pub struct ChannelNetwork<C: RaftTypeConfig> {
+    local: Nid,
+    target: Nid,
+    registry: Registry<C>,
     faults: Faults,
 }
 
-impl ChannelNetwork {
-    fn link_down<E>(&self) -> RPCError<NodeId, Node, E>
+impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> ChannelNetwork<C> {
+    fn link_down<E>(&self) -> RPCError<Nid, Node, E>
     where
         E: std::error::Error,
     {
@@ -120,7 +153,7 @@ impl ChannelNetwork {
         ))))
     }
 
-    fn target_gone<E>(&self) -> RPCError<NodeId, Node, E>
+    fn target_gone<E>(&self) -> RPCError<Nid, Node, E>
     where
         E: std::error::Error,
     {
@@ -131,12 +164,12 @@ impl ChannelNetwork {
     }
 }
 
-impl RaftNetwork<TypeConfig> for ChannelNetwork {
+impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNetwork<C> {
     async fn append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
+        rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<Nid>, RPCError<Nid, Node, RaftError<Nid>>> {
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
@@ -148,9 +181,9 @@ impl RaftNetwork<TypeConfig> for ChannelNetwork {
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<NodeId>,
+        rpc: VoteRequest<Nid>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<Nid>, RPCError<Nid, Node, RaftError<Nid>>> {
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
@@ -162,11 +195,11 @@ impl RaftNetwork<TypeConfig> for ChannelNetwork {
 
     async fn install_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
+        rpc: InstallSnapshotRequest<C>,
         _option: RPCOption,
     ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, Node, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
+        InstallSnapshotResponse<Nid>,
+        RPCError<Nid, Node, RaftError<Nid, openraft::error::InstallSnapshotError>>,
     > {
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
