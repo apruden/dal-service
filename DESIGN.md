@@ -212,7 +212,11 @@ later balancing work waits. A stuck plan may be marked `aborting`, but only
 the fenced report of §7.5 clears it. This makes the token stable between
 plan creation and resolution, avoiding an impossible attempt to atomically
 compare two independent Raft logs. The data-Raft leader serializes the actual
-change (§7.1); metadata is a durable work queue and routing aid. On recovery,
+change (§7.1); metadata is a durable work queue and routing aid. Config
+comparisons here and throughout §7 are over **voter sets** — learners are
+ignored, so a committed `add_learner` entry still compares equal to `voters`
+and a crash at the learner stage resumes the plan rather than raising an
+error. On recovery,
 inspect the partition's committed config first: if it equals `voters`, resume
 the plan (or confirm its abort if it is marked `aborting`, §7.5); if it is
 the joint configuration for `voters` and `target_voters`,
@@ -340,8 +344,10 @@ Two flavors:
    for the replacement. Leadership is transferred away first if the draining
    node was the leader (`openraft` leadership transfer).
 3. When the node appears in no partition record's `voters` or `move.target_voters`,
-   meta group removes it from the membership list. The operator can then power
-   it off. Its RocksDB can be deleted.
+   meta group removes it from the membership list. If the node is also a
+   meta-group voter, an operator-driven, learner-first meta-Raft membership
+   change (§3.1) must remove it from the meta voter set before this step. The
+   operator can then power it off. Its RocksDB can be deleted.
 
 Draining is the **safe** path: no partition ever drops below majority because
 the replacement joins *before* the old replica leaves (joint consensus moves
@@ -362,7 +368,8 @@ caught up).
    and promotes it via `change_membership` as in §7.2. If the down node is the
    planned learner of an in-flight move, the meta group instead marks that
    plan `aborting` (§7.5); a replacement plan may be created only after the
-   abort resolves.
+   abort resolves. If the down node is the voter the in-flight move is already
+   replacing, the existing plan is the replacement — it is left to finish.
 4. If the crashed node returns, it discovers (via the meta group + Raft term)
    that it has been replaced for some partitions; it marks those CFs non-serving
    before reclaiming them and, for any partition where it is still a member,
