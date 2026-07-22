@@ -50,8 +50,9 @@ argument.
 - **Liveness:** a partition remains available for reads and writes as long as a
   majority of its replicas are up and can communicate. Loss of meta-group
   quorum stops topology changes, but does not stop already-configured data
-  groups: routing state is served from cached/follower copies anyway (§8.1),
-  and the data group itself remains the authority on whether it can serve.
+  groups: a client with a cached route can still reach the data group, which is
+  the authority on whether it can serve (§7.4). A client with neither a working
+  seed endpoint nor a cached route cannot discover a route during that outage.
 
 ---
 
@@ -101,7 +102,8 @@ decisions rather than ad-hoc gossip.
 
 Cluster creation is an explicit administrative operation: it writes immutable
 cluster identity, `P`, `R`, protocol version, and the initial meta-group
-voter set to durable storage before any data partition is created. It then
+voter set to the meta group's durable state machine before any data partition
+is created. It then
 creates each initial partition with an explicit durable voter configuration;
 creation fails unless at least `R` eligible, distinct nodes exist. The initial
 meta group is itself a normal Raft group with its own documented bootstrap,
@@ -130,18 +132,24 @@ rebalancer action may start or advance without meta-group quorum.
 ### 4.2 Operations
 | Op       | Request                          | Response                              |
 |----------|----------------------------------|---------------------------------------|
-| `get`    | `{ key }`                        | `{ found, value?, version }`          |
-| `put`    | `{ key, value, if_version?, client_id, sequence }` | `{ ok, version }` or `{ redirect }` |
-| `delete` | `{ key, if_version?, client_id, sequence }` | `{ ok, version }` or `{ redirect }` |
+| `get`    | `{ key }`                        | `{ found, value?, version? }`         |
+| `put`    | `{ key, value, if_version?, client_id, sequence }` | `MutationResult` or `{ redirect }` |
+| `delete` | `{ key, if_version?, client_id, sequence }` | `MutationResult` or `{ redirect }` |
 
-- `if_version` gives optional compare-and-set (CAS): the mutation applies only
-  if the current version matches. Against an absent key any numeric
-  `if_version` fails; the distinguished sentinel `ABSENT` succeeds only if the
-  key is currently absent (create-only). `get` on an absent key returns
-  `{ found: false }` with no version. Because versions are never reused,
-  version-based ABA is impossible without tombstones. This is the single-key
-  primitive that lets clients build safe read-modify-write without cross-key
-  transactions.
+- `MutationResult` is either `{ outcome: Applied, version }` or
+  `{ outcome: ConditionFailed, current: Absent | Present { version } }`.
+  A successful mutation, including an unconditional delete of an absent key,
+  is a Raft log entry and returns that entry's index as `version`; the latter
+  does not create a key record or tombstone.
+- `if_version` gives optional compare-and-set (CAS): a numeric value applies
+  only if the current key version matches. Against an absent key any numeric
+  value fails. The distinguished sentinel `ABSENT` is accepted by `put` only
+  and succeeds only if the key is absent (create-only). A `delete` carrying
+  `ABSENT` is rejected as malformed before any Raft proposal and does not
+  consume the client's `sequence`. `get` on an absent key returns
+  `{ found: false }` with no version. Because versions are never reused, version-based ABA is impossible
+  without tombstones. This is the single-key primitive that lets clients build
+  safe read-modify-write without cross-key transactions.
 - A mutation is identified by `(client_id, partition_id, sequence)`. Sequences
   are strictly increasing and serialized per client/partition; this keeps a
   fixed-size, durable idempotency record per client/partition without an unsafe
@@ -163,12 +171,14 @@ key ──hash──► partition_id ──placement map──► [replica node 
   creation and never changed. `partition_id = xxhash64(key) % P`.
 - **Placement is an explicit, replicated assignment**, not a hash ring. The
   meta group stores which `R` nodes host each partition (`R` = replication
-  factor, e.g. 3). A simple greedy balancer proposes changes: when a node
-  joins, it takes over an equal share of replica slots from the most-loaded
-  nodes; when a node leaves, its slots go to the least-loaded nodes not
-  already hosting that partition. Only affected partitions move — `O(R·P/N)`
-  per membership change, the same movement bound a consistent-hash ring gives,
-  with strictly better balance and no virtual-node machinery.
+  factor, e.g. 3). A deterministic greedy balancer proposes single-voter
+  replacements: choose an overloaded source and an eligible, non-replica
+  destination, breaking ties by `NodeId`. A partition never has more than one
+  move in flight; moves for distinct partitions may run concurrently up to the
+  migration throttle (§7.2). This gives near-even replica counts (within one slot when feasible),
+  moves only `O(R·P/N)` slots for one join/leave, and needs no virtual-node
+  machinery. The balancer validates `eligible_nodes >= R` and every target has
+  exactly `R` distinct voters before committing a plan.
 
 Why fixed partitions? Hashing keys directly to nodes would make every key its
 own placement decision — impossible to replicate with Raft. A fixed `P` bounds
@@ -176,55 +186,56 @@ the number of Raft groups and makes placement a small explicit table. `P = 128`
 with `R = 3` keeps per-node Raft-instance and RocksDB column-family counts low
 (§6) while still giving ~1% rebalance granularity for clusters into the tens
 of nodes. Larger clusters need a larger `P` chosen at creation; dynamic
-splitting is future work (§14).
+splitting is future work (§15).
 
 `R` and `P` are cluster constants stored in the meta group.
 
 ### 5.2 Placement map
 
-The balancer computes a *desired* placement. The meta group stores the
-*actual, committed* placement map:
+The meta group stores the last confirmed data-Raft voter set and, at most, one
+immutable move plan per partition:
 
 ```
 partition_id → {
-    active_voters:     [NodeId; R],  // last observed committed data-Raft voters
-    learners:          [NodeId],     // nodes catching up (non-voting)
-    state:             Stable
-                     | Moving {
-                         plan_id:       u64,          // fencing token = meta log
-                                                      //   index of plan creation
-                         expected_old:  [NodeId; R],  // voter set the plan assumed
-                         target_voters: [NodeId; R],
-                       },
-    leader_hint:       NodeId,       // advisory only
+    voters: [NodeId; R],             // last confirmed committed data-Raft voters
+    move: Option<{
+        plan_id: u64,                // meta log index of plan creation
+        target_voters: [NodeId; R],  // differs from voters by one node
+        aborting: bool,              // set once; bars start/resume (§7.5)
+    }>,
 }
 ```
 
-Two states suffice: the data-Raft leader — not the meta group — is the
-serialization point for the actual membership change (§7.1), so finer-grained
-meta phases would be bookkeeping, not safety. The balancer *proposes*
-placement; the map is the replicated control plan and routing aid. A rebalance
-drives the observed data-Raft config toward the plan one safe membership
-change at a time (§7). If the map and a partition Raft log disagree after a
-crash, recovery first inspects the committed partition config and resumes or
-repairs the fenced plan; it never treats stale metadata as permission to alter
-or serve the data group.
+The planned learner is `target_voters - voters`; leader hints belong in client
+caches, not replicated metadata. While `move` is present it is never replaced:
+later balancing work waits. A stuck plan may be marked `aborting`, but only
+the fenced report of §7.5 clears it. This makes the token stable between
+plan creation and resolution, avoiding an impossible attempt to atomically
+compare two independent Raft logs. The data-Raft leader serializes the actual
+change (§7.1); metadata is a durable work queue and routing aid. On recovery,
+inspect the partition's committed config first: if it equals `voters`, resume
+the plan (or confirm its abort if it is marked `aborting`, §7.5); if it is
+the joint configuration for `voters` and `target_voters`,
+complete that change; if it equals `target_voters`, finalize it; otherwise stop
+and raise an operator-visible reconciliation error. Metadata never authorizes
+serving.
 
 ---
 
 ## 6. Storage layer (RocksDB)
 
-Each node runs a single RocksDB instance with **column families keyed by
-partition**, so partitions are physically isolated (cheap to drop/ingest on
-migration). With `P = 128` this is at most `3P + 1` CFs even on a node hosting
-every partition — within RocksDB's comfortable range:
+Each node runs a single RocksDB instance with **two column families per Raft
+group**. The meta group uses group id `meta`; data groups use their partition
+id. This keeps a group physically isolated (cheap to drop/ingest on migration)
+without a third metadata CF: at most `2(P + 1)` CFs for `P` data groups plus the
+meta group.
 
-- `cf_data_<partition>` — the applied key-value state machine for that partition.
-- `cf_raftlog_<partition>` — Raft log entries (openraft `RaftLogStorage`).
-- `cf_meta_<partition>` — Raft hard state (term, vote), last-applied index,
-  snapshot pointer, committed membership/config state, and local serving state.
-- `cf_cluster` — a local cache of the meta-group state (rebuilt from the meta
-  group on startup; not authoritative).
+- `cf_log_<group>` — Raft log entries, vote/hard state, committed membership,
+  and snapshot metadata (openraft `RaftLogStorage`).
+- `cf_state_<group>` — the state machine: key/value/version records and client
+  sequence records for a data group; cluster identity, node directory,
+  placement records, and plans for the meta group. It also stores
+  `last_applied` and local serving state.
 
 Implementation notes:
 - We implement openraft's `RaftLogStorage` and `RaftStateMachine` traits over
@@ -238,7 +249,8 @@ Implementation notes:
   last-applied state. Log truncation is allowed only after that durable snapshot
   point. This is also the mechanism used for learner catch-up.
 - Applying a committed entry (`put`/`delete`) and advancing `last_applied` occur
-  in **one atomic `WriteBatch`**, so recovery never double-applies or skips.
+  in **one atomic `WriteBatch`** against `cf_state_<group>`, so recovery never
+  double-applies or skips. The same rule applies to all meta-state changes.
 - `delete` removes the key and its version record in the same atomic batch. No
   logical tombstone is kept: versions are log indexes and never repeat, so
   RocksDB deletion markers may compact freely without affecting CAS or
@@ -263,18 +275,20 @@ available while nodes are **added** and **removed**. The invariant we protect:
   *actual* voter set of *one* partition, using joint consensus, and is only safe
   when the new members are caught up.
 
-The rebalancer translates the first into a *fenced sequence* of the second. A
-worker acts only while a linearizable meta-group read still names its `plan_id`,
-expected old voter set, and target set — but that read is advisory: it can be
-invalidated the moment it returns. The serialization point is the data-Raft
-leader, which verifies that its currently committed config equals the plan's
-expected old set *atomically with* proposing the membership change, and rejects
-a proposal while another change is in progress. `plan_id` is the meta-group log
-index of the plan-creation entry, so tokens are totally ordered and a leader
-also rejects any plan older than the newest it has observed for that partition.
-A stale worker therefore stops and reconciles instead of applying an obsolete
-desired placement. We never just repoint routing at new nodes and start
-serving — that would risk stale reads and lost writes.
+The rebalancer translates the first into a *fenced sequence* of the second. The
+meta group creates a plan only when the partition record has no existing plan;
+it does not supersede it. Before it starts or resumes a move, the data-Raft
+leader performs a linearizable meta read of that record; a newly elected
+leader repeats this check itself before continuing a predecessor's move. It
+accepts the plan only when it is not marked `aborting` (§7.5), its current
+committed config equals the record's `voters`, it has no membership change in
+progress, and the target replaces exactly one voter.
+`plan_id` is the meta log index of creation and is included in every
+finalization request. The data-Raft leader is the serialization point for the
+membership change; the two Raft groups are not and cannot be made atomic. A
+crash is reconciled from the data group's committed config as specified in
+§5.2. We never just repoint routing at new nodes and start serving — that would
+risk stale reads and lost writes.
 
 ### 7.2 Adding a node
 
@@ -284,26 +298,27 @@ meta group.
 1. **Register the node.** Meta group commits the new node into the membership
    list; the balancer computes a new desired placement. This is a
    metadata-only commit; no data moves yet. The node starts empty.
-2. **Prepare a fenced plan.** For each affected partition, a meta-group entry
-   moves the partition to `Moving`, recording a fresh `plan_id`, the observed
-   old voter set, and the target voter set. A subset `S` of partitions now want the new
-   node as a replica (roughly `R·P/N` of them). The plan is durable before any
-   data-group action, but it does not itself change routing authority.
+2. **Prepare one fenced plan.** For an affected stable partition, a meta-group
+   entry records its current `voters`, a fresh `plan_id`, and a target that
+   replaces exactly one voter with the new node. Further moves for that
+   partition wait until the plan is finalized or aborted (§7.5). The plan is
+   durable before any data-group
+   action, but it does not itself change routing authority.
 3. **Add as learner first.** The current data-Raft leader rechecks the plan and
    its own committed config, then runs `add_learner(new_node)`. It streams log
    and/or a verified snapshot. The learner must durably reach the leader's
    current committed log point before promotion; a merely "nearby" match is not
    a completion condition. The learner cannot vote or serve client operations.
-4. **Commit the data configuration.** The leader rechecks `plan_id` and uses
-   Raft joint consensus to change exactly from the expected old set to the
-   target voters. The reconfiguration is complete only when the final config is
-   committed and applied by the data group. Normal writes remain governed by the
-   joint configuration throughout; no separate metadata quorum is counted.
+4. **Commit the data configuration.** The leader uses Raft joint consensus to
+   change from the record's `voters` to `target_voters`. The reconfiguration is
+   complete only when the final config is committed and applied by the data
+   group. Normal writes remain governed by the joint configuration throughout;
+   no separate metadata quorum is counted.
 5. **Finalize metadata, then retire.** The leader reports the committed config
-   `LogId` to the meta group. Only a matching `plan_id` may atomically update
-   `active_voters` and return the partition to `Stable`. While a plan
-   is active, the routing candidate set is `active_voters ∪ target_voters`; this
-   bridges the unavoidable gap between the two independent Raft commits. After
+   `LogId` to the meta group. Only a matching `plan_id` and exact target config
+   may atomically replace `voters` and clear `move`. While a plan is active,
+   the routing candidate set is `voters ∪ target_voters`; this bridges the
+   unavoidable gap between the two independent Raft commits. After
    finalization, a removed node may reclaim `cf_*_<partition>` only after its
    local service gate has durably recorded that it is no longer a voter. A crash
    in any phase resumes by inspecting data Raft's committed membership first.
@@ -324,7 +339,7 @@ Two flavors:
    3), let it catch up, then `change_membership` to swap the draining node out
    for the replacement. Leadership is transferred away first if the draining
    node was the leader (`openraft` leadership transfer).
-3. When matching finalized plans show the node hosts no more voters or learners,
+3. When the node appears in no partition record's `voters` or `move.target_voters`,
    meta group removes it from the membership list. The operator can then power
    it off. Its RocksDB can be deleted.
 
@@ -344,7 +359,10 @@ caught up).
    picks a replacement node (a least-loaded node not already a replica), the
    meta group creates a fenced replacement plan, adds it as a learner to each affected
    partition, catches it up from a surviving leader's verified snapshot/log,
-   and promotes it via `change_membership` as in §7.2.
+   and promotes it via `change_membership` as in §7.2. If the down node is the
+   planned learner of an in-flight move, the meta group instead marks that
+   plan `aborting` (§7.5); a replacement plan may be created only after the
+   abort resolves.
 4. If the crashed node returns, it discovers (via the meta group + Raft term)
    that it has been replaced for some partitions; it marks those CFs non-serving
    before reclaiming them and, for any partition where it is still a member,
@@ -371,24 +389,60 @@ partition's own Raft state:
 - A node that has applied its removal records a non-serving state before it
   reclaims local data. On startup it must establish membership through its
   partition Raft state before serving any client request.
+- A node holding no local Raft state for a group refuses that group's vote and
+  append RPCs rather than lazily creating empty state; it re-enters only
+  through the learner-add path of a fenced plan. This is what makes CF
+  reclamation safe: after the drop, the absence of local state itself enforces
+  non-participation, so an amnesiac ex-voter can never help elect a leader
+  that lacks committed entries.
 - A response may carry a leader hint and candidate routes to speed retries.
   Stale client routing state is never a safety problem — a mis-routed request
   is redirected (§8.2), not served. This also preserves availability when the
   meta group is unreachable.
+
+### 7.5 Aborting a stuck plan
+
+A plan whose planned learner dies before promotion would otherwise block that
+partition's rebalancing — and any drain of its current voters — forever, since
+plans are never replaced. The escape is a fenced abort that keeps the
+data-Raft leader as the serialization point:
+
+1. The meta group marks the plan `aborting` (by operator command, or by
+   failure handling when the planned learner is `Down`). From this point no
+   leader passes the §7.1 gate for this plan, so the move can no longer start
+   or resume. The plan is not yet cleared.
+2. The current data-Raft leader, observing `aborting`, makes a
+   quorum-confirmed (ReadIndex-style) observation of its own committed config
+   with no membership change in flight and reports it with `plan_id`:
+   - config equals `voters` → the meta group atomically clears `move`; the
+     leader removes any learner the plan added. The abort succeeded.
+   - config equals `target_voters` → the move actually completed; finalize
+     normally (§7.2 step 5). The abort arrived too late, benignly.
+   - joint configuration → complete the membership change first, then
+     finalize.
+
+This is safe without comparing the two Raft logs atomically: a deposed leader
+cannot produce the report because its quorum confirmation fails, the reporting
+leader itself refuses the plan after confirming, and any newer leader must
+re-pass the §7.1 gate, which refuses an aborting plan. A plan cleared as
+aborted therefore can never be completed afterward.
 
 ---
 
 ## 8. Request routing and the client
 
 ### 8.1 Client-side routing
-The client library:
-1. Obtains cluster state from **any** meta-group replica or any node's cached
-   copy — no quorum read is needed, because routing data is advisory and the
-   serving gate (§7.4) is the sole authority. The client caches candidate
-   routes and refreshes them when it receives a redirect.
+Each client is configured with the immutable cluster id and one or more
+meta-group seed addresses; it learns `P` from the cluster rather than local
+config, so a wrong partition count cannot be configured. The client library:
+1. Obtains `P`, the node directory, and the placement map from any reachable
+   meta-group replica. This is a follower/cached read, not a quorum read, because routing
+   is advisory and the serving gate (§7.4) is the sole authority. The client
+   caches candidate routes and refreshes them after a redirect. A cold client
+   retries its seed addresses until one is reachable.
 2. Computes `partition_id = hash(key) % P`.
-3. Sends the request to `leader_hint`, then tries the advertised candidate set
-   (`active_voters`, plus `target_voters` while a plan is active) on timeout or
+3. Sends the request to its cached `leader_hint`, then tries the advertised candidate set
+   (`voters`, plus `target_voters` while a move is active) on timeout or
    redirect. During a meta outage, cached candidates can still reach an
    unchanged, healthy data group.
 
@@ -396,9 +450,10 @@ The client library:
 Routing hints are advisory. If a request reaches a non-leader, non-voter, or a
 node that cannot pass the serving gate, it replies with `{ redirect:
 leader_addr?, candidates }` rather than processing it. The client updates its
-cache and retries candidates. This keeps clients
-correct even with stale metadata: authority is checked by partition Raft, not by
-the client cache.
+cache and retries candidates. The response includes the cluster id and the
+node addresses known to the responder; a client rejects a mismatched cluster
+id. This keeps clients correct even with stale metadata: authority is checked
+by partition Raft, not by the client cache.
 
 ### 8.3 Read path
 `get` is linearizable via **ReadIndex** by default: the leader confirms a quorum
@@ -406,7 +461,7 @@ in its current membership — during joint consensus, in *both* the old and new
 configurations, the same rule as commit — and waits until its state machine has
 applied the returned index before answering. No log write is needed. There is
 no lease-read fast path: ReadIndex is the only read path, which keeps the
-design free of clock-drift assumptions entirely (§14).
+design free of clock-drift assumptions entirely (§15).
 
 ### 8.4 Idempotent retries
 Each mutation carries `(client_id, partition_id, sequence)`. The replicated
@@ -434,8 +489,10 @@ turning an old retry into a new write.
   takes effect only as a committed meta-group decision.
 - A simple timeout suffices because a false `Down` is safe: it can only trigger
   the fenced, learner-first replacement of §7.2, which cannot bypass data-Raft
-  quorum. The cost of a false positive is wasted data movement, bounded by the
-  migration throttle — an availability/efficiency cost, not a correctness risk.
+  quorum. A false positive can cause needless data movement and temporarily
+  reduce availability or fault tolerance while the move runs; it is not a
+  linearizability or acknowledged-data-loss risk. The migration throttle bounds
+  its blast radius.
 - Only the meta group may start a replacement plan, so all nodes act on one
   consistent plan — avoiding split-brain re-replication storms.
 
@@ -468,16 +525,23 @@ turning an old retry into a new write.
   append-entries, vote, snapshot, migration), one connection per peer, pooled.
 - Clients use a `DEALER` per node connection, load-balanced by the client
   library's routing (not by ZMQ round-robin — routing is key-directed).
-- Snapshot / bulk migration streams share the same `ROUTER/DEALER` channel;
-  `snapshot_chunk` (4 MiB) framing bounds how long a transfer can
-  head-of-line-block small Raft messages. A dedicated bulk channel on a second
-  port is a future optimization, adopted only if measurement shows heartbeat
-  starvation.
+- Snapshot / bulk migration streams use a dedicated `ROUTER/DEALER` pair on a
+  second port. Control traffic (Raft append/vote/heartbeat and client traffic)
+  never shares its outbound queue with a snapshot, so a bulk transfer cannot
+  starve elections. The bulk lane is still rate-limited by the migration
+  throttle.
 
 ### 10.2 Message framing
-- Envelope: `[ msg_type | partition_id | client_id? | sequence? |
-  plan_id? | payload ]`. Raft RPCs additionally carry their Raft group and
-  term/log identifiers; membership-changing control RPCs carry `plan_id`.
+- Envelope: `[ protocol_version | cluster_id | msg_type | group_id |
+  request_id | payload ]`. `group_id` is `meta` or a partition id;
+  `request_id` correlates replies but has no correctness role. Client mutation
+  payloads carry `client_id` and `sequence`; membership-changing control
+  payloads carry `plan_id`; Raft RPCs carry the Raft term/log identifiers.
+- Receivers reject an unsupported protocol version, wrong cluster id, malformed
+  group id, or a message larger than its configured per-type limit before it
+  reaches Raft or the state machine. A `ClientOp` whose key does not hash to
+  the envelope's `group_id` is also rejected — a client with a wrong partition
+  count must get an error, not a successful write into the wrong partition.
 - Payloads serialized with a compact binary codec (e.g. `bincode`/`prost`).
 - `msg_type` covers: `ClientOp`, `RaftAppend`, `RaftVote`, `RaftSnapshot`,
   `MigrationChunk`, `MetaQuery`, `Redirect`, `Heartbeat`.
@@ -503,24 +567,24 @@ ZeroMQ gives us framing and reconnection but **not** delivery guarantees, and a
 ```
 src/
   main.rs               // node bootstrap: config, sockets, spawn runtimes
-  config.rs             // P, R, V, timeouts, paths, ports
+  config.rs             // cluster id, P, R, timeouts, paths, seed addresses
   transport/
     mod.rs
     router.rs           // inbound ROUTER loop, dispatch by msg_type
     dealer.rs           // outbound DEALER pool, retries, timeouts
     codec.rs            // envelope framing + (de)serialization
-  placement.rs          // key → partition_id, greedy desired-placement calc
+  placement.rs          // key → partition_id, deterministic one-step balancer
   meta/
     group.rs            // meta Raft group: membership + placement map
-    rebalancer.rs       // desired vs actual diff → sequenced, fenced Raft changes
+    rebalancer.rs       // durable one-step plans → fenced Raft changes
     failure.rs          // heartbeats, suspect/down state machine
   partition/
     node.rs             // one openraft instance per partition
     state_machine.rs    // apply put/delete, client sequence records, CAS
-    log_store.rs        // openraft RaftLogStorage over RocksDB CF
+    log_store.rs        // openraft RaftLogStorage over cf_log_<group>
     snapshot.rs         // checkpoint/SST export + install (== migration)
   storage/
-    rocks.rs            // RocksDB handle, CF lifecycle (create/drop)
+    rocks.rs            // RocksDB handle, per-group CF lifecycle (create/drop)
     batch.rs            // atomic apply + last_applied advance
   api/
     ops.rs              // get/put/delete request handling, redirects
@@ -534,7 +598,59 @@ arbitrary threads, so each socket lives on one owning task/thread).
 
 ---
 
-## 12. Key parameters (defaults)
+## 12. Implementation plan
+
+Build in the following order. A later phase is not started until the preceding
+phase's listed tests pass; this keeps the control plane from masking a broken
+single-partition implementation.
+
+1. **Types, configuration, and storage.** Define wire types, `NodeId`,
+   `ClusterId`, `GroupId`, log entries, `MutationResult`, and validated static
+   configuration. Require `P > 0`, `R >= 3`, and at least `R` bootstrap nodes.
+   Implement `cf_log_<group>` / `cf_state_<group>` creation, crash-safe
+   `WriteBatch` application, and restart recovery. Test torn-process recovery
+   at every write boundary and reject a mismatched cluster id.
+2. **One local data state machine.** Implement `put`, `delete`, numeric CAS,
+   create-only `put(ABSENT)`, and durable client sequence records. Apply every
+   mutation request through the state machine, including condition failures and
+   absent deletes. Unit-test retries, lost responses, CAS failure sequencing,
+   delete/recreate, and ABA prevention.
+3. **One Raft group.** Implement the OpenRaft network and storage traits, then
+   bootstrap a single three-voter group. Expose write forwarding and ReadIndex
+   reads only through the serving gate. Test leader changes, message loss and
+   duplication, follower restart, snapshot install, and recovery from a
+   snapshot plus a suffix log.
+4. **Transport and client.** Add versioned, cluster-scoped control and bulk
+   sockets, bounded codecs, timeouts, and retry correlation. Build seed-based
+   discovery, route caching, redirects, and idempotent mutation retry. Test
+   stale routes, wrong-cluster messages, mis-partitioned keys, and a cold
+   client with only one live seed.
+5. **Meta group and bootstrap.** Reuse the same Raft storage/runtime for group
+   `meta`; implement the node directory, immutable cluster record, placement
+   records, and operator-only `init`/`join` commands. Create data groups only
+   after the meta bootstrap entry commits. Test a full-cluster restart and
+   meta-quorum loss while an already-configured data group continues to serve.
+6. **Rebalancing and failure handling.** Implement exactly one durable,
+   single-replacement plan per partition: add learner, verify its committed
+   match index, change membership, and finalize or abort the plan (§7.5).
+   Reconcile plans after each restart from data-Raft membership. Add
+   heartbeats, `Suspect`/`Down`, graceful drain, throttling, and explicit
+   operator status. Test crashes after every step, false `Down`, a planned
+   learner that dies mid-move (fenced abort), old-leader isolation, and
+   removal of the current leader.
+7. **System verification.** Run deterministic simulated-network tests and
+   fault-injection tests with random crash/restart, delay, reorder, duplicate,
+   and partition events. Assert linearizability of each partition, no duplicate
+   mutation application, and that every completed move has the meta voter set
+   equal to the data-Raft committed configuration. Add metrics for quorum
+   health, applied/committed lag, learner lag, plan age, and bulk-lane backlog.
+
+The v1 acceptance gate is a three-node cluster completing the scenarios in
+§14 under fault injection, with no unsafe recovery command exercised.
+
+---
+
+## 13. Key parameters (defaults)
 
 | Param | Meaning | Default |
 |-------|---------|---------|
@@ -544,11 +660,12 @@ arbitrary threads, so each socket lives on one owning task/thread).
 | `down_timeout` | minimum suspicion period before a `Down` decision | 15 s |
 | `max_concurrent_migrations` | cluster-wide rebalance throttle | N (node count) |
 | `snapshot_chunk` | migration stream chunk size | 4 MiB |
+| control/bulk ports | independent ZMQ endpoints per node | configured |
 | value size cap | max value bytes | 16 MiB |
 
 ---
 
-## 13. Failure-scenario summary
+## 14. Failure-scenario summary
 
 | Scenario | Behavior |
 |----------|----------|
@@ -556,6 +673,7 @@ arbitrary threads, so each socket lives on one owning task/thread).
 | One replica of `R=3` fails | Partition stays available (2/3 quorum); meta group re-replicates to a new node. |
 | Majority of a partition fails | Partition unavailable for writes + linearizable reads (correctness over availability) until quorum returns or manual `force_recover`. |
 | Node added | Fenced plan → verified learner catch-up → joint-consensus promotion → metadata finalization; only `~R·P/N` partitions move. |
+| Planned learner dies mid-move | Plan marked `aborting`; the data leader's quorum-confirmed report clears or finalizes it (§7.5), then a fresh plan replaces the dead node. |
 | Node gracefully removed | Replacement joins as learner and is promoted *before* old replica leaves; never drops below majority. |
 | Network partition | Only the majority side of each Raft group serves; minority returns errors/redirects, never stale data. |
 | Stale client cache | Client retries advertised candidates; partition Raft's serving gate, not the client cache, decides authority. |
@@ -563,7 +681,7 @@ arbitrary threads, so each socket lives on one owning task/thread).
 
 ---
 
-## 14. Open questions / future work
+## 15. Open questions / future work
 
 - **Load-aware placement:** current placement balances replica counts only; a
   future balancer could move partitions off hot/full nodes (the migration
