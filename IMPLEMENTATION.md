@@ -37,16 +37,29 @@ These bind every milestone:
    hot-reload.
 7. **Gates are automated.** A milestone is done when its listed tests pass in
    CI; the next milestone does not start before that (DESIGN §12 ordering).
-8. **Group state is created in exactly two places:** cluster `init` (initial
-   voters) and an explicit `BecomeLearner{plan_id}` control message from a
-   data-Raft leader executing a plan. A node never lazily creates group state
-   in response to vote/append RPCs (amnesia rule, DESIGN §7.4).
+8. **Group state is created in exactly two ways:** a durable, byte-identical
+   `BootstrapGroup` record during cluster `init`, or an explicit
+   `BecomeLearner{group_id, plan_id}` control message from that group's
+   incumbent Raft leader. `BecomeLearner` applies to data and meta groups; the
+   receiver first verifies the live, non-aborting plan and its target through a
+   linearizable meta read, then durably records the admission before creating
+   CFs. Every admission — including a byte-identical retry — re-runs that
+   verification, so a replay arriving after an abort or CF reclamation cannot
+   resurrect the group; a conflicting or stale admission is rejected. A node
+   never lazily creates group state in response to
+   vote/append RPCs (amnesia rule, DESIGN §7.4).
+9. **Control reports are not client operations.** `FinalizePlan` and
+   `AbortReport` are submitted only by the internal, peer-control path after
+   the reporting data leader has made the specified quorum-confirmed
+   observation. Public meta APIs cannot propose either command. This is a
+   protocol boundary (v1 still assumes a trusted network), not a claim that the
+   meta state machine can atomically inspect a data-Raft log.
 
 ---
 
 ## 1. Toolchain and dependencies
 
-Rust stable, edition 2021. Dependencies are deliberately few; each addition
+Rust stable, edition 2024. Dependencies are deliberately few; each addition
 needs a reason this table can hold:
 
 | Crate | Purpose |
@@ -77,20 +90,33 @@ layers, async-trait sugar beyond what openraft requires.
   `MutationResult = Applied { version } | ConditionFailed { current }`,
   `IfVersion = Number(u64) | Absent`, data command enum (`Put`, `Delete`),
   meta command enum (`ClusterInit`, `RegisterNode`, `SetNodeState`,
-  `CreatePlan`, `MarkAborting`, `FinalizePlan`, `AbortReport`). All
+  `CreatePlan`, `MarkAborting`, `FinalizePlan`, `AbortReport`). Separate
+  node-local control records are `BootstrapGroup`, a durable
+  `LearnerAdmission`, and the pending-report journal (a leader's unconfirmed
+  observations); the peer-control protocol carries a
+  `DataConfigObservation { group_id, plan_id, voter_set, config_log_id }`.
+  Placement records retain the last confirmed data config `LogId`. All are
   serde-derived; envelope byte layout is deferred to M4.
 - Config: `cluster_id`, `node_id`, control/bulk listen addrs, seed addrs,
   data dir, timeouts; `P` and `R` appear only in `init` input. Validation:
-  `P > 0`, `R >= 3`, ≥ `R` distinct bootstrap nodes.
+  `P > 0`, `P <= u16::MAX`, `R >= 3`, ≥ `R` distinct bootstrap nodes, and an
+  odd meta-voter set of ≥ 3 distinct nodes. `ClusterInit` persists a canonical hash
+  specification (`xxh64`, seed 0, raw key bytes) along with `P`; this is a
+  protocol constant, not a crate-version default.
 - Storage: open DB; create/drop `cf_log_<group>` / `cf_state_<group>` pairs;
   a node-local identity record `{cluster_id, node_id}` in the default CF —
   opening a data dir whose identity mismatches the config is a hard error.
 - `batch.rs`: the single helper that writes state-machine mutations and
   `last_applied` in one `WriteBatch` with `sync: true`. All appliers use it.
+  Snapshot-install journals live in the group's log CF; serving-gate records,
+  `LearnerAdmission`, and the pending-report journal live in the node-local
+  default CF, which survives both state-CF replacement and group-CF
+  reclamation — a snapshot can never copy or erase local authority state.
 
-**Gate:** config validation matrix; identity-mismatch rejection; fail-point
-crash at every write boundary followed by reopen with invariants intact
-(`last_applied` consistent, no partial batch visible).
+**Gate:** config validation matrix (including `u16` partition bounds and hash
+spec persistence); identity-mismatch rejection; fail-point crash at every
+write boundary followed by reopen with invariants intact (`last_applied`
+consistent, no partial batch visible).
 
 ### M2 — Data state machine, no Raft yet (DESIGN §4.2, §8.4, §12.2)
 
@@ -101,7 +127,13 @@ through M1's batch helper.
   replaced, or deleted atomically (satisfies §6's "same atomic batch" rule
   with one record instead of two).
 - Sequence record per `(client_id)` within the partition CF:
-  `(highest_sequence, stored MutationResult)`.
+  `(highest_sequence, command_digest, stored MutationResult)`, where
+  `command_digest` is a 128-bit xxh3 of the canonical command bytes (values
+  reach 16 MiB, so raw bytes are not retained; accidental collision is
+  negligible under the non-Byzantine model, and M7's oracle still checks true
+  byte identity). A retry at `highest_sequence` succeeds only when its digest
+  matches; reuse of an idempotency key for another command returns a stable
+  `SequenceMismatch` error and never returns a result for the wrong request.
 - `apply(cmd, log_index)` order of operations: sequence check first
   (`== highest` → return stored result; `== highest + 1` → decide;
   else → deterministic rejection), then CAS evaluation against current state,
@@ -109,14 +141,18 @@ through M1's batch helper.
   Every decided outcome — including `ConditionFailed` and delete-of-absent —
   advances the sequence record.
 - `delete` with `if_version: Absent` never reaches the state machine (API
-  layer rejects pre-proposal, sequence not consumed); the SM treats it as a
-  malformed entry error if it ever appears.
+  layer rejects pre-proposal, sequence not consumed). Every committed entry,
+  including a defensively handled malformed, stale, or gapped command, instead
+  produces a deterministic non-mutation apply result and atomically advances
+  `last_applied`; no apply error may wedge Raft progress. Only *decided*
+  commands advance the client sequence record.
 
 **Gate:** unit + property tests: retry returns stored result byte-identical;
-failed CAS advances `highest` (the §8.4 wedge case); delete/recreate keeps
+failed CAS advances `highest` (the §8.4 wedge case); same-sequence,
+different-command retries are rejected; delete/recreate keeps
 versions strictly increasing; numeric CAS against absent fails; `put(ABSENT)`
-create-only; gapped/stale sequences rejected without mutation; crash between
-any two applies recovers to a prefix.
+create-only; malformed/gapped/stale committed entries advance only
+`last_applied`; crash between any two applies recovers to a prefix.
 
 ### M3 — One Raft group (DESIGN §6, §7.4, §8.3, §12.3)
 
@@ -128,10 +164,19 @@ any two applies recovers to a prefix.
   membership recovery on open.
 - `RaftStateMachine` wraps M2. Snapshot build: sorted scan of
   `cf_state_<group>` → `SstFileWriter` chunks + manifest (per-file checksums,
-  last-applied `LogId`, membership). Install: stage in a unique dir, verify
-  checksums, fsync manifest + dir, drop/create the CF, `ingest_external_file_cf`,
-  then write `last_applied` — with a staging marker so a crash at any point
-  either resumes the install or discards the stage, never serves a partial CF.
+  last-applied `LogId`, membership). The snapshot contains replicated records
+  only (keys, sequence records, and replicated metadata), never node-local
+  serving/admission state. Install uses a sync-durable journal in the log CF:
+  `Prepared` (verified staged manifest), `Replacing` (old CF may be destroyed),
+  `Ingesting`, and `Installed` (new CF + snapshot metadata + `last_applied`).
+  Before `Replacing`, recovery may discard the stage; at or after `Replacing`,
+  it must recreate a clean CF and finish ingestion from the verified stage.
+  The serving gate remains closed until recovery reaches `Installed`. Multi-SST
+  ingestion is restartable from a clean CF, never resumed over an unknown
+  partial ingest; every journal transition, manifest, and staging directory is
+  fsync-durable before the next destructive action. The final snapshot metadata,
+  `last_applied`, and `Installed` journal transition are one sync-durable
+  RocksDB `WriteBatch` across their CFs.
 - `PartitionHandle` — the serving gate as an API: `write(cmd)` →
   `MutationResult` or `NotLeader{hint}`; `read(key)` → `ensure_linearizable()`
   then local get. There is no other path to the state machine.
@@ -140,7 +185,9 @@ any two applies recovers to a prefix.
 **Gate (all on ChannelNetwork, 3 voters):** leader crash/re-election with no
 acknowledged loss; message loss/duplication/reorder; follower restart from
 log; restart from snapshot + suffix log; snapshot install mid-stream crash;
-ReadIndex never returns a stale value while a deposed leader is isolated.
+ReadIndex never returns a stale value while a deposed leader is isolated;
+crash at every snapshot-journal transition (including CF drop and each SST
+ingest) never exposes a partial state machine.
 
 ### M4 — Transport and client (DESIGN §8, §10, §12.4)
 
@@ -151,6 +198,12 @@ ReadIndex never returns a stale value while a deposed leader is isolated.
   | payload]`; per-`msg_type` size limits enforced before decode. Reject:
   unsupported version, wrong cluster id, malformed group id, oversized frame,
   and `ClientOp` whose key does not hash to `group_id`.
+- The codec has no generic "propose a meta command" frame. Public traffic may
+  invoke only documented client/admin operations; `FinalizePlan`, `AbortReport`,
+  learner admission, and Raft membership controls use a distinct peer-control
+  dispatcher reachable only from configured node endpoints. The v1 trusted
+  network assumption is explicit, but this separation prevents an ordinary
+  client code path from bypassing the plan driver.
 - One ROUTER (control) + one ROUTER (bulk: `RaftSnapshot`, `MigrationChunk`)
   per node; DEALER pools outbound; each ZMQ socket owned by one poller thread
   bridged to Tokio channels. Application-level timeout + retry; `request_id`
@@ -172,23 +225,60 @@ application (asserted via M2 sequence records).
 
 - The meta group reuses M3's storage/runtime with `GroupId::Meta`. Its state
   machine applies the meta command enum with all validation inside `apply`:
-  cluster record immutable; `CreatePlan` only if no existing plan, target has
-  exactly `R` distinct voters differing from `voters` by one, eligible
-  nodes ≥ `R`; `FinalizePlan` only with matching `plan_id` and exact target
-  voter set; `MarkAborting` sets a one-way flag.
-- `init`: commits `ClusterInit` (identity, `P`, `R`, protocol version, meta
-  voters), then creates the `P` partition records and the initial data groups
-  on their assigned nodes — data groups only after the bootstrap entry
-  commits. `join` registers a node. Balancer (`placement.rs`) is a pure
-  function `(directory, placement) -> Option<PlanProposal>`, deterministic
-  with `NodeId` tie-breaks — trivially unit-testable.
+  cluster record immutable; `CreatePlan` only if no existing plan and eligible
+  nodes suffice — a data-group target has exactly `R` distinct voters
+  differing from `voters` by one, a meta-group target is a same-size
+  single-voter replacement or a single-voter removal and never leaves fewer
+  than 3 voters; `FinalizePlan` only with matching `plan_id`, group, exact
+  target voter set, and a `DataConfigObservation` whose voter set exactly
+  equals the planned target and whose config `LogId` is present;
+  `AbortReport` carries the same plan/group/config-log-id binding and is
+  additionally accepted only for a plan already marked `aborting` — a report
+  for a healthy plan is rejected outright, so no spurious or replayed report
+  can clear a live, non-aborting move; `MarkAborting` sets a one-way flag.
+  The state machine validates tokens and state transitions, while the internal
+  control handler is responsible for obtaining the cross-group quorum
+  observation before it can submit a report.
+- `init` is a resumable protocol, not a local shortcut: (1) obtain one
+  immutable bootstrap descriptor (cluster identity, hash spec, meta voters,
+  and group genesis configurations) — a retried `init` first asks every
+  reachable bootstrap node for an existing durable descriptor and reuses it,
+  deriving a fresh one (with its random `cluster_id`) only when none exists,
+  so a partially seeded bootstrap never self-conflicts; (2) write
+  `BootstrapGroup` and identity
+  records with sync durability on every initial meta voter, accepting retries
+  only when byte-identical; (3) the deterministic designated bootstrap node
+  invokes the pinned OpenRaft initialization flow with the full pre-admitted
+  meta voter configuration, then commits `ClusterInit`; (4) commit the initial
+  partition-placement records; (5) issue byte-identical `BootstrapGroup`
+  records to every initial data voter, then the deterministic designated voter
+  initializes each data group with its recorded full configuration. Startup
+  reconciliation resumes these durable phases; a conflicting init fails, and
+  a data group is never initialized before its placement record commits.
+  `join` registers a node. Balancer
+  (`placement.rs`) is a pure function `(directory, placement) ->
+  Option<PlanProposal>`, deterministic with `NodeId` tie-breaks — trivially
+  unit-testable.
+- Meta membership has an explicit policy and its own learner-first driver:
+  choose eligible directory nodes, admit the meta learner through rule 8,
+  wait for durable catch-up, use `change_membership`, and persist/reconcile
+  its membership plan under a `GroupId::Meta` record with the meta-specific
+  validation above (replacement or single-voter removal, never below 3
+  voters), otherwise exactly as for a data group. `join` alone never changes
+  meta
+  voters; removal, replacement, and leadership transfer are explicit operator
+  actions. This permits safe meta-voter replacement before a directory entry is
+  removed.
 - `MetaQuery` serves directory/placement/`P` as advisory follower reads;
   `status` renders it.
 
 **Gate:** balancer property tests (near-even counts, single-voter diff,
-determinism); plan-validation matrix inside the meta SM; full-cluster restart
-recovers meta + data groups; meta-quorum loss while a configured data group
-keeps serving reads and writes via cached routes.
+determinism); plan-validation matrix inside the meta SM; crash/retry at every
+bootstrap phase (including partial initial voter admission), byte-identical
+init retry and conflicting-init rejection; meta learner add/replace/remove and
+restart recovery; full-cluster restart recovers meta + data groups; meta-quorum
+loss while a configured data group keeps serving reads and writes via cached
+routes.
 
 ### M6 — Rebalancing, failure handling, abort (DESIGN §5.2, §7, §9.1, §12.6)
 
@@ -201,24 +291,48 @@ records, CLI `leave`/`abort-plan`.
   2. ask the current data-Raft leader to execute: leader does a linearizable
      meta read of the record; accepts only if not `aborting`, its committed
      **voter set** equals `voters`, no change in progress, single-voter diff;
-  3. leader sends `BecomeLearner{plan_id}` (the only lazy-state-creation
-     path, rule 8), `add_learner`, streams snapshot/log on the bulk lane;
+  3. leader sends `BecomeLearner{group_id, plan_id}`. The target independently
+     confirms, through a linearizable meta read, that this exact plan is live,
+     non-aborting, and names it as target; it sync-durably records the
+     admission, then creates the group. A byte-identical retry is accepted
+     only after re-running the same meta verification — a replay arriving
+     after an abort or CF reclamation is refused, not resurrected — and
+     stale/conflicting admissions are refused. The leader then `add_learner`s
+     it and streams snapshot/log on the bulk lane;
   4. promotion only at durable match with the leader's committed index;
      `change_membership(voters → target_voters)` via joint consensus;
-  5. leader reports committed config; meta `FinalizePlan` swaps `voters`,
-     clears `move`.
+  5. only after the final configuration is committed and applied, the current
+     leader passes a ReadIndex barrier in that configuration and constructs a
+     `DataConfigObservation { group_id, plan_id, voter_set: target_voters,
+     config_log_id }`, persisted in its pending-report journal until meta
+     confirms it (a rejection for an already-cleared plan counts as
+     confirmation and stops the retry). It
+     submits this through the internal peer-control path; meta `FinalizePlan`
+     stores the confirmed config `LogId`, swaps `voters`, and clears `move`.
+     No public API can manufacture this report.
 - Abort driver (§7.5): `MarkAborting` (operator command or `Down` planned
-  learner) → current data leader makes a quorum-confirmed observation with no
-  change in flight → `AbortReport{plan_id, voter_set}` → meta clears the plan
-  (== `voters`), finalizes (== `target_voters`), or completes-then-finalizes
-  (joint). Meta rejects reports for cleared plans.
+  learner) → the current data leader, if it observes the joint config, first
+  completes the membership change (only the data leader can); it then makes a
+  quorum-confirmed observation with no change in flight and submits a
+  journaled internal `AbortReport{plan_id, voter_set, config_log_id}` whose
+  voter set is exactly `voters` (meta clears the plan) or exactly
+  `target_voters` (meta finalizes) — a joint config is never reported, so a
+  single voter set always suffices. Meta rejects reports for cleared plans
+  and for plans not marked `aborting`. Delayed, duplicate, premature, and
+  deposed-leader reports are idempotent or rejected by the plan's
+  aborting/config-log-id state; none may clear a live, non-aborting move.
 - Startup reconciliation: for every local group, compare committed voter set
   against the meta record per §5.2 (learners ignored) and resume / complete /
   finalize / raise an operator-visible error.
-- Failure detection: node heartbeats to the meta leader; `Suspect` after
-  `suspect_timeout`, `Down` as a committed entry after `down_timeout`; `Down`
-  triggers replacement plans, or `MarkAborting` when the down node is a
-  planned learner; a down move-source just lets its plan finish.
+- Failure detection: node heartbeats to the meta leader carry a durable node
+  incarnation and monotonically increasing heartbeat sequence. The replicated
+  directory has an explicit transition table: heartbeats supply liveness
+  evidence only; `Suspect`, `Down`, and reactivation are committed transitions,
+  and a node declared `Down` may become eligible again only through an explicit
+  rejoin/incarnation check. `Suspect` follows `suspect_timeout`, `Down` follows
+  `down_timeout`; `Down` triggers replacement plans, or `MarkAborting` when
+  the down node is a planned learner; a down move-source just lets its plan
+  finish.
 - Drain: `leave` marks `Draining`, plans replace it everywhere, leadership
   transferred first, meta-voter removal precedes directory removal; the node
   reclaims CFs only after durably recording non-voter state.
@@ -228,7 +342,12 @@ records, CLI `leave`/`abort-plan`.
 **Gate (ChannelNetwork):** crash + restart after every numbered step resumes
 to a consistent end state; planned learner dies mid-move → abort clears and a
 replacement plan succeeds; abort racing a completing move finalizes benignly;
-false `Down` causes movement but no linearizability violation; isolated old
+duplicate, delayed, or premature `BecomeLearner`, finalization, and abort
+reports (including an abort report for a healthy plan, and replays after an
+abort or CF reclamation) cannot resurrect a group or wrongly clear a plan;
+meta-voter replacement/removal preserves meta quorum; stale heartbeats
+cannot reactivate a `Down` node; false `Down` causes movement but no
+linearizability violation; isolated old
 leader cannot serve reads or finalize; removing the current leader; drain of
 a node hosting leaders; returning crashed node refuses participation in
 groups it was removed from.
@@ -243,13 +362,17 @@ groups it was removed from.
   scheduler (e.g. madsim) only if seed-replay proves insufficient to
   reproduce failures — not before.
 - Oracles asserted continuously and at quiescence:
-  - per-key linearizability: single-register histories per key checked with a
-    WGL-style checker (small, per-key histories keep this cheap);
+  - per-key linearizability: an executable single-register model checks every
+    invocation/response interval, including CAS/version outcomes, redirects,
+    retries, and operations left pending by a crash. The checker either finds a
+    legal real-time-respecting order or emits the seed plus a minimized history;
+    small per-key histories keep this cheap;
   - exactly-once: every `(client_id, partition_id, sequence)` applied at most
-    once across the whole run;
+    once across the whole run, and every duplicate response is for byte-identical
+    command bytes;
   - convergence: every finalized plan has meta `voters` == data-Raft
-    committed voter set; no partition left with a non-`aborting` stale plan
-    and a live target;
+    committed voter set and its recorded config `LogId`; no partition left with
+    a non-`aborting` stale plan and a live target;
   - no acknowledged write lost across any minority of failures.
 - Metrics via `status`: quorum health, applied/committed lag, learner lag,
   plan age, bulk-lane backlog. Counters only — no metrics framework.
@@ -263,9 +386,10 @@ injection with all oracles green and `force_recover` never invoked.
 ## 3. Cross-cutting test strategy
 
 - **Fail-points:** `fail` crate scenarios at each durable-write boundary
-  (log append, batch apply, snapshot stage/install, meta apply, serving-gate
-  record, CF drop). Each M-gate lists which points it must cover; M7 fuzzes
-  across all of them.
+  (bootstrap marker/admission, log append, batch apply, every snapshot-journal
+  transition and SST ingest, meta apply, pending-report journal, serving-gate
+  record, CF drop). Each
+  M-gate lists which points it must cover; M7 fuzzes across all of them.
 - **Property tests:** codec round-trips, balancer invariants, state-machine
   sequence/CAS algebra.
 - **No mocked durability, no mocked consensus:** fault injection lives in the
@@ -282,9 +406,11 @@ against misconfiguration, not adversaries; v1 assumes a trusted network
 ## 5. Known risks
 
 - `rocksdb` crate coverage of SST export/ingest edge cases → M3 proves the
-  snapshot path early, before any multi-node work depends on it.
+  snapshot path early, including recovery after the destructive CF-replace
+  point, before any multi-node work depends on it.
 - openraft 0.9 API surface (`ensure_linearizable`, learner promotion
-  semantics) → M3 pins the version and encodes assumptions as tests, so an
-  upgrade that changes behavior fails loudly.
+  semantics, initialization, and meta/data membership transitions) → M3/M5
+  pin the version and encode assumptions as tests, so an upgrade that changes
+  behavior fails loudly.
 - ZMQ identity/reconnect quirks → confined to M4 by rule 3; consensus
   correctness never depends on them.

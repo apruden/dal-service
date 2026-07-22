@@ -101,11 +101,16 @@ decisions rather than ad-hoc gossip.
 ### 3.1 Bootstrap and control-plane availability
 
 Cluster creation is an explicit administrative operation: it writes immutable
-cluster identity, `P`, `R`, protocol version, and the initial meta-group
+cluster identity, `P`, `R`, the canonical key-hash specification, protocol
+version, and the initial meta-group
 voter set to the meta group's durable state machine before any data partition
 is created. It then
 creates each initial partition with an explicit durable voter configuration;
-creation fails unless at least `R` eligible, distinct nodes exist. The initial
+creation fails unless at least `R` eligible, distinct nodes exist and the
+initial meta voter set is an odd set of at least three distinct nodes.
+Creation is resumable: its durable bootstrap records are accepted on retry
+only when byte-identical, and a conflicting re-initialization fails rather
+than forking the cluster. The initial
 meta group is itself a normal Raft group with its own documented bootstrap,
 membership-change, snapshot, and disaster-recovery procedure. Joining nodes
 verify the cluster identity and protocol version before they are admitted.
@@ -198,6 +203,7 @@ immutable move plan per partition:
 ```
 partition_id → {
     voters: [NodeId; R],             // last confirmed committed data-Raft voters
+    voters_log_id: LogId,            // data-Raft log id that committed `voters`
     move: Option<{
         plan_id: u64,                // meta log index of plan creation
         target_voters: [NodeId; R],  // differs from voters by one node
@@ -222,7 +228,9 @@ the plan (or confirm its abort if it is marked `aborting`, §7.5); if it is
 the joint configuration for `voters` and `target_voters`,
 complete that change; if it equals `target_voters`, finalize it; otherwise stop
 and raise an operator-visible reconciliation error. Metadata never authorizes
-serving.
+serving. The meta group's own membership changes are tracked by an analogous
+record keyed `meta`; its target may be a same-size single-voter replacement
+or a single-voter removal, and never leaves fewer than three voters.
 
 ---
 
@@ -239,7 +247,12 @@ meta group.
 - `cf_state_<group>` — the state machine: key/value/version records and client
   sequence records for a data group; cluster identity, node directory,
   placement records, and plans for the meta group. It also stores
-  `last_applied` and local serving state.
+  `last_applied`.
+- Node-local authority state — the node identity record, serving-gate and
+  learner-admission records, and the leader's pending-report journal — lives
+  in the default CF, never in a group's CFs: snapshot installation replaces
+  `cf_state_<group>` wholesale and reclamation drops both group CFs, so
+  records that gate serving or participation must survive both.
 
 Implementation notes:
 - We implement openraft's `RaftLogStorage` and `RaftStateMachine` traits over
@@ -250,7 +263,10 @@ Implementation notes:
   plus the exact last-applied `LogId` and membership/config state. Installation
   stages files in a unique directory, verifies every checksum, fsyncs the
   manifest and directory, then atomically installs it with the corresponding
-  last-applied state. Log truncation is allowed only after that durable snapshot
+  last-applied state. Install progress is tracked in a sync-durable journal in
+  `cf_log_<group>`, so a crash at any point either resumes the install from
+  the verified stage or discards it — a partially installed state machine is
+  never served. Log truncation is allowed only after that durable snapshot
   point. This is also the mechanism used for learner catch-up.
 - Applying a committed entry (`put`/`delete`) and advancing `last_applied` occur
   in **one atomic `WriteBatch`** against `cf_state_<group>`, so recovery never
@@ -425,8 +441,14 @@ data-Raft leader as the serialization point:
      leader removes any learner the plan added. The abort succeeded.
    - config equals `target_voters` → the move actually completed; finalize
      normally (§7.2 step 5). The abort arrived too late, benignly.
-   - joint configuration → complete the membership change first, then
-     finalize.
+   - joint configuration → the leader completes the membership change first,
+     then finalizes. The report itself always carries a single voter set —
+     exactly `voters` or exactly `target_voters`; a joint configuration is
+     never reported.
+
+The meta group accepts an abort report only for a plan still present and
+marked `aborting`; a report for a healthy plan is rejected outright and can
+never clear it.
 
 This is safe without comparing the two Raft logs atomically: a deposed leader
 cannot produce the report because its quorum confirmation fails, the reporting
@@ -472,8 +494,11 @@ design free of clock-drift assumptions entirely (§15).
 
 ### 8.4 Idempotent retries
 Each mutation carries `(client_id, partition_id, sequence)`. The replicated
-state machine persists, per client/partition, the highest *decided* sequence and
-its result. Every decided outcome advances this record — including a CAS whose
+state machine persists, per client/partition, the highest *decided* sequence,
+a digest of the command's canonical bytes, and its result; a retry returns
+the stored result only when its digest matches, so reusing a sequence for a
+different command yields a stable error, never the other command's result.
+Every decided outcome advances this record — including a CAS whose
 `if_version` check fails; if a failed CAS did not advance `highest`, the
 client's next sequence would be rejected as a gap and its stream would wedge.
 `sequence == highest` returns the stored result without reapplying;
@@ -491,9 +516,14 @@ turning an old retry into a new write.
 ### 9.1 Failure detection
 - Each node sends periodic heartbeats to the meta group. (Per-partition Raft
   leaders already heartbeat their followers, so no separate peer-to-peer
-  detection layer exists.) Missed heartbeats past `suspect_timeout` mark the
-  node `Suspect`; after `down_timeout` the meta leader proposes `Down`, which
-  takes effect only as a committed meta-group decision.
+  detection layer exists.) Heartbeats carry a durable node incarnation and a
+  monotonically increasing sequence and are liveness evidence only; `Suspect`,
+  `Down`, and reactivation are committed directory transitions. Missed
+  heartbeats past `suspect_timeout` mark the node `Suspect`; after
+  `down_timeout` the meta leader proposes `Down`, which takes effect only as a
+  committed meta-group decision. A `Down` node becomes eligible again only
+  through an explicit rejoin that passes an incarnation check — a stale or
+  replayed heartbeat can never reactivate it.
 - A simple timeout suffices because a false `Down` is safe: it can only trigger
   the fenced, learner-first replacement of §7.2, which cannot bypass data-Raft
   quorum. A false positive can cause needless data movement and temporarily
@@ -551,7 +581,12 @@ turning an old retry into a new write.
   count must get an error, not a successful write into the wrong partition.
 - Payloads serialized with a compact binary codec (e.g. `bincode`/`prost`).
 - `msg_type` covers: `ClientOp`, `RaftAppend`, `RaftVote`, `RaftSnapshot`,
-  `MigrationChunk`, `MetaQuery`, `Redirect`, `Heartbeat`.
+  `MigrationChunk`, `MetaQuery`, `Redirect`, `Heartbeat`, plus the
+  peer-control types `BecomeLearner` and `DataConfigObservation`
+  (finalization/abort reports). Peer-control types are dispatched separately
+  from client operations; there is no generic "propose a meta command"
+  message, so no client code path can submit `FinalizePlan` or `AbortReport`
+  (§7.5).
 
 ### 10.3 Reliability concerns with ZeroMQ
 ZeroMQ gives us framing and reconnection but **not** delivery guarantees, and a
@@ -613,7 +648,8 @@ single-partition implementation.
 
 1. **Types, configuration, and storage.** Define wire types, `NodeId`,
    `ClusterId`, `GroupId`, log entries, `MutationResult`, and validated static
-   configuration. Require `P > 0`, `R >= 3`, and at least `R` bootstrap nodes.
+   configuration. Require `P > 0`, `P <= u16::MAX`, `R >= 3`, at least `R`
+   bootstrap nodes, and an odd meta-voter set of at least three.
    Implement `cf_log_<group>` / `cf_state_<group>` creation, crash-safe
    `WriteBatch` application, and restart recovery. Test torn-process recovery
    at every write boundary and reject a mismatched cluster id.
