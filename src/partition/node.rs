@@ -227,6 +227,11 @@ impl PartitionNode {
         self.raft.metrics().borrow().current_leader
     }
 
+    /// Whether the local serving gate is open for this group.
+    pub fn is_serving(&self) -> bool {
+        self.storage.require_serving(self.group).is_ok()
+    }
+
     /// Gracefully stop the Raft runtime.
     pub async fn shutdown(&self) -> Result<()> {
         self.raft

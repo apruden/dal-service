@@ -25,7 +25,11 @@ use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::MetaNode;
 use crate::partition::node::PartitionNode;
+use crate::runtime::config_file::cluster_id_hex;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
+use crate::runtime::http::{
+    ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusSource,
+};
 use crate::runtime::rebalance::RebalanceDriver;
 use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
@@ -272,6 +276,26 @@ impl Node {
             tasks.push(tokio::spawn(driver.run()));
         }
 
+        // Read-only HTTP admin plane. Bind here so a bad address fails startup;
+        // the serve task is aborted on shutdown with the other loops.
+        if let Some(http_addr) = &cfg.http_addr {
+            let addr: std::net::SocketAddr = http_addr
+                .parse()
+                .map_err(|e| crate::error::Error::Config(format!("http_addr {http_addr}: {e}")))?;
+            let src: Arc<dyn StatusSource> = Arc::new(NodeStatus {
+                node_id: cfg.node_id,
+                cluster: cluster.clone(),
+                meta: meta.clone(),
+                partitions: partitions.clone(),
+            });
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(crate::error::Error::Io)?;
+            tasks.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, crate::runtime::http::router(src)).await;
+            }));
+        }
+
         Ok(Node {
             node_id: cfg.node_id,
             cluster,
@@ -450,6 +474,76 @@ impl Node {
             node.shutdown().await?;
         }
         Ok(())
+    }
+}
+
+/// Builds the read-only `/status` snapshot from node-local state. Holds the same
+/// shared handles as the node, so the HTTP task sees live partition membership.
+struct NodeStatus {
+    node_id: NodeId,
+    cluster: ClusterConfig,
+    meta: Option<Arc<MetaNode>>,
+    partitions: PartitionMap,
+}
+
+impl StatusSource for NodeStatus {
+    fn status(&self) -> ClusterStatus {
+        let meta = self.meta.as_ref().map(|m| MetaStatus {
+            is_leader: m.current_leader() == Some(self.node_id),
+            leader: m.current_leader(),
+            applied: m.applied_index(),
+            voters: m.voters(),
+        });
+        let directory = self
+            .meta
+            .as_ref()
+            .and_then(|m| m.local_directory().ok())
+            .unwrap_or_default();
+
+        let mut partitions: Vec<PartitionStatus> = {
+            let map = self.partitions.read().unwrap();
+            map.iter()
+                .map(|(&partition, node)| {
+                    let committed = node.committed_voter_set();
+                    let leader = node.current_leader();
+                    let role = if leader == Some(self.node_id) {
+                        Role::Leader
+                    } else if committed.contains(&self.node_id) {
+                        Role::Voter
+                    } else {
+                        Role::Learner
+                    };
+                    let plan = self
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.local_placement(GroupId::Data(partition)).ok().flatten())
+                        .and_then(|p| p.r#move)
+                        .map(|mv| PlanStatus {
+                            plan_id: mv.plan_id,
+                            aborting: mv.aborting,
+                        });
+                    PartitionStatus {
+                        partition,
+                        role,
+                        leader,
+                        applied: node.applied_index(),
+                        committed_voters: committed.into_iter().collect(),
+                        serving: node.is_serving(),
+                        plan,
+                    }
+                })
+                .collect()
+        };
+        partitions.sort_by_key(|s| s.partition);
+
+        ClusterStatus {
+            node_id: self.node_id,
+            cluster_id: cluster_id_hex(self.cluster.cluster_id),
+            protocol_version: self.cluster.protocol_version,
+            meta,
+            partitions,
+            directory,
+        }
     }
 }
 

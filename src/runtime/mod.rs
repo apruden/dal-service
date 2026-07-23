@@ -2,5 +2,6 @@
 
 pub mod config_file;
 pub mod dispatch;
+pub mod http;
 pub mod node;
 pub mod rebalance;

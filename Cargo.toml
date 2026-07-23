@@ -22,14 +22,16 @@ tracing = "0.1"
 fail = "0.5"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "signal", "net"] }
 futures = "0.3"
 zmq = "0.10"
+axum = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
 fail = { version = "0.5", features = ["failpoints"] }
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 # Enables the `fail` crate's runtime-toggleable crash points. Off in normal

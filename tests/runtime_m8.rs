@@ -366,6 +366,78 @@ async fn become_learner_starts_a_hosted_partition() {
     Arc::try_unwrap(node).ok().unwrap().shutdown().await.unwrap();
 }
 
+fn http_get(addr: &str, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).unwrap();
+    buf
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_status_reports_node_local_view() {
+    use dal::runtime::http::{ClusterStatus, Role};
+
+    let ctx = zmq::Context::new();
+    let desc = descriptor();
+
+    // Reserve an ephemeral port for node 1's HTTP admin plane.
+    let http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let http_addr = format!("127.0.0.1:{http_port}");
+
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (i, &id) in VOTERS.iter().enumerate() {
+        let mut cfg = node_config(id, dirs[i].path().to_path_buf());
+        if id == 1 {
+            cfg.http_addr = Some(http_addr.clone());
+        }
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    // /health is a bare liveness probe.
+    let health = http_get(&http_addr, "/health");
+    assert!(health.starts_with("HTTP/1.1 200"), "health: {health}");
+
+    // /status reports node 1's local view: it runs meta and hosts partition 0.
+    let raw = http_get(&http_addr, "/status");
+    let body = raw.split_once("\r\n\r\n").expect("http body").1;
+    let status: ClusterStatus = serde_json::from_str(body).unwrap();
+    assert_eq!(status.node_id, 1);
+    assert!(status.meta.is_some(), "node 1 runs the meta group");
+    let p0 = status
+        .partitions
+        .iter()
+        .find(|p| p.partition == 0)
+        .expect("hosts partition 0");
+    assert!(matches!(p0.role, Role::Leader | Role::Voter));
+    assert_eq!(p0.committed_voters, vec![1, 2, 3]);
+    assert!(p0.serving);
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
+
 fn short_timeouts() -> Timeouts {
     Timeouts {
         suspect: Duration::from_millis(400),
