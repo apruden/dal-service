@@ -35,35 +35,21 @@ fn main() -> ExitCode {
 
     match command.as_str() {
         "init" => match flag(rest, "--config") {
-            Some(path) => {
-                // The bootstrap driver (dal::meta::bootstrap) runs the resumable
-                // protocol against the node runtime; wiring the runtime to real
-                // sockets is the remaining M5/M6 integration.
-                println!("init: would bootstrap cluster from {path}");
-                ExitCode::SUCCESS
-            }
+            Some(path) => unavailable("init", path),
             None => {
                 eprintln!("init: --config <path> required");
                 ExitCode::FAILURE
             }
         },
         "join" => match flag(rest, "--seed") {
-            Some(seed) => {
-                println!("join: would register with seed {seed}");
-                ExitCode::SUCCESS
-            }
+            Some(seed) => unavailable("join", seed),
             None => {
                 eprintln!("join: --seed <addr> required");
                 ExitCode::FAILURE
             }
         },
         "leave" => match flag(rest, "--node") {
-            Some(node) => {
-                // Drives dal::meta::rebalancer::drain_partition for each
-                // partition the node hosts, then removes it from the directory.
-                println!("leave: would drain node {node}");
-                ExitCode::SUCCESS
-            }
+            Some(node) => unavailable("leave", node),
             None => {
                 eprintln!("leave: --node <id> required");
                 ExitCode::FAILURE
@@ -71,10 +57,7 @@ fn main() -> ExitCode {
         },
         "abort-plan" => match (flag(rest, "--group"), flag(rest, "--plan")) {
             (Some(group), Some(plan)) => {
-                // Drives dal::meta::rebalancer::mark_aborting; the fenced abort
-                // report (§7.5) then clears the plan.
-                println!("abort-plan: would mark group {group} plan {plan} aborting");
-                ExitCode::SUCCESS
+                unavailable("abort-plan", &format!("group={group} plan={plan}"))
             }
             _ => {
                 eprintln!("abort-plan: --group <g> and --plan <id> required");
@@ -82,18 +65,17 @@ fn main() -> ExitCode {
             }
         },
         "status" => match flag(rest, "--seed") {
-            Some(seed) => {
-                println!("status: would query routing from seed {seed}");
-                ExitCode::SUCCESS
-            }
+            Some(seed) => unavailable("status", seed),
             None => {
                 eprintln!("status: --seed <addr> required");
                 ExitCode::FAILURE
             }
         },
         "run" => {
-            println!("dal-service {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+            eprintln!(
+                "run is unavailable: this build does not yet wire the library runtime to a process"
+            );
+            ExitCode::FAILURE
         }
         other => {
             eprintln!("unknown command: {other}\n");
@@ -101,4 +83,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn unavailable(command: &str, detail: &str) -> ExitCode {
+    eprintln!(
+        "{command} is unavailable for {detail}: this binary does not yet wire the library runtime to a process"
+    );
+    ExitCode::FAILURE
 }

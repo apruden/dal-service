@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError, Unreachable};
-use openraft::network::{RaftNetwork, RaftNetworkFactory, RPCOption};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
@@ -173,7 +173,10 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
-        let raft = self.registry.get(self.target).ok_or_else(|| self.target_gone())?;
+        let raft = self
+            .registry
+            .get(self.target)
+            .ok_or_else(|| self.target_gone())?;
         raft.append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -187,7 +190,10 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
-        let raft = self.registry.get(self.target).ok_or_else(|| self.target_gone())?;
+        let raft = self
+            .registry
+            .get(self.target)
+            .ok_or_else(|| self.target_gone())?;
         raft.vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -204,7 +210,10 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
-        let raft = self.registry.get(self.target).ok_or_else(|| self.target_gone())?;
+        let raft = self
+            .registry
+            .get(self.target)
+            .ok_or_else(|| self.target_gone())?;
         raft.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))

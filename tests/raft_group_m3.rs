@@ -10,11 +10,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
-use dal::partition::network::{Faults, Registry};
+use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::partition::ApplyResult;
+use dal::partition::network::{Faults, Registry};
+use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::storage::Storage;
-use dal::types::{DataOp, DataRequest, GroupId, MutationResult};
+use dal::types::{BootstrapGroup, DataOp, DataRequest, GroupId, MutationResult};
 
 use tempfile::TempDir;
 
@@ -39,9 +40,24 @@ impl Harness {
     async fn start(&self, idx: usize) -> PartitionNode {
         let node_id = VOTERS[idx];
         let storage = Arc::new(Storage::open_checked(self.dirs[idx].path(), 1, node_id).unwrap());
-        PartitionNode::start(node_id, G, storage, self.registry.clone(), self.faults.clone())
-            .await
-            .unwrap()
+        ensure_bootstrap_group(
+            &storage,
+            &BootstrapGroup {
+                cluster_id: 1,
+                group: G,
+                members: VOTERS.to_vec(),
+            },
+        )
+        .unwrap();
+        PartitionNode::start(
+            node_id,
+            G,
+            storage,
+            self.registry.clone(),
+            self.faults.clone(),
+        )
+        .await
+        .unwrap()
     }
 }
 
@@ -103,7 +119,10 @@ async fn bootstrap_write_and_linearizable_read() {
     let (_h, nodes) = bootstrapped().await;
 
     let r = write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
-    assert!(matches!(r, ApplyResult::Decided(MutationResult::Applied { .. })));
+    assert!(matches!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { .. })
+    ));
 
     let li = leader_idx(&nodes).unwrap();
     match nodes[li].read(b"k").await.unwrap() {
@@ -137,7 +156,10 @@ async fn followers_converge() {
 async fn leader_failover_preserves_acknowledged_write() {
     let (_h, nodes) = bootstrapped().await;
     let ack = write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
-    assert!(matches!(ack, ApplyResult::Decided(MutationResult::Applied { .. })));
+    assert!(matches!(
+        ack,
+        ApplyResult::Decided(MutationResult::Applied { .. })
+    ));
 
     let old = leader_idx(&nodes).unwrap();
     nodes[old].shutdown().await.unwrap();
@@ -145,9 +167,12 @@ async fn leader_failover_preserves_acknowledged_write() {
     // Surviving nodes elect a new leader and still serve the acknowledged write.
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old).collect();
     eventually("survivors elect a new leader", || {
-        survivors
-            .iter()
-            .any(|&i| nodes[i].current_leader().map(|l| l != nodes[old].node_id()).unwrap_or(false))
+        survivors.iter().any(|&i| {
+            nodes[i]
+                .current_leader()
+                .map(|l| l != nodes[old].node_id())
+                .unwrap_or(false)
+        })
     })
     .await;
 
@@ -157,12 +182,12 @@ async fn leader_failover_preserves_acknowledged_write() {
             .iter()
             .copied()
             .find(|&i| nodes[i].current_leader() == Some(nodes[i].node_id()));
-        if let Some(li) = li {
-            if let ReadOutcome::Value(Some((_, v))) = nodes[li].read(b"k").await.unwrap() {
-                assert_eq!(v, b"v");
-                served = true;
-                break;
-            }
+        if let Some(li) = li
+            && let ReadOutcome::Value(Some((_, v))) = nodes[li].read(b"k").await.unwrap()
+        {
+            assert_eq!(v, b"v");
+            served = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -175,7 +200,11 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
     write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
 
     let old = leader_idx(&nodes).unwrap();
-    let others: Vec<u64> = VOTERS.iter().copied().filter(|&v| v != nodes[old].node_id()).collect();
+    let others: Vec<u64> = VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != nodes[old].node_id())
+        .collect();
     h.faults.isolate(nodes[old].node_id(), &others);
 
     // The isolated ex-leader must not answer a linearizable read with a value:
@@ -218,8 +247,9 @@ async fn follower_restarts_from_log() {
     let restarted = h.start(fi).await;
 
     // It rejoins and re-holds the committed write from its own log.
-    eventually("restarted follower recovers the write", || {
-        matches!(restarted.local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v")
-    })
+    eventually(
+        "restarted follower recovers the write",
+        || matches!(restarted.local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v"),
+    )
     .await;
 }

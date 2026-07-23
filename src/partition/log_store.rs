@@ -8,18 +8,22 @@
 //! only the command/response types they carry differ. `NodeId`/`Node`/entry
 //! encoding are identical for every group.
 
+// OpenRaft storage traits prescribe this error type, so these helpers cannot
+// box it without immediately unboxing at the trait boundary.
+#![allow(clippy::result_large_err)]
+
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use openraft::storage::LogFlushed;
-use openraft::storage::LogState;
-use openraft::storage::RaftLogReader;
-use openraft::storage::RaftLogStorage;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::RaftTypeConfig;
 use openraft::StorageError;
+use openraft::storage::LogFlushed;
+use openraft::storage::LogState;
+use openraft::storage::RaftLogReader;
+use openraft::storage::RaftLogStorage;
 use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
 use crate::codec;
@@ -195,14 +199,16 @@ where
         self.read_log_singleton(&KEY_VOTE)
     }
 
-    async fn save_committed(
-        &mut self,
-        committed: Option<LogId>,
-    ) -> Result<(), StorageError<Nid>> {
+    async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         self.storage
             .db()
-            .put_cf_opt(&cf, KEY_COMMITTED, codec::encode(&committed), &Self::sync_wo())
+            .put_cf_opt(
+                &cf,
+                KEY_COMMITTED,
+                codec::encode(&committed),
+                &Self::sync_wo(),
+            )
             .map_err(|e| write_err(e.into()))?;
         Ok(())
     }

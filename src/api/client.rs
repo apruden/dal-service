@@ -11,13 +11,15 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::api::ops::{ClientReply, ClientRequest, RoutingInfo, WriteReply};
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::Transport;
+use crate::transport::codec::{Envelope, MsgType};
 use crate::types::{
     ClientId, ClusterId, DataOp, DataRequest, GroupId, HashSpec, IfVersion, NodeId, Sequence,
     Version,
@@ -38,12 +40,26 @@ struct Cache {
     next_seq: HashMap<u16, Sequence>,
 }
 
+/// A mutation that may have committed even though the client has not yet
+/// observed its response. A later operation on the same stream must retry this
+/// exact operation rather than reuse its sequence for different bytes.
+#[derive(Clone)]
+struct PendingMutation {
+    sequence: Sequence,
+    op: DataOp,
+}
+
 pub struct Client<T: Transport> {
     cluster_id: ClusterId,
     client_id: ClientId,
     seeds: Vec<String>,
     transport: T,
     cache: Mutex<Cache>,
+    /// One stream per `(client_id, partition)`. These locks enforce the
+    /// serialization required by the sequence protocol without holding a
+    /// blocking mutex across network awaits.
+    mutation_locks: Mutex<HashMap<u16, Arc<AsyncMutex<()>>>>,
+    pending: Mutex<HashMap<u16, PendingMutation>>,
     request_id: AtomicU64,
 }
 
@@ -60,6 +76,8 @@ impl<T: Transport> Client<T> {
             seeds,
             transport,
             cache: Mutex::new(Cache::default()),
+            mutation_locks: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
         }
     }
@@ -102,10 +120,16 @@ impl<T: Transport> Client<T> {
         let partition = self.partition_of(key).await?;
         let request = ClientRequest::Read { key: key.to_vec() };
         let reply = self
-            .route(partition, MsgType::ClientOp, GroupId::Data(partition), &request)
+            .route(
+                partition,
+                MsgType::ClientOp,
+                GroupId::Data(partition),
+                &request,
+            )
             .await?;
         match reply {
             ClientReply::Value(v) => Ok(v),
+            ClientReply::Refused(e) => Err(Error::Raft(format!("read refused: {e}"))),
             ClientReply::Error(e) => Err(Error::Raft(format!("read rejected: {e}"))),
             other => Err(Error::Raft(format!("unexpected read reply: {other:?}"))),
         }
@@ -113,15 +137,22 @@ impl<T: Transport> Client<T> {
 
     async fn mutate(&self, key: &[u8], op: DataOp) -> Result<WriteReply> {
         let partition = self.partition_of(key).await?;
-        let sequence = self.reserve_sequence(partition);
+        let lock = self.mutation_lock(partition);
+        let _stream = lock.lock().await;
+        let sequence = self.pending_sequence(partition, &op)?;
         let request = ClientRequest::Mutate(DataRequest {
             client_id: self.client_id,
             sequence,
-            op,
+            op: op.clone(),
         });
 
         let reply = self
-            .route(partition, MsgType::ClientOp, GroupId::Data(partition), &request)
+            .route(
+                partition,
+                MsgType::ClientOp,
+                GroupId::Data(partition),
+                &request,
+            )
             .await?;
 
         match reply {
@@ -129,7 +160,17 @@ impl<T: Transport> Client<T> {
                 // The mutation is decided: advance the client's stream so the
                 // next mutation uses a fresh sequence (DESIGN §8.4).
                 self.commit_sequence(partition, sequence);
+                self.pending.lock().unwrap().remove(&partition);
                 Ok(w)
+            }
+            ClientReply::Refused(e) => {
+                // Refusal is a pure function of the request bytes and
+                // cluster-wide constants, so no replica — including one that
+                // timed out on an earlier attempt — could have proposed this
+                // op. The sequence was never at risk: release it (without
+                // advancing the stream) so the partition does not wedge.
+                self.pending.lock().unwrap().remove(&partition);
+                Err(Error::Raft(format!("write refused: {e}")))
             }
             ClientReply::Error(e) => Err(Error::Raft(format!("write rejected: {e}"))),
             other => Err(Error::Raft(format!("unexpected write reply: {other:?}"))),
@@ -161,6 +202,40 @@ impl<T: Transport> Client<T> {
     fn reserve_sequence(&self, partition: u16) -> Sequence {
         let mut cache = self.cache.lock().unwrap();
         *cache.next_seq.entry(partition).or_insert(1)
+    }
+
+    fn mutation_lock(&self, partition: u16) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.mutation_locks.lock().unwrap();
+        locks
+            .entry(partition)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Return the durable stream sequence for `op`. An unresolved mutation
+    /// retains its sequence; callers may retry only byte-identical bytes until
+    /// its outcome is observed.
+    fn pending_sequence(&self, partition: u16, op: &DataOp) -> Result<Sequence> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(existing) = pending.get(&partition) {
+            if existing.op == *op {
+                return Ok(existing.sequence);
+            }
+            return Err(Error::Raft(format!(
+                "mutation sequence {} for partition {} is unresolved; retry that operation first",
+                existing.sequence, partition
+            )));
+        }
+
+        let sequence = self.reserve_sequence(partition);
+        pending.insert(
+            partition,
+            PendingMutation {
+                sequence,
+                op: op.clone(),
+            },
+        );
+        Ok(sequence)
     }
 
     fn commit_sequence(&self, partition: u16, decided: Sequence) {

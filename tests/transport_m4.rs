@@ -14,14 +14,15 @@ use dal::api::client::Client;
 use dal::api::gateway::{ClientGateway, RoutingSource};
 use dal::api::ops::{ClientReply, ClientRequest, RoutingInfo, WriteReply};
 use dal::codec;
+use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::PartitionNode;
 use dal::storage::Storage;
 use dal::transport::codec::{Envelope, FrameError, MsgType};
 use dal::transport::{InProcess, Transport};
 use dal::types::{
-    ClusterId, DataOp, DataRequest, GroupId, HashSpec, LogId, NodeDirectoryEntry, NodeState,
-    Placement, Version,
+    BootstrapGroup, ClusterId, DataOp, DataRequest, GroupId, HashSpec, IfVersion, LogId,
+    NodeDirectoryEntry, NodeState, Placement, Version,
 };
 
 use proptest::prelude::*;
@@ -147,8 +148,16 @@ impl Cluster {
         let mut nodes = Vec::new();
         for i in 0..3 {
             let node_id = VOTERS[i];
-            let storage =
-                Arc::new(Storage::open_checked(dirs[i].path(), CID, node_id).unwrap());
+            let storage = Arc::new(Storage::open_checked(dirs[i].path(), CID, node_id).unwrap());
+            ensure_bootstrap_group(
+                &storage,
+                &BootstrapGroup {
+                    cluster_id: CID,
+                    group: GroupId::Data(0),
+                    members: VOTERS.to_vec(),
+                },
+            )
+            .unwrap();
             let node = PartitionNode::start(
                 node_id,
                 GroupId::Data(0),
@@ -277,6 +286,47 @@ async fn client_put_then_get_round_trips() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_client_mutations_use_distinct_sequences() {
+    let c = Cluster::bootstrap().await;
+    let client = Arc::new(c.client(0xC4, vec![ctrl_addr(1)]));
+    let left = client.clone();
+    let right = client.clone();
+
+    let (a, b) = tokio::join!(
+        async move { left.put(b"left", b"1", None).await },
+        async move { right.put(b"right", b"2", None).await },
+    );
+    assert!(matches!(a.unwrap(), WriteReply::Applied { .. }));
+    assert!(matches!(b.unwrap(), WriteReply::Applied { .. }));
+    assert_eq!(
+        client.get(b"left").await.unwrap().map(|(_, v)| v),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        client.get(b"right").await.unwrap().map(|(_, v)| v),
+        Some(b"2".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_mutation_does_not_wedge_the_stream() {
+    let c = Cluster::bootstrap().await;
+    let client = c.client(0xC5, vec![ctrl_addr(1)]);
+
+    // The gateway refuses delete-if-Absent before it reaches the log.
+    assert!(client.delete(b"k", Some(IfVersion::Absent)).await.is_err());
+
+    // The refusal must release the reserved sequence: a different mutation on
+    // the same partition proceeds instead of erroring "unresolved".
+    let put = client.put(b"k", b"v", None).await.unwrap();
+    assert!(matches!(put, WriteReply::Applied { .. }));
+    assert_eq!(
+        client.get(b"k").await.unwrap().map(|(_, v)| v),
+        Some(b"v".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_client_with_one_live_seed() {
     let c = Cluster::bootstrap().await;
     // Only the second seed is a real, reachable node.
@@ -364,8 +414,8 @@ async fn mispartitioned_key_is_rejected() {
     let reply = switch.call("gw", env).await.unwrap();
     let decoded: ClientReply = codec::decode(&reply.payload).unwrap();
     assert!(
-        matches!(decoded, ClientReply::Error(ref e) if e.contains("hashes")),
-        "expected mispartition error, got {decoded:?}"
+        matches!(decoded, ClientReply::Refused(ref e) if e.contains("hashes")),
+        "expected mispartition refusal, got {decoded:?}"
     );
 }
 

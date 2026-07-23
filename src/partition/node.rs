@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::Config;
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 
 use crate::error::{Error, Result};
 use crate::partition::log_store::RocksLogStore;
@@ -26,7 +26,9 @@ use crate::types::{DataRequest, GroupId, Version};
 pub enum WriteOutcome {
     Applied(ApplyResult),
     /// This node is not the leader; retry the hinted leader (DESIGN §8.2).
-    NotLeader { leader: Option<NodeId> },
+    NotLeader {
+        leader: Option<NodeId>,
+    },
 }
 
 /// Outcome of a linearizable read.
@@ -54,7 +56,7 @@ impl PartitionNode {
         registry: Registry<TypeConfig>,
         faults: Faults,
     ) -> Result<PartitionNode> {
-        storage.ensure_group(group)?;
+        storage.authorize_group_start(group, node_id)?;
 
         let config = Config {
             cluster_name: group.token(),
@@ -161,10 +163,13 @@ impl PartitionNode {
 
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
+        self.storage.require_serving(self.group)?;
         match self.raft.client_write(req).await {
             Ok(resp) => Ok(WriteOutcome::Applied(resp.data)),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
-                Ok(WriteOutcome::NotLeader { leader: f.leader_id })
+                Ok(WriteOutcome::NotLeader {
+                    leader: f.leader_id,
+                })
             }
             Err(e) => Err(Error::Raft(e.to_string())),
         }
@@ -172,13 +177,16 @@ impl PartitionNode {
 
     /// Perform a linearizable read: ReadIndex, then a local get.
     pub async fn read(&self, key: &[u8]) -> Result<ReadOutcome> {
+        self.storage.require_serving(self.group)?;
         match self.raft.ensure_linearizable().await {
             Ok(_) => {
                 let value = self.data.get(&self.storage, key)?;
                 Ok(ReadOutcome::Value(value))
             }
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
-                Ok(ReadOutcome::NotLeader { leader: f.leader_id })
+                Ok(ReadOutcome::NotLeader {
+                    leader: f.leader_id,
+                })
             }
             Err(e) => Err(Error::Raft(e.to_string())),
         }
@@ -193,11 +201,7 @@ impl PartitionNode {
 
     /// The highest log index this node has applied, if any.
     pub fn applied_index(&self) -> Option<u64> {
-        self.raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|l| l.index)
+        self.raft.metrics().borrow().last_applied.map(|l| l.index)
     }
 
     /// The node this replica currently believes is leader, if any.

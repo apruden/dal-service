@@ -11,13 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::ops::{
-    check_partition, ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, WriteReply,
+    ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, WriteReply, check_partition,
 };
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
-use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::Server;
-use crate::types::{ClusterId, GroupId, HashSpec};
+use crate::transport::codec::{Envelope, MsgType};
+use crate::types::{ClusterId, DataOp, GroupId, HashSpec, IfVersion};
 
 /// The source of a client's routing snapshot (DESIGN §8.1). In M4 a fixed
 /// implementation answers this; M5 backs it with the meta group's placement map.
@@ -70,15 +70,17 @@ impl ClientGateway {
     async fn handle_client_op(&self, env: &Envelope) -> ClientReply {
         let req: ClientRequest = match codec::decode(&env.payload) {
             Ok(r) => r,
-            Err(e) => return ClientReply::Error(format!("malformed ClientOp: {e}")),
+            Err(e) => return ClientReply::Refused(format!("malformed ClientOp: {e}")),
         };
 
         let partition = match check_partition(&req, env.group_id, self.p, &self.hash_spec) {
             Ok(p) => p,
             Err(RejectFrame::MispartitionedKey { expected, got }) => {
-                return ClientReply::Error(RejectFrame::MispartitionedKey { expected, got }.to_string());
+                return ClientReply::Refused(
+                    RejectFrame::MispartitionedKey { expected, got }.to_string(),
+                );
             }
-            Err(e) => return ClientReply::Error(e.to_string()),
+            Err(e) => return ClientReply::Refused(e.to_string()),
         };
 
         let Some(node) = self.partitions.get(&partition) else {
@@ -91,17 +93,34 @@ impl ClientGateway {
         };
 
         match req {
-            ClientRequest::Mutate(data) => match node.write(data).await {
-                Ok(WriteOutcome::Applied(result)) => {
-                    ClientReply::Mutation(WriteReply::from_apply(result))
+            ClientRequest::Mutate(data) => {
+                // `Absent` is meaningful only for create-only puts. Reject a
+                // malformed delete before it reaches the replicated log, so it
+                // cannot consume a Raft entry or masquerade as a decided
+                // client operation.
+                if matches!(
+                    data.op,
+                    DataOp::Delete {
+                        if_version: Some(IfVersion::Absent),
+                        ..
+                    }
+                ) {
+                    return ClientReply::Refused(
+                        "delete does not support if_version=Absent".into(),
+                    );
                 }
-                Ok(WriteOutcome::NotLeader { leader }) => ClientReply::Redirect(Redirect {
-                    cluster_id: self.cluster_id,
-                    leader,
-                    candidates: self.candidates(partition),
-                }),
-                Err(e) => ClientReply::Error(format!("write failed: {e}")),
-            },
+                match node.write(data).await {
+                    Ok(WriteOutcome::Applied(result)) => {
+                        ClientReply::Mutation(WriteReply::from_apply(result))
+                    }
+                    Ok(WriteOutcome::NotLeader { leader }) => ClientReply::Redirect(Redirect {
+                        cluster_id: self.cluster_id,
+                        leader,
+                        candidates: self.candidates(partition),
+                    }),
+                    Err(e) => ClientReply::Error(format!("write failed: {e}")),
+                }
+            }
             ClientRequest::Read { key } => match node.read(&key).await {
                 Ok(ReadOutcome::Value(v)) => ClientReply::Value(v),
                 Ok(ReadOutcome::NotLeader { leader }) => ClientReply::Redirect(Redirect {

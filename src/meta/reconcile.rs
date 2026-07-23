@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::types::{voter_set, NodeId, Placement};
+use crate::types::{NodeId, Placement, voter_set};
 
 /// Whether a data-Raft leader may start or resume a plan (DESIGN §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

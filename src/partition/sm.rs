@@ -7,19 +7,23 @@
 //! authority state lives in the default CF and is never copied or erased by a
 //! snapshot (DESIGN §6).
 
+// OpenRaft storage traits prescribe this error type, so these helpers cannot
+// box it without immediately unboxing at the trait boundary.
+#![allow(clippy::result_large_err)]
+
 use std::io::Cursor;
 use std::sync::Arc;
 
-use openraft::storage::RaftSnapshotBuilder;
-use openraft::storage::RaftStateMachine;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::StorageError;
+use openraft::storage::RaftSnapshotBuilder;
+use openraft::storage::RaftStateMachine;
 
 use crate::codec;
 use crate::partition::raft_types::{
-    read_err, write_err, Entry, LogId, Node, NodeId, Snapshot, SnapshotData, SnapshotMeta,
-    StoredMembership, TypeConfig,
+    Entry, LogId, Node, NodeId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership, TypeConfig,
+    read_err, write_err,
 };
 use crate::partition::state_machine::{ApplyResult, DataStateMachine};
 use crate::storage::Storage;

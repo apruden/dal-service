@@ -8,13 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::partition::{ApplyResult, TypeConfig};
 use dal::storage::Storage;
-use dal::types::{DataOp, DataRequest, GroupId, IfVersion, KeyPresence, MutationResult};
-use dal::verify::linearizability::{is_linearizable, Invocation, Op, Outcome};
-use dal::verify::oracles::{exactly_once, no_lost_write, Applied};
+use dal::types::{
+    BootstrapGroup, DataOp, DataRequest, GroupId, IfVersion, KeyPresence, MutationResult,
+};
+use dal::verify::linearizability::{Invocation, Op, Outcome, is_linearizable};
+use dal::verify::oracles::{Applied, exactly_once, no_lost_write};
 use dal::verify::rng::Rng;
 
 use tempfile::TempDir;
@@ -138,10 +141,18 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
             let op = DataOp::Put {
                 key: key.clone(),
                 value: value.clone(),
-                if_version: if create_only { Some(IfVersion::Absent) } else { None },
+                if_version: if create_only {
+                    Some(IfVersion::Absent)
+                } else {
+                    None
+                },
             };
             let dg = digest(&op);
-            let req = DataRequest { client_id, sequence: seq, op };
+            let req = DataRequest {
+                client_id,
+                sequence: seq,
+                op,
+            };
 
             let call = s.tick();
             let Some(result) = do_write(&s, &req).await else {
@@ -155,9 +166,9 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
                     s.acked.lock().unwrap().push((key.clone(), version));
                     Outcome::Applied { version }
                 }
-                Some(MutationResult::ConditionFailed { current }) => {
-                    Outcome::ConditionFailed { present: present(current) }
-                }
+                Some(MutationResult::ConditionFailed { current }) => Outcome::ConditionFailed {
+                    present: present(current),
+                },
                 // A protocol rejection carries no register semantics; skip it.
                 None => {
                     seq += 1;
@@ -176,7 +187,11 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
                 ret,
                 inv: Invocation::Put {
                     value,
-                    if_version: if create_only { Some(IfVersion::Absent) } else { None },
+                    if_version: if create_only {
+                        Some(IfVersion::Absent)
+                    } else {
+                        None
+                    },
                 },
                 out,
             });
@@ -193,10 +208,25 @@ async fn run_once(seed: u64) {
     let mut nodes = Vec::new();
     for i in 0..3 {
         let storage = Arc::new(Storage::open_checked(dirs[i].path(), CID, VOTERS[i]).unwrap());
+        ensure_bootstrap_group(
+            &storage,
+            &BootstrapGroup {
+                cluster_id: CID,
+                group: GroupId::Data(0),
+                members: VOTERS.to_vec(),
+            },
+        )
+        .unwrap();
         nodes.push(Arc::new(
-            PartitionNode::start(VOTERS[i], GroupId::Data(0), storage, registry.clone(), faults.clone())
-                .await
-                .unwrap(),
+            PartitionNode::start(
+                VOTERS[i],
+                GroupId::Data(0),
+                storage,
+                registry.clone(),
+                faults.clone(),
+            )
+            .await
+            .unwrap(),
         ));
     }
     nodes[0].initialize(&VOTERS).await.unwrap();
@@ -231,7 +261,9 @@ async fn run_once(seed: u64) {
     for c in 0..4u128 {
         let s = shared.clone();
         let rng = Rng::new(seed ^ (c as u64).wrapping_mul(0x9E37_79B9));
-        tasks.push(tokio::spawn(async move { client(s, 0xC000 + c, rng).await }));
+        tasks.push(tokio::spawn(
+            async move { client(s, 0xC000 + c, rng).await },
+        ));
     }
     for t in tasks {
         t.await.unwrap();

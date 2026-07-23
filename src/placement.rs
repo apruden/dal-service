@@ -77,10 +77,14 @@ pub fn propose(
             .iter()
             .filter(|v| !eligible.contains(v))
             .min()
+            && let Some(dest) = least_loaded_non_replica(&eligible, &voters, &load_of)
         {
-            if let Some(dest) = least_loaded_non_replica(&eligible, &voters, &load_of) {
-                return Some(replacement(GroupId::Data(partition), &placement.voters, drop, dest));
-            }
+            return Some(replacement(
+                GroupId::Data(partition),
+                &placement.voters,
+                drop,
+                dest,
+            ));
         }
     }
 
@@ -189,10 +193,7 @@ mod tests {
     }
 
     fn map(entries: &[(u16, &[NodeId])]) -> BTreeMap<u16, Placement> {
-        entries
-            .iter()
-            .map(|(p, v)| (*p, placement(v)))
-            .collect()
+        entries.iter().map(|(p, v)| (*p, placement(v))).collect()
     }
 
     #[test]
@@ -227,7 +228,11 @@ mod tests {
         // 4 hosts nothing; 1/2/3 are overloaded → one slot should move to 4.
         let pl = map(&[(0, &[1, 2, 3]), (1, &[1, 2, 3]), (2, &[1, 2, 3])]);
         let proposal = propose(&dir, &pl, 3).unwrap();
-        let before: BTreeSet<_> = pl[&partition_of(&proposal)].voters.iter().copied().collect();
+        let before: BTreeSet<_> = pl[&partition_of(&proposal)]
+            .voters
+            .iter()
+            .copied()
+            .collect();
         let after: BTreeSet<_> = proposal.target_voters.iter().copied().collect();
         assert_eq!(after.difference(&before).count(), 1);
         assert_eq!(before.difference(&after).count(), 1);
@@ -244,7 +249,12 @@ mod tests {
     #[test]
     fn is_deterministic() {
         let dir = active(&[1, 2, 3, 4, 5]);
-        let pl = map(&[(0, &[1, 2, 3]), (1, &[1, 2, 3]), (2, &[1, 2, 3]), (3, &[1, 2, 3])]);
+        let pl = map(&[
+            (0, &[1, 2, 3]),
+            (1, &[1, 2, 3]),
+            (2, &[1, 2, 3]),
+            (3, &[1, 2, 3]),
+        ]);
         let a = propose(&dir, &pl, 3);
         let b = propose(&dir, &pl, 3);
         assert_eq!(a, b);

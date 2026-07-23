@@ -53,11 +53,17 @@ fn del(client: u128, seq: u64, key: &[u8], iv: Option<IfVersion>) -> DataRequest
 fn basic_put_get_delete() {
     let (sm, _d, s, _g) = sm_storage();
     let r = sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 10 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 10 })
+    );
     assert_eq!(sm.get(&s, b"k").unwrap(), Some((10, b"v".to_vec())));
 
     let r = sm.apply(&s, &del(1, 2, b"k", None), 11).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 11 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 11 })
+    );
     assert_eq!(sm.get(&s, b"k").unwrap(), None);
 }
 
@@ -68,7 +74,10 @@ fn retry_returns_stored_result_without_reapplying() {
     // Same (client, sequence, op) replayed at a later index: stored result,
     // and crucially the key version is NOT bumped to the new index.
     let r = sm.apply(&s, &put(1, 1, b"k", b"v", None), 50).unwrap();
-    assert_eq!(r, ApplyResult::Replayed(MutationResult::Applied { version: 10 }));
+    assert_eq!(
+        r,
+        ApplyResult::Replayed(MutationResult::Applied { version: 10 })
+    );
     assert_eq!(sm.get(&s, b"k").unwrap(), Some((10, b"v".to_vec())));
 }
 
@@ -76,7 +85,9 @@ fn retry_returns_stored_result_without_reapplying() {
 fn same_sequence_different_command_is_rejected() {
     let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
-    let r = sm.apply(&s, &put(1, 1, b"k", b"DIFFERENT", None), 11).unwrap();
+    let r = sm
+        .apply(&s, &put(1, 1, b"k", b"DIFFERENT", None), 11)
+        .unwrap();
     assert_eq!(r, ApplyResult::Rejected(RejectReason::SequenceMismatch));
     // Original value untouched.
     assert_eq!(sm.get(&s, b"k").unwrap(), Some((10, b"v".to_vec())));
@@ -99,7 +110,10 @@ fn failed_cas_advances_highest_avoiding_wedge() {
     );
     // Next sequence proceeds (not treated as a gap).
     let r = sm.apply(&s, &put(1, 3, b"k", b"w", None), 12).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 12 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 12 })
+    );
 }
 
 #[test]
@@ -123,7 +137,10 @@ fn put_absent_is_create_only() {
     let r = sm
         .apply(&s, &put(1, 1, b"k", b"v", Some(IfVersion::Absent)), 10)
         .unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 10 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 10 })
+    );
     // Second create-only fails: key now present.
     let r = sm
         .apply(&s, &put(1, 2, b"k", b"v2", Some(IfVersion::Absent)), 11)
@@ -150,7 +167,10 @@ fn delete_recreate_keeps_versions_strictly_increasing() {
 fn unconditional_delete_of_absent_is_applied() {
     let (sm, _d, s, _g) = sm_storage();
     let r = sm.apply(&s, &del(1, 1, b"missing", None), 10).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 10 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 10 })
+    );
     assert_eq!(sm.get(&s, b"missing").unwrap(), None);
 }
 
@@ -165,7 +185,10 @@ fn delete_with_absent_sentinel_is_malformed() {
     assert_eq!(s.last_applied(G).unwrap().unwrap().index, 10);
     // A real command at sequence 1 still works (sequence not burned).
     let r = sm.apply(&s, &put(1, 1, b"k", b"v", None), 11).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 11 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 11 })
+    );
 }
 
 #[test]
@@ -176,7 +199,10 @@ fn gapped_and_stale_sequences_are_rejected() {
     let r = sm.apply(&s, &put(1, 3, b"k", b"v", None), 11).unwrap();
     assert!(matches!(
         r,
-        ApplyResult::Rejected(RejectReason::SequenceGap { expected: 2, got: 3 })
+        ApplyResult::Rejected(RejectReason::SequenceGap {
+            expected: 2,
+            got: 3
+        })
     ));
     // Stale: sequence below highest.
     sm.apply(&s, &put(1, 2, b"k", b"v2", None), 12).unwrap();
@@ -204,7 +230,10 @@ fn independent_clients_have_independent_sequences() {
     sm.apply(&s, &put(1, 1, b"a", b"1", None), 10).unwrap();
     // Different client also starts at sequence 1.
     let r = sm.apply(&s, &put(2, 1, b"b", b"2", None), 11).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 11 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 11 })
+    );
 }
 
 #[test]
@@ -231,5 +260,8 @@ fn crash_between_applies_recovers_to_prefix() {
     assert_eq!(s.last_applied(G).unwrap().unwrap().index, 11);
     assert_eq!(sm.get(&s, b"k").unwrap(), Some((11, b"b".to_vec())));
     let r = sm.apply(&s, &put(1, 3, b"k", b"c", None), 12).unwrap();
-    assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 12 }));
+    assert_eq!(
+        r,
+        ApplyResult::Decided(MutationResult::Applied { version: 12 })
+    );
 }

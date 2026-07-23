@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::transport::codec::Envelope;
 use crate::transport::Transport;
+use crate::transport::codec::Envelope;
 
 /// A ZeroMQ outbound transport. The `zmq::Context` is `Send + Sync` and shared;
 /// each `call` opens a short-lived `DEALER` inside a blocking task so the

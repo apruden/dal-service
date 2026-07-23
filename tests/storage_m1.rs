@@ -8,8 +8,9 @@ use std::sync::Mutex;
 
 use dal::error::Error;
 use dal::keyspace;
+use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::storage::{StateMutation, Storage};
-use dal::types::{GroupId, LogId, ServingState};
+use dal::types::{BootstrapGroup, GroupId, LogId, ServingState};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -77,7 +78,8 @@ fn cfs_survive_reopen() {
     {
         let s = Storage::open(dir.path()).unwrap();
         s.ensure_group(G).unwrap();
-        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1)).unwrap();
+        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1))
+            .unwrap();
     }
     let s = Storage::open(dir.path()).unwrap();
     assert!(s.group_exists(G));
@@ -94,9 +96,12 @@ fn sequential_applies_recover_to_last_prefix() {
     {
         let s = Storage::open(dir.path()).unwrap();
         s.ensure_group(G).unwrap();
-        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1)).unwrap();
-        s.apply_state(G, &[put(b"b", b"2")], LogId::new(1, 2)).unwrap();
-        s.apply_state(G, &[put(b"a", b"3")], LogId::new(1, 3)).unwrap();
+        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1))
+            .unwrap();
+        s.apply_state(G, &[put(b"b", b"2")], LogId::new(1, 2))
+            .unwrap();
+        s.apply_state(G, &[put(b"a", b"3")], LogId::new(1, 3))
+            .unwrap();
     }
     let s = Storage::open(dir.path()).unwrap();
     assert_eq!(s.last_applied(G).unwrap(), Some(LogId::new(1, 3)));
@@ -113,7 +118,8 @@ fn reclaim_records_non_serving_before_dropping_cfs() {
     {
         let s = Storage::open(dir.path()).unwrap();
         s.ensure_group(G).unwrap();
-        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1)).unwrap();
+        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1))
+            .unwrap();
         assert!(s.group_exists(G));
         assert_eq!(s.serving_state(G).unwrap(), None);
 
@@ -130,13 +136,64 @@ fn reclaim_records_non_serving_before_dropping_cfs() {
 }
 
 #[test]
+fn group_start_requires_durable_admission_and_never_revives_non_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    assert!(s.authorize_group_start(G, 42).is_err());
+    assert!(!s.group_exists(G));
+
+    ensure_bootstrap_group(
+        &s,
+        &BootstrapGroup {
+            cluster_id: 0xABCD,
+            group: G,
+            members: vec![42],
+        },
+    )
+    .unwrap();
+    s.authorize_group_start(G, 42).unwrap();
+    assert!(s.group_exists(G));
+    assert_eq!(s.serving_state(G).unwrap(), Some(ServingState::Serving));
+
+    s.reclaim_group(G).unwrap();
+    assert!(s.authorize_group_start(G, 42).is_err());
+    assert!(s.require_serving(G).is_err());
+    assert!(!s.group_exists(G));
+}
+
+#[test]
+fn snapshot_replace_is_atomic_at_both_crash_boundaries() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let s = Storage::open(dir.path()).unwrap();
+    s.ensure_group(G).unwrap();
+    s.apply_state(G, &[put(b"old", b"v1")], LogId::new(1, 1))
+        .unwrap();
+    let pairs = vec![(keyspace::user_key(b"new"), b"v2".to_vec())];
+    let applied = dal::codec::encode(&LogId::new(2, 4));
+
+    fail::cfg("snapshot_install::before_write", "return").unwrap();
+    assert!(s.install_state(G, &pairs, &applied).is_err());
+    fail::remove("snapshot_install::before_write");
+    assert_eq!(read(&s, b"old"), Some(b"v1".to_vec()));
+    assert_eq!(read(&s, b"new"), None);
+
+    fail::cfg("snapshot_install::after_write", "return").unwrap();
+    assert!(s.install_state(G, &pairs, &applied).is_err());
+    fail::remove("snapshot_install::after_write");
+    assert_eq!(read(&s, b"old"), None);
+    assert_eq!(read(&s, b"new"), Some(b"v2".to_vec()));
+}
+
+#[test]
 fn crash_before_write_leaves_previous_state() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();
         s.ensure_group(G).unwrap();
-        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1)).unwrap();
+        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1))
+            .unwrap();
 
         fail::cfg("apply_state::before_write", "return").unwrap();
         let r = s.apply_state(G, &[put(b"a", b"2"), put(b"c", b"9")], LogId::new(1, 2));
@@ -157,7 +214,8 @@ fn crash_after_write_is_durable() {
     {
         let s = Storage::open(dir.path()).unwrap();
         s.ensure_group(G).unwrap();
-        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1)).unwrap();
+        s.apply_state(G, &[put(b"a", b"1")], LogId::new(1, 1))
+            .unwrap();
 
         fail::cfg("apply_state::after_write", "return").unwrap();
         let r = s.apply_state(G, &[put(b"a", b"2")], LogId::new(1, 2));

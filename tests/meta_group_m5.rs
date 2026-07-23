@@ -7,12 +7,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::meta::node::{MetaNode, MetaRead, ProposeOutcome};
 use dal::meta::raft_types::MetaTypeConfig;
 use dal::meta::state_machine::MetaApplyResult;
 use dal::partition::network::{Faults, Registry};
 use dal::storage::Storage;
-use dal::types::{ClusterConfig, GroupId, HashSpec, MetaCommand, NodeId, PROTOCOL_VERSION};
+use dal::types::{
+    BootstrapGroup, ClusterConfig, GroupId, HashSpec, MetaCommand, NodeId, PROTOCOL_VERSION,
+};
 
 use tempfile::TempDir;
 
@@ -47,6 +50,15 @@ impl Harness {
     async fn start(&self, idx: usize) -> Arc<MetaNode> {
         let node_id = VOTERS[idx];
         let storage = Arc::new(Storage::open_checked(self.dirs[idx].path(), CID, node_id).unwrap());
+        ensure_bootstrap_group(
+            &storage,
+            &BootstrapGroup {
+                cluster_id: CID,
+                group: GroupId::Meta,
+                members: VOTERS.to_vec(),
+            },
+        )
+        .unwrap();
         Arc::new(
             MetaNode::start(node_id, storage, self.registry.clone(), self.faults.clone())
                 .await
@@ -190,9 +202,12 @@ async fn leader_failover_preserves_committed_meta() {
 
     let survivors: Vec<usize> = (0..3).filter(|&i| i != old).collect();
     eventually("survivors elect a new leader", || {
-        survivors
-            .iter()
-            .any(|&i| nodes[i].current_leader().map(|l| l != nodes[old].node_id()).unwrap_or(false))
+        survivors.iter().any(|&i| {
+            nodes[i]
+                .current_leader()
+                .map(|l| l != nodes[old].node_id())
+                .unwrap_or(false)
+        })
     })
     .await;
 
@@ -203,13 +218,13 @@ async fn leader_failover_preserves_committed_meta() {
             .iter()
             .copied()
             .find(|&i| nodes[i].current_leader() == Some(nodes[i].node_id()));
-        if let Some(li) = li {
-            if let MetaRead::Value(Some(p)) = nodes[li].read_placement(GroupId::Data(0)).await.unwrap()
-            {
-                assert_eq!(p.voters, vec![1, 2, 3]);
-                served = true;
-                break;
-            }
+        if let Some(li) = li
+            && let MetaRead::Value(Some(p)) =
+                nodes[li].read_placement(GroupId::Data(0)).await.unwrap()
+        {
+            assert_eq!(p.voters, vec![1, 2, 3]);
+            served = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

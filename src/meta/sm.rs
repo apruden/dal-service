@@ -3,6 +3,10 @@
 //! mutations, the applied `LogId`, and membership commit in one atomic batch via
 //! [`Storage::apply_raft`], so recovery is a clean prefix.
 
+// OpenRaft storage traits prescribe this error type, so these helpers cannot
+// box it without immediately unboxing at the trait boundary.
+#![allow(clippy::result_large_err)]
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -11,8 +15,8 @@ use openraft::{EntryPayload, OptionalSend, StorageError};
 
 use crate::codec;
 use crate::meta::raft_types::{
-    to_crate_log_id, Entry, LogId, MetaTypeConfig, NodeId, Snapshot, SnapshotData, SnapshotMeta,
-    StoredMembership,
+    Entry, LogId, MetaTypeConfig, NodeId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership,
+    to_crate_log_id,
 };
 use crate::meta::state_machine::{MetaApplyResult, MetaStateMachine};
 use crate::partition::raft_types::{read_err, write_err};

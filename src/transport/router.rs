@@ -7,17 +7,17 @@
 //! the task completes. A slow handler cannot block the poller because replies
 //! are drained from a channel, not awaited inline.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 
 use crate::error::{Error, Result};
-use crate::transport::codec::Envelope;
 use crate::transport::Server;
+use crate::transport::codec::Envelope;
 
 /// A bound inbound endpoint. Dropping it stops the poller thread and closes the
 /// socket.
@@ -85,18 +85,13 @@ impl ZmqServer {
                     // ignored (we frame one payload per message).
                     let payload = parts.pop().unwrap();
                     let identity = parts.remove(0);
-                    match Envelope::decode(&payload) {
-                        Ok(env) => {
-                            let server = server.clone();
-                            let tx = reply_tx.clone();
-                            handle.spawn(async move {
-                                let reply = server.serve(env).await;
-                                let _ = tx.send((identity, reply.encode()));
-                            });
-                        }
-                        // Undecodable frame: drop it. A misframed request has no
-                        // reply address the client can correlate anyway.
-                        Err(_) => {}
+                    if let Ok(env) = Envelope::decode(&payload) {
+                        let server = server.clone();
+                        let tx = reply_tx.clone();
+                        handle.spawn(async move {
+                            let reply = server.serve(env).await;
+                            let _ = tx.send((identity, reply.encode()));
+                        });
                     }
                 }
                 // Timeout (EAGAIN) or a malformed short message: loop.

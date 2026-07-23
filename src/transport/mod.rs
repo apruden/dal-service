@@ -24,11 +24,7 @@ pub trait Transport: Send + Sync {
     /// Send `request` to `addr` and await the reply frame. An `Err` means the
     /// peer was unreachable or the exchange timed out — the caller retries
     /// another candidate with the same idempotency key (DESIGN §8.4).
-    fn call(
-        &self,
-        addr: &str,
-        request: Envelope,
-    ) -> impl Future<Output = Result<Envelope>> + Send;
+    fn call(&self, addr: &str, request: Envelope) -> impl Future<Output = Result<Envelope>> + Send;
 }
 
 /// A node-side request handler: consumes an inbound frame and produces its

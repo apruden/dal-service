@@ -11,14 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dal::meta::bootstrap::{
-    admit_and_promote, ensure_bootstrap_group, ensure_learner_admission, record_data_bootstrap,
-    record_meta_bootstrap, seed_cluster, BootstrapDescriptor, BootstrapOutcome, DirEntry,
+    BootstrapDescriptor, BootstrapOutcome, DirEntry, admit_and_promote, ensure_bootstrap_group,
+    ensure_learner_admission, record_data_bootstrap, record_meta_bootstrap, seed_cluster,
 };
 use dal::meta::node::{MetaNode, MetaRead};
 use dal::meta::raft_types::MetaTypeConfig;
+use dal::partition::TypeConfig;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
-use dal::partition::TypeConfig;
 use dal::storage::Storage;
 use dal::types::{
     BootstrapGroup, ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, LearnerAdmission,
@@ -95,9 +95,7 @@ impl Cluster {
     fn storage(&mut self, id: NodeId) -> Arc<Storage> {
         self.storages
             .entry(id)
-            .or_insert_with(|| {
-                Arc::new(Storage::open_checked(&self.paths[&id], CID, id).unwrap())
-            })
+            .or_insert_with(|| Arc::new(Storage::open_checked(&self.paths[&id], CID, id).unwrap()))
             .clone()
     }
 
@@ -232,10 +230,10 @@ async fn full_bootstrap(c: &mut Cluster) {
 
 async fn data_write(c: &Cluster, req: DataRequest) -> bool {
     for _ in 0..200 {
-        if let Some(leader) = c.data_leader() {
-            if let Ok(WriteOutcome::Applied(_)) = leader.write(req.clone()).await {
-                return true;
-            }
+        if let Some(leader) = c.data_leader()
+            && let Ok(WriteOutcome::Applied(_)) = leader.write(req.clone()).await
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -244,10 +242,10 @@ async fn data_write(c: &Cluster, req: DataRequest) -> bool {
 
 async fn data_read(c: &Cluster, key: &[u8]) -> Option<Vec<u8>> {
     for _ in 0..200 {
-        if let Some(leader) = c.data_leader() {
-            if let Ok(ReadOutcome::Value(v)) = leader.read(key).await {
-                return v.map(|(_, bytes)| bytes);
-            }
+        if let Some(leader) = c.data_leader()
+            && let Ok(ReadOutcome::Value(v)) = leader.read(key).await
+        {
+            return v.map(|(_, bytes)| bytes);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

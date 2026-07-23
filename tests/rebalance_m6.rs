@@ -8,23 +8,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dal::meta::bootstrap::{
-    record_data_bootstrap, record_meta_bootstrap, seed_cluster, BootstrapDescriptor, DirEntry,
+    BootstrapDescriptor, DirEntry, ensure_learner_admission, record_data_bootstrap,
+    record_meta_bootstrap, seed_cluster,
 };
 use dal::meta::node::MetaNode;
-use dal::meta::raft_types::MetaTypeConfig;
 use dal::meta::node::MetaRead;
+use dal::meta::raft_types::MetaTypeConfig;
 use dal::meta::rebalancer::{
     create_plan, drain_partition, execute_abort, execute_move, mark_aborting, resume_move,
 };
-use dal::meta::reconcile::{reconcile, ReconcileAction};
+use dal::meta::reconcile::{ReconcileAction, reconcile};
+use dal::partition::TypeConfig;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
-use dal::partition::TypeConfig;
 use dal::storage::Storage;
 use dal::types::{
-    ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, NodeId, NodeState, PROTOCOL_VERSION,
+    ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, LearnerAdmission, NodeId, NodeState,
+    PROTOCOL_VERSION,
 };
-use dal::verify::oracles::{converged, no_lost_write, PartitionState};
+use dal::verify::oracles::{PartitionState, converged, no_lost_write};
 
 use tempfile::TempDir;
 
@@ -115,6 +117,20 @@ impl Cluster {
 
     async fn start_data(&mut self, id: NodeId) -> Arc<PartitionNode> {
         let storage = self.storage(id);
+        if !DATA_VOTERS.contains(&id) {
+            // These tests model the peer-control admission step separately
+            // from the move driver; record its durable prerequisite before a
+            // joining runtime is allowed to create local group state.
+            ensure_learner_admission(
+                &storage,
+                &LearnerAdmission {
+                    cluster_id: CID,
+                    group: GroupId::Data(PART),
+                    plan_id: 0,
+                },
+            )
+            .unwrap();
+        }
         let node = Arc::new(
             PartitionNode::start(
                 id,
@@ -167,7 +183,10 @@ async fn bootstrap(c: &mut Cluster) {
     }
     c.meta_nodes[&1].initialize(&META_VOTERS).await.unwrap();
     let meta = c.meta_slice();
-    eventually("meta leader", || meta.iter().any(|n| n.current_leader().is_some())).await;
+    eventually("meta leader", || {
+        meta.iter().any(|n| n.current_leader().is_some())
+    })
+    .await;
     seed_cluster(&c.meta_slice(), &desc).await.unwrap();
 
     record_data_bootstrap(&c.storage_list(&DATA_VOTERS), &desc).unwrap();
@@ -176,7 +195,10 @@ async fn bootstrap(c: &mut Cluster) {
     }
     c.data_nodes[&1].initialize(&DATA_VOTERS).await.unwrap();
     let data: Vec<_> = c.data_nodes.values().cloned().collect();
-    eventually("data leader", || data.iter().any(|n| n.current_leader().is_some())).await;
+    eventually("data leader", || {
+        data.iter().any(|n| n.current_leader().is_some())
+    })
+    .await;
 }
 
 fn put(seq: u64, key: &[u8], val: &[u8]) -> DataRequest {
@@ -193,10 +215,10 @@ fn put(seq: u64, key: &[u8], val: &[u8]) -> DataRequest {
 
 async fn write_to_leader(c: &Cluster, req: DataRequest) {
     for _ in 0..200 {
-        if let Some(leader) = c.data_leader() {
-            if let Ok(WriteOutcome::Applied(_)) = leader.write(req.clone()).await {
-                return;
-            }
+        if let Some(leader) = c.data_leader()
+            && let Ok(WriteOutcome::Applied(_)) = leader.write(req.clone()).await
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -232,7 +254,11 @@ async fn move_adds_node_and_finalizes() {
         .copied()
         .find(|&v| v != leader.node_id())
         .unwrap();
-    let mut target: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    let mut target: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != victim)
+        .collect();
     target.push(4);
     target.sort_unstable();
 
@@ -246,9 +272,10 @@ async fn move_adds_node_and_finalizes() {
     // Meta now records the new voter set with no move in flight.
     assert_eq!(meta_voters(&c).await, target);
     // Node 4 caught up and holds the pre-move write.
-    eventually("node 4 holds the data", || {
-        matches!(c.data_nodes[&4].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v1")
-    })
+    eventually(
+        "node 4 holds the data",
+        || matches!(c.data_nodes[&4].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v1"),
+    )
     .await;
 }
 
@@ -265,7 +292,11 @@ async fn planned_learner_never_joins_then_abort_and_replace() {
         .unwrap();
 
     // Plan to bring in node 4, which never starts (its runtime is down).
-    let mut target4: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    let mut target4: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != victim)
+        .collect();
     target4.push(4);
     target4.sort_unstable();
     let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target4)
@@ -283,11 +314,19 @@ async fn planned_learner_never_joins_then_abort_and_replace() {
 
     let mut original = DATA_VOTERS.to_vec();
     original.sort_unstable();
-    assert_eq!(meta_voters(&c).await, original, "abort restores original voters");
+    assert_eq!(
+        meta_voters(&c).await,
+        original,
+        "abort restores original voters"
+    );
 
     // A replacement plan with a live node (5) now succeeds.
     c.start_data(5).await;
-    let mut target5: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    let mut target5: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != victim)
+        .collect();
     target5.push(5);
     target5.sort_unstable();
     let plan_id2 = create_plan(&c.meta_slice(), GroupId::Data(PART), &target5)
@@ -321,7 +360,11 @@ async fn drain_replaces_a_follower() {
         .unwrap();
 
     // The drained node is out of the voter set; node 4 is in and holds the data.
-    let mut expected: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != draining).collect();
+    let mut expected: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != draining)
+        .collect();
     expected.push(4);
     expected.sort_unstable();
     assert_eq!(meta_voters(&c).await, expected);
@@ -333,9 +376,10 @@ async fn drain_replaces_a_follower() {
         other => panic!("node read: {other:?}"),
     }
 
-    eventually("node 4 holds the drained partition's data", || {
-        matches!(c.data_nodes[&4].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v1")
-    })
+    eventually(
+        "node 4 holds the drained partition's data",
+        || matches!(c.data_nodes[&4].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v1"),
+    )
     .await;
 }
 
@@ -354,7 +398,11 @@ async fn interrupted_move_resumes_from_committed_config() {
         .copied()
         .find(|&v| v != leader.node_id())
         .unwrap();
-    let mut target: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    let mut target: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != victim)
+        .collect();
     target.push(4);
     target.sort_unstable();
 
@@ -366,7 +414,13 @@ async fn interrupted_move_resumes_from_committed_config() {
     // committed config is still the original voters.
     leader.add_learner(4).await.unwrap();
 
-    let placement = match c.meta_leader().unwrap().read_placement(GroupId::Data(PART)).await.unwrap() {
+    let placement = match c
+        .meta_leader()
+        .unwrap()
+        .read_placement(GroupId::Data(PART))
+        .await
+        .unwrap()
+    {
         MetaRead::Value(Some(p)) => p,
         other => panic!("placement: {other:?}"),
     };
@@ -391,7 +445,11 @@ fn follower_target(c: &Cluster) -> (Vec<NodeId>, u64) {
         .copied()
         .find(|&v| v != leader.node_id())
         .unwrap();
-    let mut target: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    let mut target: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != victim)
+        .collect();
     target.push(4);
     target.sort_unstable();
     (target, victim)
@@ -556,7 +614,11 @@ async fn drain_removes_the_current_leader() {
         .await
         .unwrap();
 
-    let mut expected: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != draining).collect();
+    let mut expected: Vec<NodeId> = DATA_VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != draining)
+        .collect();
     expected.push(4);
     expected.sort_unstable();
     assert_eq!(meta_voters(&c).await, expected);
@@ -565,7 +627,13 @@ async fn drain_removes_the_current_leader() {
 /// Sample convergence: the meta record and the data-Raft committed config must
 /// agree, with no live stale plan (DESIGN §12.7).
 async fn partition_state(c: &Cluster) -> PartitionState {
-    let placement = match c.meta_leader().unwrap().read_placement(GroupId::Data(PART)).await.unwrap() {
+    let placement = match c
+        .meta_leader()
+        .unwrap()
+        .read_placement(GroupId::Data(PART))
+        .await
+        .unwrap()
+    {
         MetaRead::Value(Some(p)) => p,
         other => panic!("placement: {other:?}"),
     };
@@ -591,14 +659,24 @@ async fn grow_to_four_then_shrink_back_converges() {
     c.start_data(4).await;
     let (grow_target, _) = follower_target(&c);
     let leader = c.data_leader().unwrap();
-    let plan = create_plan(&c.meta_slice(), GroupId::Data(PART), &grow_target).await.unwrap();
-    execute_move(&c.meta_slice(), &leader, GroupId::Data(PART), plan).await.unwrap();
+    let plan = create_plan(&c.meta_slice(), GroupId::Data(PART), &grow_target)
+        .await
+        .unwrap();
+    execute_move(&c.meta_slice(), &leader, GroupId::Data(PART), plan)
+        .await
+        .unwrap();
     converged(&[partition_state(&c).await]).expect("diverged after grow");
 
     // Shrink: drain node 4 back out, replaced by node 3 (its runtime still up).
-    let dropped = DATA_VOTERS.iter().copied().find(|&v| !grow_target.contains(&v)).unwrap();
+    let dropped = DATA_VOTERS
+        .iter()
+        .copied()
+        .find(|&v| !grow_target.contains(&v))
+        .unwrap();
     let leader = c.data_leader().unwrap();
-    drain_partition(&c.meta_slice(), &leader, GroupId::Data(PART), 4, dropped).await.unwrap();
+    drain_partition(&c.meta_slice(), &leader, GroupId::Data(PART), 4, dropped)
+        .await
+        .unwrap();
     let mut back: Vec<NodeId> = grow_target.iter().copied().filter(|&v| v != 4).collect();
     back.push(dropped);
     back.sort_unstable();
@@ -607,7 +685,9 @@ async fn grow_to_four_then_shrink_back_converges() {
 
     // The acknowledged write survived both moves.
     let mut final_state = std::collections::HashMap::new();
-    if let Ok(ReadOutcome::Value(Some((version, value)))) = c.data_leader().unwrap().read(b"k").await {
+    if let Ok(ReadOutcome::Value(Some((version, value)))) =
+        c.data_leader().unwrap().read(b"k").await
+    {
         assert_eq!(value, b"v1");
         final_state.insert(b"k".to_vec(), version);
     }

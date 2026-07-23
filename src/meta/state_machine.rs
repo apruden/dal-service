@@ -16,8 +16,8 @@ use crate::error::Result;
 use crate::keyspace;
 use crate::storage::{StateMutation, Storage};
 use crate::types::{
-    voter_set, ClusterConfig, GroupId, LogId, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId,
-    NodeState, Placement,
+    ClusterConfig, GroupId, LogId, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId, NodeState,
+    Placement, voter_set,
 };
 
 /// The outcome of applying one committed meta command.
@@ -187,7 +187,9 @@ impl MetaStateMachine {
         log_id: LogId,
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         if let Some(existing) = self.cluster(s)? {
-            let existing_meta = self.placement(s, GroupId::Meta)?.map(|p| voter_set(p.voters));
+            let existing_meta = self
+                .placement(s, GroupId::Meta)?
+                .map(|p| voter_set(p.voters));
             let incoming_meta = Some(voter_set(meta_voters.to_vec()));
             if &existing == config && existing_meta == incoming_meta {
                 return Ok((MetaApplyResult::NoOp, vec![]));
@@ -205,7 +207,7 @@ impl MetaStateMachine {
         if mv.len() != meta_voters.len() {
             return Ok((invalid("duplicate meta voter"), vec![]));
         }
-        if mv.len() < MIN_META_VOTERS || mv.len() % 2 == 0 {
+        if mv.len() < MIN_META_VOTERS || mv.len().is_multiple_of(2) {
             return Ok((invalid("meta voters must be an odd set of >= 3"), vec![]));
         }
 
@@ -271,6 +273,17 @@ impl MetaStateMachine {
             return Ok((reject(MetaReject::UnknownNode), vec![]));
         };
         if incarnation < entry.incarnation {
+            return Ok((reject(MetaReject::StaleIncarnation), vec![]));
+        }
+        // A node declared Down must not be revived by ordinary liveness
+        // evidence. Leaving Down is an explicit rejoin and therefore needs a
+        // strictly newer incarnation for *any* target state — guarding only
+        // Down -> Active would let a replayed/stale command revive the node
+        // through a Down -> Suspect -> Active two-step.
+        if entry.state == NodeState::Down
+            && state != NodeState::Down
+            && incarnation == entry.incarnation
+        {
             return Ok((reject(MetaReject::StaleIncarnation), vec![]));
         }
         if entry.state == state && entry.incarnation == incarnation {

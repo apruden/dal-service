@@ -112,7 +112,10 @@ pub fn parse_partition_count(n: u64) -> Result<u16> {
         return Err(Error::Config("P must be > 0".into()));
     }
     if n > u16::MAX as u64 {
-        return Err(Error::Config(format!("P must be <= {} (u16 bound)", u16::MAX)));
+        return Err(Error::Config(format!(
+            "P must be <= {} (u16 bound)",
+            u16::MAX
+        )));
     }
     Ok(n as u16)
 }
@@ -150,7 +153,7 @@ impl InitConfig {
                 "meta voter set must have >= {MIN_META_VOTERS} distinct nodes"
             )));
         }
-        if meta.len() % 2 == 0 {
+        if meta.len().is_multiple_of(2) {
             return Err(Error::Config("meta voter set must be odd".into()));
         }
         if !meta.is_subset(&bootstrap) {

@@ -12,13 +12,15 @@ use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
     WriteOptions,
 };
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyspace;
-use crate::types::{ClusterId, GroupId, LogId, NodeId, ServingState};
+use crate::types::{
+    BootstrapGroup, ClusterId, GroupId, LearnerAdmission, LogId, NodeId, ServingState,
+};
 
 /// MultiThreaded so CFs can be created/dropped through `&self` while other
 /// threads read — the runtime pattern for on-line rebalancing (DESIGN §6).
@@ -158,6 +160,20 @@ impl Storage {
         self.put_local(&keyspace::serving_key(group), &state)
     }
 
+    /// Refuse client-facing Raft work unless the durable local serving gate is
+    /// open. This is checked on every serving path so a concurrent reclaim or
+    /// administrative stop cannot leave a live runtime answering requests.
+    pub fn require_serving(&self, group: GroupId) -> Result<()> {
+        if self.serving_state(group)? == Some(ServingState::Serving) {
+            Ok(())
+        } else {
+            Err(Error::Raft(format!(
+                "group {:?} is not permitted to serve on this node",
+                group
+            )))
+        }
+    }
+
     /// Reclaim a removed group's local data (DESIGN §7.4): record `NonServing`
     /// *before* dropping the CFs, so a crash mid-reclaim can never leave
     /// servable-looking state behind. After the drop, the absence of local Raft
@@ -171,6 +187,53 @@ impl Storage {
     pub fn group_exists(&self, group: GroupId) -> bool {
         self.db.cf_handle(&group.cf_state()).is_some()
             && self.db.cf_handle(&group.cf_log()).is_some()
+    }
+
+    /// Authorize a local Raft runtime to open `group`. Group state may be
+    /// created only from a durable bootstrap record or learner admission; a
+    /// group previously marked non-serving can never be resurrected locally.
+    pub fn authorize_group_start(&self, group: GroupId, node_id: NodeId) -> Result<()> {
+        if self.serving_state(group)? == Some(ServingState::NonServing) {
+            return Err(Error::Raft(format!(
+                "refusing to restart non-serving group {:?}",
+                group
+            )));
+        }
+
+        let identity = self
+            .identity()?
+            .ok_or_else(|| Error::Config("group startup requires a bound node identity".into()))?;
+        if identity.node_id != node_id {
+            return Err(Error::IdentityMismatch {
+                found_cluster: identity.cluster_id,
+                found_node: identity.node_id,
+                want_cluster: identity.cluster_id,
+                want_node: node_id,
+            });
+        }
+
+        let bootstrap: Option<BootstrapGroup> = self.get_local(&keyspace::bootstrap_key(group))?;
+        let admitted_by_bootstrap = bootstrap.is_some_and(|record| {
+            record.cluster_id == identity.cluster_id
+                && record.group == group
+                && record.members.contains(&node_id)
+        });
+        let admission: Option<LearnerAdmission> =
+            self.get_local(&keyspace::admission_key(group))?;
+        let admitted_as_learner = admission.is_some_and(|record| {
+            record.cluster_id == identity.cluster_id && record.group == group
+        });
+
+        if !(admitted_by_bootstrap || admitted_as_learner) {
+            return Err(Error::Raft(format!(
+                "refusing to create unadmitted group {:?}",
+                group
+            )));
+        }
+
+        self.ensure_group(group)?;
+        self.set_serving_state(group, ServingState::Serving)?;
+        Ok(())
     }
 
     pub(crate) fn state_cf(&self, group: GroupId) -> Result<Arc<BoundColumnFamily<'_>>> {
@@ -228,31 +291,37 @@ impl Storage {
         Ok(out)
     }
 
-    /// Replace a group's state CF wholesale from a snapshot: drop and recreate
-    /// the CF, then write `pairs` plus the Raft applied-state blob in one
-    /// fsync-durable batch (M3 snapshot install). The log CF is untouched;
-    /// node-local authority state lives in the default CF and also survives.
+    /// Atomically replace a group's replicated state from a snapshot. Clearing
+    /// the existing keys and writing the replacement happen in one durable
+    /// WriteBatch, so a crash exposes either the old complete state or the new
+    /// complete state—never an empty CF between drop/recreate operations.
+    /// The log CF and node-local authority state are untouched.
     pub fn install_state(
         &self,
         group: GroupId,
         pairs: &[(Vec<u8>, Vec<u8>)],
         applied_record: &[u8],
     ) -> Result<()> {
-        let name = group.cf_state();
-        if self.db.cf_handle(&name).is_some() {
-            self.db.drop_cf(&name)?;
-        }
-        self.db.create_cf(&name, &Options::default())?;
-
         let cf = self.state_cf(group)?;
         let mut batch = rocksdb::WriteBatch::default();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            batch.delete_cf(&cf, key);
+        }
         for (k, v) in pairs {
             batch.put_cf(&cf, k, v);
         }
         batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
+        fail::fail_point!("snapshot_install::before_write", |_| Err(Error::Io(
+            std::io::Error::other("injected crash at snapshot_install::before_write")
+        )));
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
         self.db.write_opt(batch, &wo)?;
+        fail::fail_point!("snapshot_install::after_write", |_| Err(Error::Io(
+            std::io::Error::other("injected crash at snapshot_install::after_write")
+        )));
         Ok(())
     }
 }

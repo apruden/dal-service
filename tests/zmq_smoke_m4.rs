@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use dal::transport::codec::{Envelope, MsgType};
 use dal::transport::dealer::ZmqTransport;
-use dal::transport::router::{settle, ZmqServer};
+use dal::transport::router::{ZmqServer, settle};
 use dal::transport::{Server, Transport};
 use dal::types::{ClusterId, GroupId};
 
@@ -41,7 +41,13 @@ async fn zmq_dealer_router_round_trip() {
 
     let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
     let payload = b"ping-through-zmq".to_vec();
-    let env = Envelope::new(CID, MsgType::ClientOp, GroupId::Data(0), 99, payload.clone());
+    let env = Envelope::new(
+        CID,
+        MsgType::ClientOp,
+        GroupId::Data(0),
+        99,
+        payload.clone(),
+    );
 
     let reply = transport.call(addr, env).await.unwrap();
     assert_eq!(reply.cluster_id, CID);

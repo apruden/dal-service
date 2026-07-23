@@ -65,13 +65,13 @@ pub fn converged(states: &[PartitionState]) -> Result<(), String> {
                 s.partition, s.meta_voters, s.data_voters
             ));
         }
-        if let Some(aborting) = s.plan {
-            if !aborting {
-                return Err(format!(
-                    "partition {} left with a live non-aborting plan",
-                    s.partition
-                ));
-            }
+        if let Some(aborting) = s.plan
+            && !aborting
+        {
+            return Err(format!(
+                "partition {} left with a live non-aborting plan",
+                s.partition
+            ));
         }
     }
     Ok(())
@@ -109,8 +109,18 @@ mod tests {
     #[test]
     fn exactly_once_accepts_identical_replays() {
         let a = vec![
-            Applied { client_id: 1, partition: 0, sequence: 1, digest: 0xAA },
-            Applied { client_id: 1, partition: 0, sequence: 1, digest: 0xAA }, // replay
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xAA,
+            },
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xAA,
+            }, // replay
         ];
         assert!(exactly_once(&a).is_ok());
     }
@@ -118,8 +128,18 @@ mod tests {
     #[test]
     fn exactly_once_rejects_reused_sequence_for_different_command() {
         let a = vec![
-            Applied { client_id: 1, partition: 0, sequence: 1, digest: 0xAA },
-            Applied { client_id: 1, partition: 0, sequence: 1, digest: 0xBB },
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xAA,
+            },
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xBB,
+            },
         ];
         assert!(exactly_once(&a).is_err());
     }

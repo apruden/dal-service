@@ -80,10 +80,10 @@ impl HeartbeatTracker {
     /// greater than the last seen sequence for `node` — a stale or replayed
     /// frame cannot refresh liveness.
     pub fn observe(&mut self, node: NodeId, seq: u64, now_ms: u64) -> bool {
-        if let Some(&prev) = self.last_seq.get(&node) {
-            if seq <= prev {
-                return false;
-            }
+        if let Some(&prev) = self.last_seq.get(&node)
+            && seq <= prev
+        {
+            return false;
         }
         self.last_seq.insert(node, seq);
         self.last_seen_ms.insert(node, now_ms);
@@ -109,8 +109,10 @@ impl HeartbeatTracker {
         states
             .iter()
             .filter_map(|&(node, current)| {
-                let evidence =
-                    classify(Duration::from_millis(self.silence_ms(node, now_ms)), timeouts);
+                let evidence = classify(
+                    Duration::from_millis(self.silence_ms(node, now_ms)),
+                    timeouts,
+                );
                 next_state(current, evidence).map(|s| (node, s))
             })
             .collect()
@@ -148,9 +150,7 @@ mod tests {
         let to = timeouts();
 
         // Fresh: no transition.
-        assert!(tr
-            .evaluate(t0, &to, &[(1, NodeState::Active)])
-            .is_empty());
+        assert!(tr.evaluate(t0, &to, &[(1, NodeState::Active)]).is_empty());
         // Past suspect_timeout: Active -> Suspect.
         assert_eq!(
             tr.evaluate(t0 + ms(to.suspect), &to, &[(1, NodeState::Active)]),

@@ -63,7 +63,10 @@ pub fn designated(voters: &[NodeId]) -> Option<NodeId> {
 
 /// Idempotently write a group's `BootstrapGroup` marker. On retry it is accepted
 /// only when byte-identical; a differing record is a fork attempt and fails.
-pub fn ensure_bootstrap_group(storage: &Storage, record: &BootstrapGroup) -> Result<BootstrapOutcome> {
+pub fn ensure_bootstrap_group(
+    storage: &Storage,
+    record: &BootstrapGroup,
+) -> Result<BootstrapOutcome> {
     let key = keyspace::bootstrap_key(record.group);
     match storage.get_local::<BootstrapGroup>(&key)? {
         Some(existing) if &existing == record => Ok(BootstrapOutcome::AlreadyPresent),
@@ -211,12 +214,12 @@ fn accept(result: MetaApplyResult, what: &str) -> Result<()> {
     }
 }
 
-async fn propose_to_leader(
-    nodes: &[Arc<MetaNode>],
-    cmd: MetaCommand,
-) -> Result<MetaApplyResult> {
+async fn propose_to_leader(nodes: &[Arc<MetaNode>], cmd: MetaCommand) -> Result<MetaApplyResult> {
     for _ in 0..200 {
-        if let Some(leader) = nodes.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+        if let Some(leader) = nodes
+            .iter()
+            .find(|n| n.current_leader() == Some(n.node_id()))
+        {
             match leader.propose(cmd.clone()).await? {
                 ProposeOutcome::Applied(r) => return Ok(r),
                 ProposeOutcome::NotLeader { .. } => {}
@@ -224,5 +227,7 @@ async fn propose_to_leader(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err(Error::Raft("no meta leader accepted a bootstrap command".into()))
+    Err(Error::Raft(
+        "no meta leader accepted a bootstrap command".into(),
+    ))
 }

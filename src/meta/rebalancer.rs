@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
-use crate::meta::reconcile::{gate, reconcile, GateDecision, ReconcileAction};
+use crate::meta::reconcile::{GateDecision, ReconcileAction, gate, reconcile};
 use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::node::PartitionNode;
 use crate::types::{
-    voter_set, DataConfigObservation, GroupId, MetaCommand, NodeId, NodeState, Placement,
+    DataConfigObservation, GroupId, MetaCommand, NodeId, NodeState, Placement, voter_set,
 };
 
 /// Commit a `CreatePlan` for `group` and return its assigned `plan_id` (the meta
@@ -119,7 +119,15 @@ async fn finalize(
         config_log_id,
     };
     accept(
-        propose(meta, MetaCommand::FinalizePlan { group, plan_id, observation }).await?,
+        propose(
+            meta,
+            MetaCommand::FinalizePlan {
+                group,
+                plan_id,
+                observation,
+            },
+        )
+        .await?,
         "FinalizePlan",
     )
 }
@@ -226,7 +234,15 @@ pub async fn execute_abort(
         config_log_id,
     };
     accept(
-        propose(meta, MetaCommand::AbortReport { group, plan_id, observation }).await?,
+        propose(
+            meta,
+            MetaCommand::AbortReport {
+                group,
+                plan_id,
+                observation,
+            },
+        )
+        .await?,
         "abort resolution",
     )
 }
@@ -298,7 +314,10 @@ async fn read_node(
     node_id: NodeId,
 ) -> Result<Option<crate::types::NodeDirectoryEntry>> {
     for _ in 0..200 {
-        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+        if let Some(leader) = meta
+            .iter()
+            .find(|n| n.current_leader() == Some(n.node_id()))
+        {
             match leader.read_node(node_id).await? {
                 MetaRead::Value(e) => return Ok(e),
                 MetaRead::NotLeader { .. } => {}
@@ -309,7 +328,10 @@ async fn read_node(
     Err(Error::Raft("no meta leader for node read".into()))
 }
 
-async fn wait_committed(node: &PartitionNode, target: &std::collections::BTreeSet<NodeId>) -> Result<()> {
+async fn wait_committed(
+    node: &PartitionNode,
+    target: &std::collections::BTreeSet<NodeId>,
+) -> Result<()> {
     for _ in 0..200 {
         if &node.committed_voter_set() == target {
             return Ok(());
@@ -321,7 +343,10 @@ async fn wait_committed(node: &PartitionNode, target: &std::collections::BTreeSe
 
 async fn read_placement(meta: &[Arc<MetaNode>], group: GroupId) -> Result<Option<Placement>> {
     for _ in 0..200 {
-        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+        if let Some(leader) = meta
+            .iter()
+            .find(|n| n.current_leader() == Some(n.node_id()))
+        {
             match leader.read_placement(group).await? {
                 MetaRead::Value(p) => return Ok(p),
                 MetaRead::NotLeader { .. } => {}
@@ -334,7 +359,10 @@ async fn read_placement(meta: &[Arc<MetaNode>], group: GroupId) -> Result<Option
 
 async fn propose(meta: &[Arc<MetaNode>], cmd: MetaCommand) -> Result<MetaApplyResult> {
     for _ in 0..200 {
-        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+        if let Some(leader) = meta
+            .iter()
+            .find(|n| n.current_leader() == Some(n.node_id()))
+        {
             match leader.propose(cmd.clone()).await? {
                 ProposeOutcome::Applied(r) => return Ok(r),
                 ProposeOutcome::NotLeader { .. } => {}

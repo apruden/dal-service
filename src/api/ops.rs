@@ -38,8 +38,12 @@ impl ClientRequest {
 /// client can tell "your CAS failed" from "your retry was malformed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteReply {
-    Applied { version: Version },
-    ConditionFailed { current: KeyPresence },
+    Applied {
+        version: Version,
+    },
+    ConditionFailed {
+        current: KeyPresence,
+    },
     /// The state machine refused the entry without mutating (e.g. a reused
     /// sequence for a different command). Carries the reason for diagnostics.
     Rejected(RejectReason),
@@ -83,9 +87,14 @@ pub enum ClientReply {
     Mutation(WriteReply),
     Value(Option<(Version, Vec<u8>)>),
     Redirect(Redirect),
-    /// A terminal error the client cannot fix by retrying elsewhere: a
-    /// mispartitioned key, a peer-control message on the client path, or a
-    /// malformed body (DESIGN §10.2). Carries a human reason.
+    /// The gateway refused the operation before proposing it to Raft, based
+    /// only on the request bytes and cluster-wide constants (`P`, hash spec) —
+    /// so every replica refuses it identically and it cannot have committed
+    /// anywhere. A client may safely abandon the mutation's sequence.
+    Refused(String),
+    /// A terminal error with an *uncertain* outcome: the operation may have
+    /// reached the replicated log (e.g. a Raft error after proposal). A client
+    /// must not abandon an in-flight mutation sequence on this reply.
     Error(String),
 }
 

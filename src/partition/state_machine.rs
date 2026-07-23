@@ -74,6 +74,9 @@ pub enum RejectReason {
     /// Structurally invalid command that slipped past the API gate, e.g. a
     /// `delete` carrying the `ABSENT` sentinel (DESIGN §4.2).
     Malformed,
+    /// The client exhausted the `u64` sequence space. Further commands are
+    /// refused deterministically instead of overflowing during Raft apply.
+    SequenceExhausted,
 }
 
 /// Compute the idempotency digest over a command's canonical bytes. Taken over
@@ -107,9 +110,7 @@ impl DataStateMachine {
 
     /// Public linearizable-read helper: the current value/version of a key.
     pub fn get(&self, storage: &Storage, key: &[u8]) -> Result<Option<(Version, Vec<u8>)>> {
-        Ok(self
-            .key_record(storage, key)?
-            .map(|r| (r.version, r.value)))
+        Ok(self.key_record(storage, key)?.map(|r| (r.version, r.value)))
     }
 
     /// Apply one committed entry at `log_index`, writing atomically. Used by the
@@ -156,7 +157,10 @@ impl DataStateMachine {
         if req.sequence == highest {
             return Ok(match seq {
                 Some(s) if s.digest == digest(&req.op) => (ApplyResult::Replayed(s.result), vec![]),
-                Some(_) => (ApplyResult::Rejected(RejectReason::SequenceMismatch), vec![]),
+                Some(_) => (
+                    ApplyResult::Rejected(RejectReason::SequenceMismatch),
+                    vec![],
+                ),
                 // `highest == 0` with no record: sequence 0 was never decided.
                 None => (
                     ApplyResult::Rejected(RejectReason::StaleSequence {
@@ -176,10 +180,16 @@ impl DataStateMachine {
                 vec![],
             ));
         }
-        if req.sequence > highest + 1 {
+        let Some(expected) = highest.checked_add(1) else {
+            return Ok((
+                ApplyResult::Rejected(RejectReason::SequenceExhausted),
+                vec![],
+            ));
+        };
+        if req.sequence > expected {
             return Ok((
                 ApplyResult::Rejected(RejectReason::SequenceGap {
-                    expected: highest + 1,
+                    expected,
                     got: req.sequence,
                 }),
                 vec![],
@@ -256,16 +266,13 @@ impl DataStateMachine {
                 }
                 // Unconditional delete of an absent key is still Applied and
                 // returns this index as its version, creating no tombstone.
-                let mutation = current
-                    .is_some()
-                    .then(|| StateMutation::Delete {
-                        key: keyspace::user_key(key),
-                    });
+                let mutation = current.is_some().then(|| StateMutation::Delete {
+                    key: keyspace::user_key(key),
+                });
                 Ok((MutationResult::Applied { version: log_index }, mutation))
             }
         }
     }
-
 }
 
 /// Standalone (pre-Raft) log ids carry a synthetic term of 0; M3 supplies real

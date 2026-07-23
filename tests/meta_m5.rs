@@ -8,7 +8,7 @@ use dal::meta::state_machine::{MetaApplyResult, MetaReject, MetaStateMachine};
 use dal::storage::Storage;
 use dal::types::{
     ClusterConfig, DataConfigObservation, GroupId, HashSpec, LogId, MetaCommand, NodeId, NodeState,
-    Placement, PROTOCOL_VERSION,
+    PROTOCOL_VERSION, Placement,
 };
 
 use tempfile::TempDir;
@@ -181,7 +181,10 @@ fn seed_placement_rules() {
     let mut m = Meta::new();
     m.bootstrap(8, 3, &[1, 2, 3], &[1, 2, 3, 4]);
 
-    assert_eq!(m.seed(GroupId::Data(0), &[1, 2, 3]), MetaApplyResult::Applied);
+    assert_eq!(
+        m.seed(GroupId::Data(0), &[1, 2, 3]),
+        MetaApplyResult::Applied
+    );
     // Identical re-seed is a no-op; a conflicting one is rejected.
     assert_eq!(m.seed(GroupId::Data(0), &[3, 2, 1]), MetaApplyResult::NoOp);
     assert_eq!(
@@ -470,13 +473,32 @@ fn set_node_state_guards_incarnation() {
         }),
         MetaApplyResult::Applied
     );
-    // A stale incarnation cannot move it back.
+    // The same incarnation cannot reactivate a Down node.
     assert_eq!(
         m.apply(MetaCommand::SetNodeState {
             node_id: 3,
             state: NodeState::Active,
-            incarnation: 0,
+            incarnation: 1,
         }),
         MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
+    );
+    // Nor can it leave Down for any other state (a Down -> Suspect -> Active
+    // two-step must not bypass the rejoin requirement).
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Suspect,
+            incarnation: 1,
+        }),
+        MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
+    );
+    // Reactivation is a rejoin and must carry a new incarnation.
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Active,
+            incarnation: 2,
+        }),
+        MetaApplyResult::Applied
     );
 }

@@ -210,8 +210,7 @@ impl Envelope {
 
         let cluster_id = u128::from_le_bytes(bytes[4..20].try_into().unwrap());
 
-        let msg_type =
-            MsgType::from_u8(bytes[20]).ok_or(FrameError::BadMsgType(bytes[20]))?;
+        let msg_type = MsgType::from_u8(bytes[20]).ok_or(FrameError::BadMsgType(bytes[20]))?;
 
         let group_tag = bytes[21];
         let partition = u16::from_le_bytes(bytes[22..24].try_into().unwrap());
@@ -261,7 +260,13 @@ mod tests {
     use super::*;
 
     fn env(msg_type: MsgType, group: GroupId, payload: Vec<u8>) -> Envelope {
-        Envelope::new(0xABCD_1234_5678_9ABC_DEF0_1122_3344_5566, msg_type, group, 42, payload)
+        Envelope::new(
+            0xABCD_1234_5678_9ABC_DEF0_1122_3344_5566,
+            msg_type,
+            group,
+            42,
+            payload,
+        )
     }
 
     #[test]

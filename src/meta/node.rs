@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::Config;
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 
 use crate::error::{Error, Result};
 use crate::keyspace;
@@ -50,7 +50,7 @@ impl MetaNode {
         registry: Registry<MetaTypeConfig>,
         faults: Faults,
     ) -> Result<MetaNode> {
-        storage.ensure_group(GroupId::Meta)?;
+        storage.authorize_group_start(GroupId::Meta, node_id)?;
 
         let config = Config {
             cluster_name: GroupId::Meta.token(),
@@ -146,10 +146,13 @@ impl MetaNode {
 
     /// Submit a meta command through the group's serving gate.
     pub async fn propose(&self, cmd: MetaCommand) -> Result<ProposeOutcome> {
+        self.storage.require_serving(GroupId::Meta)?;
         match self.raft.client_write(cmd).await {
             Ok(resp) => Ok(ProposeOutcome::Applied(resp.data)),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
-                Ok(ProposeOutcome::NotLeader { leader: f.leader_id })
+                Ok(ProposeOutcome::NotLeader {
+                    leader: f.leader_id,
+                })
             }
             Err(e) => Err(Error::Raft(e.to_string())),
         }
@@ -157,10 +160,13 @@ impl MetaNode {
 
     /// Run a linearizable read: ReadIndex, then a local read of committed state.
     async fn linearizable<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<MetaRead<T>> {
+        self.storage.require_serving(GroupId::Meta)?;
         match self.raft.ensure_linearizable().await {
             Ok(_) => Ok(MetaRead::Value(read()?)),
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
-                Ok(MetaRead::NotLeader { leader: f.leader_id })
+                Ok(MetaRead::NotLeader {
+                    leader: f.leader_id,
+                })
             }
             Err(e) => Err(Error::Raft(e.to_string())),
         }
