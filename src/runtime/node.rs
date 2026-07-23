@@ -159,7 +159,12 @@ impl Node {
         let heartbeat_incarnation = storage.next_heartbeat_incarnation()?;
 
         let cluster = desc.config.clone();
-        let is_meta_voter = desc.meta_voters.contains(&cfg.node_id);
+        let genesis_meta_voter = desc.meta_voters.contains(&cfg.node_id);
+        // A genesis meta voter that was drained and durably reclaimed must not
+        // restart its meta group: `authorize_group_start` refuses a `NonServing`
+        // group and would hard-fail startup.
+        let is_meta_voter = genesis_meta_voter
+            && storage.serving_state(GroupId::Meta)? != Some(ServingState::NonServing);
         let hosted: Vec<(u16, Vec<NodeId>)> = desc
             .data_placements
             .iter()
@@ -297,6 +302,16 @@ impl Node {
                 starter.resume_partition(p).await?;
             }
         }
+        // The meta group's startup reconciliation: a node promoted to a meta
+        // voter by an earlier rebalance holds the meta group on disk but is not a
+        // genesis meta voter (so the block above did not start it). Resume it
+        // unless it was durably reclaimed.
+        if !genesis_meta_voter
+            && storage.serving_state(GroupId::Meta)? != Some(ServingState::NonServing)
+            && storage.group_exists(GroupId::Meta)
+        {
+            meta_starter.resume_meta().await?;
+        }
 
         let dispatch = Arc::new(RootDispatch::new(
             cfg.cluster_id,
@@ -345,6 +360,7 @@ impl Node {
             addrs.clone(),
             meta_controls.clone(),
             starter,
+            meta_starter,
         );
         tasks.push(tokio::spawn(driver.run()));
 

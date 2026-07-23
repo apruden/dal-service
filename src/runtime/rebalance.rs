@@ -39,7 +39,7 @@ use crate::types::{
 };
 
 use crate::api::gateway::PartitionMap;
-use crate::runtime::node::{MetaHandle, PartitionStarter};
+use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -57,6 +57,7 @@ pub struct RebalanceDriver {
     addrs: AddrBook,
     meta_controls: Vec<String>,
     starter: Arc<PartitionStarter>,
+    meta_starter: Arc<MetaStarter>,
 }
 
 impl RebalanceDriver {
@@ -71,6 +72,7 @@ impl RebalanceDriver {
         addrs: AddrBook,
         meta_controls: Vec<String>,
         starter: Arc<PartitionStarter>,
+        meta_starter: Arc<MetaStarter>,
     ) -> RebalanceDriver {
         RebalanceDriver {
             node_id,
@@ -82,6 +84,7 @@ impl RebalanceDriver {
             addrs,
             meta_controls,
             starter,
+            meta_starter,
         }
     }
 
@@ -95,7 +98,9 @@ impl RebalanceDriver {
             tokio::time::sleep(REBALANCE_INTERVAL).await;
             self.drive_meta_role().await;
             self.drive_data_role().await;
+            self.drive_meta_data_role().await;
             self.drive_reclaim_role().await;
+            self.drive_meta_reclaim_role().await;
         }
     }
 
@@ -169,6 +174,51 @@ impl RebalanceDriver {
                     }
                 }
                 Some(_) => {} // already aborting; resolution is the data-leader role's job
+            }
+        }
+
+        // Meta-voter drain: swap a Draining, non-leader meta voter for an
+        // eligible Active non-voter, keeping the set size (and quorum). v1 never
+        // drains the current meta leader — this node is the leader here, so a
+        // `Draining` leader is simply skipped until leadership moves elsewhere.
+        if let Ok(Some(placement)) = meta.local_placement(GroupId::Meta) {
+            match &placement.r#move {
+                None => {
+                    let drained = placement
+                        .voters
+                        .iter()
+                        .copied()
+                        .find(|v| draining.contains(v) && *v != self.node_id);
+                    if let Some(drained) = drained
+                        && let Some(&replacement) =
+                            active.iter().find(|a| !placement.voters.contains(a))
+                    {
+                        let mut target: Vec<NodeId> = placement
+                            .voters
+                            .iter()
+                            .copied()
+                            .filter(|&v| v != drained)
+                            .collect();
+                        target.push(replacement);
+                        target.sort_unstable();
+                        let _ = create_plan(std::slice::from_ref(meta), GroupId::Meta, &target).await;
+                    }
+                }
+                Some(plan) if !plan.aborting => {
+                    let current = voter_set(placement.voters.clone());
+                    let target_set = voter_set(plan.target_voters.clone());
+                    if let Some(&learner) = target_set.difference(&current).next()
+                        && state_of(learner) == Some(NodeState::Down)
+                    {
+                        let _ = meta
+                            .propose(MetaCommand::MarkAborting {
+                                group: GroupId::Meta,
+                                plan_id: plan.plan_id,
+                            })
+                            .await;
+                    }
+                }
+                Some(_) => {}
             }
         }
     }
@@ -263,6 +313,177 @@ impl RebalanceDriver {
             }
             // Best-effort: a failed reclaim retries on the next tick.
             let _ = self.starter.reclaim_partition(partition).await;
+        }
+    }
+
+    // -- meta membership role (self-referential) ----------------------------
+
+    /// Advance an in-flight meta-group membership change. The meta leader drives
+    /// the change to its *own* voter set — the meta-group analogue of
+    /// `drive_data_role`. v1 only reaches here for a non-leader drain, so the
+    /// leader stays leader across `add_learner`/`change_voters` and finalizes.
+    async fn drive_meta_data_role(&self) {
+        let Some(meta) = self.meta() else {
+            return;
+        };
+        if meta.current_leader() != Some(self.node_id) {
+            return; // only the meta leader drives its own membership change
+        }
+        let Some(placement) = meta.local_placement(GroupId::Meta).ok().flatten() else {
+            return;
+        };
+        let Some(plan) = placement.r#move.clone() else {
+            return;
+        };
+
+        match reconcile(&placement, &meta.committed_voter_set()) {
+            ReconcileAction::ResumePlan => {
+                if plan.aborting {
+                    self.report_abort_meta(&meta, &placement, &plan).await;
+                } else {
+                    self.execute_meta_move(&meta, &placement, &plan.target_voters, plan.plan_id)
+                        .await;
+                }
+            }
+            ReconcileAction::CompleteJoint => {
+                if meta.change_voters(&plan.target_voters).await.is_ok() {
+                    if plan.aborting {
+                        self.report_abort_meta(&meta, &placement, &plan).await;
+                    } else {
+                        self.report_finalize_meta(&meta, plan.plan_id, &plan.target_voters)
+                            .await;
+                    }
+                }
+            }
+            ReconcileAction::Finalize => {
+                if plan.aborting {
+                    self.report_abort_meta(&meta, &placement, &plan).await;
+                } else {
+                    self.report_finalize_meta(&meta, plan.plan_id, &plan.target_voters)
+                        .await;
+                }
+            }
+            ReconcileAction::NoPlan | ReconcileAction::Error => {}
+        }
+    }
+
+    /// The §7.2 healthy-plan steps for the meta group: gate, admit the replacement
+    /// as a meta learner, add it, switch to the target voter set, then finalize.
+    async fn execute_meta_move(
+        &self,
+        meta: &MetaNode,
+        placement: &Placement,
+        target: &[NodeId],
+        plan_id: u64,
+    ) {
+        if gate(placement, &meta.committed_voter_set()) != GateDecision::Accept {
+            return;
+        }
+        let current = voter_set(placement.voters.clone());
+        let target_set = voter_set(target.to_vec());
+        let Some(&learner) = target_set.difference(&current).next() else {
+            return;
+        };
+        if !self.ensure_learner_admitted(learner, GroupId::Meta, plan_id).await {
+            return;
+        }
+        if meta.add_learner(learner).await.is_err() {
+            return;
+        }
+        if meta.change_voters(target).await.is_err() {
+            return;
+        }
+        self.report_finalize_meta(meta, plan_id, target).await;
+    }
+
+    /// Submit the meta membership change's completion, once the target config is
+    /// committed. Mirrors `report_finalize` with `MetaNode` in place of the data
+    /// leader.
+    async fn report_finalize_meta(&self, meta: &MetaNode, plan_id: u64, target: &[NodeId]) {
+        if meta.committed_voter_set() != voter_set(target.to_vec()) {
+            return;
+        }
+        let (config_log_id, _) = meta.committed_config();
+        let Some(config_log_id) = config_log_id else {
+            return;
+        };
+        let observation = DataConfigObservation {
+            group: GroupId::Meta,
+            plan_id,
+            voter_set: target.to_vec(),
+            config_log_id,
+        };
+        self.submit_observation(ObservationBody::Finalize {
+            group: GroupId::Meta,
+            plan_id,
+            observation,
+        })
+        .await;
+    }
+
+    /// Resolve an aborting meta plan (§7.5). Mirrors `report_abort`.
+    async fn report_abort_meta(&self, meta: &MetaNode, placement: &Placement, plan: &MovePlan) {
+        let committed = meta.committed_voter_set();
+        let report = if committed == voter_set(placement.voters.clone()) {
+            placement.voters.clone()
+        } else if committed == voter_set(plan.target_voters.clone()) {
+            plan.target_voters.clone()
+        } else {
+            return;
+        };
+        let (config_log_id, _) = meta.committed_config();
+        let Some(config_log_id) = config_log_id else {
+            return;
+        };
+        let observation = DataConfigObservation {
+            group: GroupId::Meta,
+            plan_id: plan.plan_id,
+            voter_set: report,
+            config_log_id,
+        };
+        self.submit_observation(ObservationBody::Abort {
+            group: GroupId::Meta,
+            plan_id: plan.plan_id,
+            observation,
+        })
+        .await;
+    }
+
+    /// Stop and reclaim the local meta group once a drain has removed this node
+    /// from the committed meta voter set — the meta-group analogue of
+    /// `drive_reclaim_role`. A removed meta voter's *own* meta view freezes at
+    /// removal (the leader stops replicating to it), so unlike the data case it
+    /// cannot read the finalized placement locally. Instead it asks the current
+    /// meta voters over the network: reclaim once one reports a resolved meta
+    /// placement (no move) whose voter set excludes this node.
+    async fn drive_meta_reclaim_role(&self) {
+        if self.meta().is_none() {
+            return; // not hosting the meta group
+        }
+        let body = PlacementQueryBody {
+            group: GroupId::Meta,
+        };
+        let mut excluded = false;
+        for addr in &self.meta_controls {
+            let env = Envelope::new(
+                self.cluster_id,
+                MsgType::PlacementQuery,
+                GroupId::Meta,
+                0,
+                codec::encode(&body),
+            );
+            if let Ok(reply) = self.control.call(addr, env).await
+                && let Ok(PlacementQueryReply { placement: Some(p) }) =
+                    codec::decode::<PlacementQueryReply>(&reply.payload)
+                && p.r#move.is_none()
+                && !p.voters.contains(&self.node_id)
+            {
+                excluded = true;
+                break;
+            }
+        }
+        if excluded {
+            let _ = self.meta_starter.reclaim_meta().await;
         }
     }
 

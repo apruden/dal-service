@@ -80,7 +80,7 @@ pub struct Node {
     storage: Arc<Storage>,                  // one RocksDB, CF-per-group
 
     // Consensus handles
-    meta: Option<Arc<MetaNode>>,            // Some iff this node is a meta voter
+    meta: MetaHandle,                       // Arc<RwLock<Option<Arc<MetaNode>>>>; set at runtime on meta-voter drain-in/out
     partitions: Arc<RwLock<HashMap<u16, Arc<PartitionNode>>>>,  // SHARED + MUTABLE (see notes)
 
     // Client + control planes
@@ -220,8 +220,21 @@ Built (M8):
   restart. Local and deadlock-free; steady-state divergence is corrected by the
   reclaim pass, so startup + reclaim reconcile the hosted set against committed
   placement.
+- Meta-voter membership drain: the meta handle is shared/mutable
+  (`MetaHandle`), `MetaStarter` starts/stops the meta group at runtime, and the
+  driver's meta-leader role drives a size-preserving replacement of a `Draining`
+  non-leader meta voter (`CreatePlan{Meta}` → `add_learner`/`change_voters` →
+  `FinalizePlan{Meta}`), self-referentially. The drained node reclaims its meta
+  group after a current meta voter reports (over the network) a resolved
+  placement excluding it.
 
-The M8 runtime slice is now feature-complete for the partition lifecycle
-(genesis, gain via `BecomeLearner`, drain/reclaim, and restart re-hosting).
-Remaining coarse edges are pre-v1 hardening, not new mechanism: e.g. meta-voter
-membership drain/replacement and load-aware placement (DESIGN §15).
+The M8 runtime slice is now feature-complete for both the partition and
+meta-voter lifecycles (genesis, gain via `BecomeLearner`, drain/reclaim,
+restart re-hosting, and non-leader meta-voter replacement).
+
+Open (pre-v1 hardening, not new mechanism):
+- **Draining the current meta *leader*** — needs Raft leadership transfer; v1
+  waits until leadership moves.
+- **Dynamic failure-detector start** on a node promoted to a meta voter at
+  runtime (not needed for drain correctness).
+- **Meta *removal* (shrink) drain** and load-aware placement (DESIGN §15).

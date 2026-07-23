@@ -480,6 +480,27 @@ state divergence from the meta record — a group this node no longer votes for 
 is corrected by the driver's reclaim pass, so startup + reclaim together
 reconcile the hosted set against the committed placement.
 
+**Meta-voter membership drain** (`runtime/{node,rebalance,dispatch}.rs`,
+`meta/node.rs`): a `leave` on a **non-leader** meta voter triggers a
+size-preserving meta-voter *replacement*. The meta handle is shared and mutable
+(`MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>`) so a node can start or stop
+hosting the meta group at runtime; `MetaStarter` is the meta-group analogue of
+`PartitionStarter` (`admit_meta_learner`/`resume_meta`/`reclaim_meta`), and a
+`BecomeLearner` frame addressed to the meta group routes to it. The rebalance
+driver's meta-leader role creates a `CreatePlan{group: Meta}` (SM-validated as a
+single-voter replacement, floor 3) for a `Draining` non-leader meta voter, then
+the meta leader drives its *own* membership change (`add_learner` →
+`change_voters` → `FinalizePlan{Meta}`) — mirroring the data path via
+`reconcile`/`gate` over `MetaNode::committed_voter_set`. The drained node reclaims
+its meta group once a **current** meta voter reports (over the network) a resolved
+meta placement excluding it — a removed voter's own meta view freezes at removal,
+so it cannot read the finalize locally. `Node::start` skips a durably `NonServing`
+meta group on restart and resumes a meta group gained by an earlier promotion.
+**v1 limitation:** draining the current meta *leader* is not supported (it needs
+Raft leadership transfer); the plan simply waits until leadership moves. Follow-
+ups: leader drain, dynamic failure-detector start on a promoted node, meta
+*removal* (shrink) drain.
+
 ---
 
 ## 3. Cross-cutting test strategy

@@ -885,3 +885,137 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
+    use dal::transport::codec::{Envelope, MsgType};
+    use dal::transport::raft_wire::LeaveBody;
+
+    let ctx = zmq::Context::new();
+
+    // Meta voters {1,2,3}; node 4 is an Active spare. Draining a meta voter must
+    // replace it in the meta voter set with node 4.
+    let all = [1u64, 2, 3, 4];
+    let directory = all
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8mv-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8mv-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 1,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: vec![1, 2, 3],
+        directory,
+        data_placements: vec![(0, vec![1, 2, 3])],
+    };
+
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let cfg = |id: NodeId, i: usize| NodeConfig {
+        cluster_id: CID,
+        node_id: id,
+        control_addr: format!("inproc://m8mv-ctrl-{id}"),
+        bulk_addr: format!("inproc://m8mv-bulk-{id}"),
+        http_addr: None,
+        seeds: Vec::new(),
+        data_dir: dirs[i].path().to_path_buf(),
+        timeouts: short_timeouts(),
+    };
+
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg(id, i), desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    // Wait for a stable meta and data leader, then drain a voter that leads
+    // neither group (v1 drains a non-leader; a drained data leader would also
+    // step down mid-move).
+    let mut meta_leader = None;
+    let mut data_leader = None;
+    for _ in 0..100 {
+        meta_leader = nodes[0].meta_leader();
+        data_leader = nodes[0].partition_leader(0);
+        if meta_leader.is_some() && data_leader.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let meta_leader = meta_leader.expect("meta group never elected a leader");
+    let data_leader = data_leader.expect("partition 0 never elected a leader");
+    let victim = *[1u64, 2, 3]
+        .iter()
+        .find(|&&v| v != meta_leader && v != data_leader)
+        .expect("no meta voter that leads neither group");
+
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let leave = Envelope::new(
+        CID,
+        MsgType::LeaveRequest,
+        dal::types::GroupId::Meta,
+        0,
+        dal::codec::encode(&LeaveBody { node_id: victim }),
+    );
+    transport
+        .call(&format!("inproc://m8mv-ctrl-{meta_leader}"), leave)
+        .await
+        .unwrap();
+
+    let mut expected: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&v| v != victim).collect();
+    expected.push(4);
+    expected.sort_unstable();
+
+    // The meta leader (a survivor) commits the new meta voter set with the spare.
+    let survivor = &nodes[(meta_leader - 1) as usize];
+    let mut swapped = false;
+    for _ in 0..200 {
+        if let Some(mut voters) = survivor.meta_voters_of() {
+            voters.sort_unstable();
+            if voters == expected {
+                swapped = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(swapped, "meta voter set never swapped in the spare");
+
+    // The drained node, now a committed meta non-voter, reclaims its meta group.
+    let victim_node = &nodes[(victim - 1) as usize];
+    let mut reclaimed = false;
+    for _ in 0..100 {
+        if !victim_node.hosts_meta() {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        reclaimed,
+        "drained meta voter {victim} never reclaimed its meta group"
+    );
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
