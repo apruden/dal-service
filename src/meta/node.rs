@@ -225,6 +225,18 @@ impl MetaNode {
             .get_state_record(GroupId::Meta, &keyspace::meta_node_key(node_id))
     }
 
+    /// Every node-directory entry from committed local state (non-linearizable),
+    /// used by the failure detector to evaluate liveness across the cluster.
+    pub fn local_directory(&self) -> Result<Vec<NodeDirectoryEntry>> {
+        let prefix = keyspace::meta_node_prefix();
+        self.storage
+            .scan_state(GroupId::Meta)?
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| crate::codec::decode(&v).map_err(crate::error::Error::codec))
+            .collect()
+    }
+
     pub fn applied_index(&self) -> Option<u64> {
         self.raft.metrics().borrow().last_applied.map(|l| l.index)
     }

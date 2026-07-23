@@ -12,17 +12,20 @@
 //! — are a follow-up; membership here is the genesis placement.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use tokio::task::JoinHandle;
 
 use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource};
 use crate::api::ops::RoutingInfo;
-use crate::config::{NodeConfig, RaftTuning};
+use crate::config::{NodeConfig, RaftTuning, Timeouts};
 use crate::error::Result;
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
+use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::MetaNode;
 use crate::partition::node::PartitionNode;
-use crate::runtime::dispatch::RootDispatch;
+use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::{AddrBook, RaftPeerFactory};
@@ -30,10 +33,11 @@ use crate::transport::router::ZmqServer;
 use crate::transport::{
     Transport,
     codec::{Envelope, MsgType},
-    raft_wire::{BootstrapStatusBody, BootstrapStatusReply},
+    raft_wire::{BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody},
 };
 use crate::types::{
-    BootstrapGroup, ClusterConfig, GroupId, LogId, NodeDirectoryEntry, NodeId, NodeState, Placement,
+    BootstrapGroup, ClusterConfig, ClusterId, GroupId, LearnerAdmission, LogId, MetaCommand,
+    NodeDirectoryEntry, NodeId, NodeState, Placement,
 };
 
 /// How long [`Node::bootstrap`] waits for genesis to seed and replicate before
@@ -100,6 +104,9 @@ pub struct Node {
     desc: BootstrapDescriptor,
     control: ZmqTransport,
     meta_controls: Vec<String>,
+    // Background control loops (heartbeat emitter, failure detector); aborted on
+    // shutdown.
+    tasks: Vec<JoinHandle<()>>,
     // Dropping these stops the poller threads and closes the sockets.
     _control_srv: ZmqServer,
     _bulk_srv: ZmqServer,
@@ -209,15 +216,49 @@ impl Node {
             partitions.clone(),
             routing,
         ));
+        let heartbeats = Arc::new(Mutex::new(HeartbeatTracker::new()));
+        let starter = Arc::new(PartitionStarter {
+            node_id: cfg.node_id,
+            cluster_id: cfg.cluster_id,
+            storage: storage.clone(),
+            addrs: addrs.clone(),
+            control: control.clone(),
+            bulk: bulk.clone(),
+            tuning,
+            partitions: partitions.clone(),
+        });
         let dispatch = Arc::new(RootDispatch::new(
             cfg.cluster_id,
             gateway,
             meta.clone(),
             partitions.clone(),
+            heartbeats.clone(),
+            Some(starter),
         ));
 
         let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
         let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone())?;
+
+        // Control loops: every node beats to the meta voters; the meta leader
+        // turns the collected evidence into directory transitions.
+        let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
+        let hb_control = ZmqTransport::new(ctx.clone(), hb_interval);
+        let mut tasks = Vec::new();
+        tasks.push(tokio::spawn(heartbeat_emitter(
+            cfg.node_id,
+            cfg.cluster_id,
+            hb_control,
+            meta_controls.clone(),
+            hb_interval,
+        )));
+        if let Some(meta) = &meta {
+            tasks.push(tokio::spawn(failure_detector(
+                meta.clone(),
+                heartbeats.clone(),
+                cfg.timeouts,
+                hb_interval,
+            )));
+        }
 
         Ok(Node {
             node_id: cfg.node_id,
@@ -229,6 +270,7 @@ impl Node {
             desc,
             control,
             meta_controls,
+            tasks,
             _control_srv: control_srv,
             _bulk_srv: bulk_srv,
         })
@@ -342,6 +384,20 @@ impl Node {
         self.node_id
     }
 
+    /// Whether this node currently hosts the given data partition.
+    pub fn hosts_partition(&self, partition: u16) -> bool {
+        self.partitions.read().unwrap().contains_key(&partition)
+    }
+
+    /// The committed directory state of `node_id` as seen locally, if this node
+    /// runs the meta group. Used by tests to observe failure-detector output.
+    pub fn local_node_state(&self, node_id: NodeId) -> Result<Option<NodeState>> {
+        match &self.meta {
+            Some(meta) => Ok(meta.local_node(node_id)?.map(|e| e.state)),
+            None => Ok(None),
+        }
+    }
+
     pub fn cluster(&self) -> &ClusterConfig {
         &self.cluster
     }
@@ -349,6 +405,9 @@ impl Node {
     /// Gracefully stop: shut down every Raft group, then drop the inbound
     /// servers (their `Drop` stops the poller threads).
     pub async fn shutdown(self) -> Result<()> {
+        for task in &self.tasks {
+            task.abort();
+        }
         if let Some(meta) = &self.meta {
             meta.shutdown().await?;
         }
@@ -358,6 +417,138 @@ impl Node {
             node.shutdown().await?;
         }
         Ok(())
+    }
+}
+
+/// Starts a data partition as a learner in response to a `BecomeLearner` frame
+/// (DESIGN §7.2). Holds exactly what starting a `PartitionNode` over the ZMQ
+/// network needs, plus the shared partition map to publish the new group into.
+pub struct PartitionStarter {
+    node_id: NodeId,
+    cluster_id: ClusterId,
+    storage: Arc<Storage>,
+    addrs: AddrBook,
+    control: ZmqTransport,
+    bulk: ZmqTransport,
+    tuning: RaftTuning,
+    partitions: PartitionMap,
+}
+
+impl PartitionStarter {
+    /// Admit this node as a learner for `group` under `plan_id`: write the
+    /// durable admission record (the second lawful way group state is created —
+    /// ground rule 8), start the partition's Raft runtime as an uninitialized
+    /// learner, and publish it so the gateway and dispatcher can serve/route it.
+    /// Idempotent: a group already hosted returns `Ok` without restarting.
+    pub async fn admit_learner(&self, group: GroupId, plan_id: u64) -> Result<()> {
+        let GroupId::Data(partition) = group else {
+            return Err(crate::error::Error::Raft(format!(
+                "cannot admit a learner for {group:?}"
+            )));
+        };
+        if self.partitions.read().unwrap().contains_key(&partition) {
+            return Ok(());
+        }
+
+        bootstrap::ensure_learner_admission(
+            &self.storage,
+            &LearnerAdmission {
+                cluster_id: self.cluster_id,
+                group,
+                plan_id,
+            },
+        )?;
+
+        let net = RaftPeerFactory::new(
+            group,
+            self.cluster_id,
+            self.addrs.clone(),
+            self.control.clone(),
+            self.bulk.clone(),
+        );
+        let node =
+            PartitionNode::start_with_network(self.node_id, group, self.storage.clone(), net, self.tuning)
+                .await?;
+        self.partitions
+            .write()
+            .unwrap()
+            .insert(partition, Arc::new(node));
+        Ok(())
+    }
+}
+
+/// Every node periodically sends liveness evidence to the meta voters. Sends are
+/// concurrent with a short timeout so one unreachable voter cannot stall the
+/// round and make this node look silent to the others (DESIGN §9.1).
+async fn heartbeat_emitter(
+    node_id: NodeId,
+    cluster_id: crate::types::ClusterId,
+    control: ZmqTransport,
+    meta_controls: Vec<String>,
+    interval: Duration,
+) {
+    let mut seq = 1u64;
+    loop {
+        let body = HeartbeatBody {
+            node_id,
+            incarnation: 0,
+            seq,
+        };
+        let payload = crate::codec::encode(&body);
+        let sends = meta_controls.iter().map(|addr| {
+            let env = Envelope::new(
+                cluster_id,
+                MsgType::Heartbeat,
+                GroupId::Meta,
+                0,
+                payload.clone(),
+            );
+            control.call(addr, env)
+        });
+        let _ = futures::future::join_all(sends).await;
+        seq = seq.wrapping_add(1);
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// The meta leader's failure detector: turn collected heartbeat evidence into
+/// committed directory transitions. Only the current leader proposes; the
+/// incarnation guard in the meta state machine rejects a transition against a
+/// rejoined node (DESIGN §9.1).
+async fn failure_detector(
+    meta: Arc<MetaNode>,
+    tracker: Arc<Mutex<HeartbeatTracker>>,
+    timeouts: Timeouts,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if meta.current_leader() != Some(meta.node_id()) {
+            continue;
+        }
+        let Ok(directory) = meta.local_directory() else {
+            continue;
+        };
+        let states: Vec<(NodeId, NodeState)> =
+            directory.iter().map(|e| (e.node_id, e.state)).collect();
+        let transitions = {
+            let tracker = tracker.lock().unwrap();
+            tracker.evaluate(now_ms(), &timeouts, &states)
+        };
+        for (node_id, state) in transitions {
+            let incarnation = directory
+                .iter()
+                .find(|e| e.node_id == node_id)
+                .map(|e| e.incarnation)
+                .unwrap_or(0);
+            let _ = meta
+                .propose(MetaCommand::SetNodeState {
+                    node_id,
+                    state,
+                    incarnation,
+                })
+                .await;
+        }
     }
 }
 

@@ -13,19 +13,30 @@
 
 use crate::api::gateway::{ClientGateway, PartitionMap};
 use crate::codec;
+use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::{MetaNode, ProposeOutcome};
 use crate::meta::raft_types::MetaTypeConfig;
 use crate::partition::raft_types::TypeConfig;
+use crate::runtime::node::PartitionStarter;
 use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
-    AbortPlanBody, BootstrapStatusBody, BootstrapStatusReply, JoinBody, LeaveBody, ObservationBody,
-    SubmitReply,
+    AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody,
+    JoinBody, LeaveBody, LearnerReply, ObservationBody, SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Wall-clock milliseconds, the time base the [`HeartbeatTracker`] is fed.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Routes inbound frames to the client gateway or the peer/operator handlers.
 pub struct RootDispatch {
@@ -33,6 +44,8 @@ pub struct RootDispatch {
     gateway: Arc<ClientGateway>,
     meta: Option<Arc<MetaNode>>,
     partitions: PartitionMap,
+    heartbeats: Arc<Mutex<HeartbeatTracker>>,
+    starter: Option<Arc<PartitionStarter>>,
 }
 
 impl RootDispatch {
@@ -41,12 +54,16 @@ impl RootDispatch {
         gateway: Arc<ClientGateway>,
         meta: Option<Arc<MetaNode>>,
         partitions: PartitionMap,
+        heartbeats: Arc<Mutex<HeartbeatTracker>>,
+        starter: Option<Arc<PartitionStarter>>,
     ) -> RootDispatch {
         RootDispatch {
             cluster_id,
             gateway,
             meta,
             partitions,
+            heartbeats,
+            starter,
         }
     }
 
@@ -77,11 +94,8 @@ impl RootDispatch {
             MsgType::LeaveRequest => self.serve_leave(req).await,
             MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
-            // Deferred: feeds the failure detector / rebalancer (see module docs).
-            MsgType::Heartbeat | MsgType::BecomeLearner => {
-                let reply = SubmitReply::Error("heartbeat/become-learner not yet handled".into());
-                self.reply(&req, codec::encode(&reply))
-            }
+            MsgType::Heartbeat => self.serve_heartbeat(req),
+            MsgType::BecomeLearner => self.serve_become_learner(req).await,
             // Client/reply types are handled before reaching serve_control (or
             // never arrive as requests); reply unusably so a sender retries.
             _ => self.raft_unavailable(&req),
@@ -232,6 +246,38 @@ impl RootDispatch {
         self.submit(&req, cmd).await
     }
 
+    /// Admit this node as a learner for the addressed group under the plan in
+    /// the body (DESIGN §7.2). The group is created from the durable admission
+    /// record and its Raft runtime starts uninitialized, ready to receive the
+    /// data leader's `add_learner` catch-up.
+    async fn serve_become_learner(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<BecomeLearnerBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&LearnerReply::Error("malformed".into())));
+        };
+        let reply = match &self.starter {
+            None => LearnerReply::Error("node cannot host data partitions".into()),
+            Some(starter) => match starter.admit_learner(req.group_id, body.plan_id).await {
+                Ok(()) => LearnerReply::Admitted,
+                Err(e) => LearnerReply::Error(e.to_string()),
+            },
+        };
+        self.reply(&req, codec::encode(&reply))
+    }
+
+    /// Record heartbeat liveness evidence. The reply is a bare ack — the emitter
+    /// only needs to know the frame was delivered. A stale/replayed sequence is
+    /// dropped by the tracker; the meta leader's detector loop turns accepted
+    /// evidence into `SetNodeState` transitions.
+    fn serve_heartbeat(&self, req: Envelope) -> Envelope {
+        if let Ok(body) = codec::decode::<HeartbeatBody>(&req.payload) {
+            self.heartbeats
+                .lock()
+                .unwrap()
+                .observe(body.node_id, body.seq, now_ms());
+        }
+        self.reply(&req, Vec::new())
+    }
+
     /// Confirm that a data placement has committed before its designated voter
     /// initializes the group. This uses a linearizable meta read so observing a
     /// reply is sufficient to establish the bootstrap phase ordering.
@@ -304,7 +350,14 @@ mod tests {
             partitions.clone(),
             Arc::new(EmptyRouting),
         ));
-        let dispatch = RootDispatch::new(7, gateway, None, partitions);
+        let dispatch = RootDispatch::new(
+            7,
+            gateway,
+            None,
+            partitions,
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+        );
         let request = Envelope::new(
             8,
             MsgType::JoinRequest,
