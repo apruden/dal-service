@@ -9,9 +9,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openraft::Config;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
+use openraft::{Config, RaftNetworkFactory};
 
+use crate::config::RaftTuning;
 use crate::error::{Error, Result};
 use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
@@ -47,8 +48,8 @@ pub struct PartitionNode {
 }
 
 impl PartitionNode {
-    /// Build the log store, state machine, and network, then start the Raft
-    /// instance and register it so peers can reach it.
+    /// In-process variant used by tests and single-process harnesses: wires a
+    /// [`ChannelNetworkFactory`] and registers the raft handle for peers.
     pub async fn start(
         node_id: NodeId,
         group: GroupId,
@@ -56,13 +57,33 @@ impl PartitionNode {
         registry: Registry<TypeConfig>,
         faults: Faults,
     ) -> Result<PartitionNode> {
+        let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
+        let node =
+            Self::start_with_network(node_id, group, storage, network, RaftTuning::default())
+                .await?;
+        registry.register(node_id, node.raft.clone());
+        Ok(node)
+    }
+
+    /// Start this group's Raft runtime over an arbitrary network (production
+    /// wires the ZMQ-backed factory here).
+    pub async fn start_with_network<NF>(
+        node_id: NodeId,
+        group: GroupId,
+        storage: Arc<Storage>,
+        network: NF,
+        tuning: RaftTuning,
+    ) -> Result<PartitionNode>
+    where
+        NF: RaftNetworkFactory<TypeConfig>,
+    {
         storage.authorize_group_start(group, node_id)?;
 
         let config = Config {
             cluster_name: group.token(),
-            election_timeout_min: 200,
-            election_timeout_max: 400,
-            heartbeat_interval: 100,
+            election_timeout_min: tuning.election_timeout_min,
+            election_timeout_max: tuning.election_timeout_max,
+            heartbeat_interval: tuning.heartbeat_interval,
             ..Default::default()
         };
         let config = Arc::new(
@@ -73,13 +94,10 @@ impl PartitionNode {
 
         let log_store = RocksLogStore::new(storage.clone(), group);
         let sm = RocksStateMachine::new(storage.clone(), group);
-        let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
 
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
             .map_err(|e| Error::Raft(format!("raft new: {e}")))?;
-
-        registry.register(node_id, raft.clone());
 
         Ok(PartitionNode {
             node_id,

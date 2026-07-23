@@ -47,6 +47,26 @@ impl Timeouts {
     }
 }
 
+/// Raft timing knobs for one group's runtime (milliseconds). Defaults match
+/// the values the in-process tests have always used; production can relax the
+/// data-group cadence when a node hosts many partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftTuning {
+    pub election_timeout_min: u64,
+    pub election_timeout_max: u64,
+    pub heartbeat_interval: u64,
+}
+
+impl Default for RaftTuning {
+    fn default() -> Self {
+        RaftTuning {
+            election_timeout_min: 200,
+            election_timeout_max: 400,
+            heartbeat_interval: 100,
+        }
+    }
+}
+
 /// Per-node runtime configuration. Carries identity and endpoints only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {

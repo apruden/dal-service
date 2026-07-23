@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openraft::Config;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
+use openraft::{Config, RaftNetworkFactory};
 
+use crate::config::RaftTuning;
 use crate::error::{Error, Result};
 use crate::keyspace;
 use crate::meta::raft_types::{MetaTypeConfig, Node, NodeId, Raft};
@@ -44,19 +45,39 @@ pub struct MetaNode {
 }
 
 impl MetaNode {
+    /// In-process variant used by tests and single-process harnesses: wires a
+    /// [`ChannelNetworkFactory`] and registers the raft handle for peers.
     pub async fn start(
         node_id: NodeId,
         storage: Arc<Storage>,
         registry: Registry<MetaTypeConfig>,
         faults: Faults,
     ) -> Result<MetaNode> {
+        let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
+        let node =
+            Self::start_with_network(node_id, storage, network, RaftTuning::default()).await?;
+        registry.register(node_id, node.raft.clone());
+        Ok(node)
+    }
+
+    /// Start the meta Raft runtime over an arbitrary network (production wires
+    /// the ZMQ-backed factory here).
+    pub async fn start_with_network<NF>(
+        node_id: NodeId,
+        storage: Arc<Storage>,
+        network: NF,
+        tuning: RaftTuning,
+    ) -> Result<MetaNode>
+    where
+        NF: RaftNetworkFactory<MetaTypeConfig>,
+    {
         storage.authorize_group_start(GroupId::Meta, node_id)?;
 
         let config = Config {
             cluster_name: GroupId::Meta.token(),
-            election_timeout_min: 200,
-            election_timeout_max: 400,
-            heartbeat_interval: 100,
+            election_timeout_min: tuning.election_timeout_min,
+            election_timeout_max: tuning.election_timeout_max,
+            heartbeat_interval: tuning.heartbeat_interval,
             ..Default::default()
         };
         let config = Arc::new(
@@ -67,13 +88,10 @@ impl MetaNode {
 
         let log_store = RocksLogStore::new(storage.clone(), GroupId::Meta);
         let sm = MetaRaftStateMachine::new(storage.clone());
-        let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
 
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
             .map_err(|e| Error::Raft(format!("raft new: {e}")))?;
-
-        registry.register(node_id, raft.clone());
 
         Ok(MetaNode {
             node_id,
