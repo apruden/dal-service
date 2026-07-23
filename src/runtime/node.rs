@@ -263,18 +263,21 @@ impl Node {
                 cfg.timeouts,
                 hb_interval,
             )));
-            let driver = RebalanceDriver::new(
-                cfg.node_id,
-                cfg.cluster_id,
-                cluster.p,
-                meta.clone(),
-                partitions.clone(),
-                control.clone(),
-                addrs.clone(),
-                meta_controls.clone(),
-            );
-            tasks.push(tokio::spawn(driver.run()));
         }
+        // The rebalance driver runs on every node: its data-leader role must run
+        // wherever a partition is led, including on non-meta-voter nodes (which
+        // read the plan and report observations over the network).
+        let driver = RebalanceDriver::new(
+            cfg.node_id,
+            cfg.cluster_id,
+            cluster.p,
+            meta.clone(),
+            partitions.clone(),
+            control.clone(),
+            addrs.clone(),
+            meta_controls.clone(),
+        );
+        tasks.push(tokio::spawn(driver.run()));
 
         // Read-only HTTP admin plane. Bind here so a bad address fails startup;
         // the serve task is aborted on shutdown with the other loops.

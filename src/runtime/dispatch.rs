@@ -22,7 +22,8 @@ use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody,
-    JoinBody, LeaveBody, LearnerReply, ObservationBody, SubmitReply,
+    JoinBody, LeaveBody, LearnerReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
+    SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
 
@@ -94,6 +95,7 @@ impl RootDispatch {
             MsgType::LeaveRequest => self.serve_leave(req).await,
             MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
+            MsgType::PlacementQuery => self.serve_placement_query(req),
             MsgType::Heartbeat => self.serve_heartbeat(req),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
             // Client/reply types are handled before reaching serve_control (or
@@ -262,6 +264,18 @@ impl RootDispatch {
             },
         };
         self.reply(&req, codec::encode(&reply))
+    }
+
+    /// Return a group's committed placement from local meta state, so a data
+    /// leader that is not a meta voter can read its own plan. A local (committed)
+    /// read suffices: a committed plan is stable until the move that this reply
+    /// helps drive resolves it.
+    fn serve_placement_query(&self, req: Envelope) -> Envelope {
+        let placement = match (codec::decode::<PlacementQueryBody>(&req.payload), &self.meta) {
+            (Ok(body), Some(meta)) => meta.local_placement(body.group).ok().flatten(),
+            _ => None,
+        };
+        self.reply(&req, codec::encode(&PlacementQueryReply { placement }))
     }
 
     /// Record heartbeat liveness evidence. The reply is a bare ack — the emitter

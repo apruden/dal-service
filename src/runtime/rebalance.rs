@@ -30,7 +30,8 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::AddrBook;
 use crate::transport::raft_wire::{
-    BecomeLearnerBody, LearnerReply, ObservationBody, SubmitReply,
+    BecomeLearnerBody, LearnerReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
+    SubmitReply,
 };
 use crate::types::{
     ClusterId, DataConfigObservation, GroupId, MetaCommand, MovePlan, NodeId, NodeState, Placement,
@@ -41,12 +42,15 @@ use crate::api::gateway::PartitionMap;
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
 
-/// Per-node rebalance driver. Spawned only on meta voters.
+/// Per-node rebalance driver, spawned on every node. The meta-leader role is a
+/// no-op unless this node runs and leads the meta group; the data-leader role
+/// runs wherever a partition is led, reading the plan locally when this node is
+/// a meta voter and over the network otherwise.
 pub struct RebalanceDriver {
     node_id: NodeId,
     cluster_id: ClusterId,
     partition_count: u16,
-    meta: Arc<MetaNode>,
+    meta: Option<Arc<MetaNode>>,
     partitions: PartitionMap,
     control: ZmqTransport,
     addrs: AddrBook,
@@ -59,7 +63,7 @@ impl RebalanceDriver {
         node_id: NodeId,
         cluster_id: ClusterId,
         partition_count: u16,
-        meta: Arc<MetaNode>,
+        meta: Option<Arc<MetaNode>>,
         partitions: PartitionMap,
         control: ZmqTransport,
         addrs: AddrBook,
@@ -91,10 +95,13 @@ impl RebalanceDriver {
     /// a plan whose learner target has been declared `Down` (§7.5) — such a plan
     /// can never complete, so it must roll back.
     async fn drive_meta_role(&self) {
-        if self.meta.current_leader() != Some(self.node_id) {
+        let Some(meta) = &self.meta else {
+            return; // not a meta node; nothing to plan
+        };
+        if meta.current_leader() != Some(self.node_id) {
             return;
         }
-        let Ok(directory) = self.meta.local_directory() else {
+        let Ok(directory) = meta.local_directory() else {
             return;
         };
         let state_of = |id: NodeId| directory.iter().find(|e| e.node_id == id).map(|e| e.state);
@@ -111,7 +118,7 @@ impl RebalanceDriver {
 
         for partition in 0..self.partition_count {
             let group = GroupId::Data(partition);
-            let Ok(Some(placement)) = self.meta.local_placement(group) else {
+            let Ok(Some(placement)) = meta.local_placement(group) else {
                 continue;
             };
             match &placement.r#move {
@@ -134,7 +141,7 @@ impl RebalanceDriver {
                         .collect();
                     target.push(replacement);
                     target.sort_unstable();
-                    let _ = create_plan(std::slice::from_ref(&self.meta), group, &target).await;
+                    let _ = create_plan(std::slice::from_ref(meta), group, &target).await;
                 }
                 // Healthy plan whose learner target is Down: abort it.
                 Some(plan) if !plan.aborting => {
@@ -143,8 +150,7 @@ impl RebalanceDriver {
                     if let Some(&learner) = target_set.difference(&current).next()
                         && state_of(learner) == Some(NodeState::Down)
                     {
-                        let _ = self
-                            .meta
+                        let _ = meta
                             .propose(MetaCommand::MarkAborting {
                                 group,
                                 plan_id: plan.plan_id,
@@ -174,7 +180,7 @@ impl RebalanceDriver {
                 continue;
             }
             let group = GroupId::Data(partition);
-            let Ok(Some(placement)) = self.meta.local_placement(group) else {
+            let Some(placement) = self.read_placement(group).await else {
                 continue;
             };
             let Some(plan) = placement.r#move.clone() else {
@@ -344,11 +350,39 @@ impl RebalanceDriver {
         }
     }
 
+    /// Read a group's committed placement: locally when this node is a meta
+    /// voter, otherwise over the network from a meta voter.
+    async fn read_placement(&self, group: GroupId) -> Option<Placement> {
+        if let Some(meta) = &self.meta {
+            return meta.local_placement(group).ok().flatten();
+        }
+        let body = PlacementQueryBody { group };
+        for addr in &self.meta_controls {
+            let env = Envelope::new(
+                self.cluster_id,
+                MsgType::PlacementQuery,
+                GroupId::Meta,
+                0,
+                codec::encode(&body),
+            );
+            if let Ok(reply) = self.control.call(addr, env).await
+                && let Ok(PlacementQueryReply {
+                    placement: Some(p),
+                }) = codec::decode::<PlacementQueryReply>(&reply.payload)
+            {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     /// Submit a config observation to the meta group: locally if this node leads
     /// meta, otherwise via a `DataConfigObservation` frame to a meta voter.
     async fn submit_observation(&self, body: ObservationBody) {
-        if self.meta.current_leader() == Some(self.node_id) {
-            let _ = self.meta.propose(body.into_meta_command()).await;
+        if let Some(meta) = &self.meta
+            && meta.current_leader() == Some(self.node_id)
+        {
+            let _ = meta.propose(body.into_meta_command()).await;
             return;
         }
         for addr in &self.meta_controls {

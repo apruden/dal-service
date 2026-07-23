@@ -366,6 +366,120 @@ async fn become_learner_starts_a_hosted_partition() {
     Arc::try_unwrap(node).ok().unwrap().shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn non_meta_voter_data_leader_drives_a_move() {
+    use dal::transport::codec::{Envelope, MsgType};
+    use dal::transport::raft_wire::LeaveBody;
+
+    let ctx = zmq::Context::new();
+
+    // Meta lives on {1,2,3}; partition 0 lives entirely on non-meta nodes
+    // {4,5,6}, so whichever of them leads it must drive the move over the network.
+    let all: Vec<u64> = (1..=6).collect();
+    let directory = all
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8nm-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8nm-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 1,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: vec![1, 2, 3],
+        directory,
+        data_placements: vec![(0, vec![4, 5, 6])],
+    };
+
+    let dirs: Vec<tempfile::TempDir> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        let cfg = NodeConfig {
+            cluster_id: CID,
+            node_id: id,
+            control_addr: format!("inproc://m8nm-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8nm-bulk-{id}"),
+            http_addr: None,
+            seeds: Vec::new(),
+            data_dir: dirs[i].path().to_path_buf(),
+            timeouts: Timeouts::default(),
+        };
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    // Drain a non-leader voter of partition 0. The non-meta leader among {4,5,6}
+    // reads the plan and reports the finalize over the network; the spare picked
+    // is the lowest Active non-voter, node 1.
+    let mut leader = None;
+    for _ in 0..100 {
+        if let Some(l) = nodes[3].partition_leader(0) {
+            leader = Some(l);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let leader = leader.expect("partition 0 never elected a leader");
+    assert!(
+        (4..=6).contains(&leader),
+        "partition 0 leader should be a non-meta node, got {leader}"
+    );
+    let victim = *[4u64, 5, 6].iter().find(|&&v| v != leader).unwrap();
+
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let leave = Envelope::new(
+        CID,
+        MsgType::LeaveRequest,
+        dal::types::GroupId::Meta,
+        0,
+        dal::codec::encode(&LeaveBody { node_id: victim }),
+    );
+    transport
+        .call("inproc://m8nm-ctrl-1", leave)
+        .await
+        .unwrap();
+
+    let mut expected: Vec<u64> = [4u64, 5, 6].into_iter().filter(|&v| v != victim).collect();
+    expected.push(1);
+    expected.sort_unstable();
+
+    let mut migrated = false;
+    for _ in 0..200 {
+        // Query a meta voter for the committed placement.
+        if nodes[0].local_placement_voters(0).unwrap() == Some((expected.clone(), false))
+            && nodes[0].hosts_partition(0)
+        {
+            migrated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(migrated, "non-meta data leader never completed the move");
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
+
 fn http_get(addr: &str, path: &str) -> String {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(addr).unwrap();

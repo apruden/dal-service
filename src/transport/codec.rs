@@ -55,6 +55,9 @@ pub enum MsgType {
     /// Peer-control: ask a meta voter whether a descriptor's data placement is
     /// committed. Used only by startup bootstrap reconciliation.
     BootstrapStatus = 13,
+    /// Peer-control: read a group's committed meta placement. Lets a data leader
+    /// that is not a meta voter drive its own move (§7).
+    PlacementQuery = 14,
 }
 
 impl MsgType {
@@ -74,6 +77,7 @@ impl MsgType {
             11 => MsgType::LeaveRequest,
             12 => MsgType::AbortPlanRequest,
             13 => MsgType::BootstrapStatus,
+            14 => MsgType::PlacementQuery,
             _ => return None,
         })
     }
@@ -98,7 +102,8 @@ impl MsgType {
             MsgType::JoinRequest
             | MsgType::LeaveRequest
             | MsgType::AbortPlanRequest
-            | MsgType::BootstrapStatus => 4 * KIB,
+            | MsgType::BootstrapStatus
+            | MsgType::PlacementQuery => 4 * KIB,
         }
     }
 
@@ -119,6 +124,7 @@ impl MsgType {
                 | MsgType::LeaveRequest
                 | MsgType::AbortPlanRequest
                 | MsgType::BootstrapStatus
+                | MsgType::PlacementQuery
         )
     }
 }

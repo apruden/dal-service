@@ -137,6 +137,20 @@ pub struct BootstrapStatusReply {
     pub ready: bool,
 }
 
+/// `MsgType::PlacementQuery` — read a group's committed meta placement so a data
+/// leader that is not a meta voter can drive its own move (§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementQueryBody {
+    pub group: GroupId,
+}
+
+/// Reply to [`PlacementQueryBody`]: the committed placement, or `None` if the
+/// answering node has no record for the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementQueryReply {
+    pub placement: Option<crate::types::Placement>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
