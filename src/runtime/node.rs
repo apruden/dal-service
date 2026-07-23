@@ -99,12 +99,19 @@ impl RoutingSource for StaticRouting {
     }
 }
 
+/// The node's meta-group runtime, shared and mutable so a node can start hosting
+/// the meta group at runtime (a rebalance that makes it a meta voter) or stop
+/// hosting it after a drain. `None` when this node does not run the meta group.
+/// Every reader snapshots the inner `Option<Arc<MetaNode>>` before awaiting;
+/// the lock is never held across an `.await`.
+pub type MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>;
+
 pub struct Node {
     node_id: NodeId,
     cluster: ClusterConfig,
     meta_voters: Vec<NodeId>,
     hosted: Vec<(u16, Vec<NodeId>)>,
-    meta: Option<Arc<MetaNode>>,
+    meta: MetaHandle,
     partitions: PartitionMap,
     desc: BootstrapDescriptor,
     control: ZmqTransport,
@@ -222,6 +229,9 @@ impl Node {
         } else {
             None
         };
+        // Shared, mutable meta handle: a node promoted to a meta voter by a later
+        // rebalance publishes its `MetaNode` here, and a drained one clears it.
+        let meta_handle: MetaHandle = Arc::new(RwLock::new(meta.clone()));
 
         let mut map: HashMap<u16, Arc<PartitionNode>> = HashMap::new();
         for (p, _) in &hosted {
@@ -259,6 +269,16 @@ impl Node {
             tuning,
             partitions: partitions.clone(),
         });
+        let meta_starter = Arc::new(MetaStarter {
+            node_id: cfg.node_id,
+            cluster_id: cfg.cluster_id,
+            storage: storage.clone(),
+            addrs: addrs.clone(),
+            control: control.clone(),
+            bulk: bulk.clone(),
+            tuning,
+            meta: meta_handle.clone(),
+        });
 
         // Startup reconciliation (DESIGN §5.2): the genesis voters above come
         // from the descriptor, but a partition gained through a later rebalance
@@ -281,10 +301,11 @@ impl Node {
         let dispatch = Arc::new(RootDispatch::new(
             cfg.cluster_id,
             gateway,
-            meta.clone(),
+            meta_handle.clone(),
             partitions.clone(),
             heartbeats.clone(),
             Some(starter.clone()),
+            Some(meta_starter.clone()),
         ));
 
         let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
@@ -318,7 +339,7 @@ impl Node {
             cfg.node_id,
             cfg.cluster_id,
             cluster.p,
-            meta.clone(),
+            meta_handle.clone(),
             partitions.clone(),
             control.clone(),
             addrs.clone(),
@@ -334,7 +355,7 @@ impl Node {
             let src: Arc<dyn StatusSource> = Arc::new(NodeStatus {
                 node_id: cfg.node_id,
                 cluster: cluster.clone(),
-                meta: meta.clone(),
+                meta: meta_handle.clone(),
                 partitions: partitions.clone(),
             });
             tasks.push(tokio::spawn(async move {
@@ -347,7 +368,7 @@ impl Node {
             cluster,
             meta_voters: desc.meta_voters.clone(),
             hosted,
-            meta,
+            meta: meta_handle,
             partitions,
             desc,
             control,
@@ -363,7 +384,8 @@ impl Node {
     /// initializes it. Idempotent — a resumed node whose groups are already
     /// initialized does nothing.
     pub async fn bootstrap(&self) -> Result<()> {
-        if let Some(meta) = &self.meta {
+        if let Some(meta) = self.meta() {
+            let meta = &*meta;
             if !meta.is_initialized().await?
                 && bootstrap::designated(&self.meta_voters) == Some(self.node_id)
             {
@@ -427,8 +449,14 @@ impl Node {
             })
     }
 
+    /// Snapshot the meta handle. Callers clone out the `Arc<MetaNode>` and drop
+    /// the guard before awaiting; the lock is never held across an `.await`.
+    fn meta(&self) -> Option<Arc<MetaNode>> {
+        self.meta.read().unwrap().clone()
+    }
+
     async fn placement_seeded(&self, partition: u16, voters: &[NodeId]) -> Result<bool> {
-        if let Some(meta) = &self.meta {
+        if let Some(meta) = self.meta() {
             return Ok(matches!(
                 meta.local_placement(GroupId::Data(partition))?,
                 Some(placement) if placement.voters == voters && placement.r#move.is_none()
@@ -484,7 +512,7 @@ impl Node {
     /// The committed directory state of `node_id` as seen locally, if this node
     /// runs the meta group. Used by tests to observe failure-detector output.
     pub fn local_node_state(&self, node_id: NodeId) -> Result<Option<NodeState>> {
-        match &self.meta {
+        match self.meta() {
             Some(meta) => Ok(meta.local_node(node_id)?.map(|e| e.state)),
             None => Ok(None),
         }
@@ -493,12 +521,30 @@ impl Node {
     /// The committed voter set of a partition's meta placement, and whether a
     /// move is still in flight. Used by tests to observe rebalance completion.
     pub fn local_placement_voters(&self, partition: u16) -> Result<Option<(Vec<NodeId>, bool)>> {
-        match &self.meta {
+        match self.meta() {
             Some(meta) => Ok(meta
                 .local_placement(GroupId::Data(partition))?
                 .map(|p| (p.voters, p.r#move.is_some()))),
             None => Ok(None),
         }
+    }
+
+    /// Whether this node currently hosts the meta group. Used by tests to observe
+    /// meta-voter drain (a reclaimed meta group clears the handle).
+    pub fn hosts_meta(&self) -> bool {
+        self.meta.read().unwrap().is_some()
+    }
+
+    /// This node's view of the meta leader, if it hosts the meta group. Used by
+    /// tests to pick a non-leader meta voter to drain.
+    pub fn meta_leader(&self) -> Option<NodeId> {
+        self.meta().and_then(|m| m.current_leader())
+    }
+
+    /// This node's committed meta voter set, if it hosts the meta group. Used by
+    /// tests to observe meta membership change.
+    pub fn meta_voters_of(&self) -> Option<Vec<NodeId>> {
+        self.meta().map(|m| m.voters())
     }
 
     pub fn cluster(&self) -> &ClusterConfig {
@@ -511,7 +557,7 @@ impl Node {
         for task in &self.tasks {
             task.abort();
         }
-        if let Some(meta) = &self.meta {
+        if let Some(meta) = self.meta() {
             meta.shutdown().await?;
         }
         let partitions: Vec<Arc<PartitionNode>> =
@@ -528,20 +574,20 @@ impl Node {
 struct NodeStatus {
     node_id: NodeId,
     cluster: ClusterConfig,
-    meta: Option<Arc<MetaNode>>,
+    meta: MetaHandle,
     partitions: PartitionMap,
 }
 
 impl StatusSource for NodeStatus {
     fn status(&self) -> ClusterStatus {
-        let meta = self.meta.as_ref().map(|m| MetaStatus {
+        let meta_node = self.meta.read().unwrap().clone();
+        let meta = meta_node.as_ref().map(|m| MetaStatus {
             is_leader: m.current_leader() == Some(self.node_id),
             leader: m.current_leader(),
             applied: m.applied_index(),
             voters: m.voters(),
         });
-        let directory = self
-            .meta
+        let directory = meta_node
             .as_ref()
             .and_then(|m| m.local_directory().ok())
             .unwrap_or_default();
@@ -559,8 +605,7 @@ impl StatusSource for NodeStatus {
                     } else {
                         Role::Learner
                     };
-                    let plan = self
-                        .meta
+                    let plan = meta_node
                         .as_ref()
                         .and_then(|m| m.local_placement(GroupId::Data(partition)).ok().flatten())
                         .and_then(|p| p.r#move)
@@ -692,6 +737,85 @@ impl PartitionStarter {
         };
         node.shutdown().await?;
         self.storage.reclaim_group(GroupId::Data(partition))?;
+        Ok(())
+    }
+}
+
+/// Starts and stops this node's meta-group runtime at rebalance time — the
+/// meta-group analogue of [`PartitionStarter`] (DESIGN §7.2/§7.3 for the meta
+/// group). Publishes into the shared [`MetaHandle`] so the dispatcher, driver,
+/// and status source see the change.
+pub struct MetaStarter {
+    node_id: NodeId,
+    cluster_id: ClusterId,
+    storage: Arc<Storage>,
+    addrs: AddrBook,
+    control: ZmqTransport,
+    bulk: ZmqTransport,
+    tuning: RaftTuning,
+    meta: MetaHandle,
+}
+
+impl MetaStarter {
+    /// Admit this node as a meta learner under `plan_id`: write the durable
+    /// `LearnerAdmission` for the meta group (ground rule 8), start the
+    /// `MetaNode` as an uninitialized learner, and publish it. Idempotent — a
+    /// node already hosting the meta group returns `Ok` without restarting.
+    pub async fn admit_meta_learner(&self, plan_id: u64) -> Result<()> {
+        if self.meta.read().unwrap().is_some() {
+            return Ok(());
+        }
+        bootstrap::ensure_learner_admission(
+            &self.storage,
+            &LearnerAdmission {
+                cluster_id: self.cluster_id,
+                group: GroupId::Meta,
+                plan_id,
+            },
+        )?;
+        self.start_and_publish().await
+    }
+
+    /// Resume hosting the meta group from an existing durable record after a
+    /// restart of a node promoted to a meta voter (startup reconciliation). Writes
+    /// no admission record; `authorize_group_start` gates on the existing one.
+    pub async fn resume_meta(&self) -> Result<()> {
+        self.start_and_publish().await
+    }
+
+    /// Start the `MetaNode` runtime over the ZMQ network and publish it into the
+    /// shared handle. The caller has established the durable record that
+    /// `authorize_group_start` (inside `start_with_network`) requires. Idempotent.
+    async fn start_and_publish(&self) -> Result<()> {
+        if self.meta.read().unwrap().is_some() {
+            return Ok(());
+        }
+        let net = RaftPeerFactory::new(
+            GroupId::Meta,
+            self.cluster_id,
+            self.addrs.clone(),
+            self.control.clone(),
+            self.bulk.clone(),
+        );
+        let node =
+            MetaNode::start_with_network(self.node_id, self.storage.clone(), net, self.tuning)
+                .await?;
+        *self.meta.write().unwrap() = Some(Arc::new(node));
+        Ok(())
+    }
+
+    /// Stop hosting the meta group and reclaim its local data after a drain
+    /// removed this node from the meta voter set — the inverse of
+    /// [`MetaStarter::admit_meta_learner`]. Unpublish first, shut down the Raft
+    /// runtime, then durably record `NonServing` before dropping the CFs.
+    /// Idempotent — a node not hosting the meta group returns `Ok`.
+    pub async fn reclaim_meta(&self) -> Result<()> {
+        let node = self.meta.write().unwrap().take();
+        let Some(node) = node else {
+            return Ok(());
+        };
+        node.shutdown().await?;
+        self.storage.reclaim_group(GroupId::Meta)?;
         Ok(())
     }
 }

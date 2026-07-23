@@ -162,6 +162,25 @@ impl MetaNode {
             .collect()
     }
 
+    /// The committed membership: its log id and the effective voter set. During
+    /// joint consensus the voter set is the union of both configs (DESIGN §5.2).
+    /// Mirrors `PartitionNode::committed_config` so the reconcile/gate helpers
+    /// treat the meta group exactly like a data group.
+    pub fn committed_config(&self) -> (Option<crate::types::LogId>, Vec<NodeId>) {
+        let metrics = self.raft.metrics();
+        let sm = metrics.borrow().membership_config.clone();
+        let log_id = sm
+            .log_id()
+            .map(|l| crate::types::LogId::new(l.leader_id.term, l.index));
+        let voters = sm.membership().voter_ids().collect();
+        (log_id, voters)
+    }
+
+    /// The committed voter set as a comparable set (learners ignored).
+    pub fn committed_voter_set(&self) -> std::collections::BTreeSet<NodeId> {
+        self.committed_config().1.into_iter().collect()
+    }
+
     /// Submit a meta command through the group's serving gate.
     pub async fn propose(&self, cmd: MetaCommand) -> Result<ProposeOutcome> {
         self.storage.require_serving(GroupId::Meta)?;

@@ -18,7 +18,7 @@ use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::{MetaNode, ProposeOutcome};
 use crate::meta::raft_types::MetaTypeConfig;
 use crate::partition::raft_types::TypeConfig;
-use crate::runtime::node::PartitionStarter;
+use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
@@ -44,20 +44,23 @@ pub(crate) fn now_ms() -> u64 {
 pub struct RootDispatch {
     cluster_id: ClusterId,
     gateway: Arc<ClientGateway>,
-    meta: Option<Arc<MetaNode>>,
+    meta: MetaHandle,
     partitions: PartitionMap,
     heartbeats: Arc<Mutex<HeartbeatTracker>>,
     starter: Option<Arc<PartitionStarter>>,
+    meta_starter: Option<Arc<MetaStarter>>,
 }
 
 impl RootDispatch {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cluster_id: ClusterId,
         gateway: Arc<ClientGateway>,
-        meta: Option<Arc<MetaNode>>,
+        meta: MetaHandle,
         partitions: PartitionMap,
         heartbeats: Arc<Mutex<HeartbeatTracker>>,
         starter: Option<Arc<PartitionStarter>>,
+        meta_starter: Option<Arc<MetaStarter>>,
     ) -> RootDispatch {
         RootDispatch {
             cluster_id,
@@ -66,7 +69,13 @@ impl RootDispatch {
             partitions,
             heartbeats,
             starter,
+            meta_starter,
         }
+    }
+
+    /// Snapshot the meta handle; the guard is dropped before any `.await`.
+    fn meta(&self) -> Option<Arc<MetaNode>> {
+        self.meta.read().unwrap().clone()
     }
 
     fn reply(&self, req: &Envelope, payload: Vec<u8>) -> Envelope {
@@ -108,7 +117,7 @@ impl RootDispatch {
     async fn serve_raft(&self, req: Envelope) -> Envelope {
         match req.group_id {
             GroupId::Meta => {
-                let Some(meta) = self.meta.clone() else {
+                let Some(meta) = self.meta() else {
                     return self.raft_unavailable(&req);
                 };
                 let raft = meta.raft();
@@ -172,7 +181,7 @@ impl RootDispatch {
 
     /// Submit a mapped command to the meta group and reply with its outcome.
     async fn submit(&self, req: &Envelope, cmd: MetaCommand) -> Envelope {
-        let reply = match self.meta.clone() {
+        let reply = match self.meta() {
             None => SubmitReply::Error("node does not run the meta group".into()),
             Some(meta) => match meta.propose(cmd).await {
                 Ok(ProposeOutcome::Applied(outcome)) => SubmitReply::Outcome(outcome),
@@ -209,7 +218,7 @@ impl RootDispatch {
         // Draining reuses the node's current incarnation (Active -> Draining is a
         // same-incarnation transition; DESIGN §9.2). We need the directory entry
         // to read it, which only a meta node can serve.
-        let Some(meta) = self.meta.clone() else {
+        let Some(meta) = self.meta() else {
             return self.reply(
                 &req,
                 codec::encode(&SubmitReply::Error(
@@ -260,12 +269,23 @@ impl RootDispatch {
                 codec::encode(&LearnerReply::Error("malformed".into())),
             );
         };
-        let reply = match &self.starter {
-            None => LearnerReply::Error("node cannot host data partitions".into()),
-            Some(starter) => match starter.admit_learner(req.group_id, body.plan_id).await {
-                Ok(()) => LearnerReply::Admitted,
-                Err(e) => LearnerReply::Error(e.to_string()),
+        let admit = match req.group_id {
+            GroupId::Meta => match &self.meta_starter {
+                Some(meta_starter) => meta_starter.admit_meta_learner(body.plan_id).await,
+                None => Err(crate::error::Error::Raft(
+                    "node cannot host the meta group".into(),
+                )),
             },
+            GroupId::Data(_) => match &self.starter {
+                Some(starter) => starter.admit_learner(req.group_id, body.plan_id).await,
+                None => Err(crate::error::Error::Raft(
+                    "node cannot host data partitions".into(),
+                )),
+            },
+        };
+        let reply = match admit {
+            Ok(()) => LearnerReply::Admitted,
+            Err(e) => LearnerReply::Error(e.to_string()),
         };
         self.reply(&req, codec::encode(&reply))
     }
@@ -277,7 +297,7 @@ impl RootDispatch {
     fn serve_placement_query(&self, req: Envelope) -> Envelope {
         let placement = match (
             codec::decode::<PlacementQueryBody>(&req.payload),
-            &self.meta,
+            self.meta(),
         ) {
             (Ok(body), Some(meta)) => meta.local_placement(body.group).ok().flatten(),
             _ => None,
@@ -308,7 +328,7 @@ impl RootDispatch {
         let Ok(body) = codec::decode::<BootstrapStatusBody>(&req.payload) else {
             return self.reply(&req, codec::encode(&BootstrapStatusReply { ready: false }));
         };
-        let ready = match self.meta.clone() {
+        let ready = match self.meta() {
             Some(meta) => match meta.read_placement(body.group).await {
                 Ok(crate::meta::node::MetaRead::Value(Some(placement))) => {
                     placement.voters == body.voters && placement.r#move.is_none()
@@ -376,9 +396,10 @@ mod tests {
         let dispatch = RootDispatch::new(
             7,
             gateway,
-            None,
+            Arc::new(RwLock::new(None)),
             partitions,
             Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
             None,
         );
         let request = Envelope::new(

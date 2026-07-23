@@ -39,7 +39,7 @@ use crate::types::{
 };
 
 use crate::api::gateway::PartitionMap;
-use crate::runtime::node::PartitionStarter;
+use crate::runtime::node::{MetaHandle, PartitionStarter};
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -51,7 +51,7 @@ pub struct RebalanceDriver {
     node_id: NodeId,
     cluster_id: ClusterId,
     partition_count: u16,
-    meta: Option<Arc<MetaNode>>,
+    meta: MetaHandle,
     partitions: PartitionMap,
     control: ZmqTransport,
     addrs: AddrBook,
@@ -65,7 +65,7 @@ impl RebalanceDriver {
         node_id: NodeId,
         cluster_id: ClusterId,
         partition_count: u16,
-        meta: Option<Arc<MetaNode>>,
+        meta: MetaHandle,
         partitions: PartitionMap,
         control: ZmqTransport,
         addrs: AddrBook,
@@ -85,6 +85,11 @@ impl RebalanceDriver {
         }
     }
 
+    /// Snapshot the meta handle; the guard is dropped before any `.await`.
+    fn meta(&self) -> Option<Arc<MetaNode>> {
+        self.meta.read().unwrap().clone()
+    }
+
     pub async fn run(self) {
         loop {
             tokio::time::sleep(REBALANCE_INTERVAL).await;
@@ -100,9 +105,10 @@ impl RebalanceDriver {
     /// a plan whose learner target has been declared `Down` (§7.5) — such a plan
     /// can never complete, so it must roll back.
     async fn drive_meta_role(&self) {
-        let Some(meta) = &self.meta else {
+        let Some(meta) = self.meta() else {
             return; // not a meta node; nothing to plan
         };
+        let meta = &meta;
         if meta.current_leader() != Some(self.node_id) {
             return;
         }
@@ -385,7 +391,7 @@ impl RebalanceDriver {
     /// Read a group's committed placement: locally when this node is a meta
     /// voter, otherwise over the network from a meta voter.
     async fn read_placement(&self, group: GroupId) -> Option<Placement> {
-        if let Some(meta) = &self.meta {
+        if let Some(meta) = self.meta() {
             return meta.local_placement(group).ok().flatten();
         }
         let body = PlacementQueryBody { group };
@@ -410,7 +416,7 @@ impl RebalanceDriver {
     /// Submit a config observation to the meta group: locally if this node leads
     /// meta, otherwise via a `DataConfigObservation` frame to a meta voter.
     async fn submit_observation(&self, body: ObservationBody) {
-        if let Some(meta) = &self.meta
+        if let Some(meta) = self.meta()
             && meta.current_leader() == Some(self.node_id)
         {
             let _ = meta.propose(body.into_meta_command()).await;
