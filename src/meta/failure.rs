@@ -64,11 +64,12 @@ pub fn next_state(current: NodeState, evidence: Liveness) -> Option<NodeState> {
 /// transitions the evidence *justifies*; the meta leader commits them via
 /// `SetNodeState`, whose incarnation guard is the actual defence against a
 /// stale heartbeat reactivating a `Down` node. `observe` additionally drops a
-/// non-increasing sequence, so a replayed heartbeat frame is ignored outright.
+/// non-increasing sequence within one incarnation, so a replayed heartbeat is
+/// ignored without rejecting a restarted process that begins at sequence one.
 #[derive(Default)]
 pub struct HeartbeatTracker {
     last_seen_ms: HashMap<NodeId, u64>,
-    last_seq: HashMap<NodeId, u64>,
+    last_stamp: HashMap<NodeId, (u64, u64)>,
 }
 
 impl HeartbeatTracker {
@@ -76,16 +77,18 @@ impl HeartbeatTracker {
         HeartbeatTracker::default()
     }
 
-    /// Record a heartbeat. Returns `false` (ignored) when `seq` is not strictly
-    /// greater than the last seen sequence for `node` — a stale or replayed
-    /// frame cannot refresh liveness.
-    pub fn observe(&mut self, node: NodeId, seq: u64, now_ms: u64) -> bool {
-        if let Some(&prev) = self.last_seq.get(&node)
-            && seq <= prev
+    /// Record a heartbeat. A lower incarnation is stale; within one
+    /// incarnation only a strictly increasing sequence is accepted. A higher
+    /// incarnation starts a fresh stream, which makes a clean restart live
+    /// immediately while preventing an old process from refreshing liveness.
+    pub fn observe(&mut self, node: NodeId, incarnation: u64, seq: u64, now_ms: u64) -> bool {
+        if let Some(&(previous_incarnation, previous_seq)) = self.last_stamp.get(&node)
+            && (incarnation < previous_incarnation
+                || (incarnation == previous_incarnation && seq <= previous_seq))
         {
             return false;
         }
-        self.last_seq.insert(node, seq);
+        self.last_stamp.insert(node, (incarnation, seq));
         self.last_seen_ms.insert(node, now_ms);
         true
     }
@@ -134,19 +137,23 @@ mod tests {
     #[test]
     fn tracker_ignores_stale_and_replayed_heartbeats() {
         let mut t = HeartbeatTracker::new();
-        assert!(t.observe(1, 5, 1000));
+        assert!(t.observe(1, 1, 5, 1000));
         // Same or lower sequence is ignored (replay / stale).
-        assert!(!t.observe(1, 5, 2000));
-        assert!(!t.observe(1, 4, 2000));
+        assert!(!t.observe(1, 1, 5, 2000));
+        assert!(!t.observe(1, 1, 4, 2000));
         // A newer sequence refreshes liveness.
-        assert!(t.observe(1, 6, 3000));
+        assert!(t.observe(1, 1, 6, 3000));
+        // A restarted process advances its incarnation and restarts at one.
+        assert!(t.observe(1, 2, 1, 4000));
+        // The prior process cannot refresh liveness after that restart.
+        assert!(!t.observe(1, 1, 7, 5000));
     }
 
     #[test]
     fn evaluate_proposes_suspect_then_down() {
         let t0 = 10_000u64;
         let mut tr = HeartbeatTracker::new();
-        tr.observe(1, 1, t0);
+        tr.observe(1, 1, 1, t0);
         let to = timeouts();
 
         // Fresh: no transition.
@@ -166,7 +173,7 @@ mod tests {
     #[test]
     fn evaluate_never_reactivates_down_from_silence_or_beat() {
         let mut tr = HeartbeatTracker::new();
-        tr.observe(1, 1, 0);
+        tr.observe(1, 1, 1, 0);
         // Even a fresh heartbeat produces no transition for a Down node — only an
         // explicit rejoin (incarnation bump via the meta SM) may revive it.
         let out = tr.evaluate(0, &timeouts(), &[(1, NodeState::Down)]);

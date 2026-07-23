@@ -107,6 +107,20 @@ impl Storage {
         self.put_local(&keyspace::identity_key(), &id)
     }
 
+    /// Allocate the next durable heartbeat incarnation for this process start.
+    /// The in-memory sequence may then restart at one without being mistaken
+    /// for a replay from a prior process instance.
+    pub fn next_heartbeat_incarnation(&self) -> Result<u64> {
+        let previous: u64 = self
+            .get_local(&keyspace::heartbeat_incarnation_key())?
+            .unwrap_or(0);
+        let next = previous
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("heartbeat incarnation exhausted".into()))?;
+        self.put_local(&keyspace::heartbeat_incarnation_key(), &next)?;
+        Ok(next)
+    }
+
     // ---- node-local default-CF records -------------------------------------
 
     /// Read a typed node-local record from the default CF.

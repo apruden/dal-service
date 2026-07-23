@@ -56,6 +56,18 @@ fn wrong_node_id_is_rejected() {
     assert!(matches!(r, Err(Error::IdentityMismatch { .. })));
 }
 
+#[test]
+fn heartbeat_incarnation_advances_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+        assert_eq!(s.next_heartbeat_incarnation().unwrap(), 1);
+        assert_eq!(s.next_heartbeat_incarnation().unwrap(), 2);
+    }
+    let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    assert_eq!(s.next_heartbeat_incarnation().unwrap(), 3);
+}
+
 // ---- CF lifecycle ----------------------------------------------------------
 
 #[test]

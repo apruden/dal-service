@@ -128,8 +128,7 @@ impl RebalanceDriver {
                     else {
                         continue;
                     };
-                    let Some(&replacement) =
-                        active.iter().find(|a| !placement.voters.contains(a))
+                    let Some(&replacement) = active.iter().find(|a| !placement.voters.contains(a))
                     else {
                         continue; // no free Active node to take over
                     };
@@ -366,9 +365,8 @@ impl RebalanceDriver {
                 codec::encode(&body),
             );
             if let Ok(reply) = self.control.call(addr, env).await
-                && let Ok(PlacementQueryReply {
-                    placement: Some(p),
-                }) = codec::decode::<PlacementQueryReply>(&reply.payload)
+                && let Ok(PlacementQueryReply { placement: Some(p) }) =
+                    codec::decode::<PlacementQueryReply>(&reply.payload)
             {
                 return Some(p);
             }

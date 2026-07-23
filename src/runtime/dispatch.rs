@@ -22,7 +22,7 @@ use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody,
-    JoinBody, LeaveBody, LearnerReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
+    JoinBody, LearnerReply, LeaveBody, ObservationBody, PlacementQueryBody, PlacementQueryReply,
     SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
@@ -254,7 +254,10 @@ impl RootDispatch {
     /// data leader's `add_learner` catch-up.
     async fn serve_become_learner(&self, req: Envelope) -> Envelope {
         let Ok(body) = codec::decode::<BecomeLearnerBody>(&req.payload) else {
-            return self.reply(&req, codec::encode(&LearnerReply::Error("malformed".into())));
+            return self.reply(
+                &req,
+                codec::encode(&LearnerReply::Error("malformed".into())),
+            );
         };
         let reply = match &self.starter {
             None => LearnerReply::Error("node cannot host data partitions".into()),
@@ -271,7 +274,10 @@ impl RootDispatch {
     /// read suffices: a committed plan is stable until the move that this reply
     /// helps drive resolves it.
     fn serve_placement_query(&self, req: Envelope) -> Envelope {
-        let placement = match (codec::decode::<PlacementQueryBody>(&req.payload), &self.meta) {
+        let placement = match (
+            codec::decode::<PlacementQueryBody>(&req.payload),
+            &self.meta,
+        ) {
             (Ok(body), Some(meta)) => meta.local_placement(body.group).ok().flatten(),
             _ => None,
         };
@@ -284,10 +290,12 @@ impl RootDispatch {
     /// evidence into `SetNodeState` transitions.
     fn serve_heartbeat(&self, req: Envelope) -> Envelope {
         if let Ok(body) = codec::decode::<HeartbeatBody>(&req.payload) {
-            self.heartbeats
-                .lock()
-                .unwrap()
-                .observe(body.node_id, body.seq, now_ms());
+            self.heartbeats.lock().unwrap().observe(
+                body.node_id,
+                body.incarnation,
+                body.seq,
+                now_ms(),
+            );
         }
         self.reply(&req, Vec::new())
     }

@@ -88,6 +88,11 @@ pub fn identity_key() -> Vec<u8> {
     b"local/identity".to_vec()
 }
 
+/// Monotonically increasing process epoch for heartbeat sequence numbers.
+pub fn heartbeat_incarnation_key() -> Vec<u8> {
+    b"local/heartbeat_incarnation".to_vec()
+}
+
 pub fn serving_key(group: GroupId) -> Vec<u8> {
     format!("local/serving/{}", group.token()).into_bytes()
 }

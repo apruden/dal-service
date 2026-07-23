@@ -146,10 +146,7 @@ async fn draining_a_node_migrates_its_partition() {
         0,
         dal::codec::encode(&LeaveBody { node_id: victim }),
     );
-    transport
-        .call("inproc://m8dr-ctrl-1", leave)
-        .await
-        .unwrap();
+    transport.call("inproc://m8dr-ctrl-1", leave).await.unwrap();
 
     // Expected post-move voters: {1,2,3} minus the drained node, plus spare 4.
     let mut expected: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&v| v != victim).collect();
@@ -245,7 +242,12 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
     // move can never promote a dead learner; once node 4 is declared Down the
     // driver aborts the plan and rolls back to the original voters.
     let spare = nodes.remove(3);
-    Arc::try_unwrap(spare).ok().unwrap().shutdown().await.unwrap();
+    Arc::try_unwrap(spare)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
 
     let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
     let leave = Envelope::new(
@@ -255,10 +257,7 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
         0,
         dal::codec::encode(&LeaveBody { node_id: 3 }),
     );
-    transport
-        .call("inproc://m8ab-ctrl-1", leave)
-        .await
-        .unwrap();
+    transport.call("inproc://m8ab-ctrl-1", leave).await.unwrap();
 
     // First confirm a plan is actually created (target node still reads Active),
     // so the later rollback is distinguishable from the pre-plan initial state.
@@ -284,7 +283,10 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(rolled_back, "aborting plan never rolled back after target went Down");
+    assert!(
+        rolled_back,
+        "aborting plan never rolled back after target went Down"
+    );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         nodes[0].local_placement_voters(0).unwrap(),
@@ -358,12 +360,20 @@ async fn become_learner_starts_a_hosted_partition() {
     };
 
     assert_eq!(admit().await, LearnerReply::Admitted);
-    assert!(node.hosts_partition(0), "node 4 should now host partition 0");
+    assert!(
+        node.hosts_partition(0),
+        "node 4 should now host partition 0"
+    );
     // Idempotent: a repeat admission still succeeds and does not restart.
     assert_eq!(admit().await, LearnerReply::Admitted);
     assert!(node.hosts_partition(0));
 
-    Arc::try_unwrap(node).ok().unwrap().shutdown().await.unwrap();
+    Arc::try_unwrap(node)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -453,10 +463,7 @@ async fn non_meta_voter_data_leader_drives_a_move() {
         0,
         dal::codec::encode(&LeaveBody { node_id: victim }),
     );
-    transport
-        .call("inproc://m8nm-ctrl-1", leave)
-        .await
-        .unwrap();
+    transport.call("inproc://m8nm-ctrl-1", leave).await.unwrap();
 
     let mut expected: Vec<u64> = [4u64, 5, 6].into_iter().filter(|&v| v != victim).collect();
     expected.push(1);
@@ -600,7 +607,12 @@ async fn failure_detector_marks_a_silent_node_down() {
     // Crash node 3: its emitter stops, so the meta leader sees it fall silent.
     // Two voters remain, preserving meta quorum to commit the transition.
     let victim = nodes.remove(2);
-    Arc::try_unwrap(victim).ok().unwrap().shutdown().await.unwrap();
+    Arc::try_unwrap(victim)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
 
     // A surviving voter's committed directory should progress node 3 to Down.
     let mut reached_down = false;

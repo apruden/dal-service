@@ -127,11 +127,29 @@ impl Node {
         desc: BootstrapDescriptor,
     ) -> Result<Node> {
         validate_node_descriptor(&cfg, &desc)?;
+
+        // Bind the optional admin listener before starting Raft or background
+        // tasks. A malformed or occupied address now fails without leaving
+        // detached work behind.
+        let http_listener = match &cfg.http_addr {
+            Some(http_addr) => {
+                let addr: std::net::SocketAddr = http_addr.parse().map_err(|e| {
+                    crate::error::Error::Config(format!("http_addr {http_addr}: {e}"))
+                })?;
+                Some(
+                    tokio::net::TcpListener::bind(addr)
+                        .await
+                        .map_err(crate::error::Error::Io)?,
+                )
+            }
+            None => None,
+        };
         let storage = Arc::new(Storage::open_checked(
             &cfg.data_dir,
             cfg.cluster_id,
             cfg.node_id,
         )?);
+        let heartbeat_incarnation = storage.next_heartbeat_incarnation()?;
 
         let cluster = desc.config.clone();
         let is_meta_voter = desc.meta_voters.contains(&cfg.node_id);
@@ -252,6 +270,7 @@ impl Node {
         tasks.push(tokio::spawn(heartbeat_emitter(
             cfg.node_id,
             cfg.cluster_id,
+            heartbeat_incarnation,
             hb_control,
             meta_controls.clone(),
             hb_interval,
@@ -279,21 +298,16 @@ impl Node {
         );
         tasks.push(tokio::spawn(driver.run()));
 
-        // Read-only HTTP admin plane. Bind here so a bad address fails startup;
-        // the serve task is aborted on shutdown with the other loops.
-        if let Some(http_addr) = &cfg.http_addr {
-            let addr: std::net::SocketAddr = http_addr
-                .parse()
-                .map_err(|e| crate::error::Error::Config(format!("http_addr {http_addr}: {e}")))?;
+        // Read-only HTTP admin plane. Its listener was bound before runtime
+        // assembly; the serving task is aborted on shutdown with the other
+        // loops.
+        if let Some(listener) = http_listener {
             let src: Arc<dyn StatusSource> = Arc::new(NodeStatus {
                 node_id: cfg.node_id,
                 cluster: cluster.clone(),
                 meta: meta.clone(),
                 partitions: partitions.clone(),
             });
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(crate::error::Error::Io)?;
             tasks.push(tokio::spawn(async move {
                 let _ = axum::serve(listener, crate::runtime::http::router(src)).await;
             }));
@@ -596,9 +610,14 @@ impl PartitionStarter {
             self.control.clone(),
             self.bulk.clone(),
         );
-        let node =
-            PartitionNode::start_with_network(self.node_id, group, self.storage.clone(), net, self.tuning)
-                .await?;
+        let node = PartitionNode::start_with_network(
+            self.node_id,
+            group,
+            self.storage.clone(),
+            net,
+            self.tuning,
+        )
+        .await?;
         self.partitions
             .write()
             .unwrap()
@@ -613,6 +632,7 @@ impl PartitionStarter {
 async fn heartbeat_emitter(
     node_id: NodeId,
     cluster_id: crate::types::ClusterId,
+    incarnation: u64,
     control: ZmqTransport,
     meta_controls: Vec<String>,
     interval: Duration,
@@ -621,7 +641,7 @@ async fn heartbeat_emitter(
     loop {
         let body = HeartbeatBody {
             node_id,
-            incarnation: 0,
+            incarnation,
             seq,
         };
         let payload = crate::codec::encode(&body);
@@ -760,5 +780,24 @@ mod tests {
         cfg.control_addr = "tcp://wrong-control".into();
         let err = validate_node_descriptor(&cfg, &descriptor()).unwrap_err();
         assert!(err.to_string().contains("addresses do not match"));
+    }
+
+    #[tokio::test]
+    async fn invalid_http_address_fails_before_opening_storage_or_starting_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("node-data");
+        let mut cfg = config(1);
+        cfg.data_dir = data_dir.clone();
+        cfg.http_addr = Some("not-a-socket-address".into());
+
+        let err = match Node::start(zmq::Context::new(), cfg, descriptor()).await {
+            Ok(_) => panic!("invalid HTTP address unexpectedly started a node"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("http_addr"));
+        assert!(
+            !data_dir.exists(),
+            "storage must not be opened on a bad bind"
+        );
     }
 }
