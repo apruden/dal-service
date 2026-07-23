@@ -182,6 +182,14 @@ impl MetaNode {
         .await
     }
 
+    pub async fn read_node(&self, node_id: NodeId) -> Result<MetaRead<Option<NodeDirectoryEntry>>> {
+        let storage = self.storage.clone();
+        self.linearizable(move || {
+            storage.get_state_record(GroupId::Meta, &keyspace::meta_node_key(node_id))
+        })
+        .await
+    }
+
     /// Local (non-linearizable) reads for tests and startup reconciliation.
     pub fn local_placement(&self, group: GroupId) -> Result<Option<Placement>> {
         self.storage

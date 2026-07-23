@@ -12,12 +12,18 @@ use dal::meta::bootstrap::{
 };
 use dal::meta::node::MetaNode;
 use dal::meta::raft_types::MetaTypeConfig;
-use dal::meta::rebalancer::{create_plan, execute_abort, execute_move, mark_aborting};
+use dal::meta::node::MetaRead;
+use dal::meta::rebalancer::{
+    create_plan, drain_partition, execute_abort, execute_move, mark_aborting,
+};
+use dal::meta::reconcile::{reconcile, ReconcileAction};
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, WriteOutcome};
 use dal::partition::TypeConfig;
 use dal::storage::Storage;
-use dal::types::{ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, NodeId, PROTOCOL_VERSION};
+use dal::types::{
+    ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, NodeId, NodeState, PROTOCOL_VERSION,
+};
 
 use tempfile::TempDir;
 
@@ -291,4 +297,87 @@ async fn planned_learner_never_joins_then_abort_and_replace() {
         .unwrap();
 
     assert_eq!(meta_voters(&c).await, target5);
+}
+
+/// Graceful decommission (§7.3a): draining a follower swaps in a replacement
+/// via a fenced move; the partition never drops below majority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn drain_replaces_a_follower() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    write_to_leader(&c, put(1, b"k", b"v1")).await;
+    c.start_data(4).await;
+
+    let leader = c.data_leader().unwrap();
+    let draining = DATA_VOTERS
+        .iter()
+        .copied()
+        .find(|&v| v != leader.node_id())
+        .unwrap();
+
+    drain_partition(&c.meta_slice(), &leader, GroupId::Data(PART), draining, 4)
+        .await
+        .unwrap();
+
+    // The drained node is out of the voter set; node 4 is in and holds the data.
+    let mut expected: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != draining).collect();
+    expected.push(4);
+    expected.sort_unstable();
+    assert_eq!(meta_voters(&c).await, expected);
+
+    // The directory records the drained node as Draining.
+    let meta_leader = c.meta_leader().unwrap();
+    match meta_leader.read_node(draining).await.unwrap() {
+        MetaRead::Value(Some(e)) => assert_eq!(e.state, NodeState::Draining),
+        other => panic!("node read: {other:?}"),
+    }
+
+    eventually("node 4 holds the drained partition's data", || {
+        matches!(c.data_nodes[&4].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v1")
+    })
+    .await;
+}
+
+/// A move interrupted after the learner is added (before promotion) resumes:
+/// reconcile sees the committed config still equals `voters`, and re-running the
+/// driver completes and finalizes idempotently (§5.2, §7.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn interrupted_move_resumes_from_committed_config() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+
+    let leader = c.data_leader().unwrap();
+    let victim = DATA_VOTERS
+        .iter()
+        .copied()
+        .find(|&v| v != leader.node_id())
+        .unwrap();
+    let mut target: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    target.push(4);
+    target.sort_unstable();
+
+    let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+
+    // Simulate a crash after step 3 (learner added) but before promotion: the
+    // committed config is still the original voters.
+    leader.add_learner(4).await.unwrap();
+
+    let placement = match c.meta_leader().unwrap().read_placement(GroupId::Data(PART)).await.unwrap() {
+        MetaRead::Value(Some(p)) => p,
+        other => panic!("placement: {other:?}"),
+    };
+    assert_eq!(
+        reconcile(&placement, &leader.committed_voter_set()),
+        ReconcileAction::ResumePlan,
+        "an added-but-unpromoted learner must reconcile to ResumePlan"
+    );
+
+    // Re-run the driver: it resumes and finalizes.
+    execute_move(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
 }

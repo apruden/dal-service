@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyspace;
-use crate::types::{ClusterId, GroupId, LogId, NodeId};
+use crate::types::{ClusterId, GroupId, LogId, NodeId, ServingState};
 
 /// MultiThreaded so CFs can be created/dropped through `&self` while other
 /// threads read — the runtime pattern for on-line rebalancing (DESIGN §6).
@@ -145,6 +145,26 @@ impl Storage {
                 self.db.drop_cf(&name)?;
             }
         }
+        Ok(())
+    }
+
+    /// This node's durable serving-gate state for a group (DESIGN §7.4). Lives in
+    /// the default CF so it survives snapshot install and CF reclamation.
+    pub fn serving_state(&self, group: GroupId) -> Result<Option<ServingState>> {
+        self.get_local(&keyspace::serving_key(group))
+    }
+
+    pub fn set_serving_state(&self, group: GroupId, state: ServingState) -> Result<()> {
+        self.put_local(&keyspace::serving_key(group), &state)
+    }
+
+    /// Reclaim a removed group's local data (DESIGN §7.4): record `NonServing`
+    /// *before* dropping the CFs, so a crash mid-reclaim can never leave
+    /// servable-looking state behind. After the drop, the absence of local Raft
+    /// state itself enforces non-participation (the amnesia rule).
+    pub fn reclaim_group(&self, group: GroupId) -> Result<()> {
+        self.set_serving_state(group, ServingState::NonServing)?;
+        self.drop_group(group)?;
         Ok(())
     }
 

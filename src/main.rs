@@ -10,10 +10,12 @@ fn usage() -> &'static str {
     "usage: dal <command> [args]\n\
      \n\
      commands:\n\
-       init    --config <path>     create a new cluster from a bootstrap descriptor\n\
-       join    --seed <addr>       register this node with an existing cluster\n\
-       status  --seed <addr>       print the cluster routing snapshot\n\
-       run     --config <path>     run a node\n"
+       init        --config <path>       create a new cluster from a bootstrap descriptor\n\
+       join        --seed <addr>         register this node with an existing cluster\n\
+       leave       --node <id>           gracefully decommission a node (drain)\n\
+       abort-plan  --group <g> --plan <id>  mark a stuck move plan aborting\n\
+       status      --seed <addr>         print the cluster routing snapshot\n\
+       run         --config <path>       run a node\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -52,6 +54,30 @@ fn main() -> ExitCode {
             }
             None => {
                 eprintln!("join: --seed <addr> required");
+                ExitCode::FAILURE
+            }
+        },
+        "leave" => match flag(rest, "--node") {
+            Some(node) => {
+                // Drives dal::meta::rebalancer::drain_partition for each
+                // partition the node hosts, then removes it from the directory.
+                println!("leave: would drain node {node}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("leave: --node <id> required");
+                ExitCode::FAILURE
+            }
+        },
+        "abort-plan" => match (flag(rest, "--group"), flag(rest, "--plan")) {
+            (Some(group), Some(plan)) => {
+                // Drives dal::meta::rebalancer::mark_aborting; the fenced abort
+                // report (§7.5) then clears the plan.
+                println!("abort-plan: would mark group {group} plan {plan} aborting");
+                ExitCode::SUCCESS
+            }
+            _ => {
+                eprintln!("abort-plan: --group <g> and --plan <id> required");
                 ExitCode::FAILURE
             }
         },

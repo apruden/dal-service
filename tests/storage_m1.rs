@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use dal::error::Error;
 use dal::keyspace;
 use dal::storage::{StateMutation, Storage};
-use dal::types::{GroupId, LogId};
+use dal::types::{GroupId, LogId, ServingState};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -102,6 +102,31 @@ fn sequential_applies_recover_to_last_prefix() {
     assert_eq!(s.last_applied(G).unwrap(), Some(LogId::new(1, 3)));
     assert_eq!(read(&s, b"a"), Some(b"3".to_vec()));
     assert_eq!(read(&s, b"b"), Some(b"2".to_vec()));
+}
+
+// ---- serving-gate reclamation (DESIGN §7.4, M6) ----------------------------
+
+#[test]
+fn reclaim_records_non_serving_before_dropping_cfs() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Storage::open(dir.path()).unwrap();
+        s.ensure_group(G).unwrap();
+        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1)).unwrap();
+        assert!(s.group_exists(G));
+        assert_eq!(s.serving_state(G).unwrap(), None);
+
+        s.reclaim_group(G).unwrap();
+        // Non-serving is recorded and the CFs are gone.
+        assert_eq!(s.serving_state(G).unwrap(), Some(ServingState::NonServing));
+        assert!(!s.group_exists(G));
+    }
+    // The non-serving record survives reopen (default CF); the group stays gone,
+    // so the amnesia rule keeps this node from silently re-participating.
+    let s = Storage::open(dir.path()).unwrap();
+    assert_eq!(s.serving_state(G).unwrap(), Some(ServingState::NonServing));
+    assert!(!s.group_exists(G));
 }
 
 #[test]

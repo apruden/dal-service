@@ -16,7 +16,9 @@ use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
 use crate::meta::reconcile::{gate, GateDecision};
 use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::node::PartitionNode;
-use crate::types::{voter_set, DataConfigObservation, GroupId, MetaCommand, NodeId, Placement};
+use crate::types::{
+    voter_set, DataConfigObservation, GroupId, MetaCommand, NodeId, NodeState, Placement,
+};
 
 /// Commit a `CreatePlan` for `group` and return its assigned `plan_id` (the meta
 /// log index of creation — DESIGN §5.2).
@@ -163,7 +165,83 @@ pub async fn execute_abort(
     accept(propose(meta, cmd).await?, "abort resolution")
 }
 
+/// Commit a directory state transition (DESIGN §9.1). The incarnation must be
+/// at least the recorded one; the meta state machine rejects a stale value.
+pub async fn set_node_state(
+    meta: &[Arc<MetaNode>],
+    node_id: NodeId,
+    state: NodeState,
+    incarnation: u64,
+) -> Result<()> {
+    accept(
+        propose(
+            meta,
+            MetaCommand::SetNodeState {
+                node_id,
+                state,
+                incarnation,
+            },
+        )
+        .await?,
+        "SetNodeState",
+    )
+}
+
+/// Graceful decommission of one partition replica (DESIGN §7.3a). Marks the
+/// draining node `Draining`, then runs a fenced move that swaps it out for
+/// `replacement` — the replacement joins as a learner and catches up *before*
+/// the draining node leaves, so the partition never drops below majority.
+///
+/// The caller drains a non-leader (or transfers leadership first); openraft
+/// steps a removed leader down after the final config commits, but draining a
+/// follower keeps the serialization point stable.
+pub async fn drain_partition(
+    meta: &[Arc<MetaNode>],
+    data_leader: &PartitionNode,
+    group: GroupId,
+    draining: NodeId,
+    replacement: NodeId,
+) -> Result<()> {
+    // Mark Draining, reusing the node's current incarnation (Active -> Draining
+    // is a real transition, so it commits rather than no-ops).
+    let entry = read_node(meta, draining)
+        .await?
+        .ok_or_else(|| Error::Raft(format!("draining node {draining} not in directory")))?;
+    set_node_state(meta, draining, NodeState::Draining, entry.incarnation).await?;
+
+    let placement = read_placement(meta, group)
+        .await?
+        .ok_or_else(|| Error::Raft("no placement to drain".into()))?;
+    let mut target: Vec<NodeId> = placement
+        .voters
+        .iter()
+        .copied()
+        .filter(|&v| v != draining)
+        .collect();
+    target.push(replacement);
+    target.sort_unstable();
+
+    let plan_id = create_plan(meta, group, &target).await?;
+    execute_move(meta, data_leader, group, plan_id).await
+}
+
 // -- internals --------------------------------------------------------------
+
+async fn read_node(
+    meta: &[Arc<MetaNode>],
+    node_id: NodeId,
+) -> Result<Option<crate::types::NodeDirectoryEntry>> {
+    for _ in 0..200 {
+        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+            match leader.read_node(node_id).await? {
+                MetaRead::Value(e) => return Ok(e),
+                MetaRead::NotLeader { .. } => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::Raft("no meta leader for node read".into()))
+}
 
 async fn wait_committed(node: &PartitionNode, target: &std::collections::BTreeSet<NodeId>) -> Result<()> {
     for _ in 0..200 {
