@@ -259,6 +259,20 @@ async fn end_to_end_benchmark_three_nodes() {
     }
     Stats::from("seq read  (1 client)", rl, t0.elapsed()).print();
 
+    // Phase 2b — sequential stale (eventually-consistent) read latency for the
+    // same keys. Skips ReadIndex, so no quorum round trip; compare against the
+    // linearizable seq read above.
+    let mut sl = Vec::with_capacity(reads);
+    let t0 = Instant::now();
+    for i in 0..reads {
+        let key = format!("{PREFIX}-seq-{}", i % writes.max(1)).into_bytes();
+        let start = Instant::now();
+        let got = writer.stale_get(&key, None).await.unwrap();
+        assert!(got.is_some(), "stale read of a written key returned empty");
+        sl.push(start.elapsed());
+    }
+    Stats::from("seq stale read (1 client)", sl, t0.elapsed()).print();
+
     // Phase 3 — concurrent write throughput across many clients.
     let per_client = concurrent_ops.div_ceil(clients);
     let cw = run_concurrent(&ctx, clients, per_client, Workload::Write, 1_000).await;
@@ -268,6 +282,17 @@ async fn end_to_end_benchmark_three_nodes() {
     // base so fresh streams don't collide with phase 3's idempotency records.
     let cm = run_concurrent(&ctx, clients, per_client, Workload::Mixed, 1_000_000).await;
     Stats::from(&format!("conc mixed ({clients} clients)"), cm.0, cm.1).print();
+
+    // Phase 5 — concurrent linearizable read throughput over the phase-1 seq
+    // keys. Every read funnels to its partition leader via ReadIndex.
+    let cr = run_concurrent_reads(&ctx, clients, per_client, writes, false, 2_000_000).await;
+    Stats::from(&format!("conc read  ({clients} clients)"), cr.0, cr.1).print();
+
+    // Phase 6 — concurrent stale read throughput over the same keys. Reads
+    // spread across all three replicas and skip the quorum round trip; this is
+    // the phase that shows the eventually-consistent path's headroom.
+    let cs = run_concurrent_reads(&ctx, clients, per_client, writes, true, 3_000_000).await;
+    Stats::from(&format!("conc stale read ({clients} clients)"), cs.0, cs.1).print();
     println!("  ==============================================================================\n");
 
     for n in nodes {
@@ -351,6 +376,55 @@ async fn run_concurrent(
                             retry_get(&cl, &rk).await;
                         }
                     }
+                }
+                lat.push(start.elapsed());
+            }
+            lat
+        }));
+    }
+    let mut all = Vec::with_capacity(clients * per_client);
+    for t in tasks {
+        all.extend(t.await.unwrap());
+    }
+    (all, t0.elapsed())
+}
+
+/// Drive `clients` concurrent clients issuing read-only traffic over the
+/// phase-1 sequential keys (which are already present on every replica). With
+/// `stale` set, each read uses the eventually-consistent path (`stale_get`,
+/// spread across replicas); otherwise it uses the linearizable path.
+async fn run_concurrent_reads(
+    ctx: &zmq::Context,
+    clients: usize,
+    per_client: usize,
+    writes: usize,
+    stale: bool,
+    id_base: u128,
+) -> (Vec<Duration>, Duration) {
+    let mut clients_to_run = Vec::with_capacity(clients);
+    for c in 0..clients {
+        let cl = client(ctx, id_base + c as u128);
+        let _ = cl.get(format!("{PREFIX}-warm-0-0").as_bytes()).await;
+        clients_to_run.push((c, cl));
+    }
+
+    let t0 = Instant::now();
+    let mut tasks = Vec::with_capacity(clients);
+    let span = writes.max(1);
+    for (c, cl) in clients_to_run {
+        tasks.push(tokio::spawn(async move {
+            let mut lat = Vec::with_capacity(per_client);
+            for i in 0..per_client {
+                // Stagger each client's start key so replicas see a spread of
+                // keys rather than every client hammering the same one.
+                let key = format!("{PREFIX}-seq-{}", (c * per_client + i) % span).into_bytes();
+                let start = Instant::now();
+                if stale {
+                    cl.stale_get(&key, None)
+                        .await
+                        .expect("stale read failed");
+                } else {
+                    cl.get(&key).await.expect("read failed");
                 }
                 lat.push(start.elapsed());
             }
