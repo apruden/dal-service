@@ -209,7 +209,7 @@ impl PartitionNode {
         let min_version = match consistency {
             Consistency::Linearizable => {
                 return match self.raft.ensure_linearizable().await {
-                    Ok(_) => Ok(ReadOutcome::Value(self.data.get(&self.storage, key)?)),
+                    Ok(_) => Ok(ReadOutcome::Value(self.data.get(self.storage.as_ref(), key)?)),
                     Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                         Ok(ReadOutcome::NotLeader {
                             leader: f.leader_id,
@@ -238,14 +238,14 @@ impl PartitionNode {
             return Ok(ReadOutcome::TooStale { leader });
         }
         // No ReadIndex, no fsync: just this replica's locally-applied state.
-        Ok(ReadOutcome::Value(self.data.get(&self.storage, key)?))
+        Ok(ReadOutcome::Value(self.data.get(self.storage.as_ref(), key)?))
     }
 
     /// Read this node's *local* applied value for a key, bypassing the serving
     /// gate. Not linearizable — for tests and reconciliation that inspect a
     /// specific replica's applied state.
     pub fn local_get(&self, key: &[u8]) -> Result<Option<(Version, Vec<u8>)>> {
-        self.data.get(&self.storage, key)
+        self.data.get(self.storage.as_ref(), key)
     }
 
     /// The highest log index this node has applied, if any.

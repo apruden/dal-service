@@ -14,6 +14,12 @@
 //!   DAL_BENCH_READS       (default 1000) sequential single-client reads
 //!   DAL_BENCH_CLIENTS     (default 16)   concurrent clients
 //!   DAL_BENCH_OPS         (default 6000) total ops in each concurrent phase
+//!
+//! To A/B the Raft-apply fsync coalescing, run this benchmark twice:
+//!   DAL_APPLY_COALESCE=0 ...  (baseline: one fsync per committed entry)
+//!   DAL_APPLY_COALESCE=1 ...  (coalesced: one fsync per apply batch, default)
+//! The write-throughput phases (3 and 4) are where the difference shows, since
+//! that is where openraft applies committed entries in batches.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -227,11 +233,24 @@ async fn end_to_end_benchmark_three_nodes() {
     warm_up(&writer, partitions).await;
     let warm_elapsed = warm.elapsed();
 
+    let coalesce = !matches!(
+        std::env::var("DAL_APPLY_COALESCE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+
     println!("\n=== dal end-to-end benchmark (3 nodes over ZeroMQ inproc) ===");
     println!(
         "  cluster: 3 nodes, R=3, {partitions} partitions, value={VALUE_BYTES}B | boot {:.2}s, warm-up {:.2}s",
         boot_elapsed.as_secs_f64(),
         warm_elapsed.as_secs_f64(),
+    );
+    println!(
+        "  apply mode: {} (DAL_APPLY_COALESCE)",
+        if coalesce {
+            "coalesced (1 fsync / batch)"
+        } else {
+            "per-entry (1 fsync / entry)"
+        },
     );
     println!("  ------------------------------------------------------------------------------");
 

@@ -6,6 +6,9 @@
 //! randomness, no node-local state (IMPLEMENTATION ground rule 1). Raft enters
 //! at M3; here the state machine is exercised directly.
 
+use std::collections::HashMap;
+
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::codec;
@@ -16,6 +19,85 @@ use crate::types::{
     ClientId, DataOp, DataRequest, GroupId, IfVersion, KeyPresence, MutationResult, Sequence,
     Version,
 };
+
+/// A read seam over a group's state CF. `evaluate` decides an entry purely from
+/// these reads, so the same logic serves two callers: the committed CF directly
+/// ([`Storage`]), or a [`StateOverlay`] that layers not-yet-durable mutations
+/// from earlier entries in the same apply batch on top of it. The two are
+/// observationally identical, which is what lets the Raft applier coalesce a
+/// batch into one fsync without changing any decision.
+pub trait StateRead {
+    fn read_state<T: DeserializeOwned>(&self, group: GroupId, key: &[u8]) -> Result<Option<T>>;
+}
+
+impl StateRead for Storage {
+    fn read_state<T: DeserializeOwned>(&self, group: GroupId, key: &[u8]) -> Result<Option<T>> {
+        self.get_state_record(group, key)
+    }
+}
+
+/// An in-memory overlay of pending state-CF writes for one group, layered over
+/// the committed CF for the duration of a single Raft apply batch.
+///
+/// Writing each committed entry with its own fsync is correct but pays one fsync
+/// per entry. Coalescing the whole batch into one durable write requires that a
+/// later entry still observe an earlier entry's effects (a CAS chain on one key,
+/// or two ops on one client's sequence stream). This overlay provides exactly
+/// that: staged mutations are visible to subsequent [`StateRead`] calls, while
+/// the actual durable write happens once at the end of the batch. Reads fall
+/// through to the committed CF for any key the batch has not touched.
+pub struct StateOverlay<'a> {
+    storage: &'a Storage,
+    pending: HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl<'a> StateOverlay<'a> {
+    pub fn new(storage: &'a Storage) -> StateOverlay<'a> {
+        StateOverlay {
+            storage,
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Fold an entry's decided mutations into the overlay so later entries in the
+    /// same batch read them. Last write to a key wins, matching the order-in-time
+    /// semantics a per-entry commit would produce.
+    pub fn stage(&mut self, mutations: &[StateMutation]) {
+        for m in mutations {
+            match m {
+                StateMutation::Put { key, value } => {
+                    self.pending.insert(key.clone(), Some(value.clone()));
+                }
+                StateMutation::Delete { key } => {
+                    self.pending.insert(key.clone(), None);
+                }
+            }
+        }
+    }
+
+    /// Collapse the batch into one mutation per touched key. Distinct keys in a
+    /// `WriteBatch` are order-independent, so the deduped set is equivalent to
+    /// replaying every staged mutation in order.
+    pub fn into_mutations(self) -> Vec<StateMutation> {
+        self.pending
+            .into_iter()
+            .map(|(key, value)| match value {
+                Some(value) => StateMutation::Put { key, value },
+                None => StateMutation::Delete { key },
+            })
+            .collect()
+    }
+}
+
+impl StateRead for StateOverlay<'_> {
+    fn read_state<T: DeserializeOwned>(&self, group: GroupId, key: &[u8]) -> Result<Option<T>> {
+        match self.pending.get(key) {
+            Some(Some(bytes)) => Ok(Some(codec::decode(bytes)?)),
+            Some(None) => Ok(None),
+            None => self.storage.get_state_record(group, key),
+        }
+    }
+}
 
 /// One key's durable record: its value and the log index of its last mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,17 +182,17 @@ impl DataStateMachine {
         self.group
     }
 
-    fn key_record(&self, storage: &Storage, key: &[u8]) -> Result<Option<KeyRecord>> {
-        storage.get_state_record(self.group, &keyspace::user_key(key))
+    fn key_record<R: StateRead>(&self, reader: &R, key: &[u8]) -> Result<Option<KeyRecord>> {
+        reader.read_state(self.group, &keyspace::user_key(key))
     }
 
-    fn seq_record(&self, storage: &Storage, client_id: ClientId) -> Result<Option<SeqRecord>> {
-        storage.get_state_record(self.group, &keyspace::seq_key(client_id))
+    fn seq_record<R: StateRead>(&self, reader: &R, client_id: ClientId) -> Result<Option<SeqRecord>> {
+        reader.read_state(self.group, &keyspace::seq_key(client_id))
     }
 
     /// Public linearizable-read helper: the current value/version of a key.
-    pub fn get(&self, storage: &Storage, key: &[u8]) -> Result<Option<(Version, Vec<u8>)>> {
-        Ok(self.key_record(storage, key)?.map(|r| (r.version, r.value)))
+    pub fn get<R: StateRead>(&self, reader: &R, key: &[u8]) -> Result<Option<(Version, Vec<u8>)>> {
+        Ok(self.key_record(reader, key)?.map(|r| (r.version, r.value)))
     }
 
     /// Apply one committed entry at `log_index`, writing atomically. Used by the
@@ -135,9 +217,9 @@ impl DataStateMachine {
     /// responsible for the atomic write (business mutations + `last_applied`,
     /// plus, for a Raft group, membership). Replay and reject paths mutate
     /// nothing and return an empty mutation list.
-    pub fn evaluate(
+    pub fn evaluate<R: StateRead>(
         &self,
-        storage: &Storage,
+        reader: &R,
         req: &DataRequest,
         log_index: u64,
     ) -> Result<(ApplyResult, Vec<StateMutation>)> {
@@ -150,7 +232,7 @@ impl DataStateMachine {
             return Ok((ApplyResult::Rejected(RejectReason::Malformed), vec![]));
         }
 
-        let seq = self.seq_record(storage, req.client_id)?;
+        let seq = self.seq_record(reader, req.client_id)?;
         let highest = seq.as_ref().map(|s| s.highest).unwrap_or(0);
 
         // Sequence gate (DESIGN §8.4).
@@ -197,7 +279,7 @@ impl DataStateMachine {
         }
 
         // sequence == highest + 1: decide.
-        let (result, key_mutation) = self.decide(storage, &req.op, log_index)?;
+        let (result, key_mutation) = self.decide(reader, &req.op, log_index)?;
         let seq_record = SeqRecord {
             highest: req.sequence,
             digest: digest(&req.op),
@@ -216,13 +298,13 @@ impl DataStateMachine {
     }
 
     /// Evaluate CAS and produce the decided result plus any key mutation.
-    fn decide(
+    fn decide<R: StateRead>(
         &self,
-        storage: &Storage,
+        reader: &R,
         op: &DataOp,
         log_index: u64,
     ) -> Result<(MutationResult, Option<StateMutation>)> {
-        let current = self.key_record(storage, op.key())?;
+        let current = self.key_record(reader, op.key())?;
         let presence = match &current {
             Some(r) => KeyPresence::Present { version: r.version },
             None => KeyPresence::Absent,
