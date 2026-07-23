@@ -1,0 +1,238 @@
+//! The node's inbound frame dispatcher (DESIGN §10.2, ground rule 9).
+//!
+//! One `ROUTER` receives every inbound frame; this [`Server`] splits them by
+//! [`MsgType::is_peer_control`]: client frames go to the [`ClientGateway`],
+//! peer/operator frames are routed here. Raft RPCs (append/vote/snapshot) go to
+//! the addressed group's `Raft` handle; config observations and operator
+//! commands (join/leave/abort-plan) are submitted to the meta group. A client
+//! code path can never reach this half — the gateway refuses peer-control
+//! frames — so plans and membership changes stay off the client surface.
+//!
+//! Deferred (M8 follow-up): `Heartbeat` liveness tracking and `BecomeLearner`
+//! admission, which drive the failure detector and rebalancing loops.
+
+use crate::api::gateway::{ClientGateway, PartitionMap};
+use crate::codec;
+use crate::meta::node::{MetaNode, ProposeOutcome};
+use crate::meta::raft_types::MetaTypeConfig;
+use crate::partition::raft_types::TypeConfig;
+use crate::transport::Server;
+use crate::transport::codec::{Envelope, MsgType};
+use crate::transport::raft_wire::{AbortPlanBody, JoinBody, LeaveBody, ObservationBody, SubmitReply};
+use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
+
+use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
+use std::sync::Arc;
+
+/// Routes inbound frames to the client gateway or the peer/operator handlers.
+pub struct RootDispatch {
+    cluster_id: ClusterId,
+    gateway: Arc<ClientGateway>,
+    meta: Option<Arc<MetaNode>>,
+    partitions: PartitionMap,
+}
+
+impl RootDispatch {
+    pub fn new(
+        cluster_id: ClusterId,
+        gateway: Arc<ClientGateway>,
+        meta: Option<Arc<MetaNode>>,
+        partitions: PartitionMap,
+    ) -> RootDispatch {
+        RootDispatch {
+            cluster_id,
+            gateway,
+            meta,
+            partitions,
+        }
+    }
+
+    fn reply(&self, req: &Envelope, payload: Vec<u8>) -> Envelope {
+        Envelope::new(
+            self.cluster_id,
+            req.msg_type,
+            req.group_id,
+            req.request_id,
+            payload,
+        )
+    }
+
+    /// A raft reply the sender cannot decode, surfaced as a network error on its
+    /// side so openraft retries. Used when the target group is not hosted here or
+    /// the request body is malformed.
+    fn raft_unavailable(&self, req: &Envelope) -> Envelope {
+        self.reply(req, Vec::new())
+    }
+
+    async fn serve_control(&self, req: Envelope) -> Envelope {
+        match req.msg_type {
+            MsgType::RaftAppend | MsgType::RaftVote | MsgType::RaftSnapshot => {
+                self.serve_raft(req).await
+            }
+            MsgType::DataConfigObservation => self.serve_observation(req).await,
+            MsgType::JoinRequest => self.serve_join(req).await,
+            MsgType::LeaveRequest => self.serve_leave(req).await,
+            MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
+            // Deferred: feeds the failure detector / rebalancer (see module docs).
+            MsgType::Heartbeat | MsgType::BecomeLearner => {
+                let reply = SubmitReply::Error("heartbeat/become-learner not yet handled".into());
+                self.reply(&req, codec::encode(&reply))
+            }
+            // Client/reply types are handled before reaching serve_control (or
+            // never arrive as requests); reply unusably so a sender retries.
+            _ => self.raft_unavailable(&req),
+        }
+    }
+
+    async fn serve_raft(&self, req: Envelope) -> Envelope {
+        match req.group_id {
+            GroupId::Meta => {
+                let Some(meta) = self.meta.clone() else {
+                    return self.raft_unavailable(&req);
+                };
+                let raft = meta.raft();
+                match req.msg_type {
+                    MsgType::RaftAppend => {
+                        let Ok(rpc) = codec::decode::<AppendEntriesRequest<MetaTypeConfig>>(
+                            &req.payload,
+                        ) else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.append_entries(rpc).await))
+                    }
+                    MsgType::RaftVote => {
+                        let Ok(rpc) = codec::decode::<VoteRequest<u64>>(&req.payload) else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.vote(rpc).await))
+                    }
+                    _ => {
+                        let Ok(rpc) = codec::decode::<InstallSnapshotRequest<MetaTypeConfig>>(
+                            &req.payload,
+                        ) else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.install_snapshot(rpc).await))
+                    }
+                }
+            }
+            GroupId::Data(p) => {
+                let Some(node) = self.partitions.read().unwrap().get(&p).cloned() else {
+                    return self.raft_unavailable(&req);
+                };
+                let raft = node.raft();
+                match req.msg_type {
+                    MsgType::RaftAppend => {
+                        let Ok(rpc) =
+                            codec::decode::<AppendEntriesRequest<TypeConfig>>(&req.payload)
+                        else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.append_entries(rpc).await))
+                    }
+                    MsgType::RaftVote => {
+                        let Ok(rpc) = codec::decode::<VoteRequest<u64>>(&req.payload) else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.vote(rpc).await))
+                    }
+                    _ => {
+                        let Ok(rpc) =
+                            codec::decode::<InstallSnapshotRequest<TypeConfig>>(&req.payload)
+                        else {
+                            return self.raft_unavailable(&req);
+                        };
+                        self.reply(&req, codec::encode(&raft.install_snapshot(rpc).await))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Submit a mapped command to the meta group and reply with its outcome.
+    async fn submit(&self, req: &Envelope, cmd: MetaCommand) -> Envelope {
+        let reply = match self.meta.clone() {
+            None => SubmitReply::Error("node does not run the meta group".into()),
+            Some(meta) => match meta.propose(cmd).await {
+                Ok(ProposeOutcome::Applied(outcome)) => SubmitReply::Outcome(outcome),
+                Ok(ProposeOutcome::NotLeader { leader }) => SubmitReply::NotLeader { leader },
+                Err(e) => SubmitReply::Error(e.to_string()),
+            },
+        };
+        self.reply(req, codec::encode(&reply))
+    }
+
+    async fn serve_observation(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<ObservationBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        self.submit(&req, body.into_meta_command()).await
+    }
+
+    async fn serve_join(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<JoinBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        let cmd = MetaCommand::RegisterNode {
+            node_id: body.node_id,
+            control_addr: body.control_addr,
+            bulk_addr: body.bulk_addr,
+        };
+        self.submit(&req, cmd).await
+    }
+
+    async fn serve_leave(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<LeaveBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        // Draining reuses the node's current incarnation (Active -> Draining is a
+        // same-incarnation transition; DESIGN §9.2). We need the directory entry
+        // to read it, which only a meta node can serve.
+        let Some(meta) = self.meta.clone() else {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error("node does not run the meta group".into())),
+            );
+        };
+        let incarnation = match meta.local_node(body.node_id) {
+            Ok(Some(entry)) => entry.incarnation,
+            Ok(None) => {
+                return self.reply(
+                    &req,
+                    codec::encode(&SubmitReply::Error(format!(
+                        "node {} is not registered",
+                        body.node_id
+                    ))),
+                );
+            }
+            Err(e) => return self.reply(&req, codec::encode(&SubmitReply::Error(e.to_string()))),
+        };
+        let cmd = MetaCommand::SetNodeState {
+            node_id: body.node_id,
+            state: NodeState::Draining,
+            incarnation,
+        };
+        self.submit(&req, cmd).await
+    }
+
+    async fn serve_abort_plan(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<AbortPlanBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        let cmd = MetaCommand::MarkAborting {
+            group: body.group,
+            plan_id: body.plan_id,
+        };
+        self.submit(&req, cmd).await
+    }
+}
+
+impl Server for RootDispatch {
+    async fn serve(&self, request: Envelope) -> Envelope {
+        if request.msg_type.is_peer_control() {
+            self.serve_control(request).await
+        } else {
+            self.gateway.serve(request).await
+        }
+    }
+}

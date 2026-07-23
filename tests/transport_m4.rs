@@ -180,7 +180,7 @@ impl Cluster {
                 CID,
                 1,
                 HashSpec::CANONICAL,
-                partitions,
+                Arc::new(std::sync::RwLock::new(partitions)),
                 routing.clone() as Arc<dyn RoutingSource>,
             );
             switch.register(ctrl_addr(node.node_id()), Arc::new(gw));
@@ -393,7 +393,7 @@ async fn mispartitioned_key_is_rejected() {
         CID,
         4,
         HashSpec::CANONICAL,
-        HashMap::new(),
+        Arc::new(std::sync::RwLock::new(HashMap::new())),
         routing as Arc<dyn RoutingSource>,
     );
     let switch: InProcess<ClientGateway> = InProcess::new();

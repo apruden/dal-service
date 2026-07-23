@@ -22,7 +22,7 @@ tracing = "0.1"
 fail = "0.5"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "signal"] }
 futures = "0.3"
 zmq = "0.10"
 

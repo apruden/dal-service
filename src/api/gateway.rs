@@ -8,7 +8,7 @@
 //! plan or membership change.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::api::ops::{
     ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, WriteReply, check_partition,
@@ -16,6 +16,10 @@ use crate::api::ops::{
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use crate::transport::Server;
+
+/// The set of data partitions a node currently hosts, shared between the gateway
+/// and the control dispatcher and mutated as rebalancing adds/removes partitions.
+pub type PartitionMap = Arc<RwLock<HashMap<u16, Arc<PartitionNode>>>>;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::types::{ClusterId, DataOp, GroupId, HashSpec, IfVersion};
 
@@ -30,7 +34,7 @@ pub struct ClientGateway {
     cluster_id: ClusterId,
     p: u16,
     hash_spec: HashSpec,
-    partitions: HashMap<u16, Arc<PartitionNode>>,
+    partitions: PartitionMap,
     routing: Arc<dyn RoutingSource>,
 }
 
@@ -39,7 +43,7 @@ impl ClientGateway {
         cluster_id: ClusterId,
         p: u16,
         hash_spec: HashSpec,
-        partitions: HashMap<u16, Arc<PartitionNode>>,
+        partitions: PartitionMap,
         routing: Arc<dyn RoutingSource>,
     ) -> ClientGateway {
         ClientGateway {
@@ -83,7 +87,8 @@ impl ClientGateway {
             Err(e) => return ClientReply::Refused(e.to_string()),
         };
 
-        let Some(node) = self.partitions.get(&partition) else {
+        let node = self.partitions.read().unwrap().get(&partition).cloned();
+        let Some(node) = node else {
             // We do not host this partition: redirect to its candidate voters.
             return ClientReply::Redirect(Redirect {
                 cluster_id: self.cluster_id,
