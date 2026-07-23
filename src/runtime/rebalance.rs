@@ -33,7 +33,8 @@ use crate::transport::raft_wire::{
     BecomeLearnerBody, LearnerReply, ObservationBody, SubmitReply,
 };
 use crate::types::{
-    ClusterId, DataConfigObservation, GroupId, NodeId, NodeState, Placement, voter_set,
+    ClusterId, DataConfigObservation, GroupId, MetaCommand, MovePlan, NodeId, NodeState, Placement,
+    voter_set,
 };
 
 use crate::api::gateway::PartitionMap;
@@ -86,8 +87,9 @@ impl RebalanceDriver {
 
     // -- meta-leader role ---------------------------------------------------
 
-    /// Create move plans to drain `Draining` voters off their partitions. Runs
-    /// only on the meta leader (plan creation is a meta write).
+    /// Meta writes that only the leader may make: create drain plans, and abort
+    /// a plan whose learner target has been declared `Down` (§7.5) — such a plan
+    /// can never complete, so it must roll back.
     async fn drive_meta_role(&self) {
         if self.meta.current_leader() != Some(self.node_id) {
             return;
@@ -95,6 +97,7 @@ impl RebalanceDriver {
         let Ok(directory) = self.meta.local_directory() else {
             return;
         };
+        let state_of = |id: NodeId| directory.iter().find(|e| e.node_id == id).map(|e| e.state);
         let active: Vec<NodeId> = directory
             .iter()
             .filter(|e| e.state == NodeState::Active)
@@ -105,36 +108,52 @@ impl RebalanceDriver {
             .filter(|e| e.state == NodeState::Draining)
             .map(|e| e.node_id)
             .collect();
-        if draining.is_empty() {
-            return;
-        }
 
         for partition in 0..self.partition_count {
             let group = GroupId::Data(partition);
             let Ok(Some(placement)) = self.meta.local_placement(group) else {
                 continue;
             };
-            if placement.r#move.is_some() {
-                continue; // a plan is already in flight for this partition
+            match &placement.r#move {
+                // No plan: drain a `Draining` voter onto an `Active` spare.
+                None => {
+                    let Some(&drained) = placement.voters.iter().find(|v| draining.contains(v))
+                    else {
+                        continue;
+                    };
+                    let Some(&replacement) =
+                        active.iter().find(|a| !placement.voters.contains(a))
+                    else {
+                        continue; // no free Active node to take over
+                    };
+                    let mut target: Vec<NodeId> = placement
+                        .voters
+                        .iter()
+                        .copied()
+                        .filter(|&v| v != drained)
+                        .collect();
+                    target.push(replacement);
+                    target.sort_unstable();
+                    let _ = create_plan(std::slice::from_ref(&self.meta), group, &target).await;
+                }
+                // Healthy plan whose learner target is Down: abort it.
+                Some(plan) if !plan.aborting => {
+                    let current = voter_set(placement.voters.clone());
+                    let target_set = voter_set(plan.target_voters.clone());
+                    if let Some(&learner) = target_set.difference(&current).next()
+                        && state_of(learner) == Some(NodeState::Down)
+                    {
+                        let _ = self
+                            .meta
+                            .propose(MetaCommand::MarkAborting {
+                                group,
+                                plan_id: plan.plan_id,
+                            })
+                            .await;
+                    }
+                }
+                Some(_) => {} // already aborting; resolution is the data-leader role's job
             }
-            let Some(&drained) = placement.voters.iter().find(|v| draining.contains(v)) else {
-                continue;
-            };
-            let Some(&replacement) = active
-                .iter()
-                .find(|a| !placement.voters.contains(a))
-            else {
-                continue; // no free Active node to take over
-            };
-            let mut target: Vec<NodeId> = placement
-                .voters
-                .iter()
-                .copied()
-                .filter(|&v| v != drained)
-                .collect();
-            target.push(replacement);
-            target.sort_unstable();
-            let _ = create_plan(std::slice::from_ref(&self.meta), group, &target).await;
         }
     }
 
@@ -163,23 +182,42 @@ impl RebalanceDriver {
             };
 
             match reconcile(&placement, &node.committed_voter_set()) {
-                ReconcileAction::ResumePlan if !plan.aborting => {
-                    self.execute_move(&node, group, &placement, &plan.target_voters, plan.plan_id)
+                ReconcileAction::ResumePlan => {
+                    if plan.aborting {
+                        self.report_abort(&node, group, &placement, &plan).await;
+                    } else {
+                        self.execute_move(
+                            &node,
+                            group,
+                            &placement,
+                            &plan.target_voters,
+                            plan.plan_id,
+                        )
                         .await;
+                    }
                 }
-                ReconcileAction::CompleteJoint if !plan.aborting => {
+                ReconcileAction::CompleteJoint => {
+                    // Resolve the joint config to the target either way; then
+                    // finalize a healthy plan or report the abort's benign
+                    // completion.
                     if node.change_voters(&plan.target_voters).await.is_ok() {
+                        if plan.aborting {
+                            self.report_abort(&node, group, &placement, &plan).await;
+                        } else {
+                            self.report_finalize(&node, group, plan.plan_id, &plan.target_voters)
+                                .await;
+                        }
+                    }
+                }
+                ReconcileAction::Finalize => {
+                    if plan.aborting {
+                        self.report_abort(&node, group, &placement, &plan).await;
+                    } else {
                         self.report_finalize(&node, group, plan.plan_id, &plan.target_voters)
                             .await;
                     }
                 }
-                ReconcileAction::Finalize if !plan.aborting => {
-                    self.report_finalize(&node, group, plan.plan_id, &plan.target_voters)
-                        .await;
-                }
-                // Aborting plans and error phases are left to the (future)
-                // abort driver; the move driver only advances healthy plans.
-                _ => {}
+                ReconcileAction::NoPlan | ReconcileAction::Error => {}
             }
         }
     }
@@ -243,6 +281,43 @@ impl RebalanceDriver {
         self.submit_observation(ObservationBody::Finalize {
             group,
             plan_id,
+            observation,
+        })
+        .await;
+    }
+
+    /// Resolve an aborting plan (§7.5): report exactly `voters` (the move never
+    /// promoted the learner — roll back) or exactly `target_voters` (the move
+    /// completed before the abort — benign finalize). A joint config still in
+    /// flight is left for a later tick after the data leader resolves it.
+    async fn report_abort(
+        &self,
+        node: &PartitionNode,
+        group: GroupId,
+        placement: &Placement,
+        plan: &MovePlan,
+    ) {
+        let committed = node.committed_voter_set();
+        let report = if committed == voter_set(placement.voters.clone()) {
+            placement.voters.clone()
+        } else if committed == voter_set(plan.target_voters.clone()) {
+            plan.target_voters.clone()
+        } else {
+            return;
+        };
+        let (config_log_id, _) = node.committed_config();
+        let Some(config_log_id) = config_log_id else {
+            return;
+        };
+        let observation = DataConfigObservation {
+            group,
+            plan_id: plan.plan_id,
+            voter_set: report,
+            config_log_id,
+        };
+        self.submit_observation(ObservationBody::Abort {
+            group,
+            plan_id: plan.plan_id,
             observation,
         })
         .await;

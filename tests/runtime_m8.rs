@@ -173,6 +173,130 @@ async fn draining_a_node_migrates_its_partition() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
+    use dal::transport::codec::{Envelope, MsgType};
+    use dal::transport::raft_wire::LeaveBody;
+    use dal::types::NodeState;
+
+    let ctx = zmq::Context::new();
+    let all = [1u64, 2, 3, 4];
+    let directory = all
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8ab-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8ab-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 1,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: vec![1, 2, 3],
+        directory,
+        data_placements: vec![(0, vec![1, 2, 3])],
+    };
+    // Wide-ish suspect window so the drain plan is created while the spare is
+    // still Active, before it is later declared Down.
+    let timeouts = Timeouts {
+        suspect: Duration::from_millis(800),
+        down: Duration::from_millis(1600),
+        request: Duration::from_millis(500),
+    };
+
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        let cfg = NodeConfig {
+            cluster_id: CID,
+            node_id: id,
+            control_addr: format!("inproc://m8ab-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8ab-bulk-{id}"),
+            http_addr: None,
+            seeds: Vec::new(),
+            data_dir: dirs[i].path().to_path_buf(),
+            timeouts: timeouts.clone(),
+        };
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+    // Let the spare heartbeat so it is firmly Active before we crash it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Crash the only spare, then immediately drain node 3. A plan to move
+    // partition 0 onto node 4 is created while node 4 still reads Active, but the
+    // move can never promote a dead learner; once node 4 is declared Down the
+    // driver aborts the plan and rolls back to the original voters.
+    let spare = nodes.remove(3);
+    Arc::try_unwrap(spare).ok().unwrap().shutdown().await.unwrap();
+
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let leave = Envelope::new(
+        CID,
+        MsgType::LeaveRequest,
+        dal::types::GroupId::Meta,
+        0,
+        dal::codec::encode(&LeaveBody { node_id: 3 }),
+    );
+    transport
+        .call("inproc://m8ab-ctrl-1", leave)
+        .await
+        .unwrap();
+
+    // First confirm a plan is actually created (target node still reads Active),
+    // so the later rollback is distinguishable from the pre-plan initial state.
+    let mut plan_created = false;
+    for _ in 0..100 {
+        if matches!(nodes[0].local_placement_voters(0).unwrap(), Some((_, true))) {
+            plan_created = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(plan_created, "drain never created a plan");
+
+    // Once the dead target is declared Down, the plan aborts and rolls back to
+    // the original voters; with no Active spare left, it stays that way.
+    let mut rolled_back = false;
+    for _ in 0..300 {
+        if nodes[0].local_node_state(4).unwrap() == Some(NodeState::Down)
+            && nodes[0].local_placement_voters(0).unwrap() == Some((vec![1, 2, 3], false))
+        {
+            rolled_back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rolled_back, "aborting plan never rolled back after target went Down");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        nodes[0].local_placement_voters(0).unwrap(),
+        Some((vec![1, 2, 3], false))
+    );
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn become_learner_starts_a_hosted_partition() {
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::{BecomeLearnerBody, LearnerReply};
