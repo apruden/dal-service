@@ -214,10 +214,14 @@ Built (M8):
   committed placement excludes this node (`PartitionStarter::reclaim_partition`,
   `Storage::reclaim_group`); `Node::start` skips a durably `NonServing` group on
   restart.
+- Startup reconciliation (`Node::start`): after the genesis voters, resume every
+  on-disk partition that is not durably `NonServing` (`PartitionStarter::
+  resume_partition`), so a partition gained by rebalance is re-hosted after a
+  restart. Local and deadlock-free; steady-state divergence is corrected by the
+  reclaim pass, so startup + reclaim reconcile the hosted set against committed
+  placement.
 
-Open:
-- **Startup re-hosts from the genesis descriptor.** `Node::start` hosts the
-  partitions the bootstrap descriptor assigns this node (minus reclaimed ones); a
-  node that *gained* a partition through a post-genesis rebalance does not re-host
-  it after a restart. Full startup reconciliation against the live meta record
-  (DESIGN §5.2/§7) is unbuilt.
+The M8 runtime slice is now feature-complete for the partition lifecycle
+(genesis, gain via `BecomeLearner`, drain/reclaim, and restart re-hosting).
+Remaining coarse edges are pre-v1 hardening, not new mechanism: e.g. meta-voter
+membership drain/replacement and load-aware placement (DESIGN §15).

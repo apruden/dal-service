@@ -466,12 +466,19 @@ group whose durable serving gate is `NonServing`, so a reclaimed node never
 re-hosts it on restart. A rolled-back plan leaves the node a voter, so it is not
 reclaimed.
 
-**Open / not yet wired (M8 remainder):**
-- **Startup re-hosts from the genesis descriptor, not current meta placement.**
-  `Node::start` hosts the partitions the immutable bootstrap descriptor assigns
-  this node (minus reclaimed ones). A node that *gained* a partition through a
-  post-genesis rebalance does not re-host it after a restart. Full startup
-  reconciliation against the live meta record (DESIGN §5.2/§7) is unbuilt.
+**Startup reconciliation** (`runtime/node.rs`): `Node::start` first starts the
+genesis voters from the descriptor (needed for `Node::bootstrap`), then resumes
+every partition still held on disk (`Storage::group_exists`) that has not been
+durably reclaimed (`serving_state != NonServing`), via
+`PartitionStarter::resume_partition` — so a partition *gained* through a
+post-genesis rebalance is re-hosted after a restart. The decision is local and
+deadlock-free (a synchronous meta read at startup can't work: the meta quorum
+needs the control servers bound, which happens after data-partition start);
+`resume_partition` writes no admission record, so `authorize_group_start`'s
+existing bootstrap/admission record is what gates it (the amnesia rule). Steady-
+state divergence from the meta record — a group this node no longer votes for —
+is corrected by the driver's reclaim pass, so startup + reclaim together
+reconcile the hosted set against the committed placement.
 
 ---
 

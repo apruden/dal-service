@@ -259,6 +259,25 @@ impl Node {
             tuning,
             partitions: partitions.clone(),
         });
+
+        // Startup reconciliation (DESIGN §5.2): the genesis voters above come
+        // from the descriptor, but a partition gained through a later rebalance
+        // is not in it. Resume every partition still held on disk that has not
+        // been durably reclaimed — its admission record authorizes the restart,
+        // and a `NonServing` group stays gone. Already-hosted genesis partitions
+        // are skipped by `resume_partition`. Steady-state divergence from the
+        // meta record (a group this node no longer votes for) is corrected by the
+        // rebalance driver's reclaim pass.
+        for p in 0..cluster.p {
+            let group = GroupId::Data(p);
+            if storage.serving_state(group)? == Some(ServingState::NonServing) {
+                continue;
+            }
+            if storage.group_exists(group) {
+                starter.resume_partition(p).await?;
+            }
+        }
+
         let dispatch = Arc::new(RootDispatch::new(
             cfg.cluster_id,
             gateway,
@@ -612,7 +631,30 @@ impl PartitionStarter {
                 plan_id,
             },
         )?;
+        self.start_and_publish(partition).await
+    }
 
+    /// Resume hosting a partition this node holds durable state for but is not
+    /// currently running — one gained through an earlier rebalance and left on
+    /// disk after a restart (startup reconciliation, DESIGN §5.2). Unlike
+    /// [`PartitionStarter::admit_learner`] it writes no admission record: it
+    /// relies on the existing bootstrap or admission record, and
+    /// `authorize_group_start` refuses a group that has neither (the amnesia
+    /// rule) or that was durably reclaimed. Idempotent.
+    pub async fn resume_partition(&self, partition: u16) -> Result<()> {
+        self.start_and_publish(partition).await
+    }
+
+    /// Start `partition`'s Raft runtime over the ZMQ network and publish it into
+    /// the shared map so the gateway and dispatcher can serve/route it. The
+    /// caller has already established the durable record that
+    /// `authorize_group_start` (inside `start_with_network`) requires. Idempotent
+    /// — a group already hosted returns `Ok` without restarting.
+    async fn start_and_publish(&self, partition: u16) -> Result<()> {
+        if self.partitions.read().unwrap().contains_key(&partition) {
+            return Ok(());
+        }
+        let group = GroupId::Data(partition);
         let net = RaftPeerFactory::new(
             group,
             self.cluster_id,

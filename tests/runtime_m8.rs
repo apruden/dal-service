@@ -757,3 +757,131 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
+    use dal::transport::codec::{Envelope, MsgType};
+    use dal::transport::raft_wire::LeaveBody;
+
+    let ctx = zmq::Context::new();
+
+    // Partition 0 lives on {1,2,3}; node 4 is an Active spare that a drain will
+    // move it onto — so node 4 *gains* a partition it was never a genesis voter of.
+    let all = [1u64, 2, 3, 4];
+    let directory = all
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8rh-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8rh-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 1,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: vec![1, 2, 3],
+        directory,
+        data_placements: vec![(0, vec![1, 2, 3])],
+    };
+
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let cfg = |id: NodeId, i: usize| NodeConfig {
+        cluster_id: CID,
+        node_id: id,
+        control_addr: format!("inproc://m8rh-ctrl-{id}"),
+        bulk_addr: format!("inproc://m8rh-bulk-{id}"),
+        http_addr: None,
+        seeds: Vec::new(),
+        data_dir: dirs[i].path().to_path_buf(),
+        timeouts: short_timeouts(),
+    };
+
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg(id, i), desc.clone())
+                .await
+                .unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    // Drain a non-leader voter so the surviving data leader can finalize the move
+    // onto node 4.
+    let mut leader = None;
+    for _ in 0..100 {
+        if let Some(l) = nodes[0].partition_leader(0) {
+            leader = Some(l);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let leader = leader.expect("partition 0 never elected a leader");
+    let victim = *[1u64, 2, 3].iter().find(|&&v| v != leader).unwrap();
+
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let leave = Envelope::new(
+        CID,
+        MsgType::LeaveRequest,
+        dal::types::GroupId::Meta,
+        0,
+        dal::codec::encode(&LeaveBody { node_id: victim }),
+    );
+    transport.call("inproc://m8rh-ctrl-1", leave).await.unwrap();
+
+    let mut expected: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&v| v != victim).collect();
+    expected.push(4);
+    expected.sort_unstable();
+
+    let mut migrated = false;
+    for _ in 0..200 {
+        if nodes[0].local_placement_voters(0).unwrap() == Some((expected.clone(), false))
+            && nodes[3].hosts_partition(0)
+        {
+            migrated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(migrated, "partition 0 never migrated onto the spare");
+
+    // Restart node 4 with the same data dir. It is not a genesis voter of
+    // partition 0, so without startup reconciliation it would come back not
+    // hosting it; startup resumes the partition from its on-disk state.
+    let node4 = nodes.remove(3);
+    Arc::try_unwrap(node4)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    settle();
+    let restarted = Node::start(ctx.clone(), cfg(4, 3), desc.clone())
+        .await
+        .unwrap();
+    assert!(
+        restarted.hosts_partition(0),
+        "restarted node did not re-host the partition it gained by rebalance"
+    );
+
+    restarted.shutdown().await.unwrap();
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
