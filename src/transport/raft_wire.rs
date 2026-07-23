@@ -120,6 +120,23 @@ pub enum LearnerReply {
     Error(String),
 }
 
+/// `MsgType::BootstrapStatus` — ask a meta voter whether a data placement from
+/// the immutable bootstrap descriptor is committed. The expected voters are
+/// included so a node never initializes a data group based on a placement from
+/// a conflicting descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapStatusBody {
+    pub group: GroupId,
+    pub voters: Vec<NodeId>,
+}
+
+/// Reply to [`BootstrapStatusBody`]. `ready` is true only after a linearizable
+/// meta read observes the exact expected placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapStatusReply {
+    pub ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

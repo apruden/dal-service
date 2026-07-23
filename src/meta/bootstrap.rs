@@ -188,6 +188,38 @@ pub async fn seed_cluster(nodes: &[Arc<MetaNode>], desc: &BootstrapDescriptor) -
     Ok(())
 }
 
+/// Attempt to seed through one local meta replica. Unlike [`seed_cluster`],
+/// this does not wait for another replica to become leader: it returns `false`
+/// as soon as this replica forwards to a leader. Startup calls this from every
+/// meta process, allowing whichever replica currently leads to resume a
+/// partially completed genesis after a restart.
+pub async fn seed_cluster_if_leader(node: &MetaNode, desc: &BootstrapDescriptor) -> Result<bool> {
+    let mut commands = Vec::with_capacity(1 + desc.directory.len() + desc.data_placements.len());
+    commands.push(MetaCommand::ClusterInit {
+        config: desc.config.clone(),
+        meta_voters: desc.meta_voters.clone(),
+    });
+    commands.extend(desc.directory.iter().map(|d| MetaCommand::RegisterNode {
+        node_id: d.node_id,
+        control_addr: d.control_addr.clone(),
+        bulk_addr: d.bulk_addr.clone(),
+    }));
+    commands.extend(desc.data_placements.iter().map(|(partition, voters)| {
+        MetaCommand::SeedPlacement {
+            group: GroupId::Data(*partition),
+            voters: voters.clone(),
+        }
+    }));
+
+    for command in commands {
+        match node.propose(command).await? {
+            ProposeOutcome::Applied(result) => accept(result, "bootstrap command")?,
+            ProposeOutcome::NotLeader { .. } => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// Learner-first meta membership change (DESIGN §7.2): admit the new node as a
 /// learner, block for durable catch-up, then replace the voter set. The joining
 /// node's durable admission record must already be written (ground rule 8).

@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource};
 use crate::api::ops::RoutingInfo;
@@ -26,9 +27,20 @@ use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::{AddrBook, RaftPeerFactory};
 use crate::transport::router::ZmqServer;
+use crate::transport::{
+    Transport,
+    codec::{Envelope, MsgType},
+    raft_wire::{BootstrapStatusBody, BootstrapStatusReply},
+};
 use crate::types::{
     BootstrapGroup, ClusterConfig, GroupId, LogId, NodeDirectoryEntry, NodeId, NodeState, Placement,
 };
+
+/// How long [`Node::bootstrap`] waits for genesis to seed and replicate before
+/// failing loudly, rather than hanging `dal run` when a quorum never forms.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll cadence while waiting for genesis to complete.
+const BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 
 /// A routing snapshot fixed at genesis from the bootstrap descriptor. Routing is
 /// advisory (the serving gate is authority), so a static snapshot is sufficient
@@ -86,6 +98,8 @@ pub struct Node {
     meta: Option<Arc<MetaNode>>,
     partitions: PartitionMap,
     desc: BootstrapDescriptor,
+    control: ZmqTransport,
+    meta_controls: Vec<String>,
     // Dropping these stops the poller threads and closes the sockets.
     _control_srv: ZmqServer,
     _bulk_srv: ZmqServer,
@@ -100,6 +114,7 @@ impl Node {
         cfg: NodeConfig,
         desc: BootstrapDescriptor,
     ) -> Result<Node> {
+        validate_node_descriptor(&cfg, &desc)?;
         let storage = Arc::new(Storage::open_checked(
             &cfg.data_dir,
             cfg.cluster_id,
@@ -143,6 +158,12 @@ impl Node {
         for d in &desc.directory {
             addrs.set(d.node_id, d.control_addr.clone(), d.bulk_addr.clone());
         }
+        let meta_controls: Vec<String> = desc
+            .directory
+            .iter()
+            .filter(|d| desc.meta_voters.contains(&d.node_id))
+            .map(|d| d.control_addr.clone())
+            .collect();
 
         let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
         let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
@@ -157,8 +178,7 @@ impl Node {
                 bulk.clone(),
             );
             Some(Arc::new(
-                MetaNode::start_with_network(cfg.node_id, storage.clone(), net, tuning)
-                    .await?,
+                MetaNode::start_with_network(cfg.node_id, storage.clone(), net, tuning).await?,
             ))
         } else {
             None
@@ -207,6 +227,8 @@ impl Node {
             meta,
             partitions,
             desc,
+            control,
+            meta_controls,
             _control_srv: control_srv,
             _bulk_srv: bulk_srv,
         })
@@ -217,15 +239,28 @@ impl Node {
     /// initializes it. Idempotent — a resumed node whose groups are already
     /// initialized does nothing.
     pub async fn bootstrap(&self) -> Result<()> {
-        let designated_meta = self
-            .meta
-            .as_ref()
-            .filter(|_| bootstrap::designated(&self.meta_voters) == Some(self.node_id));
-        if let Some(meta) = designated_meta {
-            if !meta.is_initialized().await? {
+        if let Some(meta) = &self.meta {
+            if !meta.is_initialized().await?
+                && bootstrap::designated(&self.meta_voters) == Some(self.node_id)
+            {
                 meta.initialize(&self.meta_voters).await?;
             }
-            bootstrap::seed_cluster(std::slice::from_ref(meta), &self.desc).await?;
+            // Every meta process participates in resumption. Only the current
+            // leader submits; followers wait until that leader's seeded
+            // placement has replicated locally instead of failing startup.
+            let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+            while !self.meta_seeded_locally(meta)? {
+                if meta.current_leader() == Some(self.node_id) {
+                    bootstrap::seed_cluster_if_leader(meta, &self.desc).await?;
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::Error::Raft(format!(
+                        "node {} timed out waiting for meta genesis to seed",
+                        self.node_id
+                    )));
+                }
+                tokio::time::sleep(BOOTSTRAP_POLL).await;
+            }
         }
 
         for (p, voters) in &self.hosted {
@@ -236,11 +271,71 @@ impl Node {
             let Some(node) = self.partitions.read().unwrap().get(p).cloned() else {
                 continue;
             };
+            let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+            while !self.placement_seeded(*p, voters).await? {
+                if Instant::now() >= deadline {
+                    return Err(crate::error::Error::Raft(format!(
+                        "node {} timed out waiting for placement {p} to seed",
+                        self.node_id
+                    )));
+                }
+                tokio::time::sleep(BOOTSTRAP_POLL).await;
+            }
             if !node.is_initialized().await? {
                 node.initialize(voters).await?;
             }
         }
         Ok(())
+    }
+
+    fn meta_seeded_locally(&self, meta: &MetaNode) -> Result<bool> {
+        self.desc
+            .data_placements
+            .iter()
+            .try_fold(true, |ready, (p, voters)| {
+                if !ready {
+                    return Ok(false);
+                }
+                Ok(matches!(
+                    meta.local_placement(GroupId::Data(*p))?,
+                    Some(placement) if placement.voters == *voters && placement.r#move.is_none()
+                ))
+            })
+    }
+
+    async fn placement_seeded(&self, partition: u16, voters: &[NodeId]) -> Result<bool> {
+        if let Some(meta) = &self.meta {
+            return Ok(matches!(
+                meta.local_placement(GroupId::Data(partition))?,
+                Some(placement) if placement.voters == voters && placement.r#move.is_none()
+            ));
+        }
+
+        let body = BootstrapStatusBody {
+            group: GroupId::Data(partition),
+            voters: voters.to_vec(),
+        };
+        for addr in &self.meta_controls {
+            let request = Envelope::new(
+                self.desc.cluster_id,
+                MsgType::BootstrapStatus,
+                GroupId::Meta,
+                0,
+                crate::codec::encode(&body),
+            );
+            let Ok(reply) = self.control.call(addr, request).await else {
+                continue;
+            };
+            if reply.cluster_id != self.desc.cluster_id
+                || reply.msg_type != MsgType::BootstrapStatus
+            {
+                continue;
+            }
+            if let Ok(BootstrapStatusReply { ready: true }) = crate::codec::decode(&reply.payload) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -263,5 +358,86 @@ impl Node {
             node.shutdown().await?;
         }
         Ok(())
+    }
+}
+
+fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Result<()> {
+    cfg.validate()?;
+    if cfg.cluster_id != desc.cluster_id || desc.config.cluster_id != desc.cluster_id {
+        return Err(crate::error::Error::Config(
+            "node config and bootstrap descriptor disagree on cluster_id".into(),
+        ));
+    }
+    let Some(directory_entry) = desc.directory.iter().find(|d| d.node_id == cfg.node_id) else {
+        return Err(crate::error::Error::Config(format!(
+            "node {} is not present in the bootstrap descriptor",
+            cfg.node_id
+        )));
+    };
+    if directory_entry.control_addr != cfg.control_addr
+        || directory_entry.bulk_addr != cfg.bulk_addr
+    {
+        return Err(crate::error::Error::Config(format!(
+            "node {} addresses do not match the bootstrap descriptor",
+            cfg.node_id
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::bootstrap::DirEntry;
+    use crate::types::{HashSpec, PROTOCOL_VERSION};
+
+    fn descriptor() -> BootstrapDescriptor {
+        BootstrapDescriptor {
+            cluster_id: 7,
+            config: ClusterConfig {
+                cluster_id: 7,
+                protocol_version: PROTOCOL_VERSION,
+                p: 1,
+                r: 3,
+                hash_spec: HashSpec::CANONICAL,
+            },
+            meta_voters: vec![1, 2, 3],
+            directory: vec![DirEntry {
+                node_id: 1,
+                control_addr: "tcp://node-1-control".into(),
+                bulk_addr: "tcp://node-1-bulk".into(),
+            }],
+            data_placements: vec![(0, vec![1, 2, 3])],
+        }
+    }
+
+    fn config(node_id: NodeId) -> NodeConfig {
+        NodeConfig {
+            cluster_id: 7,
+            node_id,
+            control_addr: "tcp://node-1-control".into(),
+            bulk_addr: "tcp://node-1-bulk".into(),
+            http_addr: None,
+            seeds: Vec::new(),
+            data_dir: std::path::PathBuf::from("/tmp/dal-node-test"),
+            timeouts: crate::config::Timeouts::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_config_outside_descriptor_before_opening_storage() {
+        let err = validate_node_descriptor(&config(9), &descriptor()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not present in the bootstrap descriptor")
+        );
+    }
+
+    #[test]
+    fn rejects_address_mismatch_before_opening_storage() {
+        let mut cfg = config(1);
+        cfg.control_addr = "tcp://wrong-control".into();
+        let err = validate_node_descriptor(&cfg, &descriptor()).unwrap_err();
+        assert!(err.to_string().contains("addresses do not match"));
     }
 }

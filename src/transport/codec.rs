@@ -52,6 +52,9 @@ pub enum MsgType {
     LeaveRequest = 11,
     /// Operator-control: mark a stuck move plan aborting (`dal abort-plan`).
     AbortPlanRequest = 12,
+    /// Peer-control: ask a meta voter whether a descriptor's data placement is
+    /// committed. Used only by startup bootstrap reconciliation.
+    BootstrapStatus = 13,
 }
 
 impl MsgType {
@@ -70,6 +73,7 @@ impl MsgType {
             10 => MsgType::JoinRequest,
             11 => MsgType::LeaveRequest,
             12 => MsgType::AbortPlanRequest,
+            13 => MsgType::BootstrapStatus,
             _ => return None,
         })
     }
@@ -91,7 +95,10 @@ impl MsgType {
             MsgType::Heartbeat => 4 * KIB,
             MsgType::BecomeLearner => 4 * KIB,
             MsgType::DataConfigObservation => 4 * KIB,
-            MsgType::JoinRequest | MsgType::LeaveRequest | MsgType::AbortPlanRequest => 4 * KIB,
+            MsgType::JoinRequest
+            | MsgType::LeaveRequest
+            | MsgType::AbortPlanRequest
+            | MsgType::BootstrapStatus => 4 * KIB,
         }
     }
 
@@ -111,6 +118,7 @@ impl MsgType {
                 | MsgType::JoinRequest
                 | MsgType::LeaveRequest
                 | MsgType::AbortPlanRequest
+                | MsgType::BootstrapStatus
         )
     }
 }

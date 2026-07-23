@@ -276,13 +276,12 @@ mod tests {
 
         let mut factory =
             RaftPeerFactory::new(GroupId::Meta, 0x1234, addrs, switch.clone(), switch.clone());
-        let mut peer =
-            <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
-                &mut factory,
-                2,
-                &Node::default(),
-            )
-            .await;
+        let mut peer = <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
+            &mut factory,
+            2,
+            &Node::default(),
+        )
+        .await;
 
         let req = VoteRequest::<NodeId>::new(Vote::new(5, 1), None);
         let resp = <RaftPeer<_> as RaftNetwork<MetaTypeConfig>>::vote(
@@ -306,13 +305,12 @@ mod tests {
             switch.clone(),
             switch.clone(),
         );
-        let mut peer =
-            <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
-                &mut factory,
-                7,
-                &Node::default(),
-            )
-            .await;
+        let mut peer = <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
+            &mut factory,
+            7,
+            &Node::default(),
+        )
+        .await;
         let err = <RaftPeer<_> as RaftNetwork<MetaTypeConfig>>::vote(
             &mut peer,
             VoteRequest::<NodeId>::new(Vote::new(1, 1), None),

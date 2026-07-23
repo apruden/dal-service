@@ -18,7 +18,10 @@ use crate::meta::raft_types::MetaTypeConfig;
 use crate::partition::raft_types::TypeConfig;
 use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
-use crate::transport::raft_wire::{AbortPlanBody, JoinBody, LeaveBody, ObservationBody, SubmitReply};
+use crate::transport::raft_wire::{
+    AbortPlanBody, BootstrapStatusBody, BootstrapStatusReply, JoinBody, LeaveBody, ObservationBody,
+    SubmitReply,
+};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
@@ -73,6 +76,7 @@ impl RootDispatch {
             MsgType::JoinRequest => self.serve_join(req).await,
             MsgType::LeaveRequest => self.serve_leave(req).await,
             MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
+            MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
             // Deferred: feeds the failure detector / rebalancer (see module docs).
             MsgType::Heartbeat | MsgType::BecomeLearner => {
                 let reply = SubmitReply::Error("heartbeat/become-learner not yet handled".into());
@@ -93,9 +97,9 @@ impl RootDispatch {
                 let raft = meta.raft();
                 match req.msg_type {
                     MsgType::RaftAppend => {
-                        let Ok(rpc) = codec::decode::<AppendEntriesRequest<MetaTypeConfig>>(
-                            &req.payload,
-                        ) else {
+                        let Ok(rpc) =
+                            codec::decode::<AppendEntriesRequest<MetaTypeConfig>>(&req.payload)
+                        else {
                             return self.raft_unavailable(&req);
                         };
                         self.reply(&req, codec::encode(&raft.append_entries(rpc).await))
@@ -107,9 +111,9 @@ impl RootDispatch {
                         self.reply(&req, codec::encode(&raft.vote(rpc).await))
                     }
                     _ => {
-                        let Ok(rpc) = codec::decode::<InstallSnapshotRequest<MetaTypeConfig>>(
-                            &req.payload,
-                        ) else {
+                        let Ok(rpc) =
+                            codec::decode::<InstallSnapshotRequest<MetaTypeConfig>>(&req.payload)
+                        else {
                             return self.raft_unavailable(&req);
                         };
                         self.reply(&req, codec::encode(&raft.install_snapshot(rpc).await))
@@ -191,7 +195,9 @@ impl RootDispatch {
         let Some(meta) = self.meta.clone() else {
             return self.reply(
                 &req,
-                codec::encode(&SubmitReply::Error("node does not run the meta group".into())),
+                codec::encode(&SubmitReply::Error(
+                    "node does not run the meta group".into(),
+                )),
             );
         };
         let incarnation = match meta.local_node(body.node_id) {
@@ -225,14 +231,96 @@ impl RootDispatch {
         };
         self.submit(&req, cmd).await
     }
+
+    /// Confirm that a data placement has committed before its designated voter
+    /// initializes the group. This uses a linearizable meta read so observing a
+    /// reply is sufficient to establish the bootstrap phase ordering.
+    async fn serve_bootstrap_status(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<BootstrapStatusBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&BootstrapStatusReply { ready: false }));
+        };
+        let ready = match self.meta.clone() {
+            Some(meta) => match meta.read_placement(body.group).await {
+                Ok(crate::meta::node::MetaRead::Value(Some(placement))) => {
+                    placement.voters == body.voters && placement.r#move.is_none()
+                }
+                Ok(crate::meta::node::MetaRead::Value(None))
+                | Ok(crate::meta::node::MetaRead::NotLeader { .. })
+                | Err(_) => false,
+            },
+            None => false,
+        };
+        self.reply(&req, codec::encode(&BootstrapStatusReply { ready }))
+    }
 }
 
 impl Server for RootDispatch {
     async fn serve(&self, request: Envelope) -> Envelope {
+        // The gateway applies this check for client traffic. Peer-control
+        // frames bypass the gateway, so enforce the same cluster boundary here
+        // before a foreign Raft or operator request reaches a local group.
+        if request.cluster_id != self.cluster_id {
+            return self.raft_unavailable(&request);
+        }
         if request.msg_type.is_peer_control() {
             self.serve_control(request).await
         } else {
             self.gateway.serve(request).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    use crate::api::gateway::RoutingSource;
+    use crate::api::ops::RoutingInfo;
+    use crate::types::HashSpec;
+
+    struct EmptyRouting;
+
+    impl RoutingSource for EmptyRouting {
+        fn routing(&self) -> RoutingInfo {
+            RoutingInfo {
+                cluster_id: 7,
+                p: 1,
+                hash_spec: HashSpec::CANONICAL,
+                directory: Vec::new(),
+                placements: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_peer_control_is_rejected_before_dispatch() {
+        let partitions = Arc::new(RwLock::new(HashMap::new()));
+        let gateway = Arc::new(ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            partitions.clone(),
+            Arc::new(EmptyRouting),
+        ));
+        let dispatch = RootDispatch::new(7, gateway, None, partitions);
+        let request = Envelope::new(
+            8,
+            MsgType::JoinRequest,
+            GroupId::Meta,
+            42,
+            codec::encode(&JoinBody {
+                node_id: 9,
+                control_addr: "tcp://foreign-control".into(),
+                bulk_addr: "tcp://foreign-bulk".into(),
+            }),
+        );
+
+        let reply = dispatch.serve(request).await;
+        assert_eq!(reply.cluster_id, 7);
+        assert_eq!(reply.msg_type, MsgType::JoinRequest);
+        assert_eq!(reply.request_id, 42);
+        assert!(reply.payload.is_empty());
     }
 }
