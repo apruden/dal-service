@@ -54,6 +54,9 @@ pub struct NodeConfig {
     pub node_id: NodeId,
     pub control_addr: String,
     pub bulk_addr: String,
+    /// Optional read-only HTTP admin listener (`GET /status`). Absent means
+    /// the admin plane is disabled.
+    pub http_addr: Option<String>,
     pub seeds: Vec<String>,
     pub data_dir: PathBuf,
     pub timeouts: Timeouts,
@@ -75,6 +78,16 @@ impl NodeConfig {
             return Err(Error::Config(
                 "control_addr and bulk_addr must differ (separate lanes, DESIGN §10.1)".into(),
             ));
+        }
+        if let Some(http) = &self.http_addr {
+            if http.is_empty() {
+                return Err(Error::Config("http_addr, if set, must be non-empty".into()));
+            }
+            if http == &self.control_addr || http == &self.bulk_addr {
+                return Err(Error::Config(
+                    "http_addr must differ from control_addr and bulk_addr".into(),
+                ));
+            }
         }
         if self.data_dir.as_os_str().is_empty() {
             return Err(Error::Config("data_dir must be set".into()));
@@ -275,17 +288,28 @@ mod tests {
             node_id: 1,
             control_addr: "tcp://127.0.0.1:5001".into(),
             bulk_addr: "tcp://127.0.0.1:5002".into(),
+            http_addr: Some("127.0.0.1:7001".into()),
             seeds: vec!["tcp://127.0.0.1:5001".into()],
             data_dir: PathBuf::from("/tmp/dal"),
             timeouts: Timeouts::default(),
         };
         nc.validate().unwrap();
 
+        nc.http_addr = None;
+        nc.validate().unwrap();
+        nc.http_addr = Some("127.0.0.1:7001".into());
+
         nc.node_id = 0;
         assert!(nc.validate().is_err());
         nc.node_id = 1;
 
         nc.bulk_addr = nc.control_addr.clone();
+        assert!(nc.validate().is_err());
+        nc.bulk_addr = "tcp://127.0.0.1:5002".into();
+
+        nc.http_addr = Some(nc.control_addr.clone());
+        assert!(nc.validate().is_err());
+        nc.http_addr = Some(String::new());
         assert!(nc.validate().is_err());
     }
 

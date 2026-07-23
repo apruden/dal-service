@@ -12,6 +12,7 @@ pub mod keyspace;
 pub mod meta;
 pub mod partition;
 pub mod placement;
+pub mod runtime;
 pub mod storage;
 pub mod transport;
 pub mod types;
