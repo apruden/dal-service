@@ -446,12 +446,14 @@ view. Plus: heartbeat incarnation persists and advances across restarts
 (`storage_m1`), and an invalid `http_addr` fails before storage is opened
 (`runtime::node` unit test).
 
+**Operator CLI** (`runtime/admin.rs`, `main.rs`): `join`, `leave`, `abort-plan`,
+and `status` are wired as thin ZMQ clients that send one typed control frame and
+render the reply, following `NotLeader` hints to the meta leader. `join`/`leave`/
+`abort-plan` submit to the meta group (`SubmitReply`); `status` reads any node's
+cached routing (`MetaQuery`). There is no `init` subcommand — genesis is driven by
+`dal run` from the `--cluster` descriptor.
+
 **Open / not yet wired (M8 is not complete):**
-- **Operator CLI subcommands are stubs.** Only `dal run` is wired; `init`, `join`,
-  `leave`, `abort-plan`, and `status` print an "unavailable" message. `RootDispatch`
-  *serves* the corresponding `LeaveRequest`/`AbortPlanRequest`/`JoinRequest` frames,
-  but no client-side CLI issues them — driving a live cluster needs the `api`
-  client wired to these subcommands.
 - **No runtime partition-stop / CF reclamation.** When a drain (§7.3) removes this
   node from a partition's voters, membership swaps correctly but the now-orphaned
   local `PartitionNode` is not stopped and its CFs are not reclaimed. Dynamic

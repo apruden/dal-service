@@ -206,11 +206,11 @@ Built (M8):
   `dal run` binary wiring.
 - Background drivers: heartbeat emitter (durable incarnation), failure detector,
   rebalance/abort driver.
+- Operator CLI (`runtime/admin.rs`): `join`/`leave`/`abort-plan`/`status` send
+  typed control frames to the cluster and follow `NotLeader` hints. No `init` —
+  genesis is driven by `dal run`.
 
 Open:
-- **Operator CLI subcommands** `init`/`join`/`leave`/`abort-plan`/`status` are
-  stubs in `main.rs` (only `run` is wired). `RootDispatch` serves the matching
-  frames, but no `api` client issues them.
 - **Runtime partition teardown.** A drain that removes this node from a
   partition swaps membership but does not stop the orphaned local `PartitionNode`
   or reclaim its CFs (DESIGN §7.3). Dynamic *start* exists; dynamic *stop* does

@@ -1,5 +1,6 @@
 //! Production server runtime (M8): wires the library into the `dal` binary.
 
+pub mod admin;
 pub mod config_file;
 pub mod dispatch;
 pub mod http;

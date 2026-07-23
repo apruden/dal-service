@@ -8,8 +8,9 @@
 //! code path can never reach this half — the gateway refuses peer-control
 //! frames — so plans and membership changes stay off the client surface.
 //!
-//! Deferred (M8 follow-up): `Heartbeat` liveness tracking and `BecomeLearner`
-//! admission, which drive the failure detector and rebalancing loops.
+//! `Heartbeat` liveness tracking feeds the failure detector; `BecomeLearner`
+//! admission drives rebalancing. The operator commands (`join`/`leave`/
+//! `abort-plan`) are issued by the `dal` CLI via [`crate::runtime::admin`].
 
 use crate::api::gateway::{ClientGateway, PartitionMap};
 use crate::codec;

@@ -1,25 +1,31 @@
 //! `dal` binary entry point.
 //!
-//! Subcommands: `init` (create a cluster), `join` (register a node), `status`
-//! (render the routing snapshot), plus `run`. The heavy lifting lives in the
-//! library (`dal::meta::bootstrap`, `dal::api`); this is thin argument plumbing.
+//! Subcommands: `run` (start a node; it drives resumable genesis from the
+//! cluster descriptor) plus the operator admin clients `join`, `leave`,
+//! `abort-plan`, and `status`. There is no separate `init` — genesis happens
+//! inside `run`. The heavy lifting lives in the library (`dal::runtime`);
+//! this is thin argument plumbing.
 
+use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
 
+use dal::api::ops::RoutingInfo;
+use dal::meta::state_machine::MetaApplyResult;
+use dal::runtime::admin;
 use dal::runtime::config_file::{load_init_descriptor, load_node_config};
 use dal::runtime::node::Node;
+use dal::types::GroupId;
 
 fn usage() -> &'static str {
     "usage: dal <command> [args]\n\
      \n\
      commands:\n\
-       init        --config <path>       create a new cluster from a bootstrap descriptor\n\
-       join        --seed <addr>         register this node with an existing cluster\n\
-       leave       --node <id>           gracefully decommission a node (drain)\n\
-       abort-plan  --group <g> --plan <id>  mark a stuck move plan aborting\n\
-       status      --seed <addr>         print the cluster routing snapshot\n\
-       run         --config <path> --cluster <path>   run a node\n"
+       run         --config <node.json> --cluster <init.json>   run a node (drives genesis)\n\
+       join        --config <node.json>                         register this node with its cluster\n\
+       leave       --cluster <init.json> --node <id> [--seed <addr>]   gracefully drain a node\n\
+       abort-plan  --cluster <init.json> --group <meta|N> --plan <id> [--seed <addr>]   abort a stuck plan\n\
+       status      --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -38,47 +44,46 @@ fn main() -> ExitCode {
     let rest = &args[1..];
 
     match command.as_str() {
-        "init" => match flag(rest, "--config") {
-            Some(path) => unavailable("init", path),
-            None => {
-                eprintln!("init: --config <path> required");
-                ExitCode::FAILURE
-            }
-        },
-        "join" => match flag(rest, "--seed") {
-            Some(seed) => unavailable("join", seed),
-            None => {
-                eprintln!("join: --seed <addr> required");
-                ExitCode::FAILURE
-            }
-        },
-        "leave" => match flag(rest, "--node") {
-            Some(node) => unavailable("leave", node),
-            None => {
-                eprintln!("leave: --node <id> required");
-                ExitCode::FAILURE
-            }
-        },
-        "abort-plan" => match (flag(rest, "--group"), flag(rest, "--plan")) {
-            (Some(group), Some(plan)) => {
-                unavailable("abort-plan", &format!("group={group} plan={plan}"))
-            }
-            _ => {
-                eprintln!("abort-plan: --group <g> and --plan <id> required");
-                ExitCode::FAILURE
-            }
-        },
-        "status" => match flag(rest, "--seed") {
-            Some(seed) => unavailable("status", seed),
-            None => {
-                eprintln!("status: --seed <addr> required");
-                ExitCode::FAILURE
-            }
-        },
         "run" => match (flag(rest, "--config"), flag(rest, "--cluster")) {
             (Some(config), Some(cluster)) => run_node(config, cluster),
             _ => {
                 eprintln!("run: --config <node.json> and --cluster <init.json> required");
+                ExitCode::FAILURE
+            }
+        },
+        "join" => match flag(rest, "--config") {
+            Some(config) => join(config),
+            None => {
+                eprintln!("join: --config <node.json> required");
+                ExitCode::FAILURE
+            }
+        },
+        "leave" => match (flag(rest, "--cluster"), flag(rest, "--node")) {
+            (Some(cluster), Some(node)) => leave(cluster, node, flag(rest, "--seed")),
+            _ => {
+                eprintln!("leave: --cluster <init.json> and --node <id> required");
+                ExitCode::FAILURE
+            }
+        },
+        "abort-plan" => match (
+            flag(rest, "--cluster"),
+            flag(rest, "--group"),
+            flag(rest, "--plan"),
+        ) {
+            (Some(cluster), Some(group), Some(plan)) => {
+                abort_plan(cluster, group, plan, flag(rest, "--seed"))
+            }
+            _ => {
+                eprintln!(
+                    "abort-plan: --cluster <init.json>, --group <meta|N>, and --plan <id> required"
+                );
+                ExitCode::FAILURE
+            }
+        },
+        "status" => match flag(rest, "--cluster") {
+            Some(cluster) => status(cluster, flag(rest, "--seed")),
+            None => {
+                eprintln!("status: --cluster <init.json> required");
                 ExitCode::FAILURE
             }
         },
@@ -112,18 +117,7 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("run: runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    rt.block_on(async move {
+    with_runtime(async move {
         let ctx = zmq::Context::new();
         let node = match Node::start(ctx, node_cfg, desc).await {
             Ok(n) => n,
@@ -147,9 +141,156 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
     })
 }
 
-fn unavailable(command: &str, detail: &str) -> ExitCode {
-    eprintln!(
-        "{command} is unavailable for {detail}: this binary does not yet wire the library runtime to a process"
-    );
-    ExitCode::FAILURE
+fn join(config: &str) -> ExitCode {
+    let cfg = match load_node_config(Path::new(config)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("join: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    with_runtime(async move {
+        report("join", admin::join(zmq::Context::new(), &cfg).await)
+    })
+}
+
+fn leave(cluster: &str, node: &str, seed: Option<&str>) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("leave: cluster: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(node_id) = node.parse::<u64>() else {
+        eprintln!("leave: --node must be a node id (u64)");
+        return ExitCode::FAILURE;
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        report(
+            "leave",
+            admin::leave(zmq::Context::new(), &desc, node_id, seed.as_deref()).await,
+        )
+    })
+}
+
+fn abort_plan(cluster: &str, group: &str, plan: &str, seed: Option<&str>) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("abort-plan: cluster: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let group = match parse_group(group) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("abort-plan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(plan_id) = plan.parse::<u64>() else {
+        eprintln!("abort-plan: --plan must be a plan id (u64)");
+        return ExitCode::FAILURE;
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        report(
+            "abort-plan",
+            admin::abort_plan(zmq::Context::new(), &desc, group, plan_id, seed.as_deref()).await,
+        )
+    })
+}
+
+fn status(cluster: &str, seed: Option<&str>) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("status: cluster: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        match admin::status(zmq::Context::new(), &desc, seed.as_deref()).await {
+            Ok(info) => {
+                print_routing(&info);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("status: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// A partition group is `meta` or a partition number.
+fn parse_group(s: &str) -> Result<GroupId, String> {
+    if s.eq_ignore_ascii_case("meta") {
+        return Ok(GroupId::Meta);
+    }
+    s.parse::<u16>()
+        .map(GroupId::Data)
+        .map_err(|e| format!("--group must be 'meta' or a partition number: {e}"))
+}
+
+/// Render a meta apply outcome and map it to a process exit code.
+fn report(command: &str, result: dal::error::Result<MetaApplyResult>) -> ExitCode {
+    match result {
+        Ok(MetaApplyResult::Applied) => {
+            println!("{command}: applied");
+            ExitCode::SUCCESS
+        }
+        Ok(MetaApplyResult::NoOp) => {
+            println!("{command}: no change (already applied)");
+            ExitCode::SUCCESS
+        }
+        Ok(MetaApplyResult::Rejected(why)) => {
+            eprintln!("{command}: rejected: {why:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("{command}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_routing(info: &RoutingInfo) {
+    println!("cluster_id: {:#x}", info.cluster_id);
+    println!("partitions (p): {}", info.p);
+    println!("nodes:");
+    for e in &info.directory {
+        println!(
+            "  {:>4}  {:<28}  {:?}  incarnation={}",
+            e.node_id, e.control_addr, e.state, e.incarnation
+        );
+    }
+    println!("placements:");
+    let mut placements = info.placements.clone();
+    placements.sort_by_key(|(p, _)| *p);
+    for (p, placement) in &placements {
+        let mv = match &placement.r#move {
+            Some(m) => format!("  (move plan {} -> {:?})", m.plan_id, m.target_voters),
+            None => String::new(),
+        };
+        println!("  partition {p:>4}: voters {:?}{mv}", placement.voters);
+    }
+}
+
+/// Build a multi-thread runtime and drive `fut` to completion. Every subcommand
+/// is a short-lived async client, so one runtime per invocation is fine.
+fn with_runtime<F: Future<Output = ExitCode>>(fut: F) -> ExitCode {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(fut),
+        Err(e) => {
+            eprintln!("runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -692,3 +692,51 @@ async fn three_node_cluster_serves_a_client_op() {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_cli_commands_query_and_mutate_the_cluster() {
+    use dal::meta::state_machine::{MetaApplyResult, MetaReject};
+    use dal::runtime::admin;
+    use dal::types::{GroupId, NodeState};
+
+    let ctx = zmq::Context::new();
+    let desc = descriptor();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let nodes = start_and_bootstrap(&ctx, &desc, &dirs, short_timeouts()).await;
+
+    // `status`: any node answers the routing snapshot from its cached placement,
+    // so no leader is required.
+    let info = admin::status(ctx.clone(), &desc, None).await.unwrap();
+    assert_eq!(info.cluster_id, CID);
+    assert_eq!(info.p, 1);
+    assert_eq!(info.directory.len(), 3);
+
+    // `abort-plan` for a group with no active plan reaches the meta leader
+    // (following `NotLeader`) and is deterministically rejected — exercising the
+    // same submit path as `leave` and `join`.
+    let aborted = admin::abort_plan(ctx.clone(), &desc, GroupId::Data(0), 999, None)
+        .await
+        .unwrap();
+    assert_eq!(aborted, MetaApplyResult::Rejected(MetaReject::NoPlan));
+
+    // `leave` marks node 3 Draining; the committed directory reflects it.
+    let left = admin::leave(ctx.clone(), &desc, 3, None).await.unwrap();
+    assert!(matches!(
+        left,
+        MetaApplyResult::Applied | MetaApplyResult::NoOp
+    ));
+
+    let mut draining = false;
+    for _ in 0..40 {
+        if nodes[0].local_node_state(3).unwrap() == Some(NodeState::Draining) {
+            draining = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(draining, "node 3 never reached Draining after leave");
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
