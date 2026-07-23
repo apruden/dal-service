@@ -45,6 +45,13 @@ pub enum MsgType {
     /// Peer-control: a leader's finalize/abort configuration observation
     /// (§7.5). Also peer-only.
     DataConfigObservation = 9,
+    /// Operator-control: register a node in the directory (`dal join`). Narrow
+    /// and typed — never a generic meta-command carrier (§10.2).
+    JoinRequest = 10,
+    /// Operator-control: mark a node draining (`dal leave`).
+    LeaveRequest = 11,
+    /// Operator-control: mark a stuck move plan aborting (`dal abort-plan`).
+    AbortPlanRequest = 12,
 }
 
 impl MsgType {
@@ -60,6 +67,9 @@ impl MsgType {
             7 => MsgType::Heartbeat,
             8 => MsgType::BecomeLearner,
             9 => MsgType::DataConfigObservation,
+            10 => MsgType::JoinRequest,
+            11 => MsgType::LeaveRequest,
+            12 => MsgType::AbortPlanRequest,
             _ => return None,
         })
     }
@@ -81,11 +91,13 @@ impl MsgType {
             MsgType::Heartbeat => 4 * KIB,
             MsgType::BecomeLearner => 4 * KIB,
             MsgType::DataConfigObservation => 4 * KIB,
+            MsgType::JoinRequest | MsgType::LeaveRequest | MsgType::AbortPlanRequest => 4 * KIB,
         }
     }
 
-    /// Whether this type is peer-control (reachable only from configured node
-    /// endpoints, never from a client code path — DESIGN §10.2, ground rule 9).
+    /// Whether this type is peer/operator-control (dispatched on the node
+    /// control path, never through the client gateway — DESIGN §10.2, ground
+    /// rule 9).
     pub fn is_peer_control(self) -> bool {
         matches!(
             self,
@@ -96,6 +108,9 @@ impl MsgType {
                 | MsgType::Heartbeat
                 | MsgType::BecomeLearner
                 | MsgType::DataConfigObservation
+                | MsgType::JoinRequest
+                | MsgType::LeaveRequest
+                | MsgType::AbortPlanRequest
         )
     }
 }
@@ -349,7 +364,22 @@ mod tests {
     fn peer_control_classification() {
         assert!(MsgType::RaftAppend.is_peer_control());
         assert!(MsgType::BecomeLearner.is_peer_control());
+        assert!(MsgType::JoinRequest.is_peer_control());
+        assert!(MsgType::LeaveRequest.is_peer_control());
+        assert!(MsgType::AbortPlanRequest.is_peer_control());
         assert!(!MsgType::ClientOp.is_peer_control());
         assert!(!MsgType::MetaQuery.is_peer_control());
+    }
+
+    #[test]
+    fn operator_frames_round_trip() {
+        for t in [
+            MsgType::JoinRequest,
+            MsgType::LeaveRequest,
+            MsgType::AbortPlanRequest,
+        ] {
+            let e = env(t, GroupId::Meta, b"body".to_vec());
+            assert_eq!(e, Envelope::decode(&e.encode()).unwrap());
+        }
     }
 }

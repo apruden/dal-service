@@ -8,6 +8,7 @@
 
 pub mod codec;
 pub mod dealer;
+pub mod raft_wire;
 pub mod router;
 
 use std::collections::HashMap;
