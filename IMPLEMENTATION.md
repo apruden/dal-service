@@ -453,13 +453,25 @@ render the reply, following `NotLeader` hints to the meta leader. `join`/`leave`
 cached routing (`MetaQuery`). There is no `init` subcommand — genesis is driven by
 `dal run` from the `--cluster` descriptor.
 
-**Open / not yet wired (M8 is not complete):**
-- **No runtime partition-stop / CF reclamation.** When a drain (§7.3) removes this
-  node from a partition's voters, membership swaps correctly but the now-orphaned
-  local `PartitionNode` is not stopped and its CFs are not reclaimed. Dynamic
-  partition *start* exists (via `BecomeLearner`); dynamic *stop* does not — there is
-  no reconcile loop that tears down locally-removed groups after durably recording
-  non-voter state.
+**Partition-stop / CF reclamation** (`runtime/rebalance.rs`, `runtime/node.rs`,
+`storage/rocks.rs`): a reclaim pass runs each rebalance tick. For every hosted
+partition it reads the committed placement; once the move that removed this node
+has resolved (no in-flight plan) and the committed `voters` exclude it, it calls
+`PartitionStarter::reclaim_partition` — the inverse of `admit_learner`: unpublish
+the group, shut down its Raft runtime, then `Storage::reclaim_group` records
+`NonServing` durably *before* dropping the CFs (crash-safe, §7.4). The decision is
+read purely from committed meta state, so it is safe (the cluster has already
+committed a config without this node) and idempotent. `Node::start` skips any
+group whose durable serving gate is `NonServing`, so a reclaimed node never
+re-hosts it on restart. A rolled-back plan leaves the node a voter, so it is not
+reclaimed.
+
+**Open / not yet wired (M8 remainder):**
+- **Startup re-hosts from the genesis descriptor, not current meta placement.**
+  `Node::start` hosts the partitions the immutable bootstrap descriptor assigns
+  this node (minus reclaimed ones). A node that *gained* a partition through a
+  post-genesis rebalance does not re-host it after a restart. Full startup
+  reconciliation against the live meta record (DESIGN §5.2/§7) is unbuilt.
 
 ---
 

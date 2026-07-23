@@ -39,6 +39,7 @@ use crate::types::{
 };
 
 use crate::api::gateway::PartitionMap;
+use crate::runtime::node::PartitionStarter;
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -55,6 +56,7 @@ pub struct RebalanceDriver {
     control: ZmqTransport,
     addrs: AddrBook,
     meta_controls: Vec<String>,
+    starter: Arc<PartitionStarter>,
 }
 
 impl RebalanceDriver {
@@ -68,6 +70,7 @@ impl RebalanceDriver {
         control: ZmqTransport,
         addrs: AddrBook,
         meta_controls: Vec<String>,
+        starter: Arc<PartitionStarter>,
     ) -> RebalanceDriver {
         RebalanceDriver {
             node_id,
@@ -78,6 +81,7 @@ impl RebalanceDriver {
             control,
             addrs,
             meta_controls,
+            starter,
         }
     }
 
@@ -86,6 +90,7 @@ impl RebalanceDriver {
             tokio::time::sleep(REBALANCE_INTERVAL).await;
             self.drive_meta_role().await;
             self.drive_data_role().await;
+            self.drive_reclaim_role().await;
         }
     }
 
@@ -224,6 +229,34 @@ impl RebalanceDriver {
                 }
                 ReconcileAction::NoPlan | ReconcileAction::Error => {}
             }
+        }
+    }
+
+    // -- reclaim role -------------------------------------------------------
+
+    /// Stop and reclaim any partition this node still hosts but is no longer a
+    /// voter of (DESIGN §7.3, §7.4). The decision is read purely from committed
+    /// meta state: reclaim only once the move that removed this node has resolved
+    /// (no in-flight plan) and the committed `voters` exclude it. That makes it
+    /// safe — the cluster has already committed a config without this node — and
+    /// idempotent, so a missed tick simply retries. A partition whose committed
+    /// placement cannot be read is left untouched, never reclaimed on a guess.
+    async fn drive_reclaim_role(&self) {
+        let hosted: Vec<u16> = self.partitions.read().unwrap().keys().copied().collect();
+        for partition in hosted {
+            let Some(placement) = self.read_placement(GroupId::Data(partition)).await else {
+                continue;
+            };
+            // An in-flight move may still name this node (a source mid-move or a
+            // target learner): wait for the plan to resolve before reclaiming.
+            if placement.r#move.is_some() {
+                continue;
+            }
+            if placement.voters.contains(&self.node_id) {
+                continue; // still a voter: keep serving
+            }
+            // Best-effort: a failed reclaim retries on the next tick.
+            let _ = self.starter.reclaim_partition(partition).await;
         }
     }
 

@@ -42,7 +42,7 @@ use crate::transport::{
 };
 use crate::types::{
     BootstrapGroup, ClusterConfig, ClusterId, GroupId, LearnerAdmission, LogId, MetaCommand,
-    NodeDirectoryEntry, NodeId, NodeState, Placement,
+    NodeDirectoryEntry, NodeId, NodeState, Placement, ServingState,
 };
 
 /// How long [`Node::bootstrap`] waits for genesis to seed and replicate before
@@ -157,6 +157,15 @@ impl Node {
             .data_placements
             .iter()
             .filter(|(_, voters)| voters.contains(&cfg.node_id))
+            // A partition this node durably reclaimed after a drain stays gone:
+            // never re-host a group whose local serving gate is `NonServing`, or
+            // `authorize_group_start` would refuse it and fail startup.
+            .filter(|(p, _)| {
+                !matches!(
+                    storage.serving_state(GroupId::Data(*p)),
+                    Ok(Some(ServingState::NonServing))
+                )
+            })
             .cloned()
             .collect();
 
@@ -256,7 +265,7 @@ impl Node {
             meta.clone(),
             partitions.clone(),
             heartbeats.clone(),
-            Some(starter),
+            Some(starter.clone()),
         ));
 
         let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
@@ -295,6 +304,7 @@ impl Node {
             control.clone(),
             addrs.clone(),
             meta_controls.clone(),
+            starter,
         );
         tasks.push(tokio::spawn(driver.run()));
 
@@ -622,6 +632,24 @@ impl PartitionStarter {
             .write()
             .unwrap()
             .insert(partition, Arc::new(node));
+        Ok(())
+    }
+
+    /// Stop hosting `partition` and reclaim its local data after a drain removed
+    /// this node from the group (DESIGN §7.3, §7.4) — the inverse of
+    /// [`PartitionStarter::admit_learner`]. Unpublish it so the gateway and
+    /// dispatcher stop routing to it, shut down its Raft runtime, then durably
+    /// record `NonServing` and drop the CFs. Ordering matters: the runtime is
+    /// stopped before the CFs are dropped, and `reclaim_group` records
+    /// `NonServing` before the drop so a crash mid-reclaim cannot leave
+    /// servable-looking state. Idempotent — a partition not hosted returns `Ok`.
+    pub async fn reclaim_partition(&self, partition: u16) -> Result<()> {
+        let node = self.partitions.write().unwrap().remove(&partition);
+        let Some(node) = node else {
+            return Ok(());
+        };
+        node.shutdown().await?;
+        self.storage.reclaim_group(GroupId::Data(partition))?;
         Ok(())
     }
 }

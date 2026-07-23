@@ -164,6 +164,23 @@ async fn draining_a_node_migrates_its_partition() {
     }
     assert!(migrated, "partition 0 never migrated off the drained node");
 
+    // The drained node, now excluded from the committed voter set, stops hosting
+    // and reclaims partition 0 (DESIGN §7.4). `all`/`nodes` are index-aligned, so
+    // the victim's handle is at `victim - 1`.
+    let victim_node = &nodes[(victim - 1) as usize];
+    let mut reclaimed = false;
+    for _ in 0..100 {
+        if !victim_node.hosts_partition(0) {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        reclaimed,
+        "drained node {victim} never reclaimed its removed partition"
+    );
+
     for n in nodes {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }

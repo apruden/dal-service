@@ -136,9 +136,10 @@ impl Server for RootDispatch {
    `ClientGateway::new` takes today. Rebalancing adds/removes hosted partitions at
    runtime (a `BecomeLearner` frame starts a new `PartitionNode`; a completed
    drain stops one). Gateway and control dispatcher must see the same live set →
-   `Arc<RwLock<HashMap<..>>>`. Done for *start*: `ClientGateway` reads the shared
-   handle and `BecomeLearner` inserts a freshly started `PartitionNode`. *Stop* is
-   still open — a completed drain does not yet remove/reclaim the local group.
+   `Arc<RwLock<HashMap<..>>>`. Done both ways: `BecomeLearner` inserts a freshly
+   started `PartitionNode`, and the driver's reclaim pass removes and reclaims a
+   group once committed placement excludes this node (`PartitionStarter::
+   reclaim_partition`). `ClientGateway` reads the shared handle throughout.
 2. **Inbound server must be bound before quorum can form, yet tolerate
    "group not up yet."** Peers must reach each other's ROUTER to elect, so bind
    early; the dispatcher returns a retryable error for frames whose target group
@@ -209,9 +210,14 @@ Built (M8):
 - Operator CLI (`runtime/admin.rs`): `join`/`leave`/`abort-plan`/`status` send
   typed control frames to the cluster and follow `NotLeader` hints. No `init` —
   genesis is driven by `dal run`.
+- Partition teardown: the driver's reclaim pass stops and reclaims a group once
+  committed placement excludes this node (`PartitionStarter::reclaim_partition`,
+  `Storage::reclaim_group`); `Node::start` skips a durably `NonServing` group on
+  restart.
 
 Open:
-- **Runtime partition teardown.** A drain that removes this node from a
-  partition swaps membership but does not stop the orphaned local `PartitionNode`
-  or reclaim its CFs (DESIGN §7.3). Dynamic *start* exists; dynamic *stop* does
-  not — no reconcile loop tears down locally-removed groups.
+- **Startup re-hosts from the genesis descriptor.** `Node::start` hosts the
+  partitions the bootstrap descriptor assigns this node (minus reclaimed ones); a
+  node that *gained* a partition through a post-genesis rebalance does not re-host
+  it after a restart. Full startup reconciliation against the live meta record
+  (DESIGN §5.2/§7) is unbuilt.
