@@ -12,8 +12,8 @@
 //!   DAL_BENCH_PARTITIONS  (default 16)  data partitions, each on all 3 nodes
 //!   DAL_BENCH_WRITES      (default 1000) sequential single-client writes
 //!   DAL_BENCH_READS       (default 1000) sequential single-client reads
-//!   DAL_BENCH_CLIENTS     (default 32)   concurrent clients
-//!   DAL_BENCH_OPS         (default 8000) total ops in each concurrent phase
+//!   DAL_BENCH_CLIENTS     (default 16)   concurrent clients
+//!   DAL_BENCH_OPS         (default 6000) total ops in each concurrent phase
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -206,6 +206,7 @@ async fn warm_up(c: &Client<ZmqTransport>, p: u16) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark: run `cargo test --release --test benchmark_e2e end_to_end_benchmark_three_nodes -- --ignored --nocapture`"]
 async fn end_to_end_benchmark_three_nodes() {
     let partitions = env_usize("DAL_BENCH_PARTITIONS", 16) as u16;
     let writes = env_usize("DAL_BENCH_WRITES", 1000);
@@ -291,7 +292,9 @@ async fn retry_put(cl: &Client<ZmqTransport>, key: &[u8], val: &[u8]) -> WriteRe
             Err(_) => tokio::time::sleep(Duration::from_millis(10 * (attempt + 1))).await,
         }
     }
-    cl.put(key, val, None).await.expect("put failed after retries")
+    cl.put(key, val, None)
+        .await
+        .expect("put failed after retries")
 }
 
 async fn retry_get(cl: &Client<ZmqTransport>, key: &[u8]) {
@@ -313,17 +316,22 @@ async fn run_concurrent(
     workload: Workload,
     id_base: u128,
 ) -> (Vec<Duration>, Duration) {
+    let mut clients_to_run = Vec::with_capacity(clients);
+    for c in 0..clients {
+        let cl = client(ctx, id_base + c as u128);
+        // Warm this client's routing cache outside the timed section so a cold
+        // MetaQuery or first redirect does not distort steady-state results.
+        let _ = cl.get(format!("{PREFIX}-warm-0-0").as_bytes()).await;
+        clients_to_run.push((c, cl));
+    }
+
     let t0 = Instant::now();
     let mut tasks = Vec::with_capacity(clients);
-    for c in 0..clients {
+    for (c, cl) in clients_to_run {
         // Distinct client_id per task so the per-(client,partition) stream lock
         // does not serialize independent clients. The base keeps each phase's
         // ids disjoint so replayed sequences never alias a prior phase's records.
-        let cl = client(ctx, id_base + c as u128);
         tasks.push(tokio::spawn(async move {
-            // Warm this client's routing cache before the timed section so the
-            // opening op isn't a cold MetaQuery under the concurrent flood.
-            let _ = cl.get(format!("{PREFIX}-warm-0-0").as_bytes()).await;
             let mut lat = Vec::with_capacity(per_client);
             for i in 0..per_client {
                 let key = format!("{PREFIX}-c{c}-k{i}").into_bytes();

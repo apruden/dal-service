@@ -40,9 +40,11 @@ impl ZmqServer {
     {
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
-        // Short receive timeout so the loop can also drain outgoing replies and
-        // observe the shutdown flag.
-        socket.set_rcvtimeo(50).map_err(zmq_io)?;
+        // The poller owns the socket, while handlers complete on Tokio. Bound
+        // the wait so a completed reply is flushed promptly even when no new
+        // request arrives. One millisecond avoids the former 50 ms tail while
+        // keeping this single-owner design simple and portable.
+        socket.set_rcvtimeo(1).map_err(zmq_io)?;
         socket.bind(addr).map_err(zmq_io)?;
 
         let handle = Handle::current();
@@ -74,11 +76,7 @@ impl ZmqServer {
         S: Server + 'static,
     {
         while running.load(Ordering::Relaxed) {
-            // Flush any completed replies first.
-            while let Ok((identity, bytes)) = reply_rx.try_recv() {
-                let _ = socket.send_multipart([identity, bytes], 0);
-            }
-
+            Self::flush_replies(&socket, &reply_rx);
             match socket.recv_multipart(0) {
                 Ok(mut parts) if parts.len() >= 2 => {
                     // ROUTER delivers [identity, payload]; extra frames are
@@ -97,6 +95,12 @@ impl ZmqServer {
                 // Timeout (EAGAIN) or a malformed short message: loop.
                 _ => {}
             }
+        }
+    }
+
+    fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<(Vec<u8>, Vec<u8>)>) {
+        while let Ok((identity, bytes)) = reply_rx.try_recv() {
+            let _ = socket.send_multipart([identity, bytes], 0);
         }
     }
 
