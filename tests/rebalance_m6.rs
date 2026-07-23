@@ -18,12 +18,13 @@ use dal::meta::rebalancer::{
 };
 use dal::meta::reconcile::{reconcile, ReconcileAction};
 use dal::partition::network::{Faults, Registry};
-use dal::partition::node::{PartitionNode, WriteOutcome};
+use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::partition::TypeConfig;
 use dal::storage::Storage;
 use dal::types::{
     ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, NodeId, NodeState, PROTOCOL_VERSION,
 };
+use dal::verify::oracles::{converged, no_lost_write, PartitionState};
 
 use tempfile::TempDir;
 
@@ -559,4 +560,56 @@ async fn drain_removes_the_current_leader() {
     expected.push(4);
     expected.sort_unstable();
     assert_eq!(meta_voters(&c).await, expected);
+}
+
+/// Sample convergence: the meta record and the data-Raft committed config must
+/// agree, with no live stale plan (DESIGN §12.7).
+async fn partition_state(c: &Cluster) -> PartitionState {
+    let placement = match c.meta_leader().unwrap().read_placement(GroupId::Data(PART)).await.unwrap() {
+        MetaRead::Value(Some(p)) => p,
+        other => panic!("placement: {other:?}"),
+    };
+    PartitionState {
+        partition: PART,
+        meta_voters: placement.voters.iter().copied().collect(),
+        data_voters: c.data_leader().unwrap().committed_voter_set(),
+        plan: placement.r#move.map(|m| m.aborting),
+    }
+}
+
+/// v1 acceptance shape (DESIGN §14): a three-node cluster grows to four and
+/// shrinks back during the run; convergence and no-lost-write hold at each
+/// quiescence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn grow_to_four_then_shrink_back_converges() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    write_to_leader(&c, put(1, b"k", b"v1")).await;
+    let acked = vec![(b"k".to_vec(), 1u64)]; // version >= 1; exact value checked below
+
+    // Grow: bring node 4 in for a follower.
+    c.start_data(4).await;
+    let (grow_target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+    let plan = create_plan(&c.meta_slice(), GroupId::Data(PART), &grow_target).await.unwrap();
+    execute_move(&c.meta_slice(), &leader, GroupId::Data(PART), plan).await.unwrap();
+    converged(&[partition_state(&c).await]).expect("diverged after grow");
+
+    // Shrink: drain node 4 back out, replaced by node 3 (its runtime still up).
+    let dropped = DATA_VOTERS.iter().copied().find(|&v| !grow_target.contains(&v)).unwrap();
+    let leader = c.data_leader().unwrap();
+    drain_partition(&c.meta_slice(), &leader, GroupId::Data(PART), 4, dropped).await.unwrap();
+    let mut back: Vec<NodeId> = grow_target.iter().copied().filter(|&v| v != 4).collect();
+    back.push(dropped);
+    back.sort_unstable();
+    assert_eq!(meta_voters(&c).await, back);
+    converged(&[partition_state(&c).await]).expect("diverged after shrink");
+
+    // The acknowledged write survived both moves.
+    let mut final_state = std::collections::HashMap::new();
+    if let Ok(ReadOutcome::Value(Some((version, value)))) = c.data_leader().unwrap().read(b"k").await {
+        assert_eq!(value, b"v1");
+        final_state.insert(b"k".to_vec(), version);
+    }
+    no_lost_write(&acked, &final_state).expect("acknowledged write lost across grow/shrink");
 }

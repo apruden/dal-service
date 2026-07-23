@@ -15,5 +15,6 @@ pub mod placement;
 pub mod storage;
 pub mod transport;
 pub mod types;
+pub mod verify;
 
 pub use error::{Error, Result};
