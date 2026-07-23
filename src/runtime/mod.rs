@@ -3,3 +3,4 @@
 pub mod config_file;
 pub mod dispatch;
 pub mod node;
+pub mod rebalance;

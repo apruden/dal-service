@@ -64,6 +64,115 @@ fn node_config(id: NodeId, dir: PathBuf) -> NodeConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draining_a_node_migrates_its_partition() {
+    use dal::transport::codec::{Envelope, MsgType};
+    use dal::transport::raft_wire::LeaveBody;
+
+    let ctx = zmq::Context::new();
+
+    // Three meta voters (an odd set); partition 0 lives on {1,2,3}; node 4 is a
+    // data-only Active spare that the drain will move the partition onto.
+    let all = [1u64, 2, 3, 4];
+    let directory = all
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8dr-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8dr-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 1,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: vec![1, 2, 3],
+        directory,
+        data_placements: vec![(0, vec![1, 2, 3])],
+    };
+
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        let cfg = NodeConfig {
+            cluster_id: CID,
+            node_id: id,
+            control_addr: format!("inproc://m8dr-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8dr-bulk-{id}"),
+            http_addr: None,
+            seeds: Vec::new(),
+            data_dir: dirs[i].path().to_path_buf(),
+            timeouts: Timeouts::default(),
+        };
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let n = n.clone();
+            tokio::spawn(async move { n.bootstrap().await })
+        })
+        .collect();
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    // Drain a *non-leader* voter so the surviving meta-voter data leader can
+    // finalize the move (a drained leader would step down mid-change). Wait for
+    // a stable partition leader first.
+    let mut leader = None;
+    for _ in 0..100 {
+        if let Some(l) = nodes[0].partition_leader(0) {
+            leader = Some(l);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let leader = leader.expect("partition 0 never elected a leader");
+    let victim = *[1u64, 2, 3].iter().find(|&&v| v != leader).unwrap();
+
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let leave = Envelope::new(
+        CID,
+        MsgType::LeaveRequest,
+        dal::types::GroupId::Meta,
+        0,
+        dal::codec::encode(&LeaveBody { node_id: victim }),
+    );
+    transport
+        .call("inproc://m8dr-ctrl-1", leave)
+        .await
+        .unwrap();
+
+    // Expected post-move voters: {1,2,3} minus the drained node, plus spare 4.
+    let mut expected: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&v| v != victim).collect();
+    expected.push(4);
+    expected.sort_unstable();
+
+    let mut migrated = false;
+    for _ in 0..200 {
+        let placement = nodes[0].local_placement_voters(0).unwrap();
+        if placement == Some((expected.clone(), false)) && nodes[3].hosts_partition(0) {
+            migrated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(migrated, "partition 0 never migrated off the drained node");
+
+    for n in nodes {
+        Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn become_learner_starts_a_hosted_partition() {
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::{BecomeLearnerBody, LearnerReply};

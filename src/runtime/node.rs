@@ -26,6 +26,7 @@ use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::MetaNode;
 use crate::partition::node::PartitionNode;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
+use crate::runtime::rebalance::RebalanceDriver;
 use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::{AddrBook, RaftPeerFactory};
@@ -258,6 +259,17 @@ impl Node {
                 cfg.timeouts,
                 hb_interval,
             )));
+            let driver = RebalanceDriver::new(
+                cfg.node_id,
+                cfg.cluster_id,
+                cluster.p,
+                meta.clone(),
+                partitions.clone(),
+                control.clone(),
+                addrs.clone(),
+                meta_controls.clone(),
+            );
+            tasks.push(tokio::spawn(driver.run()));
         }
 
         Ok(Node {
@@ -389,11 +401,32 @@ impl Node {
         self.partitions.read().unwrap().contains_key(&partition)
     }
 
+    /// The data-Raft leader this node believes serves `partition`, if it hosts
+    /// it. Used by tests to pick a non-leader replica to drain.
+    pub fn partition_leader(&self, partition: u16) -> Option<NodeId> {
+        self.partitions
+            .read()
+            .unwrap()
+            .get(&partition)
+            .and_then(|n| n.current_leader())
+    }
+
     /// The committed directory state of `node_id` as seen locally, if this node
     /// runs the meta group. Used by tests to observe failure-detector output.
     pub fn local_node_state(&self, node_id: NodeId) -> Result<Option<NodeState>> {
         match &self.meta {
             Some(meta) => Ok(meta.local_node(node_id)?.map(|e| e.state)),
+            None => Ok(None),
+        }
+    }
+
+    /// The committed voter set of a partition's meta placement, and whether a
+    /// move is still in flight. Used by tests to observe rebalance completion.
+    pub fn local_placement_voters(&self, partition: u16) -> Result<Option<(Vec<NodeId>, bool)>> {
+        match &self.meta {
+            Some(meta) => Ok(meta
+                .local_placement(GroupId::Data(partition))?
+                .map(|p| (p.voters, p.r#move.is_some()))),
             None => Ok(None),
         }
     }
