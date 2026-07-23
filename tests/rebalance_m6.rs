@@ -23,8 +23,8 @@ use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::storage::Storage;
 use dal::types::{
-    ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, LearnerAdmission, NodeId, NodeState,
-    PROTOCOL_VERSION,
+    ClusterConfig, Consistency, DataOp, DataRequest, GroupId, HashSpec, LearnerAdmission, NodeId,
+    NodeState, PROTOCOL_VERSION,
 };
 use dal::verify::oracles::{PartitionState, converged, no_lost_write};
 
@@ -685,8 +685,11 @@ async fn grow_to_four_then_shrink_back_converges() {
 
     // The acknowledged write survived both moves.
     let mut final_state = std::collections::HashMap::new();
-    if let Ok(ReadOutcome::Value(Some((version, value)))) =
-        c.data_leader().unwrap().read(b"k").await
+    if let Ok(ReadOutcome::Value(Some((version, value)))) = c
+        .data_leader()
+        .unwrap()
+        .read(b"k", Consistency::Linearizable)
+        .await
     {
         assert_eq!(value, b"v1");
         final_state.insert(b"k".to_vec(), version);

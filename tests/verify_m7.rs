@@ -14,7 +14,8 @@ use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::partition::{ApplyResult, TypeConfig};
 use dal::storage::Storage;
 use dal::types::{
-    BootstrapGroup, DataOp, DataRequest, GroupId, IfVersion, KeyPresence, MutationResult,
+    BootstrapGroup, Consistency, DataOp, DataRequest, GroupId, IfVersion, KeyPresence,
+    MutationResult,
 };
 use dal::verify::linearizability::{Invocation, Op, Outcome, is_linearizable};
 use dal::verify::oracles::{Applied, exactly_once, no_lost_write};
@@ -103,9 +104,9 @@ async fn do_write(s: &Shared, req: &DataRequest) -> Option<ApplyResult> {
 async fn do_read(s: &Shared, key: &[u8]) -> Option<Option<(u64, Vec<u8>)>> {
     for _ in 0..400 {
         if let Some(li) = s.leader() {
-            match s.nodes[li].read(key).await {
+            match s.nodes[li].read(key, Consistency::Linearizable).await {
                 Ok(ReadOutcome::Value(v)) => return Some(v),
-                Ok(ReadOutcome::NotLeader { .. }) | Err(_) => {}
+                Ok(ReadOutcome::NotLeader { .. }) | Ok(ReadOutcome::TooStale { .. }) | Err(_) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -29,6 +29,20 @@ pub type Sequence = u64;
 /// strictly monotonic per partition and never reused (DESIGN §4.1).
 pub type Version = u64;
 
+/// Read consistency, selected per request (DESIGN §8.3, §15). The default is
+/// linearizable, so a caller must explicitly opt into staleness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Consistency {
+    /// ReadIndex against the current membership, then serve applied state. The
+    /// only path that never returns a value older than the last ack'd write.
+    Linearizable,
+    /// Serve from any voter's locally-applied state, skipping ReadIndex. May
+    /// return a superseded value. `min_version`, when set, enforces
+    /// read-your-writes / monotonic reads: the replica must have applied at
+    /// least that version or it redirects to fresher candidates.
+    Stale { min_version: Option<Version> },
+}
+
 /// Identifies one Raft group: the single meta group or one data partition.
 ///
 /// `Ord` is derived so groups can live in `BTreeSet`/`BTreeMap` with a stable

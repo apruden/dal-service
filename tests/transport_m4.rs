@@ -21,8 +21,8 @@ use dal::storage::Storage;
 use dal::transport::codec::{Envelope, FrameError, MsgType};
 use dal::transport::{InProcess, Transport};
 use dal::types::{
-    BootstrapGroup, ClusterId, DataOp, DataRequest, GroupId, HashSpec, IfVersion, LogId,
-    NodeDirectoryEntry, NodeState, Placement, Version,
+    BootstrapGroup, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion,
+    LogId, NodeDirectoryEntry, NodeState, Placement, Version,
 };
 
 use proptest::prelude::*;
@@ -363,7 +363,10 @@ async fn wrong_cluster_reply_is_rejected() {
     let leader = c.leader().unwrap();
 
     // A frame stamped with a foreign cluster id.
-    let req = ClientRequest::Read { key: b"k".to_vec() };
+    let req = ClientRequest::Read {
+        key: b"k".to_vec(),
+        consistency: Consistency::Linearizable,
+    };
     let env = Envelope::new(
         0xBAD,
         MsgType::ClientOp,
@@ -403,7 +406,10 @@ async fn mispartitioned_key_is_rejected() {
     let correct = HashSpec::CANONICAL.partition_of(key, 4);
     let wrong = (correct + 1) % 4;
 
-    let req = ClientRequest::Read { key: key.to_vec() };
+    let req = ClientRequest::Read {
+        key: key.to_vec(),
+        consistency: Consistency::Linearizable,
+    };
     let env = Envelope::new(
         CID,
         MsgType::ClientOp,
@@ -490,6 +496,7 @@ async fn retry_across_leader_change_applies_exactly_once() {
     // The value reflects exactly one application.
     let read = ClientRequest::Read {
         key: b"once".to_vec(),
+        consistency: Consistency::Linearizable,
     };
     let served = poll_for_value(&c.switch, &ctrl_addr(new_leader), &read).await;
     assert_eq!(served, Some(b"v1".to_vec()));

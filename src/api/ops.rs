@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::partition::state_machine::{ApplyResult, RejectReason};
 use crate::types::{
-    ClusterId, DataRequest, GroupId, HashSpec, KeyPresence, NodeDirectoryEntry, NodeId, Placement,
-    Version,
+    ClusterId, Consistency, DataRequest, GroupId, HashSpec, KeyPresence, NodeDirectoryEntry,
+    NodeId, Placement, Version,
 };
 
 /// A client-submitted operation (the `ClientOp` payload). A mutation carries its
@@ -18,7 +18,7 @@ use crate::types::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientRequest {
     Mutate(DataRequest),
-    Read { key: Vec<u8> },
+    Read { key: Vec<u8>, consistency: Consistency },
 }
 
 impl ClientRequest {
@@ -27,7 +27,7 @@ impl ClientRequest {
     pub fn key(&self) -> &[u8] {
         match self {
             ClientRequest::Mutate(req) => req.op.key(),
-            ClientRequest::Read { key } => key,
+            ClientRequest::Read { key, .. } => key,
         }
     }
 }

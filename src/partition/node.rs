@@ -20,7 +20,7 @@ use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
 use crate::partition::sm::RocksStateMachine;
 use crate::partition::state_machine::{ApplyResult, DataStateMachine};
 use crate::storage::Storage;
-use crate::types::{DataRequest, GroupId, Version};
+use crate::types::{Consistency, DataRequest, GroupId, Version};
 
 /// Outcome of a write submitted through the serving gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +32,15 @@ pub enum WriteOutcome {
     },
 }
 
-/// Outcome of a linearizable read.
+/// Outcome of a read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Value(Option<(Version, Vec<u8>)>),
     NotLeader { leader: Option<NodeId> },
+    /// A stale read was refused: this replica is not currently attached to a
+    /// leader, or is behind the caller's `min_version`. Retry a fresher
+    /// candidate (DESIGN §8.3, §15).
+    TooStale { leader: Option<NodeId> },
 }
 
 pub struct PartitionNode {
@@ -193,21 +197,48 @@ impl PartitionNode {
         }
     }
 
-    /// Perform a linearizable read: ReadIndex, then a local get.
-    pub async fn read(&self, key: &[u8]) -> Result<ReadOutcome> {
+    /// Perform a read at the requested consistency. Linearizable runs ReadIndex
+    /// then a local get; stale skips ReadIndex and serves local applied state,
+    /// still gated by the serving gate and a coarse freshness/version check.
+    pub async fn read(&self, key: &[u8], consistency: Consistency) -> Result<ReadOutcome> {
+        // The serving gate is authority on both paths (DESIGN §7.4): an
+        // amnesiac ex-voter or a node that applied its removal still refuses,
+        // so relaxing consistency never resurrects a ghost replica.
         self.storage.require_serving(self.group)?;
-        match self.raft.ensure_linearizable().await {
-            Ok(_) => {
-                let value = self.data.get(&self.storage, key)?;
-                Ok(ReadOutcome::Value(value))
+
+        let min_version = match consistency {
+            Consistency::Linearizable => {
+                return match self.raft.ensure_linearizable().await {
+                    Ok(_) => Ok(ReadOutcome::Value(self.data.get(&self.storage, key)?)),
+                    Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
+                        Ok(ReadOutcome::NotLeader {
+                            leader: f.leader_id,
+                        })
+                    }
+                    Err(e) => Err(Error::Raft(e.to_string())),
+                };
             }
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
-                Ok(ReadOutcome::NotLeader {
-                    leader: f.leader_id,
-                })
-            }
-            Err(e) => Err(Error::Raft(e.to_string())),
+            Consistency::Stale { min_version } => min_version,
+        };
+
+        // Bounded-staleness guard: an isolated replica loses its leader after
+        // the election timeout, so no known leader means "not recently attached
+        // to a quorum" — refuse rather than serve unboundedly-old data. This is
+        // coarse (a merely-slow follower still passes); a precise lag bound
+        // needs a metric openraft does not expose cleanly today.
+        let leader = self.current_leader();
+        if leader.is_none() {
+            return Ok(ReadOutcome::TooStale { leader: None });
         }
+        // Read-your-writes / monotonic: the replica must have caught up to the
+        // version the caller last observed.
+        if let Some(min) = min_version
+            && self.applied_index().unwrap_or(0) < min
+        {
+            return Ok(ReadOutcome::TooStale { leader });
+        }
+        // No ReadIndex, no fsync: just this replica's locally-applied state.
+        Ok(ReadOutcome::Value(self.data.get(&self.storage, key)?))
     }
 
     /// Read this node's *local* applied value for a key, bypassing the serving

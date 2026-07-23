@@ -15,7 +15,7 @@ use dal::partition::ApplyResult;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::storage::Storage;
-use dal::types::{BootstrapGroup, DataOp, DataRequest, GroupId, MutationResult};
+use dal::types::{BootstrapGroup, Consistency, DataOp, DataRequest, GroupId, MutationResult};
 
 use tempfile::TempDir;
 
@@ -125,7 +125,7 @@ async fn bootstrap_write_and_linearizable_read() {
     ));
 
     let li = leader_idx(&nodes).unwrap();
-    match nodes[li].read(b"k").await.unwrap() {
+    match nodes[li].read(b"k", Consistency::Linearizable).await.unwrap() {
         ReadOutcome::Value(Some((_, v))) => assert_eq!(v, b"v"),
         other => panic!("leader read returned {other:?}"),
     }
@@ -133,9 +133,133 @@ async fn bootstrap_write_and_linearizable_read() {
     // A follower must redirect, not serve.
     let fi = (li + 1) % 3;
     assert!(matches!(
-        nodes[fi].read(b"k").await.unwrap(),
+        nodes[fi]
+            .read(b"k", Consistency::Linearizable)
+            .await
+            .unwrap(),
         ReadOutcome::NotLeader { .. }
     ));
+}
+
+/// A stale read is served from a *follower's* local applied state, skipping the
+/// ReadIndex round trip a linearizable read would take (DESIGN §8.3, §15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_serves_stale_read() {
+    let (_h, nodes) = bootstrapped().await;
+    write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
+
+    let li = leader_idx(&nodes).unwrap();
+    let fi = (li + 1) % 3;
+
+    // The follower must have applied the write and know a leader, so the stale
+    // path's freshness guard passes.
+    eventually("follower applied the write", || {
+        matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v")
+            && nodes[fi].current_leader().is_some()
+    })
+    .await;
+
+    // Under linearizable this same follower redirects (see the read test above);
+    // a stale read serves it locally with no ReadIndex.
+    match nodes[fi]
+        .read(b"k", Consistency::Stale { min_version: None })
+        .await
+        .unwrap()
+    {
+        ReadOutcome::Value(Some((_, v))) => assert_eq!(v, b"v"),
+        other => panic!("stale follower read returned {other:?}"),
+    }
+}
+
+/// A stale read whose `min_version` floor is not yet applied is refused rather
+/// than served old, preserving read-your-writes; a satisfiable floor serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_read_below_min_version_redirects() {
+    let (_h, nodes) = bootstrapped().await;
+    let version = match write_to_leader(&nodes, put(1, 1, b"k", b"v")).await {
+        ApplyResult::Decided(MutationResult::Applied { version }) => version,
+        other => panic!("unexpected write outcome: {other:?}"),
+    };
+
+    let li = leader_idx(&nodes).unwrap();
+
+    // A floor beyond anything applied: even the leader refuses.
+    match nodes[li]
+        .read(
+            b"k",
+            Consistency::Stale {
+                min_version: Some(version + 100),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ReadOutcome::TooStale { .. } => {}
+        other => panic!("expected TooStale above the applied floor, got {other:?}"),
+    }
+
+    // The observed version is satisfiable and serves. The applied-index metric
+    // lags the actual apply, so the floor can refuse transiently right after the
+    // write — the real client retries the resulting redirect, so poll here too.
+    eventually("leader's applied-index metric reaches the write", || {
+        nodes[li].applied_index().unwrap_or(0) >= version
+    })
+    .await;
+    match nodes[li]
+        .read(
+            b"k",
+            Consistency::Stale {
+                min_version: Some(version),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ReadOutcome::Value(Some((got, v))) => {
+            assert_eq!(v, b"v");
+            assert_eq!(got, version);
+        }
+        other => panic!("expected value at the applied floor, got {other:?}"),
+    }
+}
+
+/// The bounded-staleness guard: a replica no longer attached to a leader refuses
+/// a stale read rather than serve unboundedly-old data (DESIGN §15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_replica_refuses_stale_read() {
+    let (h, nodes) = bootstrapped().await;
+    write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
+
+    let li = leader_idx(&nodes).unwrap();
+    let fi = (li + 1) % 3;
+    // The follower has the value locally before we cut it off.
+    eventually("follower applied the write", || {
+        matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v")
+    })
+    .await;
+
+    let others: Vec<u64> = VOTERS
+        .iter()
+        .copied()
+        .filter(|&v| v != nodes[fi].node_id())
+        .collect();
+    h.faults.isolate(nodes[fi].node_id(), &others);
+
+    eventually("isolated follower loses its leader", || {
+        nodes[fi].current_leader().is_none()
+    })
+    .await;
+
+    // Even though it holds the value locally, no known leader means "not recently
+    // attached to a quorum": refuse.
+    match nodes[fi]
+        .read(b"k", Consistency::Stale { min_version: None })
+        .await
+        .unwrap()
+    {
+        ReadOutcome::TooStale { .. } => {}
+        other => panic!("isolated replica served a stale read: {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -183,7 +307,8 @@ async fn leader_failover_preserves_acknowledged_write() {
             .copied()
             .find(|&i| nodes[i].current_leader() == Some(nodes[i].node_id()));
         if let Some(li) = li
-            && let ReadOutcome::Value(Some((_, v))) = nodes[li].read(b"k").await.unwrap()
+            && let ReadOutcome::Value(Some((_, v))) =
+                nodes[li].read(b"k", Consistency::Linearizable).await.unwrap()
         {
             assert_eq!(v, b"v");
             served = true;
@@ -211,9 +336,9 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
     // ReadIndex cannot reach a quorum, so it redirects or errors.
     let mut safe = false;
     for _ in 0..200 {
-        match nodes[old].read(b"k").await {
+        match nodes[old].read(b"k", Consistency::Linearizable).await {
             Ok(ReadOutcome::Value(_)) => {}
-            Ok(ReadOutcome::NotLeader { .. }) | Err(_) => {
+            Ok(ReadOutcome::NotLeader { .. }) | Ok(ReadOutcome::TooStale { .. }) | Err(_) => {
                 safe = true;
                 break;
             }

@@ -21,8 +21,8 @@ use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::storage::Storage;
 use dal::types::{
-    BootstrapGroup, ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, LearnerAdmission,
-    NodeId, PROTOCOL_VERSION,
+    BootstrapGroup, ClusterConfig, Consistency, DataOp, DataRequest, GroupId, HashSpec,
+    LearnerAdmission, NodeId, PROTOCOL_VERSION,
 };
 
 use tempfile::TempDir;
@@ -243,7 +243,7 @@ async fn data_write(c: &Cluster, req: DataRequest) -> bool {
 async fn data_read(c: &Cluster, key: &[u8]) -> Option<Vec<u8>> {
     for _ in 0..200 {
         if let Some(leader) = c.data_leader()
-            && let Ok(ReadOutcome::Value(v)) = leader.read(key).await
+            && let Ok(ReadOutcome::Value(v)) = leader.read(key, Consistency::Linearizable).await
         {
             return v.map(|(_, bytes)| bytes);
         }

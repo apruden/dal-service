@@ -21,8 +21,8 @@ use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::types::{
-    ClientId, ClusterId, DataOp, DataRequest, GroupId, HashSpec, IfVersion, NodeId, Sequence,
-    Version,
+    ClientId, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion, NodeId,
+    Sequence, Version,
 };
 
 /// How many refresh-and-retry rounds a single operation will attempt before
@@ -61,6 +61,23 @@ pub struct Client<T: Transport> {
     mutation_locks: Mutex<HashMap<u16, Arc<AsyncMutex<()>>>>,
     pending: Mutex<HashMap<u16, PendingMutation>>,
     request_id: AtomicU64,
+    /// Rotates the candidate start position for spread (stale) reads, so
+    /// successive stale reads distribute across replicas (DESIGN §10.1).
+    rotation: AtomicU64,
+}
+
+/// How [`Client::route`] orders the candidate nodes for an operation.
+#[derive(Clone, Copy)]
+enum RouteOrder {
+    /// Cached `leader_hint` first, then the voter set. Writes and linearizable
+    /// reads must reach the leader, so they try it first.
+    LeaderFirst,
+    /// Rotate the voter set per request, spreading stale reads across replicas
+    /// instead of hammering the leader. Every candidate is still tried within a
+    /// round, so a satisfiable read always resolves. When `prefer_hint` is set
+    /// (a `min_version` floor), the cached leader hint — the replica most likely
+    /// to be caught up — leads, then the rotated remainder follows as fallback.
+    Spread { prefer_hint: bool },
 }
 
 impl<T: Transport> Client<T> {
@@ -79,6 +96,7 @@ impl<T: Transport> Client<T> {
             mutation_locks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             request_id: AtomicU64::new(1),
+            rotation: AtomicU64::new(0),
         }
     }
 
@@ -116,15 +134,49 @@ impl<T: Transport> Client<T> {
         .await
     }
 
+    /// Linearizable read (DESIGN §8.3): the default, one quorum round trip.
     pub async fn get(&self, key: &[u8]) -> Result<Option<(Version, Vec<u8>)>> {
+        self.get_with(key, Consistency::Linearizable).await
+    }
+
+    /// Eventually-consistent read (DESIGN §15): any voter may serve from its
+    /// applied state, skipping ReadIndex. `min_version` opts into
+    /// read-your-writes / monotonic reads; `None` accepts any applied value.
+    pub async fn stale_get(
+        &self,
+        key: &[u8],
+        min_version: Option<Version>,
+    ) -> Result<Option<(Version, Vec<u8>)>> {
+        self.get_with(key, Consistency::Stale { min_version }).await
+    }
+
+    async fn get_with(
+        &self,
+        key: &[u8],
+        consistency: Consistency,
+    ) -> Result<Option<(Version, Vec<u8>)>> {
         let partition = self.partition_of(key).await?;
-        let request = ClientRequest::Read { key: key.to_vec() };
+        // A stale read may be served by any voter, so spread across replicas; a
+        // linearizable read must reach the leader, so try the hint first. A stale
+        // read with a `min_version` floor still spreads, but leads with the hint
+        // since the leader is likeliest to have applied that version.
+        let order = match consistency {
+            Consistency::Linearizable => RouteOrder::LeaderFirst,
+            Consistency::Stale { min_version } => RouteOrder::Spread {
+                prefer_hint: min_version.is_some(),
+            },
+        };
+        let request = ClientRequest::Read {
+            key: key.to_vec(),
+            consistency,
+        };
         let reply = self
             .route(
                 partition,
                 MsgType::ClientOp,
                 GroupId::Data(partition),
                 &request,
+                order,
             )
             .await?;
         match reply {
@@ -152,6 +204,7 @@ impl<T: Transport> Client<T> {
                 MsgType::ClientOp,
                 GroupId::Data(partition),
                 &request,
+                RouteOrder::LeaderFirst,
             )
             .await?;
 
@@ -276,19 +329,41 @@ impl<T: Transport> Client<T> {
         )))
     }
 
-    /// The ordered candidate list for a partition: cached `leader_hint` first,
-    /// then the placement's voter set (DESIGN §8.1).
-    fn candidate_nodes(&self, partition: u16) -> Vec<NodeId> {
+    /// The ordered candidate list for a partition (DESIGN §8.1). `LeaderFirst`
+    /// puts the cached `leader_hint` ahead of the voter set; `Spread` omits the
+    /// hint and rotates the voter set per call so stale reads distribute.
+    fn candidate_nodes(&self, partition: u16, order: RouteOrder) -> Vec<NodeId> {
         let cache = self.cache.lock().unwrap();
+        let lead_with_hint = matches!(
+            order,
+            RouteOrder::LeaderFirst | RouteOrder::Spread { prefer_hint: true }
+        );
+
+        let Some(info) = cache.routing.as_ref() else {
+            // No routing yet: the only lead we might have is a redirect hint.
+            return match (lead_with_hint, cache.leader_hint.get(&partition)) {
+                (true, Some(&hint)) => vec![hint],
+                _ => Vec::new(),
+            };
+        };
+
+        let mut voters = info.candidates(partition);
+        if let RouteOrder::Spread { .. } = order
+            && !voters.is_empty()
+        {
+            let shift = (self.rotation.fetch_add(1, Ordering::Relaxed) as usize) % voters.len();
+            voters.rotate_left(shift);
+        }
+
         let mut out = Vec::new();
-        if let Some(&hint) = cache.leader_hint.get(&partition) {
+        if lead_with_hint
+            && let Some(&hint) = cache.leader_hint.get(&partition)
+        {
             out.push(hint);
         }
-        if let Some(info) = cache.routing.as_ref() {
-            for c in info.candidates(partition) {
-                if !out.contains(&c) {
-                    out.push(c);
-                }
+        for c in voters {
+            if !out.contains(&c) {
+                out.push(c);
             }
         }
         out
@@ -312,11 +387,12 @@ impl<T: Transport> Client<T> {
         msg_type: MsgType,
         group: GroupId,
         request: &ClientRequest,
+        order: RouteOrder,
     ) -> Result<ClientReply> {
         let payload = codec::encode(request);
 
         for _round in 0..MAX_ROUNDS {
-            let candidates = self.candidate_nodes(partition);
+            let candidates = self.candidate_nodes(partition, order);
             let mut redirected = false;
 
             for node in candidates {
@@ -383,6 +459,98 @@ impl<T: Transport> Client<T> {
                     cache.leader_hint.remove(&partition);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ops::RoutingInfo;
+    use crate::transport::{InProcess, Server};
+    use crate::types::{HashSpec, LogId, Placement};
+
+    struct NullServer;
+    impl Server for NullServer {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            request
+        }
+    }
+
+    /// A client whose cache already knows partition 0's voter set, so
+    /// `candidate_nodes` can be exercised without any network.
+    fn client_with_voters(voters: Vec<NodeId>) -> Client<InProcess<NullServer>> {
+        let client = Client::new(1, 1, Vec::new(), InProcess::new());
+        client.cache.lock().unwrap().routing = Some(RoutingInfo {
+            cluster_id: 1,
+            p: 1,
+            hash_spec: HashSpec::CANONICAL,
+            directory: Vec::new(),
+            placements: vec![(
+                0,
+                Placement {
+                    voters,
+                    voters_log_id: LogId::new(1, 1),
+                    r#move: None,
+                },
+            )],
+        });
+        client
+    }
+
+    #[test]
+    fn leader_first_prepends_hint_and_dedupes() {
+        let client = client_with_voters(vec![1, 2, 3]);
+        client.cache.lock().unwrap().leader_hint.insert(0, 3);
+        // The hint leads; the remaining voters follow without duplicating it.
+        assert_eq!(
+            client.candidate_nodes(0, RouteOrder::LeaderFirst),
+            vec![3, 1, 2]
+        );
+    }
+
+    #[test]
+    fn spread_omits_hint_and_rotates_over_all_voters() {
+        let client = client_with_voters(vec![1, 2, 3]);
+        // A stale hint must not bias the spread order (min_version: None).
+        client.cache.lock().unwrap().leader_hint.insert(0, 3);
+
+        // Successive stale reads start at rotating positions, so load spreads
+        // instead of always hitting the same replica.
+        let orders: Vec<Vec<NodeId>> = (0..3)
+            .map(|_| client.candidate_nodes(0, RouteOrder::Spread { prefer_hint: false }))
+            .collect();
+        assert_eq!(orders[0], vec![1, 2, 3]);
+        assert_eq!(orders[1], vec![2, 3, 1]);
+        assert_eq!(orders[2], vec![3, 1, 2]);
+
+        // Each order is still a full permutation of the voter set, so every
+        // candidate is tried within a round and a satisfiable read never starves.
+        for order in &orders {
+            let mut sorted = order.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec![1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn spread_with_min_version_leads_with_hint_then_rotates() {
+        let client = client_with_voters(vec![1, 2, 3]);
+        client.cache.lock().unwrap().leader_hint.insert(0, 3);
+
+        // A `min_version` floor keeps the hinted leader first every attempt (it
+        // is likeliest caught up), while the remaining voters still rotate as a
+        // spread fallback.
+        let a = client.candidate_nodes(0, RouteOrder::Spread { prefer_hint: true });
+        let b = client.candidate_nodes(0, RouteOrder::Spread { prefer_hint: true });
+        assert_eq!(a, vec![3, 1, 2]);
+        assert_eq!(b, vec![3, 2, 1]);
+
+        // Still full permutations: every candidate reachable within a round.
+        for order in [&a, &b] {
+            let mut sorted = order.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec![1, 2, 3]);
         }
     }
 }

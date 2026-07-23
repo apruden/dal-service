@@ -126,13 +126,17 @@ impl ClientGateway {
                     Err(e) => ClientReply::Error(format!("write failed: {e}")),
                 }
             }
-            ClientRequest::Read { key } => match node.read(&key).await {
+            ClientRequest::Read { key, consistency } => match node.read(&key, consistency).await {
                 Ok(ReadOutcome::Value(v)) => ClientReply::Value(v),
-                Ok(ReadOutcome::NotLeader { leader }) => ClientReply::Redirect(Redirect {
-                    cluster_id: self.cluster_id,
-                    leader,
-                    candidates: self.candidates(partition),
-                }),
+                // A stale read refused for freshness reuses the redirect channel,
+                // so the client just walks to a fresher candidate (DESIGN §8.3).
+                Ok(ReadOutcome::NotLeader { leader }) | Ok(ReadOutcome::TooStale { leader }) => {
+                    ClientReply::Redirect(Redirect {
+                        cluster_id: self.cluster_id,
+                        leader,
+                        candidates: self.candidates(partition),
+                    })
+                }
                 Err(e) => ClientReply::Error(format!("read failed: {e}")),
             },
         }
