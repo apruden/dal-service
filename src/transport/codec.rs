@@ -221,6 +221,16 @@ impl Envelope {
         buf
     }
 
+    /// Read the `request_id` from an already-framed envelope without decoding or
+    /// validating the payload. Returns `None` if the frame is too short to hold
+    /// the header field. Used by the outbound transport to correlate a reply
+    /// with the request that is waiting for it.
+    pub fn peek_request_id(frame: &[u8]) -> Option<u64> {
+        frame
+            .get(24..32)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+
     /// Parse and validate a frame. Validation order matches DESIGN §10.2:
     /// structural length, version, msg type, group tag, then the size limit —
     /// all before the payload is read out.
