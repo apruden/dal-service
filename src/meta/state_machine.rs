@@ -453,13 +453,20 @@ impl MetaStateMachine {
 
         let observed = voter_set(observation.voter_set.clone());
         let (new_voters, muts_ok): (Vec<NodeId>, bool) = if is_abort {
-            // An abort clears only a plan that is already marked aborting, and
-            // the observed config must equal the original voters (rolled back).
+            // An abort report resolves only a plan already marked aborting. Its
+            // single voter set is either `voters` (the move never completed —
+            // clear/roll back) or `target_voters` (the move actually completed
+            // before the abort — finalize benignly). DESIGN §7.5.
             if !plan.aborting {
                 return Ok((reject(MetaReject::NotAborting), vec![]));
             }
-            let matches = observed == voter_set(placement.voters.clone());
-            (placement.voters.clone(), matches)
+            if observed == voter_set(placement.voters.clone()) {
+                (placement.voters.clone(), true)
+            } else if observed == voter_set(plan.target_voters.clone()) {
+                (plan.target_voters.clone(), true)
+            } else {
+                (placement.voters.clone(), false)
+            }
         } else {
             // A finalize completes a healthy plan; the observed config must
             // equal the planned target.

@@ -14,7 +14,7 @@ use dal::meta::node::MetaNode;
 use dal::meta::raft_types::MetaTypeConfig;
 use dal::meta::node::MetaRead;
 use dal::meta::rebalancer::{
-    create_plan, drain_partition, execute_abort, execute_move, mark_aborting,
+    create_plan, drain_partition, execute_abort, execute_move, mark_aborting, resume_move,
 };
 use dal::meta::reconcile::{reconcile, ReconcileAction};
 use dal::partition::network::{Faults, Registry};
@@ -380,4 +380,183 @@ async fn interrupted_move_resumes_from_committed_config() {
         .await
         .unwrap();
     assert_eq!(meta_voters(&c).await, target);
+}
+
+/// The replace-a-follower target for a plan that keeps the current leader.
+fn follower_target(c: &Cluster) -> (Vec<NodeId>, u64) {
+    let leader = c.data_leader().unwrap();
+    let victim = DATA_VOTERS
+        .iter()
+        .copied()
+        .find(|&v| v != leader.node_id())
+        .unwrap();
+    let mut target: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != victim).collect();
+    target.push(4);
+    target.sort_unstable();
+    (target, victim)
+}
+
+// -- crash-after-every-step resume matrix (DESIGN §5.2, §7) -------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn resume_after_create_plan() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    // Crash right after step 1 (plan committed, nothing executed).
+    create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    resume_move(&c.meta_slice(), &leader, GroupId::Data(PART))
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn resume_after_add_learner() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    // Crash after step 3 (learner added, not promoted).
+    leader.add_learner(4).await.unwrap();
+    resume_move(&c.meta_slice(), &leader, GroupId::Data(PART))
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn resume_after_change_membership() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    // Crash after step 4 (membership committed, meta not yet finalized).
+    leader.add_learner(4).await.unwrap();
+    leader.change_voters(&target).await.unwrap();
+    resume_move(&c.meta_slice(), &leader, GroupId::Data(PART))
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn duplicate_finalize_is_benign() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    execute_move(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+
+    // A resume after the plan is fully resolved is a no-op (NoPlan): a delayed
+    // or duplicate finalization cannot re-drive a cleared plan.
+    resume_move(&c.meta_slice(), &leader, GroupId::Data(PART))
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn abort_racing_a_completed_move_finalizes_benignly() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    // The move actually completes (committed config == target) ...
+    leader.add_learner(4).await.unwrap();
+    leader.change_voters(&target).await.unwrap();
+    // ... but an abort is marked concurrently. The leader observes the target
+    // config and finalizes benignly rather than rolling back (§7.5).
+    mark_aborting(&c.meta_slice(), GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    execute_abort(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cleared_plan_cannot_be_resurrected() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    let leader = c.data_leader().unwrap();
+    let (target, _) = follower_target(&c);
+
+    let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    // Abort before the learner ever joins: the plan clears, rolling back.
+    mark_aborting(&c.meta_slice(), GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    execute_abort(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+
+    let mut original = DATA_VOTERS.to_vec();
+    original.sort_unstable();
+    assert_eq!(meta_voters(&c).await, original);
+
+    // A replayed abort report for the cleared plan is refused, not honoured.
+    assert!(
+        execute_abort(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+            .await
+            .is_err(),
+        "a cleared plan must not be re-abortable"
+    );
+    // And reconciliation is a no-op (no plan to resume).
+    resume_move(&c.meta_slice(), &leader, GroupId::Data(PART))
+        .await
+        .unwrap();
+    assert_eq!(meta_voters(&c).await, original);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn drain_removes_the_current_leader() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    write_to_leader(&c, put(1, b"k", b"v1")).await;
+    c.start_data(4).await;
+
+    // Drain the *leader*: change_membership removes it, openraft steps it down
+    // after the final config commits, and the move still finalizes.
+    let leader = c.data_leader().unwrap();
+    let draining = leader.node_id();
+    drain_partition(&c.meta_slice(), &leader, GroupId::Data(PART), draining, 4)
+        .await
+        .unwrap();
+
+    let mut expected: Vec<NodeId> = DATA_VOTERS.iter().copied().filter(|&v| v != draining).collect();
+    expected.push(4);
+    expected.sort_unstable();
+    assert_eq!(meta_voters(&c).await, expected);
 }

@@ -352,15 +352,17 @@ fn abort_only_clears_an_aborting_plan_rolled_back() {
         MetaApplyResult::Rejected(MetaReject::PlanAborting)
     );
 
-    // The abort observation must roll back to the original voters.
+    // An abort report must carry exactly `voters` or `target_voters`; anything
+    // else is rejected (DESIGN §7.5).
     assert_eq!(
         m.apply(MetaCommand::AbortReport {
             group: GroupId::Data(0),
             plan_id,
-            observation: obs(GroupId::Data(0), plan_id, &[1, 2, 4]),
+            observation: obs(GroupId::Data(0), plan_id, &[1, 2, 9]),
         }),
         MetaApplyResult::Rejected(MetaReject::ObservationMismatch)
     );
+    // Reporting `voters` clears the plan and rolls back.
     assert_eq!(
         m.apply(MetaCommand::AbortReport {
             group: GroupId::Data(0),
@@ -371,6 +373,32 @@ fn abort_only_clears_an_aborting_plan_rolled_back() {
     );
     let placement = m.placement(GroupId::Data(0)).unwrap();
     assert_eq!(placement.voters, vec![1, 2, 3], "voters roll back on abort");
+    assert!(placement.r#move.is_none());
+}
+
+#[test]
+fn abort_report_with_target_finalizes_a_completed_move() {
+    let mut m = Meta::new();
+    m.bootstrap(8, 3, &[1, 2, 3], &[1, 2, 3, 4]);
+    m.seed(GroupId::Data(0), &[1, 2, 3]);
+    let (_, plan_id) = m.create_plan(GroupId::Data(0), &[1, 2, 4]);
+    m.apply(MetaCommand::MarkAborting {
+        group: GroupId::Data(0),
+        plan_id,
+    });
+
+    // The move actually completed (config == target) before the abort resolved:
+    // the report carries `target_voters` and meta finalizes benignly.
+    assert_eq!(
+        m.apply(MetaCommand::AbortReport {
+            group: GroupId::Data(0),
+            plan_id,
+            observation: obs(GroupId::Data(0), plan_id, &[1, 2, 4]),
+        }),
+        MetaApplyResult::Applied
+    );
+    let placement = m.placement(GroupId::Data(0)).unwrap();
+    assert_eq!(placement.voters, vec![1, 2, 4], "late completion finalizes");
     assert!(placement.r#move.is_none());
 }
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
-use crate::meta::reconcile::{gate, GateDecision};
+use crate::meta::reconcile::{gate, reconcile, GateDecision, ReconcileAction};
 use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::node::PartitionNode;
 use crate::types::{
@@ -91,23 +91,89 @@ pub async fn execute_move(
     data_leader.add_learner(learner).await?;
     // Step 4: joint-consensus change to the target voter set.
     data_leader.change_voters(&target).await?;
-
     // Step 5: barrier on the new config, then a single-voter-set observation.
+    let _ = target_set;
+    finalize(meta, data_leader, group, plan_id, &target).await
+}
+
+/// Step 5 in isolation: barrier on the target config being committed and
+/// applied, then submit a single-voter-set `DataConfigObservation`. Split out so
+/// the resume driver can finalize a move whose membership change already
+/// committed before a crash.
+async fn finalize(
+    meta: &[Arc<MetaNode>],
+    data_leader: &PartitionNode,
+    group: GroupId,
+    plan_id: u64,
+    target: &[NodeId],
+) -> Result<()> {
+    let target_set = voter_set(target.to_vec());
     wait_committed(data_leader, &target_set).await?;
     let (config_log_id, _) = data_leader.committed_config();
     let config_log_id =
         config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
-
     let observation = DataConfigObservation {
         group,
         plan_id,
-        voter_set: target,
+        voter_set: target.to_vec(),
         config_log_id,
     };
     accept(
         propose(meta, MetaCommand::FinalizePlan { group, plan_id, observation }).await?,
         "FinalizePlan",
     )
+}
+
+/// Startup / crash reconciliation for one group (DESIGN §5.2, IMPLEMENTATION
+/// §M6). Reads the meta record and the data group's committed voter set, then
+/// drives the plan to a consistent end state from whatever durable point a
+/// crash left behind — resume, complete the joint change, finalize, or confirm
+/// an abort. Idempotent: a fully-resolved plan reconciles to a no-op.
+pub async fn resume_move(
+    meta: &[Arc<MetaNode>],
+    data_leader: &PartitionNode,
+    group: GroupId,
+) -> Result<()> {
+    let Some(placement) = read_placement(meta, group).await? else {
+        return Ok(());
+    };
+    let Some(plan) = placement.r#move.clone() else {
+        return Ok(());
+    };
+    let committed = data_leader.committed_voter_set();
+
+    match reconcile(&placement, &committed) {
+        ReconcileAction::NoPlan => Ok(()),
+        // Committed config still equals `voters`: the change never happened.
+        ReconcileAction::ResumePlan => {
+            if plan.aborting {
+                execute_abort(meta, data_leader, group, plan.plan_id).await
+            } else {
+                execute_move(meta, data_leader, group, plan.plan_id).await
+            }
+        }
+        // A joint config is in effect: complete the change, then resolve.
+        ReconcileAction::CompleteJoint => {
+            data_leader.change_voters(&plan.target_voters).await?;
+            if plan.aborting {
+                execute_abort(meta, data_leader, group, plan.plan_id).await
+            } else {
+                finalize(meta, data_leader, group, plan.plan_id, &plan.target_voters).await
+            }
+        }
+        // Final config committed but the plan is not yet cleared: finalize (or,
+        // for an aborting plan, report the benign late completion).
+        ReconcileAction::Finalize => {
+            if plan.aborting {
+                execute_abort(meta, data_leader, group, plan.plan_id).await
+            } else {
+                finalize(meta, data_leader, group, plan.plan_id, &plan.target_voters).await
+            }
+        }
+        ReconcileAction::Error => Err(Error::Raft(
+            "reconcile: committed config matches no plan phase".into(),
+        )),
+    }
 }
 
 /// Drive an aborting plan to resolution (DESIGN §7.5). Handles the common case
@@ -140,11 +206,13 @@ pub async fn execute_abort(
         config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
 
     // A joint config must be resolved by the leader before it can report a
-    // single voter set (§7.5); complete the change toward the target.
-    let (voter_set_report, command) = if committed == voters {
-        (placement.voters.clone(), true) // abort: roll back to voters
+    // single voter set (§7.5). The abort report always carries exactly `voters`
+    // (roll back / clear) or exactly `target_voters` (the move completed before
+    // the abort — meta finalizes benignly).
+    let voter_set_report = if committed == voters {
+        placement.voters.clone()
     } else if committed == target {
-        (plan.target_voters.clone(), false) // late completion: finalize
+        plan.target_voters.clone()
     } else {
         return Err(Error::Raft(
             "joint config in flight; leader must complete the change first".into(),
@@ -157,12 +225,10 @@ pub async fn execute_abort(
         voter_set: voter_set_report,
         config_log_id,
     };
-    let cmd = if command {
-        MetaCommand::AbortReport { group, plan_id, observation }
-    } else {
-        MetaCommand::FinalizePlan { group, plan_id, observation }
-    };
-    accept(propose(meta, cmd).await?, "abort resolution")
+    accept(
+        propose(meta, MetaCommand::AbortReport { group, plan_id, observation }).await?,
+        "abort resolution",
+    )
 }
 
 /// Commit a directory state transition (DESIGN §9.1). The incarnation must be
