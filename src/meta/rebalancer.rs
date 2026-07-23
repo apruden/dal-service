@@ -1,0 +1,209 @@
+//! The fenced move and abort drivers (DESIGN §7.2, §7.5, IMPLEMENTATION §M6).
+//!
+//! The data-Raft leader is the single serialization point for a partition's
+//! membership change; the meta group is a durable work queue and routing aid.
+//! Every step is idempotent so a crash resumes from the data group's committed
+//! config (§5.2). These drivers orchestrate already-running meta and data nodes
+//! over the ChannelNetwork; the target learner's runtime (durable admission +
+//! group start) is a precondition, exactly as a real node would arrange before
+//! answering `BecomeLearner`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
+use crate::meta::reconcile::{gate, GateDecision};
+use crate::meta::state_machine::MetaApplyResult;
+use crate::partition::node::PartitionNode;
+use crate::types::{voter_set, DataConfigObservation, GroupId, MetaCommand, NodeId, Placement};
+
+/// Commit a `CreatePlan` for `group` and return its assigned `plan_id` (the meta
+/// log index of creation — DESIGN §5.2).
+pub async fn create_plan(
+    meta: &[Arc<MetaNode>],
+    group: GroupId,
+    target_voters: &[NodeId],
+) -> Result<u64> {
+    accept(
+        propose(
+            meta,
+            MetaCommand::CreatePlan {
+                group,
+                plan_id: 0,
+                target_voters: target_voters.to_vec(),
+            },
+        )
+        .await?,
+        "CreatePlan",
+    )?;
+    let placement = read_placement(meta, group)
+        .await?
+        .ok_or_else(|| Error::Raft("placement missing after CreatePlan".into()))?;
+    placement
+        .r#move
+        .map(|m| m.plan_id)
+        .ok_or_else(|| Error::Raft("move missing after CreatePlan".into()))
+}
+
+/// Mark a plan aborting (operator command, or failure handling when the planned
+/// learner is `Down` — DESIGN §7.5). One-way.
+pub async fn mark_aborting(meta: &[Arc<MetaNode>], group: GroupId, plan_id: u64) -> Result<()> {
+    accept(
+        propose(meta, MetaCommand::MarkAborting { group, plan_id }).await?,
+        "MarkAborting",
+    )
+}
+
+/// Drive a healthy plan to completion (DESIGN §7.2 steps 3–5). Preconditions:
+/// the plan is committed and the added learner's `PartitionNode` is already
+/// started and reachable (its durable admission recorded).
+pub async fn execute_move(
+    meta: &[Arc<MetaNode>],
+    data_leader: &PartitionNode,
+    group: GroupId,
+    plan_id: u64,
+) -> Result<()> {
+    let placement = read_placement(meta, group)
+        .await?
+        .ok_or_else(|| Error::Raft("no placement for move".into()))?;
+
+    // §7.1 gate: the leader re-checks the record against its own committed
+    // config before starting or resuming.
+    match gate(&placement, &data_leader.committed_voter_set()) {
+        GateDecision::Accept => {}
+        other => return Err(Error::Raft(format!("move gate refused: {other:?}"))),
+    }
+    let plan = placement.r#move.as_ref().unwrap();
+    let target = plan.target_voters.clone();
+
+    // The learner is the single node the target adds over the current voters.
+    let current = voter_set(placement.voters.clone());
+    let target_set = voter_set(target.clone());
+    let learner = *target_set
+        .difference(&current)
+        .next()
+        .ok_or_else(|| Error::Raft("target adds no learner".into()))?;
+
+    // Step 3: add as learner and block for durable catch-up.
+    data_leader.add_learner(learner).await?;
+    // Step 4: joint-consensus change to the target voter set.
+    data_leader.change_voters(&target).await?;
+
+    // Step 5: barrier on the new config, then a single-voter-set observation.
+    wait_committed(data_leader, &target_set).await?;
+    let (config_log_id, _) = data_leader.committed_config();
+    let config_log_id =
+        config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
+
+    let observation = DataConfigObservation {
+        group,
+        plan_id,
+        voter_set: target,
+        config_log_id,
+    };
+    accept(
+        propose(meta, MetaCommand::FinalizePlan { group, plan_id, observation }).await?,
+        "FinalizePlan",
+    )
+}
+
+/// Drive an aborting plan to resolution (DESIGN §7.5). Handles the common case
+/// where the learner was never promoted (committed config still equals
+/// `voters`): the leader reports `voters` and the meta group clears the plan. If
+/// the move actually completed (config equals `target_voters`) it finalizes
+/// benignly instead.
+pub async fn execute_abort(
+    meta: &[Arc<MetaNode>],
+    data_leader: &PartitionNode,
+    group: GroupId,
+    plan_id: u64,
+) -> Result<()> {
+    let placement = read_placement(meta, group)
+        .await?
+        .ok_or_else(|| Error::Raft("no placement for abort".into()))?;
+    let plan = placement
+        .r#move
+        .as_ref()
+        .ok_or_else(|| Error::Raft("no move to abort".into()))?;
+    if !plan.aborting {
+        return Err(Error::Raft("plan is not marked aborting".into()));
+    }
+
+    let voters = voter_set(placement.voters.clone());
+    let target = voter_set(plan.target_voters.clone());
+    let committed = data_leader.committed_voter_set();
+    let (config_log_id, _) = data_leader.committed_config();
+    let config_log_id =
+        config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
+
+    // A joint config must be resolved by the leader before it can report a
+    // single voter set (§7.5); complete the change toward the target.
+    let (voter_set_report, command) = if committed == voters {
+        (placement.voters.clone(), true) // abort: roll back to voters
+    } else if committed == target {
+        (plan.target_voters.clone(), false) // late completion: finalize
+    } else {
+        return Err(Error::Raft(
+            "joint config in flight; leader must complete the change first".into(),
+        ));
+    };
+
+    let observation = DataConfigObservation {
+        group,
+        plan_id,
+        voter_set: voter_set_report,
+        config_log_id,
+    };
+    let cmd = if command {
+        MetaCommand::AbortReport { group, plan_id, observation }
+    } else {
+        MetaCommand::FinalizePlan { group, plan_id, observation }
+    };
+    accept(propose(meta, cmd).await?, "abort resolution")
+}
+
+// -- internals --------------------------------------------------------------
+
+async fn wait_committed(node: &PartitionNode, target: &std::collections::BTreeSet<NodeId>) -> Result<()> {
+    for _ in 0..200 {
+        if &node.committed_voter_set() == target {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err(Error::Raft("timed out waiting for committed config".into()))
+}
+
+async fn read_placement(meta: &[Arc<MetaNode>], group: GroupId) -> Result<Option<Placement>> {
+    for _ in 0..200 {
+        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+            match leader.read_placement(group).await? {
+                MetaRead::Value(p) => return Ok(p),
+                MetaRead::NotLeader { .. } => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::Raft("no meta leader for placement read".into()))
+}
+
+async fn propose(meta: &[Arc<MetaNode>], cmd: MetaCommand) -> Result<MetaApplyResult> {
+    for _ in 0..200 {
+        if let Some(leader) = meta.iter().find(|n| n.current_leader() == Some(n.node_id())) {
+            match leader.propose(cmd.clone()).await? {
+                ProposeOutcome::Applied(r) => return Ok(r),
+                ProposeOutcome::NotLeader { .. } => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(Error::Raft("no meta leader accepted the command".into()))
+}
+
+fn accept(result: MetaApplyResult, what: &str) -> Result<()> {
+    match result {
+        MetaApplyResult::Applied | MetaApplyResult::NoOp => Ok(()),
+        MetaApplyResult::Rejected(r) => Err(Error::Raft(format!("{what} rejected: {r:?}"))),
+    }
+}

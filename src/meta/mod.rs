@@ -3,7 +3,10 @@
 //! validation; the running meta Raft group and bootstrap driver build on it.
 
 pub mod bootstrap;
+pub mod failure;
 pub mod node;
 pub mod raft_types;
+pub mod rebalancer;
+pub mod reconcile;
 pub mod sm;
 pub mod state_machine;

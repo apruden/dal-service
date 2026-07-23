@@ -9,11 +9,21 @@ use dal::types::{DataOp, DataRequest, GroupId, IfVersion, KeyPresence, MutationR
 static SERIAL: Mutex<()> = Mutex::new(());
 const G: GroupId = GroupId::Data(0);
 
-fn sm_storage() -> (DataStateMachine, tempfile::TempDir, Storage) {
+/// Every test holds `SERIAL` for its whole duration: the `apply_state`
+/// failpoint is process-global, so a crash test injecting it must not overlap a
+/// normal test calling the same durable path. The guard is returned and bound by
+/// the caller so it lives as long as the test.
+fn sm_storage() -> (
+    DataStateMachine,
+    tempfile::TempDir,
+    Storage,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
     storage.ensure_group(G).unwrap();
-    (DataStateMachine::new(G), dir, storage)
+    (DataStateMachine::new(G), dir, storage, guard)
 }
 
 fn put(client: u128, seq: u64, key: &[u8], val: &[u8], iv: Option<IfVersion>) -> DataRequest {
@@ -41,7 +51,7 @@ fn del(client: u128, seq: u64, key: &[u8], iv: Option<IfVersion>) -> DataRequest
 
 #[test]
 fn basic_put_get_delete() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     let r = sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
     assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 10 }));
     assert_eq!(sm.get(&s, b"k").unwrap(), Some((10, b"v".to_vec())));
@@ -53,7 +63,7 @@ fn basic_put_get_delete() {
 
 #[test]
 fn retry_returns_stored_result_without_reapplying() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
     // Same (client, sequence, op) replayed at a later index: stored result,
     // and crucially the key version is NOT bumped to the new index.
@@ -64,7 +74,7 @@ fn retry_returns_stored_result_without_reapplying() {
 
 #[test]
 fn same_sequence_different_command_is_rejected() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
     let r = sm.apply(&s, &put(1, 1, b"k", b"DIFFERENT", None), 11).unwrap();
     assert_eq!(r, ApplyResult::Rejected(RejectReason::SequenceMismatch));
@@ -76,7 +86,7 @@ fn same_sequence_different_command_is_rejected() {
 fn failed_cas_advances_highest_avoiding_wedge() {
     // The §8.4 wedge case: a failed CAS must still advance `highest`, else the
     // client's next sequence is seen as a gap and its stream wedges forever.
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap(); // version 10
     let r = sm
         .apply(&s, &put(1, 2, b"k", b"x", Some(IfVersion::Number(999))), 11)
@@ -94,7 +104,7 @@ fn failed_cas_advances_highest_avoiding_wedge() {
 
 #[test]
 fn numeric_cas_against_absent_fails() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     let r = sm
         .apply(&s, &put(1, 1, b"k", b"v", Some(IfVersion::Number(0))), 10)
         .unwrap();
@@ -109,7 +119,7 @@ fn numeric_cas_against_absent_fails() {
 
 #[test]
 fn put_absent_is_create_only() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     let r = sm
         .apply(&s, &put(1, 1, b"k", b"v", Some(IfVersion::Absent)), 10)
         .unwrap();
@@ -128,7 +138,7 @@ fn put_absent_is_create_only() {
 
 #[test]
 fn delete_recreate_keeps_versions_strictly_increasing() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"a", None), 10).unwrap();
     sm.apply(&s, &del(1, 2, b"k", None), 20).unwrap();
     sm.apply(&s, &put(1, 3, b"k", b"b", None), 30).unwrap();
@@ -138,7 +148,7 @@ fn delete_recreate_keeps_versions_strictly_increasing() {
 
 #[test]
 fn unconditional_delete_of_absent_is_applied() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     let r = sm.apply(&s, &del(1, 1, b"missing", None), 10).unwrap();
     assert_eq!(r, ApplyResult::Decided(MutationResult::Applied { version: 10 }));
     assert_eq!(sm.get(&s, b"missing").unwrap(), None);
@@ -146,7 +156,7 @@ fn unconditional_delete_of_absent_is_applied() {
 
 #[test]
 fn delete_with_absent_sentinel_is_malformed() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     let r = sm
         .apply(&s, &del(1, 1, b"k", Some(IfVersion::Absent)), 10)
         .unwrap();
@@ -160,7 +170,7 @@ fn delete_with_absent_sentinel_is_malformed() {
 
 #[test]
 fn gapped_and_stale_sequences_are_rejected() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
     // Gap: highest is 1, jump to 3.
     let r = sm.apply(&s, &put(1, 3, b"k", b"v", None), 11).unwrap();
@@ -181,7 +191,7 @@ fn gapped_and_stale_sequences_are_rejected() {
 fn every_committed_entry_advances_last_applied() {
     // Decided, replayed, and rejected entries all move last_applied forward so
     // Raft can never wedge.
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 11).unwrap(); // replay
     sm.apply(&s, &put(1, 5, b"k", b"v", None), 12).unwrap(); // gap reject
@@ -190,7 +200,7 @@ fn every_committed_entry_advances_last_applied() {
 
 #[test]
 fn independent_clients_have_independent_sequences() {
-    let (sm, _d, s) = sm_storage();
+    let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"a", b"1", None), 10).unwrap();
     // Different client also starts at sequence 1.
     let r = sm.apply(&s, &put(2, 1, b"b", b"2", None), 11).unwrap();
@@ -199,7 +209,7 @@ fn independent_clients_have_independent_sequences() {
 
 #[test]
 fn crash_between_applies_recovers_to_prefix() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();

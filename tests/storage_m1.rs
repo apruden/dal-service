@@ -72,6 +72,7 @@ fn group_cf_lifecycle() {
 
 #[test]
 fn cfs_survive_reopen() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();
@@ -88,6 +89,7 @@ fn cfs_survive_reopen() {
 
 #[test]
 fn sequential_applies_recover_to_last_prefix() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();
@@ -104,7 +106,7 @@ fn sequential_applies_recover_to_last_prefix() {
 
 #[test]
 fn crash_before_write_leaves_previous_state() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();
@@ -125,7 +127,7 @@ fn crash_before_write_leaves_previous_state() {
 
 #[test]
 fn crash_after_write_is_durable() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();
@@ -145,7 +147,7 @@ fn crash_after_write_is_durable() {
 
 #[test]
 fn multi_mutation_batch_is_all_or_nothing() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     {
         let s = Storage::open(dir.path()).unwrap();

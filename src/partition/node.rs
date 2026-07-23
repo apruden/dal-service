@@ -120,6 +120,45 @@ impl PartitionNode {
             .map_err(|e| Error::Raft(format!("is_initialized: {e}")))
     }
 
+    /// Admit `id` as a learner and block until it reaches this leader's
+    /// committed log point (DESIGN §7.2 step 3). Only a caught-up learner may
+    /// later be promoted.
+    pub async fn add_learner(&self, id: NodeId) -> Result<()> {
+        self.raft
+            .add_learner(id, Node::default(), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("add_learner: {e}")))
+    }
+
+    /// Change the voter set via joint consensus (DESIGN §7.2 step 4); removed
+    /// voters are dropped, not retained.
+    pub async fn change_voters(&self, voters: &[NodeId]) -> Result<()> {
+        let set: std::collections::BTreeSet<NodeId> = voters.iter().copied().collect();
+        self.raft
+            .change_membership(set, false)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("change_membership: {e}")))
+    }
+
+    /// The committed membership: its log id and the effective voter set. During
+    /// joint consensus the voter set is the union of both configs (DESIGN §5.2).
+    pub fn committed_config(&self) -> (Option<crate::types::LogId>, Vec<NodeId>) {
+        let metrics = self.raft.metrics();
+        let sm = metrics.borrow().membership_config.clone();
+        let log_id = sm
+            .log_id()
+            .map(|l| crate::types::LogId::new(l.leader_id.term, l.index));
+        let voters = sm.membership().voter_ids().collect();
+        (log_id, voters)
+    }
+
+    /// The committed voter set as a comparable set (learners ignored).
+    pub fn committed_voter_set(&self) -> std::collections::BTreeSet<NodeId> {
+        self.committed_config().1.into_iter().collect()
+    }
+
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
         match self.raft.client_write(req).await {
