@@ -15,8 +15,9 @@ Read-only HTTP observability plane for a running node, exposing `/status` and
   timestamp to the placement record).
 - **HTTP is read-only** — routes are `GET /status` and `GET /health`. No
   mutation routes.
-- The full `runtime::Node` assembly is **deferred**; the HTTP layer is built and
-  tested against a narrow trait so it does not block on the runtime.
+- The HTTP layer is built and tested against a narrow `StatusSource` trait so it
+  did not block on the runtime. (The full `runtime::Node` assembly has since
+  landed and implements that source via a `NodeStatus` struct.)
 
 ## Dependencies (`Cargo.toml`)
 
@@ -37,7 +38,7 @@ src/runtime/
 
 ## Step 1 — `StatusSource` trait + DTO (`src/runtime/http.rs`)
 
-Decouples HTTP from the (deferred) concrete node.
+Decouples HTTP from the concrete node (built later as `NodeStatus`).
 
 ```rust
 pub trait StatusSource: Send + Sync {
@@ -81,27 +82,27 @@ Field → source mapping:
 
 - `GET /status` → `Json<ClusterStatus>` from `State<Arc<dyn StatusSource>>`.
 - `GET /health` → `200 "ok"` (liveness only; reads no state).
-- Entry point:
+- Router: `http::router(src)` returns the axum `Router`; the caller owns the
+  listener and the serving task.
 
-```rust
-pub async fn serve(
-    addr: SocketAddr,
-    src: Arc<dyn StatusSource>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<()>
-```
+**As built (drift from the original sketch):** there is no `serve(addr, src,
+shutdown)` helper with `.with_graceful_shutdown`. `Node::start` binds the
+`TcpListener` itself — before storage opens, so a bad `http_addr` fails startup
+(`Error::Config` on parse, `Error::Io` on bind) without leaking background
+tasks — then spawns `axum::serve(listener, http::router(src))` into the node's
+task set. Shutdown aborts that task with the other loops rather than driving a
+graceful-shutdown future.
 
-  Uses `TcpListener::bind(addr).await?` then
-  `axum::serve(listener, app).with_graceful_shutdown(shutdown)`. Bind failure is
-  a startup error (`Error::Io`).
+## Step 3 — CLI / runtime wiring (built)
 
-## Step 3 — CLI / runtime wiring (deferred until `runtime::Node` exists)
-
-- `dal run`: after node assembly,
-  `if let Some(addr) = cfg.http_addr { tokio::spawn(http::serve(addr.parse()?, node.clone(), shutdown_rx)) }`.
-  When `http_addr` is `None`, the plane is not started.
-- `runtime::Node` implements `StatusSource::status()`.
-- `dal status` is unchanged by this work (stays on ZMQ).
+- `Node::start` parses and binds `cfg.http_addr` up front (before opening
+  storage), then spawns the axum serve task over that listener. `None` → the
+  plane is not started.
+- The `StatusSource` is a dedicated `NodeStatus` struct (holding `node_id`,
+  cluster config, `meta`, and the shared `partitions` handle), not `Node`
+  itself.
+- `dal status` is unchanged by this work (stays on ZMQ); the `status` CLI
+  subcommand is currently a stub (see IMPLEMENTATION.md §2 M8 open items).
 
 ## Step 4 — Tests (`src/runtime/http.rs` `#[cfg(test)]`)
 
@@ -113,7 +114,8 @@ pub async fn serve(
 
 ## Explicitly deferred
 
-- `runtime::Node` process assembly and `dal run` (separate M8 slice).
+- `runtime::Node` process assembly and `dal run` — **since built** (separate M8
+  slice, now landed; see RUNTIME_ARCHITECTURE.md and IMPLEMENTATION.md §2 M8).
 - `plan.age` (needs a timestamp on the placement/plan record).
 - `/metrics`, per-node counters — room left in the router, not built now.
 - Operator mutations over HTTP — stay on ZMQ control frames.

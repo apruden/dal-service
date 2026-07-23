@@ -1,10 +1,12 @@
 # Runtime architecture
 
 How a `dal` node is assembled and started as a process. Describes the design
-(DESIGN §10–11) and the current tree, marking what exists versus the seams still
-to build. The keystone piece — an assembled `runtime::Node` launched by
-`dal run` — does **not** exist yet; today the composition lives only in test
-harnesses.
+(DESIGN §10–11) and the current tree. The keystone piece — an assembled
+`runtime::Node` launched by `dal run` — is **built** (M8, `src/runtime/`), and
+the `runtime_m8` suite exercises a three-node cluster over real ZeroMQ
+`inproc://`. What remains open is operability, not assembly: the operator CLI
+subcommands are stubs and there is no runtime teardown of a locally-removed
+partition (see "Status" at the end).
 
 ## Layers
 
@@ -17,15 +19,18 @@ harnesses.
   group (only if it is a meta voter) **plus** whichever data partitions its
   placement assigns it.
 
-### 2. Network seam (`RaftNetworkFactory`) — one impl built, one missing
+### 2. Network seam (`RaftNetworkFactory`) — both impls built
 - The `RaftNetworkFactory` trait is the isolation seam (ground rule 3). Nodes
   take it via `start_with_network(...)`.
 - **`ChannelNetworkFactory`** (`partition/network.rs`): in-process, forwards each
   RPC straight to the target's `Raft` handle via a `Registry` (node_id → handle),
   with seeded, directional fault injection. Every correctness test and the M7
   harness runs on this.
-- **ZMQ-backed factory**: the production seam, **not built**. No `RaftNetwork`
-  impl dials sockets yet; `start_with_network`'s doc comment marks the hole.
+- **`RaftPeerFactory<T>`** (`transport/raft_net.rs`): the production seam. Dials a
+  peer's `control_addr` (append/vote) and `bulk_addr` (snapshot) resolved from the
+  meta directory over the DEALER pool. `runtime::Node` passes it into
+  `start_with_network` for both the meta and each data group; the `runtime_m8`
+  tests run it over ZeroMQ `inproc://`.
 
 ### 3. Storage (RocksDB) — built
 - One `Storage`/DB per process, **column-family per group**. `RocksLogStore` per
@@ -33,14 +38,15 @@ harnesses.
   (serving gate, learner admission, bootstrap markers, sequence/idempotency
   records, snapshots via SST export/ingest) live in `Storage`.
 
-### 4. Transport planes — partially built
+### 4. Transport planes — built
 - **Control lane** (`control_addr`): small RPCs. Inbound = ZMQ `ROUTER`
   (`ZmqServer`, `transport/router.rs`); outbound = `DEALER`
   (`transport/dealer.rs`). Single `Envelope` codec; `MsgType` discriminates.
 - **Bulk lane** (`bulk_addr`): snapshot install traffic, off the control lane
   (config enforces `control_addr != bulk_addr`).
-- **HTTP lane** (`http_addr`): read-only `/status` + `/health` — planned (see
-  `M8_HTTP_STATUS_PLAN.md`).
+- **HTTP lane** (`http_addr`): read-only `/status` + `/health`, built
+  (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`). Listener bound before storage
+  opens; serving task aborted on shutdown.
 
 ### 5. Dispatch / envelope routing (§10.2)
 Inbound frame → decode `Envelope` → split by `MsgType::is_peer_control()`:
@@ -49,9 +55,9 @@ Inbound frame → decode `Envelope` → split by `MsgType::is_peer_control()`:
   partition, serves or redirects, and **rejects any peer-control frame** (ground
   rule 9).
 - **Peer/operator-control frames** (Raft append/vote/snapshot, heartbeat,
-  become-learner, config observations, join/leave/abort-plan) → a peer-control
-  dispatcher that **does not exist yet**. The `transport/raft_wire.rs` body types
-  are the payloads for exactly this dispatcher.
+  become-learner, config observations, join/leave/abort-plan) → the peer-control
+  dispatcher `RootDispatch` (`runtime/dispatch.rs`), built. The
+  `transport/raft_wire.rs` body types are its payloads.
 
 ### 6. Threading model (§11)
 - A tokio multi-thread runtime runs all async work (raft, gateway handlers, HTTP).
@@ -59,7 +65,12 @@ Inbound frame → decode `Envelope` → split by `MsgType::is_peer_control()`:
   thread** that bridges to the runtime via channels — a slow handler cannot block
   the poller.
 
-## The `runtime::Node` struct (proposed)
+## The `runtime::Node` struct
+
+Built in `src/runtime/node.rs`. The sketch below is the original design intent;
+field-level details (e.g. the production factory is carried into
+`start_with_network` rather than stored, and inbound servers are `ZmqServer`s
+owning `RootDispatch`) live in the code — read it for the exact shape.
 
 ```rust
 // src/runtime/node.rs
@@ -76,7 +87,8 @@ pub struct Node {
     gateway: Arc<ClientGateway>,            // reads `partitions` + routing
     routing: Arc<dyn RoutingSource>,        // meta-placement-backed snapshot
 
-    // Production network seam (UNBUILT)
+    // Production network seam — built as RaftPeerFactory<T>; the real Node
+    // passes it into start_with_network rather than storing these fields.
     net_meta: ZmqNetworkFactory<MetaTypeConfig>,
     net_data: ZmqNetworkFactory<TypeConfig>,
 
@@ -91,15 +103,16 @@ pub struct Node {
 }
 ```
 
-Two supporting pieces this struct forces into being, neither of which exists yet:
+Two supporting pieces this struct forced into being, both now built:
 
 ```rust
 // Production RaftNetwork: dials control_addr (RPC) / bulk_addr (snapshot)
 // resolved from the meta directory, over the ZMQ DEALER pool. Replaces
 // ChannelNetworkFactory at the `start_with_network` seam.
+// Built as `RaftPeerFactory<T>` in transport/raft_net.rs.
 struct ZmqNetworkFactory<C> { resolver: Arc<DirectoryResolver>, dealer: DealerPool, /* ... */ }
 
-// The peer/operator-control dispatcher: the missing Server.
+// The peer/operator-control dispatcher. Built in runtime/dispatch.rs.
 struct RootDispatch {
     gateway: Arc<ClientGateway>,
     meta: Option<Arc<MetaNode>>,
@@ -123,8 +136,9 @@ impl Server for RootDispatch {
    `ClientGateway::new` takes today. Rebalancing adds/removes hosted partitions at
    runtime (a `BecomeLearner` frame starts a new `PartitionNode`; a completed
    drain stops one). Gateway and control dispatcher must see the same live set →
-   `Arc<RwLock<HashMap<..>>>`. **Refactor required:** `ClientGateway` reads that
-   shared handle.
+   `Arc<RwLock<HashMap<..>>>`. Done for *start*: `ClientGateway` reads the shared
+   handle and `BecomeLearner` inserts a freshly started `PartitionNode`. *Stop* is
+   still open — a completed drain does not yet remove/reclaim the local group.
 2. **Inbound server must be bound before quorum can form, yet tolerate
    "group not up yet."** Peers must reach each other's ROUTER to elect, so bind
    early; the dispatcher returns a retryable error for frames whose target group
@@ -179,11 +193,25 @@ to the same signal.
 state-machine apply → reply. Not-leader/not-hosted → `Redirect` with candidate
 voters (advisory; the serving gate is authority).
 
-## Net new work this implies
-- `ZmqNetworkFactory` + `DirectoryResolver` + DEALER pool — the production
-  `RaftNetwork`.
-- `RootDispatch::serve_control` — the peer/operator dispatcher (consumes the
-  `raft_wire.rs` bodies).
-- `ClientGateway` refactor to the shared partition registry.
-- The reconcile loop that mutates the hosted partition set at runtime.
-- The `runtime::Node` assembly itself and `dal run` wiring.
+## Status
+
+Built (M8):
+- `RaftPeerFactory<T>` + directory-backed address resolution + DEALER pool — the
+  production `RaftNetwork` (`transport/raft_net.rs`).
+- `RootDispatch` — the peer/operator dispatcher consuming the `raft_wire.rs`
+  bodies (`runtime/dispatch.rs`).
+- `ClientGateway` over the shared partition registry; `BecomeLearner` starts and
+  inserts a new `PartitionNode` at runtime.
+- The `runtime::Node` assembly, `Node::bootstrap` (resumable genesis), and the
+  `dal run` binary wiring.
+- Background drivers: heartbeat emitter (durable incarnation), failure detector,
+  rebalance/abort driver.
+
+Open:
+- **Operator CLI subcommands** `init`/`join`/`leave`/`abort-plan`/`status` are
+  stubs in `main.rs` (only `run` is wired). `RootDispatch` serves the matching
+  frames, but no `api` client issues them.
+- **Runtime partition teardown.** A drain that removes this node from a
+  partition swaps membership but does not stop the orphaned local `PartitionNode`
+  or reclaim its CFs (DESIGN §7.3). Dynamic *start* exists; dynamic *stop* does
+  not — no reconcile loop tears down locally-removed groups.

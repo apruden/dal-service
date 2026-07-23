@@ -381,6 +381,84 @@ groups it was removed from.
 back during the run) completes every DESIGN §14 scenario under fault
 injection with all oracles green and `force_recover` never invoked.
 
+### M8 — Process assembly and operability (DESIGN §10–11, RUNTIME_ARCHITECTURE.md)
+
+M1–M7 prove correctness on `ChannelNetwork` inside test harnesses; M8 assembles
+those components into a runnable process over the production ZMQ transport. It
+adds no consensus mechanism and relaxes no invariant — it wires existing pieces
+and is gated on the same behaviors holding over real sockets.
+
+**Scope:** `transport/raft_net.rs`, `runtime/{node,dispatch,http,rebalance,
+config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
+`storage/rocks.rs`.
+
+- **Production Raft network (rule 3's second impl).** `RaftPeerFactory<T>`
+  (`transport/raft_net.rs`) is the `RaftNetworkFactory` that dials peers'
+  `control_addr` (append/vote) and `bulk_addr` (snapshot) resolved from the meta
+  directory over the DEALER pool. It replaces `ChannelNetworkFactory` at the
+  `start_with_network` seam; consensus code is unchanged.
+- **`runtime::Node` assembly** (`runtime/node.rs`, startup sequence in
+  RUNTIME_ARCHITECTURE.md): open storage → recover-or-bootstrap identity → start
+  the meta group iff this node is a meta voter → start each hosted data partition
+  into a shared, mutable `Arc<RwLock<HashMap<u16, PartitionNode>>>` registry →
+  build routing + `ClientGateway` over that shared handle → assemble
+  `RootDispatch` → bind control and bulk `ZmqServer`s → spawn background drivers.
+  `Node::bootstrap` drives resumable genesis from the descriptor; `Node::shutdown`
+  signals, drops the servers, shuts down every Raft, aborts tasks, and closes
+  storage.
+- **`RootDispatch` — the peer/operator-control dispatcher** (`runtime/dispatch.rs`):
+  the inbound `Server` that splits on `MsgType::is_peer_control()`. Client frames
+  (`ClientOp`, `MetaQuery`) go to the `ClientGateway`; peer/operator frames are
+  served here — `RaftAppend`/`RaftVote`/`RaftSnapshot`, `DataConfigObservation`,
+  `JoinRequest`, `LeaveRequest`, `AbortPlanRequest`, `BootstrapStatus`,
+  `PlacementQuery`, `Heartbeat`, and `BecomeLearner` (which starts a new hosted
+  partition through the rule-8 admission path). A client frame can never reach a
+  peer-control handler (rule 9).
+- **Background drivers** (`runtime/node.rs`, `runtime/rebalance.rs`): a heartbeat
+  emitter (durable incarnation + monotonic sequence, per §M6 failure detection); a
+  failure detector on meta voters that turns collected liveness evidence into
+  `SetNodeState` transitions; and the rebalance/abort driver, which runs on *every*
+  node so a partition's data-leader role can drive its own move and report
+  observations even on a non-meta-voter node.
+- **Durable heartbeat incarnation** (`storage/rocks.rs`,
+  `meta/failure.rs`): a monotonic incarnation allocated from storage once per
+  process start. The failure detector tracks `(incarnation, seq)`, so a restarted
+  process that resets its sequence to one is recognized as live immediately while
+  an old process cannot refresh liveness.
+- **Read-only HTTP admin plane** (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`):
+  `GET /status` + `GET /health`, node-local and best-effort (never
+  `ensure_linearizable`), a third inbound plane off the correctness path. Its
+  listener is bound before storage opens or any task spawns, so a bad `http_addr`
+  fails startup without leaking detached work; the serving task is aborted on
+  shutdown with the other loops.
+- **Config + binary** (`runtime/config_file.rs`, `main.rs`): JSON node config
+  (`http_addr`, initial placements) and immutable init descriptor; `dal run
+  --config <node> --cluster <init>` starts a node, drives genesis, and serves
+  until SIGINT.
+
+**Gate:** the `runtime_m8` suite on a real ZeroMQ `inproc://` three-node cluster
+(production `RaftPeerFactory`, not `ChannelNetwork`): serves a client op end to
+end; a drained node's partition migrates to a spare; an aborting plan whose target
+dies rolls back to the original voters; `BecomeLearner` starts a hosted partition
+idempotently; a non-meta-voter data leader drives its own move; the failure
+detector progresses a silenced node to `Down`; `/status` reports the node-local
+view. Plus: heartbeat incarnation persists and advances across restarts
+(`storage_m1`), and an invalid `http_addr` fails before storage is opened
+(`runtime::node` unit test).
+
+**Open / not yet wired (M8 is not complete):**
+- **Operator CLI subcommands are stubs.** Only `dal run` is wired; `init`, `join`,
+  `leave`, `abort-plan`, and `status` print an "unavailable" message. `RootDispatch`
+  *serves* the corresponding `LeaveRequest`/`AbortPlanRequest`/`JoinRequest` frames,
+  but no client-side CLI issues them — driving a live cluster needs the `api`
+  client wired to these subcommands.
+- **No runtime partition-stop / CF reclamation.** When a drain (§7.3) removes this
+  node from a partition's voters, membership swaps correctly but the now-orphaned
+  local `PartitionNode` is not stopped and its CFs are not reclaimed. Dynamic
+  partition *start* exists (via `BecomeLearner`); dynamic *stop* does not — there is
+  no reconcile loop that tears down locally-removed groups after durably recording
+  non-voter state.
+
 ---
 
 ## 3. Cross-cutting test strategy

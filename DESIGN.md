@@ -687,9 +687,20 @@ single-partition implementation.
    mutation application, and that every completed move has the meta voter set
    equal to the data-Raft committed configuration. Add metrics for quorum
    health, applied/committed lag, learner lag, plan age, and bulk-lane backlog.
+8. **Process assembly and operability.** Assemble the phase 1–7 components into
+   a runnable process: the production ZeroMQ `RaftNetwork`, the `runtime::Node`
+   startup/shutdown lifecycle, the peer/operator-control dispatcher, the
+   background drivers (heartbeat, failure detection, rebalance/abort), a
+   durable heartbeat incarnation, a read-only HTTP `/status` plane, and the
+   `dal run` binary. Adds no protocol; gated on the phase-6 behaviors holding
+   over real sockets (a ZeroMQ three-node cluster serves ops, migrates on
+   drain, rolls back a doomed plan, and marks a silent node `Down`).
 
-The v1 acceptance gate is a three-node cluster completing the scenarios in
-§14 under fault injection, with no unsafe recovery command exercised.
+The v1 *correctness* acceptance gate is phase 7: a three-node cluster completing
+the scenarios in §14 under fault injection, with no unsafe recovery command
+exercised. Phase 8 is the operable-binary layer on top; it inherits the same
+invariants over the production transport (see IMPLEMENTATION.md §2 M8 for its
+gate and the operator-CLI / partition-teardown items still open).
 
 ---
 
