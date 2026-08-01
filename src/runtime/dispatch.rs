@@ -22,11 +22,11 @@ use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
-    AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody,
-    JoinBody, LearnerReply, LeaveBody, ObservationBody, PlacementQueryBody, PlacementQueryReply,
-    SubmitReply,
+    AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
+    DirectoryQueryReply, HeartbeatBody, JoinBody, LearnerReply, LeaveBody, ObservationBody,
+    PlacementQueryBody, PlacementQueryReply, SubmitReply,
 };
-use crate::types::{ClusterId, GroupId, MetaCommand, NodeState};
+use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,7 @@ pub struct RootDispatch {
     heartbeats: Arc<Mutex<HeartbeatTracker>>,
     starter: Option<Arc<PartitionStarter>>,
     meta_starter: Option<Arc<MetaStarter>>,
+    identity_gate: ProcessIdentityGate,
 }
 
 impl RootDispatch {
@@ -70,7 +71,13 @@ impl RootDispatch {
             heartbeats,
             starter,
             meta_starter,
+            identity_gate: ProcessIdentityGate::default(),
         }
+    }
+
+    pub fn with_identity_gate(mut self, identity_gate: ProcessIdentityGate) -> Self {
+        self.identity_gate = identity_gate;
+        self
     }
 
     /// Snapshot the meta handle; the guard is dropped before any `.await`.
@@ -105,7 +112,8 @@ impl RootDispatch {
             MsgType::LeaveRequest => self.serve_leave(req).await,
             MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
-            MsgType::PlacementQuery => self.serve_placement_query(req),
+            MsgType::PlacementQuery => self.serve_placement_query(req).await,
+            MsgType::DirectoryQuery => self.serve_directory_query(req).await,
             MsgType::Heartbeat => self.serve_heartbeat(req),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
             // Client/reply types are handled before reaching serve_control (or
@@ -290,19 +298,49 @@ impl RootDispatch {
         self.reply(&req, codec::encode(&reply))
     }
 
-    /// Return a group's committed placement from local meta state, so a data
-    /// leader that is not a meta voter can read its own plan. A local (committed)
-    /// read suffices: a committed plan is stable until the move that this reply
-    /// helps drive resolves it.
-    fn serve_placement_query(&self, req: Envelope) -> Envelope {
+    /// Return a group's placement only after a ReadIndex barrier. Move execution
+    /// and learner admission both use this as a fencing read, so a follower's
+    /// cached pre-abort plan must never be returned.
+    async fn serve_placement_query(&self, req: Envelope) -> Envelope {
         let placement = match (
             codec::decode::<PlacementQueryBody>(&req.payload),
             self.meta(),
         ) {
-            (Ok(body), Some(meta)) => meta.local_placement(body.group).ok().flatten(),
+            (Ok(body), Some(meta)) => match meta.read_placement(body.group).await {
+                Ok(crate::meta::node::MetaRead::Value(placement)) => placement,
+                Ok(crate::meta::node::MetaRead::NotLeader { .. }) | Err(_) => None,
+            },
             _ => None,
         };
         self.reply(&req, codec::encode(&PlacementQueryReply { placement }))
+    }
+
+    /// Return an authoritative directory only from the current meta leader
+    /// after ReadIndex. Followers include their local view only as a leader-id
+    /// resolution hint; callers must never merge that hint into authority state.
+    async fn serve_directory_query(&self, req: Envelope) -> Envelope {
+        let reply = match self.meta() {
+            Some(meta) if meta.current_leader() != Some(meta.node_id()) => {
+                DirectoryQueryReply::NotLeader {
+                    leader: meta.current_leader(),
+                    directory_hint: meta.local_directory().unwrap_or_default(),
+                }
+            }
+            Some(meta) => match meta.read_directory().await {
+                Ok(crate::meta::node::MetaRead::Value(directory)) => {
+                    DirectoryQueryReply::Value(directory)
+                }
+                Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
+                    DirectoryQueryReply::NotLeader {
+                        leader,
+                        directory_hint: meta.local_directory().unwrap_or_default(),
+                    }
+                }
+                Err(_) => DirectoryQueryReply::Unavailable,
+            },
+            None => DirectoryQueryReply::Unavailable,
+        };
+        self.reply(&req, codec::encode(&reply))
     }
 
     /// Record heartbeat liveness evidence. The reply is a bare ack — the emitter
@@ -314,6 +352,7 @@ impl RootDispatch {
             self.heartbeats.lock().unwrap().observe(
                 body.node_id,
                 body.incarnation,
+                body.process_incarnation,
                 body.seq,
                 now_ms(),
             );
@@ -321,23 +360,39 @@ impl RootDispatch {
         self.reply(&req, Vec::new())
     }
 
-    /// Confirm that a data placement has committed before its designated voter
-    /// initializes the group. This uses a linearizable meta read so observing a
-    /// reply is sufficient to establish the bootstrap phase ordering.
+    /// Confirm bootstrap progress. A query addressed to the meta group confirms
+    /// that a descriptor placement has committed via a linearizable meta read;
+    /// a query addressed to a data group confirms that its local Raft runtime
+    /// has completed first initialization.
     async fn serve_bootstrap_status(&self, req: Envelope) -> Envelope {
         let Ok(body) = codec::decode::<BootstrapStatusBody>(&req.payload) else {
             return self.reply(&req, codec::encode(&BootstrapStatusReply { ready: false }));
         };
-        let ready = match self.meta() {
-            Some(meta) => match meta.read_placement(body.group).await {
-                Ok(crate::meta::node::MetaRead::Value(Some(placement))) => {
-                    placement.voters == body.voters && placement.r#move.is_none()
-                }
-                Ok(crate::meta::node::MetaRead::Value(None))
-                | Ok(crate::meta::node::MetaRead::NotLeader { .. })
-                | Err(_) => false,
+        // The envelope identifies which runtime answers. Bootstrap placement
+        // checks are addressed to `Meta` but carry the *data* group in the
+        // body; the genesis fence addresses the data runtime itself.
+        let ready = match req.group_id {
+            GroupId::Meta => match self.meta() {
+                Some(meta) => match meta.read_placement(body.group).await {
+                    Ok(crate::meta::node::MetaRead::Value(Some(placement))) => {
+                        placement.voters == body.voters && placement.r#move.is_none()
+                    }
+                    Ok(crate::meta::node::MetaRead::Value(None))
+                    | Ok(crate::meta::node::MetaRead::NotLeader { .. })
+                    | Err(_) => false,
+                },
+                None => false,
             },
-            None => false,
+            GroupId::Data(partition) => {
+                if body.group != GroupId::Data(partition) {
+                    return self.reply(&req, codec::encode(&BootstrapStatusReply { ready: false }));
+                }
+                let node = self.partitions.read().unwrap().get(&partition).cloned();
+                match node {
+                    Some(node) => node.is_initialized().await.unwrap_or(false),
+                    None => false,
+                }
+            }
         };
         self.reply(&req, codec::encode(&BootstrapStatusReply { ready }))
     }
@@ -348,7 +403,7 @@ impl Server for RootDispatch {
         // The gateway applies this check for client traffic. Peer-control
         // frames bypass the gateway, so enforce the same cluster boundary here
         // before a foreign Raft or operator request reaches a local group.
-        if request.cluster_id != self.cluster_id {
+        if request.cluster_id != self.cluster_id || !self.identity_gate.is_open() {
             return self.raft_unavailable(&request);
         }
         if request.msg_type.is_peer_control() {
@@ -372,14 +427,20 @@ mod tests {
     struct EmptyRouting;
 
     impl RoutingSource for EmptyRouting {
-        fn routing(&self) -> RoutingInfo {
-            RoutingInfo {
-                cluster_id: 7,
-                p: 1,
-                hash_spec: HashSpec::CANONICAL,
-                directory: Vec::new(),
-                placements: Vec::new(),
-            }
+        fn routing(
+            &self,
+            _local_only: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RoutingInfo>> + Send + '_>>
+        {
+            Box::pin(async {
+                Some(RoutingInfo {
+                    cluster_id: 7,
+                    p: 1,
+                    hash_spec: HashSpec::CANONICAL,
+                    directory: Vec::new(),
+                    placements: Vec::new(),
+                })
+            })
         }
     }
 

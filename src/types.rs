@@ -6,12 +6,14 @@
 //! [`LogId`]/voter-set representations at the M3 boundary.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 /// Wire/protocol version. Bumped only on an incompatible envelope or command
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Stable node identity, assigned at `join` and never reused.
 pub type NodeId = u64;
@@ -24,6 +26,28 @@ pub type ClientId = u128;
 
 /// Strictly increasing, per-client/partition mutation sequence.
 pub type Sequence = u64;
+
+/// Shared one-way fence for a running process identity. Once a newer or
+/// conflicting authoritative registration is observed, every network surface
+/// using this gate stops participating until the process is restarted.
+#[derive(Debug, Clone)]
+pub struct ProcessIdentityGate(Arc<AtomicBool>);
+
+impl Default for ProcessIdentityGate {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl ProcessIdentityGate {
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn fence(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// A key's version is the Raft log index of its last mutation, so versions are
 /// strictly monotonic per partition and never reused (DESIGN §4.1).
@@ -331,6 +355,25 @@ pub struct LearnerAdmission {
     pub cluster_id: ClusterId,
     pub group: GroupId,
     pub plan_id: u64,
+}
+
+/// The exact replicated directory identity this process was authorized to use.
+/// Heartbeats and endpoint ownership remain bound to this tuple for the entire
+/// process lifetime; a later directory incarnation requires a restart (or
+/// fences this process when discovered by the live verifier).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationBinding {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub control_addr: String,
+    pub bulk_addr: String,
+    pub directory_incarnation: u64,
+}
+
+impl RegistrationBinding {
+    pub fn matches_endpoints(&self, control_addr: &str, bulk_addr: &str) -> bool {
+        self.control_addr == control_addr && self.bulk_addr == bulk_addr
+    }
 }
 
 /// A leader's pending, not-yet-meta-confirmed configuration observation

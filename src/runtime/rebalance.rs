@@ -1,27 +1,26 @@
 //! The rebalance driver loop (DESIGN §7, M6 mechanics over the network).
 //!
-//! Two roles run each tick on every meta-voter node:
+//! Several roles run each tick on every node:
 //!
-//! - **meta-leader role** (only while this node leads the meta group): a drain
-//!   trigger that, for each partition with a `Draining` voter and no active plan,
-//!   creates a move plan swapping that voter for an `Active` non-voter.
+//! - **meta-leader role** (only while this node leads the meta group): runs the
+//!   deterministic placement planner to evacuate ineligible voters and balance
+//!   replicas across `Active` nodes, and replaces ineligible meta voters.
 //! - **data-leader role** (for each hosted partition this node leads): read the
-//!   plan from *local* committed meta state, gate it, ensure the target has
-//!   started its learner runtime (`BecomeLearner`), drive `add_learner` +
-//!   `change_voters`, then report the result to the meta group with a
-//!   `DataConfigObservation` frame.
+//!   plan from committed meta state, gate it, ensure the target has started its
+//!   learner runtime (`BecomeLearner`), drive `add_learner` +
+//!   `change_voters`, then submit a quorum-fenced result to the meta group with
+//!   a `DataConfigObservation` frame.
 //!
-//! Reading the plan locally means the data leader needs no meta leadership; the
-//! only meta write it performs is the observation, submitted over the network.
-//! Constraint (M8 slice): the driver runs on meta voters, so a partition whose
-//! data leader is not a meta voter is not driven — true for small clusters where
-//! every node is a meta voter.
+//! A data leader needs no meta leadership; the only meta write it performs is
+//! the observation, submitted over the network.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec;
-use crate::meta::node::MetaNode;
+use crate::meta::bootstrap;
+use crate::meta::node::{MetaNode, MetaRead};
 use crate::meta::rebalancer::create_plan;
 use crate::meta::reconcile::{GateDecision, ReconcileAction, gate, reconcile};
 use crate::partition::node::PartitionNode;
@@ -35,11 +34,13 @@ use crate::transport::raft_wire::{
 };
 use crate::types::{
     ClusterId, DataConfigObservation, GroupId, MetaCommand, MovePlan, NodeId, NodeState, Placement,
-    voter_set,
+    ProcessIdentityGate, RegistrationBinding, voter_set,
 };
 
 use crate::api::gateway::PartitionMap;
+use crate::runtime::directory::fetch_authoritative_directory;
 use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
+use crate::runtime::readiness::RuntimeReadiness;
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -51,13 +52,18 @@ pub struct RebalanceDriver {
     node_id: NodeId,
     cluster_id: ClusterId,
     partition_count: u16,
+    replication_factor: usize,
+    bootstrap_placements: BTreeMap<u16, Vec<NodeId>>,
     meta: MetaHandle,
     partitions: PartitionMap,
     control: ZmqTransport,
     addrs: AddrBook,
-    meta_controls: Vec<String>,
     starter: Arc<PartitionStarter>,
     meta_starter: Arc<MetaStarter>,
+    directory_timeout: Duration,
+    registration: RegistrationBinding,
+    identity_gate: ProcessIdentityGate,
+    readiness: RuntimeReadiness,
 }
 
 impl RebalanceDriver {
@@ -66,25 +72,35 @@ impl RebalanceDriver {
         node_id: NodeId,
         cluster_id: ClusterId,
         partition_count: u16,
+        replication_factor: usize,
+        bootstrap_placements: BTreeMap<u16, Vec<NodeId>>,
         meta: MetaHandle,
         partitions: PartitionMap,
         control: ZmqTransport,
         addrs: AddrBook,
-        meta_controls: Vec<String>,
         starter: Arc<PartitionStarter>,
         meta_starter: Arc<MetaStarter>,
+        directory_timeout: Duration,
+        registration: RegistrationBinding,
+        identity_gate: ProcessIdentityGate,
+        readiness: RuntimeReadiness,
     ) -> RebalanceDriver {
         RebalanceDriver {
             node_id,
             cluster_id,
             partition_count,
+            replication_factor,
+            bootstrap_placements,
             meta,
             partitions,
             control,
             addrs,
-            meta_controls,
             starter,
             meta_starter,
+            directory_timeout,
+            registration,
+            identity_gate,
+            readiness,
         }
     }
 
@@ -95,26 +111,81 @@ impl RebalanceDriver {
 
     pub async fn run(self) {
         loop {
-            tokio::time::sleep(REBALANCE_INTERVAL).await;
-            self.drive_meta_role().await;
+            if !self.identity_gate.is_open() {
+                return;
+            }
+            self.refresh_addr_book().await;
+            if !self.identity_gate.is_open() {
+                return;
+            }
+            // Recovery of an already-durable plan remains available before
+            // bootstrap is marked ready. Creating a new plan or reclaiming a
+            // group cannot be allowed to race first initialization, though.
             self.drive_data_role().await;
             self.drive_meta_data_role().await;
-            self.drive_reclaim_role().await;
-            self.drive_meta_reclaim_role().await;
+            if self.readiness.is_ready() {
+                self.drive_meta_role().await;
+                self.drive_reclaim_role().await;
+                self.drive_meta_reclaim_role().await;
+            }
+            tokio::time::sleep(REBALANCE_INTERVAL).await;
         }
+    }
+
+    /// Merge only a ReadIndex-fenced directory into the address book shared by
+    /// every Raft network factory and control-plane loop on this process.
+    /// Advisory `MetaQuery` snapshots are intentionally excluded here.
+    async fn refresh_addr_book(&self) {
+        if let Some(meta) = self.meta() {
+            match meta.read_directory().await {
+                Ok(MetaRead::Value(directory)) if !directory.is_empty() => {
+                    self.merge_authoritative_directory(&directory);
+                    return;
+                }
+                Ok(MetaRead::Value(_)) | Ok(MetaRead::NotLeader { .. }) | Err(_) => {}
+            }
+        }
+
+        if let Ok(directory) = fetch_authoritative_directory(
+            &self.control,
+            self.cluster_id,
+            self.addrs.control_addrs(),
+            self.directory_timeout,
+        )
+        .await
+        {
+            self.merge_authoritative_directory(&directory);
+        }
+    }
+
+    fn merge_authoritative_directory(&self, directory: &[crate::types::NodeDirectoryEntry]) {
+        if let Some(entry) = directory.iter().find(|entry| entry.node_id == self.node_id)
+            && (entry.incarnation != self.registration.directory_incarnation
+                || !self
+                    .registration
+                    .matches_endpoints(&entry.control_addr, &entry.bulk_addr))
+        {
+            self.identity_gate.fence();
+            return;
+        }
+        let _ = self.addrs.update_directory(directory);
     }
 
     // -- meta-leader role ---------------------------------------------------
 
-    /// Meta writes that only the leader may make: create drain plans, and abort
-    /// a plan whose learner target has been declared `Down` (§7.5) — such a plan
-    /// can never complete, so it must roll back.
+    /// Meta writes that only the leader may make: create deterministic
+    /// replacement/load-balancing plans, and abort a plan whose learner target
+    /// has been declared `Down` (§7.5) — such a plan can never complete, so it
+    /// must roll back.
     async fn drive_meta_role(&self) {
         let Some(meta) = self.meta() else {
             return; // not a meta node; nothing to plan
         };
         let meta = &meta;
         if meta.current_leader() != Some(self.node_id) {
+            return;
+        }
+        if !self.genesis_data_ready(meta).await {
             return;
         }
         let Ok(directory) = meta.local_directory() else {
@@ -126,69 +197,67 @@ impl RebalanceDriver {
             .filter(|e| e.state == NodeState::Active)
             .map(|e| e.node_id)
             .collect();
-        let draining: Vec<NodeId> = directory
-            .iter()
-            .filter(|e| e.state == NodeState::Draining)
-            .map(|e| e.node_id)
-            .collect();
 
+        let mut placements = BTreeMap::new();
         for partition in 0..self.partition_count {
             let group = GroupId::Data(partition);
             let Ok(Some(placement)) = meta.local_placement(group) else {
-                continue;
+                // Never balance from an incomplete load snapshot.
+                return;
             };
-            match &placement.r#move {
-                // No plan: drain a `Draining` voter onto an `Active` spare.
-                None => {
-                    let Some(&drained) = placement.voters.iter().find(|v| draining.contains(v))
-                    else {
-                        continue;
-                    };
-                    let Some(&replacement) = active.iter().find(|a| !placement.voters.contains(a))
-                    else {
-                        continue; // no free Active node to take over
-                    };
-                    let mut target: Vec<NodeId> = placement
-                        .voters
-                        .iter()
-                        .copied()
-                        .filter(|&v| v != drained)
-                        .collect();
-                    target.push(replacement);
-                    target.sort_unstable();
-                    let _ = create_plan(std::slice::from_ref(meta), group, &target).await;
+            // Healthy plan whose learner target is Down: abort it.
+            if let Some(plan) = &placement.r#move
+                && !plan.aborting
+            {
+                let current = voter_set(placement.voters.clone());
+                let target_set = voter_set(plan.target_voters.clone());
+                if let Some(&learner) = target_set.difference(&current).next()
+                    && state_of(learner) == Some(NodeState::Down)
+                {
+                    let _ = meta
+                        .propose(MetaCommand::MarkAborting {
+                            group,
+                            plan_id: plan.plan_id,
+                        })
+                        .await;
                 }
-                // Healthy plan whose learner target is Down: abort it.
-                Some(plan) if !plan.aborting => {
-                    let current = voter_set(placement.voters.clone());
-                    let target_set = voter_set(plan.target_voters.clone());
-                    if let Some(&learner) = target_set.difference(&current).next()
-                        && state_of(learner) == Some(NodeState::Down)
-                    {
-                        let _ = meta
-                            .propose(MetaCommand::MarkAborting {
-                                group,
-                                plan_id: plan.plan_id,
-                            })
-                            .await;
-                    }
-                }
-                Some(_) => {} // already aborting; resolution is the data-leader role's job
+            }
+            placements.insert(partition, placement);
+        }
+
+        // Keep one data migration active cluster-wide. Besides bounding the
+        // migration blast radius, this means a fresh plan is never calculated
+        // against a configuration that is still settling in another group.
+        if !placements
+            .values()
+            .any(|placement| placement.r#move.is_some())
+        {
+            // The pure planner handles both evacuation of every ineligible
+            // voter (Down, Draining, Suspect, or unknown) and redistribution
+            // onto newly joined Active nodes.
+            if let Some(proposal) =
+                crate::placement::propose(&directory, &placements, self.replication_factor)
+            {
+                let _ = create_plan(
+                    std::slice::from_ref(meta),
+                    proposal.group,
+                    &proposal.target_voters,
+                )
+                .await;
             }
         }
 
-        // Meta-voter drain: swap a Draining, non-leader meta voter for an
-        // eligible Active non-voter, keeping the set size (and quorum). v1 never
-        // drains the current meta leader — this node is the leader here, so a
-        // `Draining` leader is simply skipped until leadership moves elsewhere.
+        // Meta-voter replacement: swap any ineligible non-leader meta voter for
+        // an Active non-voter, keeping the set size (and quorum). v1 never
+        // replaces the current meta leader — this node is the leader here, so
+        // an ineligible leader waits until leadership moves elsewhere.
         if let Ok(Some(placement)) = meta.local_placement(GroupId::Meta) {
             match &placement.r#move {
                 None => {
-                    let drained = placement
-                        .voters
-                        .iter()
-                        .copied()
-                        .find(|v| draining.contains(v) && *v != self.node_id);
+                    let drained =
+                        placement.voters.iter().copied().find(|v| {
+                            state_of(*v) != Some(NodeState::Active) && *v != self.node_id
+                        });
                     if let Some(drained) = drained
                         && let Some(&replacement) =
                             active.iter().find(|a| !placement.voters.contains(a))
@@ -201,7 +270,8 @@ impl RebalanceDriver {
                             .collect();
                         target.push(replacement);
                         target.sort_unstable();
-                        let _ = create_plan(std::slice::from_ref(meta), GroupId::Meta, &target).await;
+                        let _ =
+                            create_plan(std::slice::from_ref(meta), GroupId::Meta, &target).await;
                     }
                 }
                 Some(plan) if !plan.aborting => {
@@ -221,6 +291,66 @@ impl RebalanceDriver {
                 Some(_) => {}
             }
         }
+    }
+
+    /// Confirm that every original data group has crossed its first Raft
+    /// initialization before this meta leader is allowed to create a plan.
+    ///
+    /// The process-local readiness gate prevents its own bootstrap from racing
+    /// the planner. This second, distributed check closes the remaining race:
+    /// a meta voter can finish its local bootstrap while the designated voter
+    /// for another data group is still waiting to initialize. Once a placement
+    /// has diverged from the descriptor (or has a durable move), it is
+    /// necessarily post-genesis and no longer needs this check on restart.
+    async fn genesis_data_ready(&self, meta: &MetaNode) -> bool {
+        for (&partition, initial_voters) in &self.bootstrap_placements {
+            let Ok(Some(placement)) = meta.local_placement(GroupId::Data(partition)) else {
+                return false;
+            };
+            if placement.voters != *initial_voters || placement.r#move.is_some() {
+                continue;
+            }
+
+            let Some(designated) = bootstrap::designated(initial_voters) else {
+                return false;
+            };
+            if designated == self.node_id {
+                let node = self.partitions.read().unwrap().get(&partition).cloned();
+                let Some(node) = node else {
+                    return false;
+                };
+                if !node.is_initialized().await.unwrap_or(false) {
+                    return false;
+                }
+                continue;
+            }
+            let Some(addr) = self.addrs.control(designated) else {
+                return false;
+            };
+            let request = Envelope::new(
+                self.cluster_id,
+                MsgType::BootstrapStatus,
+                GroupId::Data(partition),
+                0,
+                codec::encode(&crate::transport::raft_wire::BootstrapStatusBody {
+                    group: GroupId::Data(partition),
+                    voters: initial_voters.clone(),
+                }),
+            );
+            let Ok(reply) = self.control.call(&addr, request).await else {
+                return false;
+            };
+            if reply.cluster_id != self.cluster_id
+                || reply.msg_type != MsgType::BootstrapStatus
+                || !matches!(
+                    codec::decode(&reply.payload),
+                    Ok(crate::transport::raft_wire::BootstrapStatusReply { ready: true })
+                )
+            {
+                return false;
+            }
+        }
+        true
     }
 
     // -- data-leader role ---------------------------------------------------
@@ -384,7 +514,10 @@ impl RebalanceDriver {
         let Some(&learner) = target_set.difference(&current).next() else {
             return;
         };
-        if !self.ensure_learner_admitted(learner, GroupId::Meta, plan_id).await {
+        if !self
+            .ensure_learner_admitted(learner, GroupId::Meta, plan_id)
+            .await
+        {
             return;
         }
         if meta.add_learner(learner).await.is_err() {
@@ -400,10 +533,12 @@ impl RebalanceDriver {
     /// committed. Mirrors `report_finalize` with `MetaNode` in place of the data
     /// leader.
     async fn report_finalize_meta(&self, meta: &MetaNode, plan_id: u64, target: &[NodeId]) {
-        if meta.committed_voter_set() != voter_set(target.to_vec()) {
+        let Ok((config_log_id, committed)) = meta.confirmed_committed_config().await else {
+            return;
+        };
+        if voter_set(committed) != voter_set(target.to_vec()) {
             return;
         }
-        let (config_log_id, _) = meta.committed_config();
         let Some(config_log_id) = config_log_id else {
             return;
         };
@@ -423,7 +558,10 @@ impl RebalanceDriver {
 
     /// Resolve an aborting meta plan (§7.5). Mirrors `report_abort`.
     async fn report_abort_meta(&self, meta: &MetaNode, placement: &Placement, plan: &MovePlan) {
-        let committed = meta.committed_voter_set();
+        let Ok((config_log_id, committed)) = meta.confirmed_committed_config().await else {
+            return;
+        };
+        let committed = voter_set(committed);
         let report = if committed == voter_set(placement.voters.clone()) {
             placement.voters.clone()
         } else if committed == voter_set(plan.target_voters.clone()) {
@@ -431,7 +569,6 @@ impl RebalanceDriver {
         } else {
             return;
         };
-        let (config_log_id, _) = meta.committed_config();
         let Some(config_log_id) = config_log_id else {
             return;
         };
@@ -464,7 +601,7 @@ impl RebalanceDriver {
             group: GroupId::Meta,
         };
         let mut excluded = false;
-        for addr in &self.meta_controls {
+        for addr in self.addrs.control_addrs() {
             let env = Envelope::new(
                 self.cluster_id,
                 MsgType::PlacementQuery,
@@ -472,7 +609,7 @@ impl RebalanceDriver {
                 0,
                 codec::encode(&body),
             );
-            if let Ok(reply) = self.control.call(addr, env).await
+            if let Ok(reply) = self.control.call(&addr, env).await
                 && let Ok(PlacementQueryReply { placement: Some(p) }) =
                     codec::decode::<PlacementQueryReply>(&reply.payload)
                 && p.r#move.is_none()
@@ -530,10 +667,12 @@ impl RebalanceDriver {
         plan_id: u64,
         target: &[NodeId],
     ) {
-        if node.committed_voter_set() != voter_set(target.to_vec()) {
+        let Ok((config_log_id, committed)) = node.confirmed_committed_config().await else {
+            return;
+        };
+        if voter_set(committed) != voter_set(target.to_vec()) {
             return;
         }
-        let (config_log_id, _) = node.committed_config();
         let Some(config_log_id) = config_log_id else {
             return;
         };
@@ -562,7 +701,10 @@ impl RebalanceDriver {
         placement: &Placement,
         plan: &MovePlan,
     ) {
-        let committed = node.committed_voter_set();
+        let Ok((config_log_id, committed)) = node.confirmed_committed_config().await else {
+            return;
+        };
+        let committed = voter_set(committed);
         let report = if committed == voter_set(placement.voters.clone()) {
             placement.voters.clone()
         } else if committed == voter_set(plan.target_voters.clone()) {
@@ -570,7 +712,6 @@ impl RebalanceDriver {
         } else {
             return;
         };
-        let (config_log_id, _) = node.committed_config();
         let Some(config_log_id) = config_log_id else {
             return;
         };
@@ -609,14 +750,17 @@ impl RebalanceDriver {
         }
     }
 
-    /// Read a group's committed placement: locally when this node is a meta
-    /// voter, otherwise over the network from a meta voter.
+    /// Read a group's placement through a meta ReadIndex barrier, locally when
+    /// this node leads meta or over the network otherwise. This is the plan
+    /// fence: cached pre-abort state must never authorize a membership change.
     async fn read_placement(&self, group: GroupId) -> Option<Placement> {
-        if let Some(meta) = self.meta() {
-            return meta.local_placement(group).ok().flatten();
+        if let Some(meta) = self.meta()
+            && let Ok(MetaRead::Value(placement)) = meta.read_placement(group).await
+        {
+            return placement;
         }
         let body = PlacementQueryBody { group };
-        for addr in &self.meta_controls {
+        for addr in self.addrs.control_addrs() {
             let env = Envelope::new(
                 self.cluster_id,
                 MsgType::PlacementQuery,
@@ -624,7 +768,7 @@ impl RebalanceDriver {
                 0,
                 codec::encode(&body),
             );
-            if let Ok(reply) = self.control.call(addr, env).await
+            if let Ok(reply) = self.control.call(&addr, env).await
                 && let Ok(PlacementQueryReply { placement: Some(p) }) =
                     codec::decode::<PlacementQueryReply>(&reply.payload)
             {
@@ -643,7 +787,7 @@ impl RebalanceDriver {
             let _ = meta.propose(body.into_meta_command()).await;
             return;
         }
-        for addr in &self.meta_controls {
+        for addr in self.addrs.control_addrs() {
             let env = Envelope::new(
                 self.cluster_id,
                 MsgType::DataConfigObservation,
@@ -651,7 +795,7 @@ impl RebalanceDriver {
                 0,
                 codec::encode(&body),
             );
-            if let Ok(reply) = self.control.call(addr, env).await
+            if let Ok(reply) = self.control.call(&addr, env).await
                 && let Ok(SubmitReply::Outcome(_)) = codec::decode::<SubmitReply>(&reply.payload)
             {
                 return;

@@ -93,6 +93,11 @@ pub fn heartbeat_incarnation_key() -> Vec<u8> {
     b"local/heartbeat_incarnation".to_vec()
 }
 
+/// The exact replicated registration used by this process identity.
+pub fn registration_binding_key() -> Vec<u8> {
+    b"local/registration_binding".to_vec()
+}
+
 pub fn serving_key(group: GroupId) -> Vec<u8> {
     format!("local/serving/{}", group.token()).into_bytes()
 }

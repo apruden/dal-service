@@ -12,7 +12,7 @@
 //! failures map to [`Unreachable`] so openraft retries another leader/candidate;
 //! a decoded [`RaftError`] from the peer maps to [`RemoteError`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError, Unreachable};
@@ -28,9 +28,30 @@ use crate::codec;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{AppendReply, SnapshotReply, VoteReply};
-use crate::types::{ClusterId, GroupId, NodeId};
+use crate::types::{ClusterId, GroupId, NodeDirectoryEntry, NodeId, ProcessIdentityGate};
 
 type Node = BasicNode;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryMergeError {
+    ConflictingIncarnation { node_id: NodeId, incarnation: u64 },
+}
+
+impl std::fmt::Display for DirectoryMergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirectoryMergeError::ConflictingIncarnation {
+                node_id,
+                incarnation,
+            } => write!(
+                f,
+                "node {node_id} has conflicting endpoints at incarnation {incarnation}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DirectoryMergeError {}
 
 /// Shared, updatable map of `node_id -> (control_addr, bulk_addr)`. Seeded from
 /// the bootstrap directory and refreshed as the meta directory grows, so a
@@ -38,6 +59,11 @@ type Node = BasicNode;
 #[derive(Clone, Default)]
 pub struct AddrBook {
     inner: Arc<RwLock<HashMap<NodeId, (String, String)>>>,
+    incarnations: Arc<RwLock<HashMap<NodeId, u64>>>,
+    /// Operator-configured control seeds remain usable even when this node is
+    /// absent from the immutable bootstrap descriptor or has not yet refreshed
+    /// the replicated directory.
+    control_seeds: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl AddrBook {
@@ -52,12 +78,84 @@ impl AddrBook {
             .insert(id, (control_addr, bulk_addr));
     }
 
+    pub fn add_control_seed(&self, control_addr: String) {
+        self.control_seeds.write().unwrap().insert(control_addr);
+    }
+
+    pub fn set_incarnation(&self, id: NodeId, incarnation: u64) {
+        self.incarnations.write().unwrap().insert(id, incarnation);
+    }
+
+    pub fn incarnation(&self, id: NodeId) -> Option<u64> {
+        self.incarnations.read().unwrap().get(&id).copied()
+    }
+
     pub fn control(&self, id: NodeId) -> Option<String> {
         self.inner.read().unwrap().get(&id).map(|(c, _)| c.clone())
     }
 
     pub fn bulk(&self, id: NodeId) -> Option<String> {
         self.inner.read().unwrap().get(&id).map(|(_, b)| b.clone())
+    }
+
+    /// Merge a replicated directory snapshot into the live address book.
+    /// Existing Raft factories share the same inner map and observe updates
+    /// without being rebuilt.
+    pub fn update_directory(
+        &self,
+        directory: &[NodeDirectoryEntry],
+    ) -> Result<(), DirectoryMergeError> {
+        let mut inner = self.inner.write().unwrap();
+        let mut incarnations = self.incarnations.write().unwrap();
+        let mut next_inner = inner.clone();
+        let mut next_incarnations = incarnations.clone();
+        for entry in directory {
+            let previous_incarnation = next_incarnations.get(&entry.node_id).copied();
+            match previous_incarnation {
+                Some(previous) if entry.incarnation < previous => continue,
+                Some(previous) if entry.incarnation == previous => {
+                    if let Some((control, bulk)) = next_inner.get(&entry.node_id)
+                        && (control != &entry.control_addr || bulk != &entry.bulk_addr)
+                    {
+                        return Err(DirectoryMergeError::ConflictingIncarnation {
+                            node_id: entry.node_id,
+                            incarnation: entry.incarnation,
+                        });
+                    }
+                }
+                _ => {
+                    next_inner.insert(
+                        entry.node_id,
+                        (entry.control_addr.clone(), entry.bulk_addr.clone()),
+                    );
+                    next_incarnations.insert(entry.node_id, entry.incarnation);
+                }
+            }
+        }
+        *inner = next_inner;
+        *incarnations = next_incarnations;
+        Ok(())
+    }
+
+    /// Every currently known control endpoint, in node-id order. Control-plane
+    /// discovery may contact non-meta nodes harmlessly; current meta hosts are
+    /// the ones that return authoritative replies.
+    pub fn control_addrs(&self) -> Vec<String> {
+        let mut entries: Vec<(NodeId, String)> = self
+            .inner
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&id, (control, _))| (id, control.clone()))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        let mut addresses: Vec<String> = entries.into_iter().map(|(_, address)| address).collect();
+        for seed in self.control_seeds.read().unwrap().iter() {
+            if !addresses.contains(seed) {
+                addresses.push(seed.clone());
+            }
+        }
+        addresses
     }
 }
 
@@ -68,6 +166,7 @@ pub struct RaftPeerFactory<T: Transport> {
     addrs: AddrBook,
     control: T,
     bulk: T,
+    identity_gate: ProcessIdentityGate,
 }
 
 impl<T: Transport + Clone> RaftPeerFactory<T> {
@@ -84,7 +183,13 @@ impl<T: Transport + Clone> RaftPeerFactory<T> {
             addrs,
             control,
             bulk,
+            identity_gate: ProcessIdentityGate::default(),
         }
+    }
+
+    pub fn with_identity_gate(mut self, identity_gate: ProcessIdentityGate) -> Self {
+        self.identity_gate = identity_gate;
+        self
     }
 }
 
@@ -96,6 +201,7 @@ pub struct RaftPeer<T: Transport> {
     addrs: AddrBook,
     control: T,
     bulk: T,
+    identity_gate: ProcessIdentityGate,
 }
 
 fn unreachable<E>(target: NodeId, what: &str) -> RPCError<NodeId, Node, E>
@@ -142,6 +248,7 @@ where
             addrs: self.addrs.clone(),
             control: self.control.clone(),
             bulk: self.bulk.clone(),
+            identity_gate: self.identity_gate.clone(),
         }
     }
 }
@@ -158,6 +265,9 @@ where
         rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+        if !self.identity_gate.is_open() {
+            return Err(unreachable(self.target, "local process identity is fenced"));
+        }
         let addr = self
             .addrs
             .control(self.target)
@@ -184,6 +294,9 @@ where
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+        if !self.identity_gate.is_open() {
+            return Err(unreachable(self.target, "local process identity is fenced"));
+        }
         let addr = self
             .addrs
             .control(self.target)
@@ -213,6 +326,9 @@ where
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, Node, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
+        if !self.identity_gate.is_open() {
+            return Err(unreachable(self.target, "local process identity is fenced"));
+        }
         let addr = self
             .addrs
             .bulk(self.target)
@@ -240,6 +356,7 @@ mod tests {
     use super::*;
     use crate::meta::raft_types::MetaTypeConfig;
     use crate::transport::{InProcess, Server};
+    use crate::types::NodeState;
     use openraft::Vote;
     use std::sync::Arc;
 
@@ -319,5 +436,93 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, RPCError::Unreachable(_)));
+    }
+
+    #[test]
+    fn directory_merge_never_regresses_or_rebinds_an_incarnation() {
+        let bootstrap_hint = AddrBook::new();
+        bootstrap_hint.set(7, "stale-control".into(), "stale-bulk".into());
+        bootstrap_hint
+            .update_directory(&[NodeDirectoryEntry {
+                node_id: 7,
+                control_addr: "live-control".into(),
+                bulk_addr: "live-bulk".into(),
+                state: NodeState::Active,
+                incarnation: 1,
+            }])
+            .unwrap();
+        assert_eq!(bootstrap_hint.control(7).as_deref(), Some("live-control"));
+
+        let addrs = AddrBook::new();
+        let current = NodeDirectoryEntry {
+            node_id: 7,
+            control_addr: "control-2".into(),
+            bulk_addr: "bulk-2".into(),
+            state: NodeState::Active,
+            incarnation: 2,
+        };
+        addrs
+            .update_directory(std::slice::from_ref(&current))
+            .unwrap();
+
+        let stale = NodeDirectoryEntry {
+            control_addr: "control-1".into(),
+            bulk_addr: "bulk-1".into(),
+            incarnation: 1,
+            ..current.clone()
+        };
+        addrs.update_directory(&[stale]).unwrap();
+        assert_eq!(addrs.control(7).as_deref(), Some("control-2"));
+        assert_eq!(addrs.incarnation(7), Some(2));
+
+        let conflicting = NodeDirectoryEntry {
+            control_addr: "control-conflict".into(),
+            ..current
+        };
+        assert!(matches!(
+            addrs.update_directory(&[conflicting]),
+            Err(DirectoryMergeError::ConflictingIncarnation {
+                node_id: 7,
+                incarnation: 2
+            })
+        ));
+        assert_eq!(addrs.control(7).as_deref(), Some("control-2"));
+    }
+
+    #[tokio::test]
+    async fn fenced_factory_refuses_outbound_raft() {
+        let switch = InProcess::new();
+        switch.register("peer-2", Arc::new(StubPeer));
+        let addrs = AddrBook::new();
+        addrs.set(2, "peer-2".into(), "peer-2-bulk".into());
+        let gate = ProcessIdentityGate::default();
+        let mut factory =
+            RaftPeerFactory::new(GroupId::Meta, 0x1234, addrs, switch.clone(), switch)
+                .with_identity_gate(gate.clone());
+        let mut peer = <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
+            &mut factory,
+            2,
+            &Node::default(),
+        )
+        .await;
+        gate.fence();
+
+        let result = <RaftPeer<_> as RaftNetwork<MetaTypeConfig>>::vote(
+            &mut peer,
+            VoteRequest::<NodeId>::new(Vote::new(1, 1), None),
+            RPCOption::new(std::time::Duration::from_secs(1)),
+        )
+        .await;
+        assert!(matches!(result, Err(RPCError::Unreachable(_))));
+    }
+
+    #[test]
+    fn control_seeds_remain_discovery_candidates() {
+        let addrs = AddrBook::new();
+        addrs.set(2, "node-2".into(), "node-2-bulk".into());
+        addrs.add_control_seed("seed-only".into());
+        addrs.add_control_seed("node-2".into());
+
+        assert_eq!(addrs.control_addrs(), vec!["node-2", "seed-only"]);
     }
 }

@@ -6,11 +6,11 @@
 //! install and CF reclamation.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
-    WriteOptions,
+    WriteOptions, statistics::Ticker,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyspace;
+use crate::perf::{RocksCounters, WriteStage};
+use crate::storage::durability::{DurabilityConfig, OnDurable, WalDurability};
 use crate::types::{
-    BootstrapGroup, ClusterId, GroupId, LearnerAdmission, LogId, NodeId, ServingState,
+    BootstrapGroup, ClusterId, GroupId, LearnerAdmission, LogId, NodeId, RegistrationBinding,
+    ServingState,
 };
 
 /// MultiThreaded so CFs can be created/dropped through `&self` while other
@@ -35,8 +38,15 @@ pub struct Identity {
 }
 
 pub struct Storage {
-    db: Db,
+    // Drop the coordinator first: it drains callbacks and joins its worker
+    // before the final RocksDB handle is released.
+    durability: WalDurability,
+    db: Arc<Db>,
+    profile_options: Option<Options>,
     path: PathBuf,
+    /// Orders each non-sync WAL write with registration of its durability
+    /// callback. The worker itself never takes this lock while flushing.
+    log_append_gate: Mutex<()>,
 }
 
 fn sync_write() -> WriteOptions {
@@ -48,10 +58,20 @@ fn sync_write() -> WriteOptions {
 impl Storage {
     /// Open (or create) the store, re-attaching every existing column family.
     pub fn open(path: impl AsRef<Path>) -> Result<Storage> {
+        Self::open_with_durability(path, DurabilityConfig::default())
+    }
+
+    fn open_with_durability(
+        path: impl AsRef<Path>,
+        durability_config: DurabilityConfig,
+    ) -> Result<Storage> {
         let path = path.as_ref().to_path_buf();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        if crate::perf::write_path_enabled() {
+            opts.enable_statistics();
+        }
 
         // On a fresh dir there is no descriptor list yet; start with default.
         let existing = Db::list_cf(&opts, &path).unwrap_or_else(|_| vec!["default".to_string()]);
@@ -60,8 +80,20 @@ impl Storage {
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
             .collect();
 
-        let db = Db::open_cf_descriptors(&opts, &path, descriptors)?;
-        Ok(Storage { db, path })
+        let db = Arc::new(Db::open_cf_descriptors(&opts, &path, descriptors)?);
+        let flush_db = db.clone();
+        let durability = WalDurability::with_config(durability_config, move || {
+            flush_db
+                .flush_wal(true)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })?;
+        Ok(Storage {
+            durability,
+            db,
+            profile_options: crate::perf::write_path_enabled().then_some(opts),
+            path,
+            log_append_gate: Mutex::new(()),
+        })
     }
 
     /// Open and bind identity: on a fresh dir persist `(cluster_id, node_id)`;
@@ -119,6 +151,50 @@ impl Storage {
             .ok_or_else(|| Error::Config("heartbeat incarnation exhausted".into()))?;
         self.put_local(&keyspace::heartbeat_incarnation_key(), &next)?;
         Ok(next)
+    }
+
+    pub fn registration_binding(&self) -> Result<Option<RegistrationBinding>> {
+        self.get_local(&keyspace::registration_binding_key())
+    }
+
+    /// Persist the registration identity before the process starts serving.
+    /// Equal incarnations must be byte-identical and incarnations never move
+    /// backwards, even if a caller presents a stale directory snapshot.
+    pub fn record_registration_binding(&self, binding: &RegistrationBinding) -> Result<()> {
+        let identity = self.identity()?.ok_or_else(|| {
+            Error::Config("registration binding requires a bound node identity".into())
+        })?;
+        if binding.cluster_id != identity.cluster_id || binding.node_id != identity.node_id {
+            return Err(Error::IdentityMismatch {
+                found_cluster: identity.cluster_id,
+                found_node: identity.node_id,
+                want_cluster: binding.cluster_id,
+                want_node: binding.node_id,
+            });
+        }
+        if binding.directory_incarnation == 0 {
+            return Err(Error::Config(
+                "registration binding incarnation must be non-zero".into(),
+            ));
+        }
+        if let Some(previous) = self.registration_binding()? {
+            if binding.directory_incarnation < previous.directory_incarnation {
+                return Err(Error::Config(format!(
+                    "registration incarnation regressed from {} to {}",
+                    previous.directory_incarnation, binding.directory_incarnation
+                )));
+            }
+            if binding.directory_incarnation == previous.directory_incarnation {
+                if binding == &previous {
+                    return Ok(());
+                }
+                return Err(Error::Config(format!(
+                    "registration endpoints conflict at incarnation {}",
+                    binding.directory_incarnation
+                )));
+            }
+        }
+        self.put_local(&keyspace::registration_binding_key(), binding)
     }
 
     // ---- node-local default-CF records -------------------------------------
@@ -198,14 +274,44 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist an admission that has just been verified against a live,
+    /// linearizable meta plan. Unlike the low-level bootstrap helper, this may
+    /// replace an older plan's admission and may reopen a reclaimed group.
+    /// Admission and the serving-state transition are one durable local batch,
+    /// so a crash cannot retain one without the other.
+    pub fn record_verified_learner_admission(&self, record: &LearnerAdmission) -> Result<()> {
+        let identity = self.identity()?.ok_or_else(|| {
+            Error::Config("learner admission requires a bound node identity".into())
+        })?;
+        if identity.cluster_id != record.cluster_id {
+            return Err(Error::IdentityMismatch {
+                found_cluster: identity.cluster_id,
+                found_node: identity.node_id,
+                want_cluster: record.cluster_id,
+                want_node: identity.node_id,
+            });
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(keyspace::admission_key(record.group), codec::encode(record));
+        batch.put(
+            keyspace::serving_key(record.group),
+            codec::encode(&ServingState::Serving),
+        );
+        self.db.write_opt(batch, &sync_write())?;
+        Ok(())
+    }
+
     pub fn group_exists(&self, group: GroupId) -> bool {
         self.db.cf_handle(&group.cf_state()).is_some()
             && self.db.cf_handle(&group.cf_log()).is_some()
     }
 
     /// Authorize a local Raft runtime to open `group`. Group state may be
-    /// created only from a durable bootstrap record or learner admission; a
-    /// group previously marked non-serving can never be resurrected locally.
+    /// created only from a durable bootstrap record or learner admission. A
+    /// group marked non-serving stays fenced unless a newly live-verified plan
+    /// first records a fresh admission with
+    /// [`Self::record_verified_learner_admission`].
     pub fn authorize_group_start(&self, group: GroupId, node_id: NodeId) -> Result<()> {
         if self.serving_state(group)? == Some(ServingState::NonServing) {
             return Err(Error::Raft(format!(
@@ -266,6 +372,50 @@ impl Storage {
 
     pub(crate) fn db(&self) -> &Db {
         &self.db
+    }
+
+    pub fn rocks_counters(&self) -> RocksCounters {
+        let Some(options) = &self.profile_options else {
+            return RocksCounters::default();
+        };
+        RocksCounters {
+            wal_syncs: options.get_ticker_count(Ticker::WalFileSynced),
+            wal_bytes: options.get_ticker_count(Ticker::WalFileBytes),
+            stall_micros: options.get_ticker_count(Ticker::StallMicros),
+        }
+    }
+
+    /// Write a Raft log batch to the WAL without syncing it, then register its
+    /// callback with the database-wide group-commit worker. The callback is
+    /// never completed successfully until `flush_wal(true)` covers this write.
+    pub(crate) fn write_log_batch(
+        &self,
+        batch: rocksdb::WriteBatch,
+        wal_bytes: usize,
+        callback: OnDurable,
+    ) -> Result<()> {
+        // Reserve first so bytes waiting for durability remain bounded even if
+        // the disk becomes slower than Raft producers.
+        let reservation = {
+            let _profile = crate::perf::timer(WriteStage::WalCapacityWait);
+            self.durability.reserve(wal_bytes)?
+        };
+        let _append = {
+            let _profile = crate::perf::timer(WriteStage::WalAppendLockWait);
+            self.log_append_gate
+                .lock()
+                .map_err(|_| std::io::Error::other("Raft log append lock poisoned"))?
+        };
+
+        let mut options = WriteOptions::default();
+        options.set_sync(false);
+        {
+            let _profile = crate::perf::timer(WriteStage::WalWriteUnsynced);
+            self.db.write_opt(batch, &options)?;
+        }
+        self.durability
+            .submit(reservation, callback)
+            .map_err(Error::Io)
     }
 
     // ---- state-CF reads (writes go through the batch helper) ---------------
@@ -337,5 +487,62 @@ impl Storage {
             std::io::Error::other("injected crash at snapshot_install::after_write")
         )));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn delayed_config(delay: Duration) -> DurabilityConfig {
+        DurabilityConfig {
+            max_pending_requests: 8,
+            max_pending_bytes: 1_024,
+            max_batch_delay: delay,
+        }
+    }
+
+    #[test]
+    fn log_batch_is_readable_before_its_durable_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(100)))
+                .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(b"log-key", b"log-value");
+
+        storage
+            .write_log_batch(batch, 18, Box::new(move |result| tx.send(result).unwrap()))
+            .unwrap();
+
+        assert_eq!(storage.db().get(b"log-key").unwrap().unwrap(), b"log-value");
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+    }
+
+    #[test]
+    fn dropping_storage_durably_drains_pending_log_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_secs(10)))
+                .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(b"shutdown-key", b"shutdown-value");
+        storage
+            .write_log_batch(batch, 26, Box::new(move |result| tx.send(result).unwrap()))
+            .unwrap();
+
+        drop(storage);
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+        let reopened = Storage::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.db().get(b"shutdown-key").unwrap().unwrap(),
+            b"shutdown-value"
+        );
     }
 }

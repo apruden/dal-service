@@ -35,6 +35,8 @@ struct Cache {
     routing: Option<RoutingInfo>,
     /// Best-known leader per partition, tried first (DESIGN §8.1).
     leader_hint: HashMap<u16, NodeId>,
+    /// Candidates learned from redirects newer than the cached routing snapshot.
+    redirect_candidates: HashMap<u16, Vec<NodeId>>,
     /// Next unused sequence per partition for this client (DESIGN §8.4).
     /// Sequence 0 is never decided, so streams start at 1.
     next_seq: HashMap<u16, Sequence>,
@@ -341,13 +343,28 @@ impl<T: Transport> Client<T> {
 
         let Some(info) = cache.routing.as_ref() else {
             // No routing yet: the only lead we might have is a redirect hint.
-            return match (lead_with_hint, cache.leader_hint.get(&partition)) {
-                (true, Some(&hint)) => vec![hint],
-                _ => Vec::new(),
-            };
+            let mut out = cache
+                .redirect_candidates
+                .get(&partition)
+                .cloned()
+                .unwrap_or_default();
+            if lead_with_hint
+                && let Some(&hint) = cache.leader_hint.get(&partition)
+                && !out.contains(&hint)
+            {
+                out.insert(0, hint);
+            }
+            return out;
         };
 
         let mut voters = info.candidates(partition);
+        if let Some(redirected) = cache.redirect_candidates.get(&partition) {
+            for &candidate in redirected {
+                if !voters.contains(&candidate) {
+                    voters.push(candidate);
+                }
+            }
+        }
         if let RouteOrder::Spread { .. } = order
             && !voters.is_empty()
         {
@@ -356,9 +373,7 @@ impl<T: Transport> Client<T> {
         }
 
         let mut out = Vec::new();
-        if lead_with_hint
-            && let Some(&hint) = cache.leader_hint.get(&partition)
-        {
+        if lead_with_hint && let Some(&hint) = cache.leader_hint.get(&partition) {
             out.push(hint);
         }
         for c in voters {
@@ -422,18 +437,32 @@ impl<T: Transport> Client<T> {
                 let reply: ClientReply = codec::decode(&reply_env.payload)?;
                 match reply {
                     ClientReply::Redirect(r) => {
+                        if r.cluster_id != self.cluster_id {
+                            return Err(Error::Raft(format!(
+                                "redirect from cluster {:#x}, expected {:#x}",
+                                r.cluster_id, self.cluster_id
+                            )));
+                        }
+                        let restart_for_hint = r.leader.is_some_and(|leader| leader != node);
                         self.apply_redirect(partition, node, &r);
                         redirected = true;
-                        break;
+                        if restart_for_hint {
+                            break;
+                        }
+                        continue;
                     }
                     other => return Ok(other),
                 }
             }
 
-            // A redirect updated the cache: restart the round so the new leader
-            // hint is tried first. Otherwise all candidates were unreachable —
-            // refresh routing from the seeds and try again.
-            if !redirected {
+            // Redirects name node ids but carry no addresses. Refresh after one
+            // so a newly promoted/joined candidate can actually be resolved;
+            // keep the redirect hint when seeds are temporarily unavailable.
+            // With no redirect, exhausting every candidate requires a
+            // successful refresh before another identical round is useful.
+            if redirected {
+                let _ = self.refresh_routing().await;
+            } else {
                 self.refresh_routing().await?;
             }
         }
@@ -448,6 +477,12 @@ impl<T: Transport> Client<T> {
     /// newly advertised candidates. Advisory only (DESIGN §8.2).
     fn apply_redirect(&self, partition: u16, from: NodeId, r: &crate::api::ops::Redirect) {
         let mut cache = self.cache.lock().unwrap();
+        let candidates = cache.redirect_candidates.entry(partition).or_default();
+        for &candidate in &r.candidates {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
         match r.leader {
             Some(leader) => {
                 cache.leader_hint.insert(partition, leader);
@@ -466,9 +501,9 @@ impl<T: Transport> Client<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ops::RoutingInfo;
+    use crate::api::ops::{Redirect, RoutingInfo};
     use crate::transport::{InProcess, Server};
-    use crate::types::{HashSpec, LogId, Placement};
+    use crate::types::{HashSpec, LogId, NodeDirectoryEntry, NodeState, Placement};
 
     struct NullServer;
     impl Server for NullServer {
@@ -552,5 +587,122 @@ mod tests {
             sorted.sort();
             assert_eq!(sorted, vec![1, 2, 3]);
         }
+    }
+
+    #[test]
+    fn redirect_candidates_extend_a_stale_placement() {
+        let client = client_with_voters(vec![1, 2, 3]);
+        client.apply_redirect(
+            0,
+            1,
+            &crate::api::ops::Redirect {
+                cluster_id: 1,
+                leader: None,
+                candidates: vec![2, 3, 4],
+            },
+        );
+        assert_eq!(
+            client.candidate_nodes(0, RouteOrder::LeaderFirst),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    enum ScriptedReply {
+        Redirect,
+        Leader,
+        Routing(RoutingInfo),
+    }
+
+    struct ScriptedServer(ScriptedReply);
+
+    impl Server for ScriptedServer {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            let payload = match &self.0 {
+                ScriptedReply::Redirect => codec::encode(&ClientReply::Redirect(Redirect {
+                    cluster_id: 1,
+                    leader: Some(4),
+                    candidates: vec![4],
+                })),
+                ScriptedReply::Leader => {
+                    codec::encode(&ClientReply::Value(Some((7, b"new".to_vec()))))
+                }
+                ScriptedReply::Routing(info) => codec::encode(info),
+            };
+            Envelope::new(
+                1,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                payload,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_to_an_unknown_node_refreshes_its_address() {
+        let transport = InProcess::new();
+        transport.register("node-1", Arc::new(ScriptedServer(ScriptedReply::Redirect)));
+        transport.register("node-4", Arc::new(ScriptedServer(ScriptedReply::Leader)));
+
+        let fresh = RoutingInfo {
+            cluster_id: 1,
+            p: 1,
+            hash_spec: HashSpec::CANONICAL,
+            directory: vec![
+                NodeDirectoryEntry {
+                    node_id: 1,
+                    control_addr: "node-1".into(),
+                    bulk_addr: "node-1-bulk".into(),
+                    state: NodeState::Active,
+                    incarnation: 1,
+                },
+                NodeDirectoryEntry {
+                    node_id: 4,
+                    control_addr: "node-4".into(),
+                    bulk_addr: "node-4-bulk".into(),
+                    state: NodeState::Active,
+                    incarnation: 1,
+                },
+            ],
+            placements: vec![(
+                0,
+                Placement {
+                    voters: vec![1, 2, 4],
+                    voters_log_id: LogId::new(2, 10),
+                    r#move: None,
+                },
+            )],
+        };
+        transport.register(
+            "seed",
+            Arc::new(ScriptedServer(ScriptedReply::Routing(fresh))),
+        );
+
+        let client = Client::new(1, 9, vec!["seed".into()], transport);
+        client.cache.lock().unwrap().routing = Some(RoutingInfo {
+            cluster_id: 1,
+            p: 1,
+            hash_spec: HashSpec::CANONICAL,
+            directory: vec![NodeDirectoryEntry {
+                node_id: 1,
+                control_addr: "node-1".into(),
+                bulk_addr: "node-1-bulk".into(),
+                state: NodeState::Active,
+                incarnation: 1,
+            }],
+            placements: vec![(
+                0,
+                Placement {
+                    voters: vec![1],
+                    voters_log_id: LogId::new(1, 1),
+                    r#move: None,
+                },
+            )],
+        });
+
+        assert_eq!(
+            client.get(b"key").await.unwrap(),
+            Some((7, b"new".to_vec()))
+        );
     }
 }

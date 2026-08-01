@@ -63,13 +63,19 @@ pub fn next_state(current: NodeState, evidence: Liveness) -> Option<NodeState> {
 /// Heartbeats are liveness evidence only. `evaluate` returns the directory
 /// transitions the evidence *justifies*; the meta leader commits them via
 /// `SetNodeState`, whose incarnation guard is the actual defence against a
-/// stale heartbeat reactivating a `Down` node. `observe` additionally drops a
-/// non-increasing sequence within one incarnation, so a replayed heartbeat is
-/// ignored without rejecting a restarted process that begins at sequence one.
+/// stale heartbeat reactivating a `Down` node. `observe` additionally fences on
+/// the replicated directory incarnation and drops a non-increasing process
+/// epoch/sequence, so a replay is ignored without rejecting a restarted process
+/// that begins at sequence one.
 #[derive(Default)]
 pub struct HeartbeatTracker {
     last_seen_ms: HashMap<NodeId, u64>,
-    last_stamp: HashMap<NodeId, (u64, u64)>,
+    /// `(directory incarnation, durable process incarnation, sequence)`.
+    last_stamp: HashMap<NodeId, (u64, u64, u64)>,
+    /// Start of the grace period for a directory incarnation for which no
+    /// matching heartbeat has been observed. This prevents a newly registered
+    /// node (or a freshly started detector) from becoming Down immediately.
+    unobserved_since_ms: HashMap<NodeId, (u64, u64)>,
 }
 
 impl HeartbeatTracker {
@@ -77,45 +83,80 @@ impl HeartbeatTracker {
         HeartbeatTracker::default()
     }
 
-    /// Record a heartbeat. A lower incarnation is stale; within one
-    /// incarnation only a strictly increasing sequence is accepted. A higher
-    /// incarnation starts a fresh stream, which makes a clean restart live
-    /// immediately while preventing an old process from refreshing liveness.
-    pub fn observe(&mut self, node: NodeId, incarnation: u64, seq: u64, now_ms: u64) -> bool {
-        if let Some(&(previous_incarnation, previous_seq)) = self.last_stamp.get(&node)
+    /// Record a heartbeat. A lower directory incarnation is stale. Within one
+    /// directory incarnation, a higher durable process incarnation starts a
+    /// fresh stream and only a strictly increasing sequence is accepted. Thus a
+    /// clean restart can begin at sequence one while its old process can no
+    /// longer refresh liveness.
+    pub fn observe(
+        &mut self,
+        node: NodeId,
+        incarnation: u64,
+        process_incarnation: u64,
+        seq: u64,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(&(previous_incarnation, previous_process, previous_seq)) =
+            self.last_stamp.get(&node)
             && (incarnation < previous_incarnation
-                || (incarnation == previous_incarnation && seq <= previous_seq))
+                || (incarnation == previous_incarnation
+                    && (process_incarnation < previous_process
+                        || (process_incarnation == previous_process && seq <= previous_seq))))
         {
             return false;
         }
-        self.last_stamp.insert(node, (incarnation, seq));
+        self.last_stamp
+            .insert(node, (incarnation, process_incarnation, seq));
         self.last_seen_ms.insert(node, now_ms);
         true
     }
 
-    /// Time since the last accepted heartbeat, or `u64::MAX` if never seen.
-    fn silence_ms(&self, node: NodeId, now_ms: u64) -> u64 {
-        self.last_seen_ms
+    /// Time since the last heartbeat matching the directory's committed
+    /// incarnation. `None` starts a full grace period and intentionally causes
+    /// no transition during this evaluation. Heartbeats from an older or
+    /// uncommitted future incarnation never refresh that grace period.
+    fn silence_ms(&mut self, node: NodeId, incarnation: u64, now_ms: u64) -> Option<u64> {
+        if self
+            .last_stamp
             .get(&node)
-            .map(|&t| now_ms.saturating_sub(t))
-            .unwrap_or(u64::MAX)
+            .is_some_and(|(observed, _, _)| *observed == incarnation)
+        {
+            self.unobserved_since_ms.remove(&node);
+            return self
+                .last_seen_ms
+                .get(&node)
+                .map(|&seen| now_ms.saturating_sub(seen));
+        }
+
+        match self.unobserved_since_ms.get_mut(&node) {
+            Some((expected, since)) if *expected == incarnation => {
+                Some(now_ms.saturating_sub(*since))
+            }
+            Some(entry) => {
+                *entry = (incarnation, now_ms);
+                None
+            }
+            None => {
+                self.unobserved_since_ms.insert(node, (incarnation, now_ms));
+                None
+            }
+        }
     }
 
     /// The directory transitions justified by current liveness, given each
-    /// node's committed state. Only nodes needing a change are returned.
+    /// node's committed state and incarnation. Only nodes needing a change are
+    /// returned.
     pub fn evaluate(
-        &self,
+        &mut self,
         now_ms: u64,
         timeouts: &Timeouts,
-        states: &[(NodeId, NodeState)],
+        states: &[(NodeId, NodeState, u64)],
     ) -> Vec<(NodeId, NodeState)> {
         states
             .iter()
-            .filter_map(|&(node, current)| {
-                let evidence = classify(
-                    Duration::from_millis(self.silence_ms(node, now_ms)),
-                    timeouts,
-                );
+            .filter_map(|&(node, current, incarnation)| {
+                let silence = self.silence_ms(node, incarnation, now_ms)?;
+                let evidence = classify(Duration::from_millis(silence), timeouts);
                 next_state(current, evidence).map(|s| (node, s))
             })
             .collect()
@@ -137,35 +178,39 @@ mod tests {
     #[test]
     fn tracker_ignores_stale_and_replayed_heartbeats() {
         let mut t = HeartbeatTracker::new();
-        assert!(t.observe(1, 1, 5, 1000));
+        assert!(t.observe(1, 1, 1, 5, 1000));
         // Same or lower sequence is ignored (replay / stale).
-        assert!(!t.observe(1, 1, 5, 2000));
-        assert!(!t.observe(1, 1, 4, 2000));
+        assert!(!t.observe(1, 1, 1, 5, 2000));
+        assert!(!t.observe(1, 1, 1, 4, 2000));
         // A newer sequence refreshes liveness.
-        assert!(t.observe(1, 1, 6, 3000));
-        // A restarted process advances its incarnation and restarts at one.
-        assert!(t.observe(1, 2, 1, 4000));
+        assert!(t.observe(1, 1, 1, 6, 3000));
+        // A restarted process advances its process incarnation and restarts at
+        // sequence one within the same replicated directory incarnation.
+        assert!(t.observe(1, 1, 2, 1, 4000));
         // The prior process cannot refresh liveness after that restart.
-        assert!(!t.observe(1, 1, 7, 5000));
+        assert!(!t.observe(1, 1, 1, 7, 5000));
     }
 
     #[test]
     fn evaluate_proposes_suspect_then_down() {
         let t0 = 10_000u64;
         let mut tr = HeartbeatTracker::new();
-        tr.observe(1, 1, 1, t0);
+        tr.observe(1, 1, 1, 1, t0);
         let to = timeouts();
 
         // Fresh: no transition.
-        assert!(tr.evaluate(t0, &to, &[(1, NodeState::Active)]).is_empty());
+        assert!(
+            tr.evaluate(t0, &to, &[(1, NodeState::Active, 1)])
+                .is_empty()
+        );
         // Past suspect_timeout: Active -> Suspect.
         assert_eq!(
-            tr.evaluate(t0 + ms(to.suspect), &to, &[(1, NodeState::Active)]),
+            tr.evaluate(t0 + ms(to.suspect), &to, &[(1, NodeState::Active, 1)]),
             vec![(1, NodeState::Suspect)]
         );
         // Past down_timeout: Suspect -> Down.
         assert_eq!(
-            tr.evaluate(t0 + ms(to.down), &to, &[(1, NodeState::Suspect)]),
+            tr.evaluate(t0 + ms(to.down), &to, &[(1, NodeState::Suspect, 1)]),
             vec![(1, NodeState::Down)]
         );
     }
@@ -173,11 +218,51 @@ mod tests {
     #[test]
     fn evaluate_never_reactivates_down_from_silence_or_beat() {
         let mut tr = HeartbeatTracker::new();
-        tr.observe(1, 1, 1, 0);
+        tr.observe(1, 1, 1, 1, 0);
         // Even a fresh heartbeat produces no transition for a Down node — only an
         // explicit rejoin (incarnation bump via the meta SM) may revive it.
-        let out = tr.evaluate(0, &timeouts(), &[(1, NodeState::Down)]);
+        let out = tr.evaluate(0, &timeouts(), &[(1, NodeState::Down, 1)]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unobserved_node_gets_a_full_grace_period() {
+        let mut tr = HeartbeatTracker::new();
+        let to = timeouts();
+        let start = 10_000;
+
+        assert!(
+            tr.evaluate(start, &to, &[(7, NodeState::Active, 1)])
+                .is_empty()
+        );
+        assert_eq!(
+            tr.evaluate(start + ms(to.suspect), &to, &[(7, NodeState::Active, 1)]),
+            vec![(7, NodeState::Suspect)]
+        );
+        assert_eq!(
+            tr.evaluate(start + ms(to.down), &to, &[(7, NodeState::Suspect, 1)]),
+            vec![(7, NodeState::Down)]
+        );
+    }
+
+    #[test]
+    fn old_incarnation_cannot_refresh_current_liveness() {
+        let mut tr = HeartbeatTracker::new();
+        let to = timeouts();
+        let start = 20_000;
+
+        assert!(tr.observe(3, 1, 1, 1, start));
+        // The directory has committed incarnation 2, so incarnation 1 starts
+        // no liveness stream for the current registration.
+        assert!(
+            tr.evaluate(start, &to, &[(3, NodeState::Active, 2)])
+                .is_empty()
+        );
+        assert!(tr.observe(3, 1, 1, 2, start + ms(to.down) - 1));
+        assert_eq!(
+            tr.evaluate(start + ms(to.down), &to, &[(3, NodeState::Suspect, 2)]),
+            vec![(3, NodeState::Down)]
+        );
     }
 
     #[test]

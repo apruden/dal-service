@@ -16,6 +16,7 @@ use crate::config::NodeConfig;
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::BootstrapDescriptor;
 use crate::meta::state_machine::MetaApplyResult;
+use crate::runtime::directory::fetch_authoritative_directory;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::dealer::ZmqTransport;
@@ -52,17 +53,72 @@ impl Targets {
             .iter()
             .map(|e| (e.node_id, e.control_addr.clone()))
             .collect();
-        let candidates = match seed {
-            Some(addr) => vec![addr.to_string()],
-            None => contact_ids
+        let mut candidates = Vec::new();
+        if let Some(addr) = seed {
+            candidates.push(addr.to_string());
+        }
+        candidates.extend(
+            contact_ids
                 .iter()
-                .filter_map(|id| directory.get(id).cloned())
-                .collect(),
-        };
+                .filter_map(|id| directory.get(id).cloned()),
+        );
+        let mut seen = HashSet::new();
+        candidates.retain(|address| seen.insert(address.clone()));
         Targets {
             candidates,
             directory,
         }
+    }
+
+    /// Replace immutable bootstrap targets with a ReadIndex-fenced live
+    /// directory when possible. If no leader is reachable, an advisory routing
+    /// snapshot may expand the contact set, but remains discovery-only.
+    async fn discover_live(mut self, transport: &ZmqTransport, cluster_id: ClusterId) -> Targets {
+        if let Ok(live) = fetch_authoritative_directory(
+            transport,
+            cluster_id,
+            self.candidates.clone(),
+            ADMIN_TIMEOUT,
+        )
+        .await
+        {
+            self.directory = live
+                .iter()
+                .map(|entry| (entry.node_id, entry.control_addr.clone()))
+                .collect();
+            for entry in live {
+                if !self.candidates.contains(&entry.control_addr) {
+                    self.candidates.push(entry.control_addr);
+                }
+            }
+            return self;
+        }
+
+        for addr in self.candidates.clone() {
+            let request =
+                Envelope::new(cluster_id, MsgType::MetaQuery, GroupId::Meta, 0, Vec::new());
+            let Ok(reply) = transport.call(&addr, request).await else {
+                continue;
+            };
+            if reply.cluster_id != cluster_id || reply.msg_type != MsgType::MetaQuery {
+                continue;
+            }
+            let Ok(info) = codec::decode::<RoutingInfo>(&reply.payload) else {
+                continue;
+            };
+            if info.cluster_id != cluster_id {
+                continue;
+            }
+            for entry in info.directory {
+                self.directory
+                    .insert(entry.node_id, entry.control_addr.clone());
+                if !self.candidates.contains(&entry.control_addr) {
+                    self.candidates.push(entry.control_addr);
+                }
+            }
+            break;
+        }
+        self
     }
 }
 
@@ -139,11 +195,19 @@ pub async fn status(
 ) -> Result<RoutingInfo> {
     let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
     let contact_ids: Vec<NodeId> = desc.directory.iter().map(|e| e.node_id).collect();
-    let targets = Targets::from_descriptor(desc, seed, &contact_ids);
+    let targets = Targets::from_descriptor(desc, seed, &contact_ids)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
 
     let mut last_error: Option<String> = None;
     for addr in &targets.candidates {
-        let env = Envelope::new(desc.cluster_id, MsgType::MetaQuery, GroupId::Meta, 1, Vec::new());
+        let env = Envelope::new(
+            desc.cluster_id,
+            MsgType::MetaQuery,
+            GroupId::Meta,
+            1,
+            Vec::new(),
+        );
         let reply = match transport.call(addr, env).await {
             Ok(reply) => reply,
             Err(e) => {
@@ -177,13 +241,22 @@ pub async fn join(ctx: zmq::Context, cfg: &NodeConfig) -> Result<MetaApplyResult
     let targets = Targets {
         candidates: cfg.seeds.clone(),
         directory: HashMap::new(),
-    };
+    }
+    .discover_live(&transport, cfg.cluster_id)
+    .await;
     let body = codec::encode(&JoinBody {
         node_id: cfg.node_id,
         control_addr: cfg.control_addr.clone(),
         bulk_addr: cfg.bulk_addr.clone(),
     });
-    submit(&transport, cfg.cluster_id, &targets, MsgType::JoinRequest, body).await
+    submit(
+        &transport,
+        cfg.cluster_id,
+        &targets,
+        MsgType::JoinRequest,
+        body,
+    )
+    .await
 }
 
 /// `dal leave`: mark a node `Draining` so the cluster migrates its partitions
@@ -195,9 +268,18 @@ pub async fn leave(
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
     let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
-    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters);
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
     let body = codec::encode(&LeaveBody { node_id });
-    submit(&transport, desc.cluster_id, &targets, MsgType::LeaveRequest, body).await
+    submit(
+        &transport,
+        desc.cluster_id,
+        &targets,
+        MsgType::LeaveRequest,
+        body,
+    )
+    .await
 }
 
 /// `dal abort-plan`: mark a stuck move plan `aborting` so the driver rolls it
@@ -210,7 +292,9 @@ pub async fn abort_plan(
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
     let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
-    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters);
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
     let body = codec::encode(&AbortPlanBody { group, plan_id });
     submit(
         &transport,

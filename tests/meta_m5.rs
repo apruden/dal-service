@@ -7,8 +7,8 @@ use dal::keyspace;
 use dal::meta::state_machine::{MetaApplyResult, MetaReject, MetaStateMachine};
 use dal::storage::Storage;
 use dal::types::{
-    ClusterConfig, DataConfigObservation, GroupId, HashSpec, LogId, MetaCommand, NodeId, NodeState,
-    PROTOCOL_VERSION, Placement,
+    ClusterConfig, DataConfigObservation, GroupId, HashSpec, LogId, MetaCommand,
+    NodeDirectoryEntry, NodeId, NodeState, PROTOCOL_VERSION, Placement,
 };
 
 use tempfile::TempDir;
@@ -55,6 +55,12 @@ impl Meta {
     fn placement(&self, group: GroupId) -> Option<Placement> {
         self.storage
             .get_state_record(GroupId::Meta, &keyspace::meta_placement_key(group))
+            .unwrap()
+    }
+
+    fn node(&self, node_id: NodeId) -> Option<NodeDirectoryEntry> {
+        self.storage
+            .get_state_record(GroupId::Meta, &keyspace::meta_node_key(node_id))
             .unwrap()
     }
 
@@ -172,6 +178,47 @@ fn commands_before_init_are_rejected() {
     );
 }
 
+#[test]
+fn explicit_registration_revives_a_down_node_at_the_same_addresses() {
+    let mut m = Meta::new();
+    m.bootstrap(8, 3, &[1, 2, 3], &[1, 2, 3]);
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Down,
+            incarnation: 1,
+        }),
+        MetaApplyResult::Applied
+    );
+
+    assert_eq!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 3,
+            control_addr: "c3".into(),
+            bulk_addr: "b3".into(),
+        }),
+        MetaApplyResult::Applied
+    );
+    let node = m.node(3).unwrap();
+    assert_eq!(node.state, NodeState::Active);
+    assert_eq!(node.incarnation, 2);
+}
+
+#[test]
+fn registration_rejects_addresses_owned_by_another_node() {
+    let mut m = Meta::new();
+    m.bootstrap(8, 3, &[1, 2, 3], &[1, 2, 3]);
+    assert!(matches!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 4,
+            control_addr: "b2".into(),
+            bulk_addr: "b4".into(),
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
+    assert!(m.node(4).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Seed placement
 // ---------------------------------------------------------------------------
@@ -256,6 +303,19 @@ fn create_plan_rejects_bad_targets() {
     assert_eq!(
         m.create_plan(GroupId::Data(7), &[1, 2, 3]).0,
         MetaApplyResult::Rejected(MetaReject::NoPlacement)
+    );
+}
+
+#[test]
+fn meta_replacement_is_not_blocked_by_data_replication_factor() {
+    let mut m = Meta::new();
+    // Only four Active nodes exist, fewer than data replication factor five.
+    // A valid three-voter meta replacement still preserves its own quorum and
+    // must not be rejected by the data-group capacity rule.
+    m.bootstrap(8, 5, &[1, 2, 3], &[1, 2, 3, 4]);
+    assert_eq!(
+        m.create_plan(GroupId::Meta, &[1, 2, 4]).0,
+        MetaApplyResult::Applied
     );
 }
 

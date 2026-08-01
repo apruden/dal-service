@@ -38,11 +38,21 @@ fn eligible_nodes(directory: &[NodeDirectoryEntry]) -> BTreeSet<NodeId> {
         .collect()
 }
 
-/// Replica load per node across all non-moving partitions.
+/// Anticipated replica load per node. A healthy move already reserves capacity
+/// at its target voter set even though the placement record's durable `voters`
+/// field remains the old set until finalization. Counting the old set here lets
+/// successive planner ticks repeatedly choose the same destination and overshoot
+/// the balanced distribution.
 fn load_map(placements: &BTreeMap<u16, Placement>) -> BTreeMap<NodeId, usize> {
     let mut load = BTreeMap::new();
     for placement in placements.values() {
-        for &v in &placement.voters {
+        let voters = placement
+            .r#move
+            .as_ref()
+            .filter(|plan| !plan.aborting)
+            .map(|plan| plan.target_voters.as_slice())
+            .unwrap_or(&placement.voters);
+        for &v in voters {
             *load.entry(v).or_insert(0) += 1;
         }
     }
@@ -58,6 +68,16 @@ pub fn propose(
 ) -> Option<PlanProposal> {
     let eligible = eligible_nodes(directory);
     if eligible.len() < r {
+        return None;
+    }
+
+    // An aborting move has no stable anticipated target: it may roll back to
+    // `voters` or benignly finalize to `target_voters`. Do not stack a new
+    // balancing decision on top of that unresolved configuration.
+    if placements
+        .values()
+        .any(|placement| placement.r#move.as_ref().is_some_and(|plan| plan.aborting))
+    {
         return None;
     }
 
@@ -276,5 +296,42 @@ mod tests {
         });
         // The only draining candidate is already moving → nothing to propose.
         assert_eq!(propose(&dir2, &pl, 3), None);
+    }
+
+    #[test]
+    fn in_flight_target_reserves_destination_load() {
+        let dir = active(&[1, 2, 3, 4]);
+        let mut pl = map(&[
+            (0, &[1, 2, 3]),
+            (1, &[1, 2, 3]),
+            (2, &[1, 2, 3]),
+            (3, &[1, 2, 3]),
+        ]);
+        pl.get_mut(&0).unwrap().r#move = Some(crate::types::MovePlan {
+            plan_id: 7,
+            target_voters: vec![2, 3, 4],
+            aborting: false,
+        });
+
+        // Node 4 already owns the anticipated target of partition 0. The next
+        // proposal may still use it once, but its source must no longer be node
+        // 1, whose anticipated load has already fallen below nodes 2 and 3.
+        let proposal = propose(&dir, &pl, 3).unwrap();
+        assert_eq!(proposal.group, GroupId::Data(1));
+        assert!(proposal.target_voters.contains(&4));
+        assert!(proposal.target_voters.contains(&1));
+        assert!(!proposal.target_voters.contains(&2));
+    }
+
+    #[test]
+    fn aborting_move_blocks_new_balance_work() {
+        let dir = active(&[1, 2, 3, 4]);
+        let mut pl = map(&[(0, &[1, 2, 3]), (1, &[1, 2, 3])]);
+        pl.get_mut(&0).unwrap().r#move = Some(crate::types::MovePlan {
+            plan_id: 7,
+            target_voters: vec![1, 2, 4],
+            aborting: true,
+        });
+        assert_eq!(propose(&dir, &pl, 3), None);
     }
 }

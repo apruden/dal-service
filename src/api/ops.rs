@@ -18,7 +18,19 @@ use crate::types::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientRequest {
     Mutate(DataRequest),
-    Read { key: Vec<u8>, consistency: Consistency },
+    Read {
+        key: Vec<u8>,
+        consistency: Consistency,
+    },
+}
+
+/// Controls whether a `MetaQuery` may proxy to another node. Public clients send
+/// an empty payload (equivalent to `local_only = false`). Runtime-to-runtime
+/// lookups set `local_only` so a non-meta node fails fast instead of recursively
+/// proxying the same query through its peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingQuery {
+    pub local_only: bool,
 }
 
 impl ClientRequest {

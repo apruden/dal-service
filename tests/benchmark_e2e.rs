@@ -14,12 +14,24 @@
 //!   DAL_BENCH_READS       (default 1000) sequential single-client reads
 //!   DAL_BENCH_CLIENTS     (default 16)   concurrent clients
 //!   DAL_BENCH_OPS         (default 6000) total ops in each concurrent phase
+//!   DAL_BENCH_DIR          (default OS temp directory) parent for RocksDB dirs;
+//!                          set this explicitly to a durable filesystem
 //!
 //! To A/B the Raft-apply fsync coalescing, run this benchmark twice:
 //!   DAL_APPLY_COALESCE=0 ...  (baseline: one fsync per committed entry)
 //!   DAL_APPLY_COALESCE=1 ...  (coalesced: one fsync per apply batch, default)
 //! The write-throughput phases (3 and 4) are where the difference shows, since
 //! that is where openraft applies committed entries in batches.
+//!
+//! To A/B database-wide Raft WAL group commit while keeping apply behavior
+//! fixed, run twice with `DAL_APPLY_COALESCE=1`:
+//!   DAL_LOG_GROUP_COMMIT=0 ... (baseline: synchronous fsync per log append)
+//!   DAL_LOG_GROUP_COMMIT=1 ... (database-wide group commit, default)
+//!
+//! To A/B committed-marker fsync coalescing, run twice with the other modes
+//! fixed:
+//!   DAL_COMMITTED_SYNC=1 ... (baseline: synchronous marker write)
+//!   DAL_COMMITTED_SYNC=0 ... (marker is flushed by state apply, default)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +41,7 @@ use dal::api::client::Client;
 use dal::api::ops::WriteReply;
 use dal::config::{NodeConfig, Timeouts};
 use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
+use dal::perf::RocksCounters;
 use dal::runtime::node::Node;
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::settle;
@@ -44,6 +57,37 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn benchmark_dirs(count: usize) -> (Vec<tempfile::TempDir>, PathBuf, bool) {
+    match std::env::var_os("DAL_BENCH_DIR") {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let dirs = (0..count)
+                .map(|_| {
+                    tempfile::Builder::new()
+                        .prefix("dal-bench-")
+                        .tempdir_in(&root)
+                        .unwrap()
+                })
+                .collect();
+            (dirs, root, true)
+        }
+        None => {
+            let dirs: Vec<tempfile::TempDir> =
+                (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
+            let root = dirs[0].path().parent().unwrap().to_path_buf();
+            (dirs, root, false)
+        }
+    }
+}
+
+fn rocks_counters(nodes: &[Arc<Node>]) -> RocksCounters {
+    nodes.iter().fold(RocksCounters::default(), |sum, node| {
+        sum + node.rocks_counters()
+    })
 }
 
 fn descriptor(p: u16) -> BootstrapDescriptor {
@@ -222,7 +266,7 @@ async fn end_to_end_benchmark_three_nodes() {
 
     let ctx = zmq::Context::new();
     let desc = descriptor(partitions);
-    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let (dirs, data_root, explicit_data_root) = benchmark_dirs(3);
 
     let boot = Instant::now();
     let nodes = start_cluster(&ctx, &desc, &dirs).await;
@@ -232,10 +276,20 @@ async fn end_to_end_benchmark_three_nodes() {
     let warm = Instant::now();
     warm_up(&writer, partitions).await;
     let warm_elapsed = warm.elapsed();
+    let rocks_before = rocks_counters(&nodes);
+    dal::perf::reset_write_path();
 
     let coalesce = !matches!(
         std::env::var("DAL_APPLY_COALESCE").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
+    );
+    let log_group_commit = !matches!(
+        std::env::var("DAL_LOG_GROUP_COMMIT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+    let committed_sync = matches!(
+        std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     );
 
     println!("\n=== dal end-to-end benchmark (3 nodes over ZeroMQ inproc) ===");
@@ -244,12 +298,32 @@ async fn end_to_end_benchmark_three_nodes() {
         boot_elapsed.as_secs_f64(),
         warm_elapsed.as_secs_f64(),
     );
+    println!("  RocksDB directory parent: {}", data_root.display());
+    if !explicit_data_root {
+        println!("  WARNING: DAL_BENCH_DIR is unset; verify that the OS temp directory is durable");
+    }
     println!(
         "  apply mode: {} (DAL_APPLY_COALESCE)",
         if coalesce {
             "coalesced (1 fsync / batch)"
         } else {
             "per-entry (1 fsync / entry)"
+        },
+    );
+    println!(
+        "  log durability: {} (DAL_LOG_GROUP_COMMIT)",
+        if log_group_commit {
+            "database-wide group commit"
+        } else {
+            "synchronous fsync per append"
+        },
+    );
+    println!(
+        "  committed marker: {} (DAL_COMMITTED_SYNC)",
+        if committed_sync {
+            "synchronous fsync per update"
+        } else {
+            "WAL write; fsync coalesced with state apply"
         },
     );
     println!("  ------------------------------------------------------------------------------");
@@ -312,6 +386,16 @@ async fn end_to_end_benchmark_three_nodes() {
     // the phase that shows the eventually-consistent path's headroom.
     let cs = run_concurrent_reads(&ctx, clients, per_client, writes, true, 3_000_000).await;
     Stats::from(&format!("conc stale read ({clients} clients)"), cs.0, cs.1).print();
+    if let Some(report) = dal::perf::write_path_report() {
+        print!("{report}");
+        let rocks = rocks_counters(&nodes).saturating_sub(rocks_before);
+        println!(
+            "  RocksDB: WAL syncs={}, WAL bytes={:.2} MiB, write-stall={:.2}ms",
+            rocks.wal_syncs,
+            rocks.wal_bytes as f64 / (1024.0 * 1024.0),
+            rocks.stall_micros as f64 / 1_000.0,
+        );
+    }
     println!("  ==============================================================================\n");
 
     for n in nodes {
@@ -439,9 +523,7 @@ async fn run_concurrent_reads(
                 let key = format!("{PREFIX}-seq-{}", (c * per_client + i) % span).into_bytes();
                 let start = Instant::now();
                 if stale {
-                    cl.stale_get(&key, None)
-                        .await
-                        .expect("stale read failed");
+                    cl.stale_get(&key, None).await.expect("stale read failed");
                 } else {
                     cl.get(&key).await.expect("read failed");
                 }

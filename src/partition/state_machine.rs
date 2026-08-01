@@ -186,7 +186,11 @@ impl DataStateMachine {
         reader.read_state(self.group, &keyspace::user_key(key))
     }
 
-    fn seq_record<R: StateRead>(&self, reader: &R, client_id: ClientId) -> Result<Option<SeqRecord>> {
+    fn seq_record<R: StateRead>(
+        &self,
+        reader: &R,
+        client_id: ClientId,
+    ) -> Result<Option<SeqRecord>> {
         reader.read_state(self.group, &keyspace::seq_key(client_id))
     }
 

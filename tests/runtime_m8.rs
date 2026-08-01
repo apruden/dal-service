@@ -17,9 +17,15 @@ use dal::transport::Transport;
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::settle;
 use dal::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
+use tokio::sync::Semaphore;
 
 const CID: ClusterId = 0x0000_0000_0000_0000_0000_0000_0000_0DA1;
 const VOTERS: [NodeId; 3] = [1, 2, 3];
+
+// Each test embeds several complete node processes, including RocksDB handles
+// and per-peer ZeroMQ sockets. Keep a little cross-test concurrency while
+// bounding the aggregate descriptors below ordinary process limits.
+static RUNTIME_TEST_SLOTS: Semaphore = Semaphore::const_new(2);
 
 fn descriptor() -> BootstrapDescriptor {
     let directory = VOTERS
@@ -65,6 +71,7 @@ fn node_config(id: NodeId, dir: PathBuf) -> NodeConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn draining_a_node_migrates_its_partition() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
 
@@ -164,6 +171,26 @@ async fn draining_a_node_migrates_its_partition() {
     }
     assert!(migrated, "partition 0 never migrated off the drained node");
 
+    // A data-only node proxies MetaQuery to a live meta host, so the client view
+    // reflects the committed placement instead of the genesis descriptor.
+    let routing_reply = transport
+        .call(
+            "inproc://m8dr-ctrl-4",
+            Envelope::new(
+                CID,
+                MsgType::MetaQuery,
+                dal::types::GroupId::Meta,
+                0,
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+    let routing: dal::api::ops::RoutingInfo = dal::codec::decode(&routing_reply.payload).unwrap();
+    let mut routed = routing.candidates(0);
+    routed.sort_unstable();
+    assert_eq!(routed, expected);
+
     // The drained node, now excluded from the committed voter set, stops hosting
     // and reclaims partition 0 (DESIGN §7.4). `all`/`nodes` are index-aligned, so
     // the victim's handle is at `victim - 1`.
@@ -188,6 +215,7 @@ async fn draining_a_node_migrates_its_partition() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
     use dal::types::NodeState;
@@ -316,7 +344,8 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn become_learner_starts_a_hosted_partition() {
+async fn become_learner_requires_a_live_plan() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::{BecomeLearnerBody, LearnerReply};
     use dal::types::GroupId;
@@ -357,13 +386,13 @@ async fn become_learner_starts_a_hosted_partition() {
         timeouts: Timeouts::default(),
     };
 
-    // Node 4 alone is enough to exercise the handler: admission is local.
+    // Without a live, linearly-read plan an arbitrary admission must be refused.
     let node = Arc::new(Node::start(ctx.clone(), cfg, desc).await.unwrap());
     node.bootstrap().await.unwrap();
     settle();
     assert!(!node.hosts_partition(0), "node 4 should host nothing yet");
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(6));
     let admit = || async {
         let env = Envelope::new(
             CID,
@@ -376,14 +405,8 @@ async fn become_learner_starts_a_hosted_partition() {
         dal::codec::decode::<LearnerReply>(&reply.payload).unwrap()
     };
 
-    assert_eq!(admit().await, LearnerReply::Admitted);
-    assert!(
-        node.hosts_partition(0),
-        "node 4 should now host partition 0"
-    );
-    // Idempotent: a repeat admission still succeeds and does not restart.
-    assert_eq!(admit().await, LearnerReply::Admitted);
-    assert!(node.hosts_partition(0));
+    assert!(matches!(admit().await, LearnerReply::Error(_)));
+    assert!(!node.hosts_partition(0));
 
     Arc::try_unwrap(node)
         .ok()
@@ -395,6 +418,7 @@ async fn become_learner_starts_a_hosted_partition() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn non_meta_voter_data_leader_drives_a_move() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
 
@@ -516,6 +540,7 @@ fn http_get(addr: &str, path: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_status_reports_node_local_view() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::runtime::http::{ClusterStatus, Role};
 
     let ctx = zmq::Context::new();
@@ -614,15 +639,41 @@ async fn start_and_bootstrap(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failure_detector_marks_a_silent_node_down() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::types::NodeState;
 
     let ctx = zmq::Context::new();
-    let desc = descriptor();
-    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = start_and_bootstrap(&ctx, &desc, &dirs, short_timeouts()).await;
+    let all = [1u64, 2, 3, 4];
+    let mut desc = descriptor();
+    desc.directory.push(DirEntry {
+        node_id: 4,
+        control_addr: "inproc://m8-ctrl-4".into(),
+        bulk_addr: "inproc://m8-bulk-4".into(),
+    });
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (i, &id) in all.iter().enumerate() {
+        let mut cfg = node_config(id, dirs[i].path().to_path_buf());
+        cfg.timeouts = short_timeouts();
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+        ));
+    }
+    settle();
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            let node = node.clone();
+            tokio::spawn(async move { node.bootstrap().await })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
 
     // Crash node 3: its emitter stops, so the meta leader sees it fall silent.
-    // Two voters remain, preserving meta quorum to commit the transition.
+    // Two voters remain, preserving meta quorum to commit the transition, and
+    // node 4 is an Active spare available to restore replication.
     let victim = nodes.remove(2);
     Arc::try_unwrap(victim)
         .ok()
@@ -642,6 +693,27 @@ async fn failure_detector_marks_a_silent_node_down() {
     }
     assert!(reached_down, "node 3 was never marked Down");
 
+    // The production meta-leader loop must consume the deterministic planner,
+    // replace the Down data voter, and restore the meta voter set as well.
+    let mut data_replaced = false;
+    let mut meta_replaced = false;
+    for _ in 0..160 {
+        if nodes[0].local_placement_voters(0).unwrap() == Some((vec![1, 2, 4], false))
+            && nodes[2].hosts_partition(0)
+        {
+            data_replaced = true;
+        }
+        if nodes[0].meta_voters_of() == Some(vec![1, 2, 4]) && nodes[2].hosts_meta() {
+            meta_replaced = true;
+        }
+        if data_replaced && meta_replaced {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(data_replaced, "Down data voter was never replaced");
+    assert!(meta_replaced, "Down meta voter was never replaced");
+
     for n in nodes {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }
@@ -649,6 +721,7 @@ async fn failure_detector_marks_a_silent_node_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_serves_a_client_op() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     let ctx = zmq::Context::new();
     let desc = descriptor();
 
@@ -712,6 +785,7 @@ async fn three_node_cluster_serves_a_client_op() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operator_cli_commands_query_and_mutate_the_cluster() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::meta::state_machine::{MetaApplyResult, MetaReject};
     use dal::runtime::admin;
     use dal::types::{GroupId, NodeState};
@@ -753,13 +827,159 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
     }
     assert!(draining, "node 3 never reached Draining after leave");
 
+    // A join configured with only one follower seed first discovers the live
+    // directory, then follows that follower's NotLeader hint to the leader.
+    let leader = nodes[0].meta_leader().expect("meta leader");
+    let follower = *VOTERS.iter().find(|&&id| id != leader).unwrap();
+    let joined_dir = tempfile::tempdir().unwrap();
+    let mut joined_cfg = node_config(4, joined_dir.path().to_path_buf());
+    joined_cfg.seeds = vec![format!("inproc://m8-ctrl-{follower}")];
+    joined_cfg.timeouts = short_timeouts();
+    let joined = admin::join(ctx.clone(), &joined_cfg).await.unwrap();
+    assert!(matches!(
+        joined,
+        MetaApplyResult::Applied | MetaApplyResult::NoOp
+    ));
+    assert_eq!(
+        nodes[0].local_node_state(4).unwrap(),
+        Some(NodeState::Active),
+        "a newly registered node must receive a full heartbeat grace period"
+    );
+
     for n in nodes {
         Arc::try_unwrap(n).ok().unwrap().shutdown().await.unwrap();
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn joined_node_discovers_live_members_and_receives_rebalanced_data() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
+    use dal::meta::state_machine::MetaApplyResult;
+    use dal::runtime::admin;
+
+    let ctx = zmq::Context::new();
+    let voters = [1u64, 2, 3];
+    let directory = voters
+        .iter()
+        .map(|&id| DirEntry {
+            node_id: id,
+            control_addr: format!("inproc://m8join-ctrl-{id}"),
+            bulk_addr: format!("inproc://m8join-bulk-{id}"),
+        })
+        .collect();
+    let desc = BootstrapDescriptor {
+        cluster_id: CID,
+        config: ClusterConfig {
+            cluster_id: CID,
+            protocol_version: PROTOCOL_VERSION,
+            p: 4,
+            r: 3,
+            hash_spec: HashSpec::CANONICAL,
+        },
+        meta_voters: voters.to_vec(),
+        directory,
+        data_placements: (0..4).map(|p| (p, voters.to_vec())).collect(),
+    };
+    let timeouts = Timeouts {
+        suspect: Duration::from_secs(2),
+        down: Duration::from_secs(6),
+        request: Duration::from_secs(1),
+    };
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let config = |id: NodeId, index: usize| NodeConfig {
+        cluster_id: CID,
+        node_id: id,
+        control_addr: format!("inproc://m8join-ctrl-{id}"),
+        bulk_addr: format!("inproc://m8join-bulk-{id}"),
+        http_addr: None,
+        seeds: voters
+            .iter()
+            .filter(|&&peer| peer != id)
+            .map(|peer| format!("inproc://m8join-ctrl-{peer}"))
+            .collect(),
+        data_dir: dirs[index].path().to_path_buf(),
+        timeouts: timeouts.clone(),
+    };
+
+    let mut nodes = Vec::new();
+    for (index, &id) in voters.iter().enumerate() {
+        nodes.push(Arc::new(
+            Node::start(ctx.clone(), config(id, index), desc.clone())
+                .await
+                .unwrap(),
+        ));
+    }
+    settle();
+    let bootstraps: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            let node = node.clone();
+            tokio::spawn(async move { node.bootstrap().await })
+        })
+        .collect();
+    for bootstrap in bootstraps {
+        bootstrap.await.unwrap().unwrap();
+    }
+
+    let leader = nodes[0].meta_leader().expect("meta leader");
+    let follower = *voters.iter().find(|&&id| id != leader).unwrap();
+    let mut joined_cfg = config(4, 3);
+    joined_cfg.seeds = vec![format!("inproc://m8join-ctrl-{follower}")];
+    let joined = admin::join(ctx.clone(), &joined_cfg).await.unwrap();
+    assert!(matches!(
+        joined,
+        MetaApplyResult::Applied | MetaApplyResult::NoOp
+    ));
+
+    // Model an old bootstrap directory whose original endpoints are no longer
+    // useful to the joined process. Its configured follower seed is the only
+    // live discovery path until the replicated directory refresh arrives.
+    let mut stale_desc = desc.clone();
+    for entry in &mut stale_desc.directory {
+        entry.control_addr = format!("inproc://m8join-stale-ctrl-{}", entry.node_id);
+        entry.bulk_addr = format!("inproc://m8join-stale-bulk-{}", entry.node_id);
+    }
+    let joined_node = Arc::new(
+        Node::start(ctx.clone(), joined_cfg, stale_desc)
+            .await
+            .unwrap(),
+    );
+    nodes.push(joined_node.clone());
+    settle();
+
+    let mut rebalanced = false;
+    for _ in 0..200 {
+        let placement_finished = (0..4).any(|partition| {
+            nodes[0]
+                .local_placement_voters(partition)
+                .unwrap()
+                .is_some_and(|(voters, moving)| voters.contains(&4) && !moving)
+        });
+        if placement_finished && (0..4).any(|partition| joined_node.hosts_partition(partition)) {
+            rebalanced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        rebalanced,
+        "joined node never discovered the live cluster or received a balanced partition"
+    );
+
+    drop(joined_node);
+    for node in nodes {
+        Arc::try_unwrap(node)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
 
@@ -888,6 +1108,7 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
 
@@ -933,7 +1154,9 @@ async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
     let mut nodes = Vec::new();
     for (i, &id) in all.iter().enumerate() {
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg(id, i), desc.clone()).await.unwrap(),
+            Node::start(ctx.clone(), cfg(id, i), desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();

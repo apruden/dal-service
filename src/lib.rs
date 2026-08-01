@@ -11,6 +11,7 @@ pub mod error;
 pub mod keyspace;
 pub mod meta;
 pub mod partition;
+pub mod perf;
 pub mod placement;
 pub mod runtime;
 pub mod storage;

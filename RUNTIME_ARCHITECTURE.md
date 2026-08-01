@@ -3,10 +3,9 @@
 How a `dal` node is assembled and started as a process. Describes the design
 (DESIGN §10–11) and the current tree. The keystone piece — an assembled
 `runtime::Node` launched by `dal run` — is **built** (M8, `src/runtime/`), and
-the `runtime_m8` suite exercises a three-node cluster over real ZeroMQ
-`inproc://`. What remains open is operability, not assembly: the operator CLI
-subcommands are stubs and there is no runtime teardown of a locally-removed
-partition (see "Status" at the end).
+the `runtime_m8` suite exercises multi-node clusters over real ZeroMQ
+`inproc://`. Operator commands, runtime learner admission, and safe local
+reclamation are assembled; remaining items are listed under "Status".
 
 ## Layers
 
@@ -154,9 +153,12 @@ impl Server for RootDispatch {
    - *Fresh:* not found → run the bootstrap driver from the descriptor
      (`ensure_bootstrap_group`; on the `designated` node, `seed_cluster`).
      Bootstrap is idempotent/resumable — a crash mid-bootstrap re-runs safely.
-3. **Build the directory resolver** — `node_id → (control_addr, bulk_addr)` from
-   the meta directory (or the bootstrap descriptor initially). Shared
-   `zmq::Context` + DEALER pool created here.
+3. **Bind the process registration and build the directory resolver** — fsync
+   the exact registered endpoints/incarnation (genesis incarnation one, or a
+   ReadIndex-fenced live directory entry), then seed
+   `node_id → (control_addr, bulk_addr)` from that directory and the bootstrap
+   descriptor. Shared `zmq::Context` + DEALER pool created here. Later merges
+   are monotonic; a conflicting authoritative self-entry fences the process.
 4. **Construct the ZMQ network factories** for meta and data groups over the
    resolver. *(Unbuilt seam.)*
 5. **Start the meta group** — if `node_id ∈ meta_voters`:
@@ -179,14 +181,18 @@ impl Server for RootDispatch {
 11. **Spawn background drivers** — heartbeat emitter (liveness → meta voters), the
     reconcile loop (reacts to placement changes: start/stop partitions, honor
     `BecomeLearner`), and — active only while meta leader — the rebalancer/plan
-    driver.
+    driver. Address refresh and recovery run immediately; new plans and reclaim
+    work wait for successful `Node::bootstrap` plus confirmation that every
+    designated genesis data voter has initialized.
 12. **Return `Node`**; `run` awaits the shutdown signal.
 
 ## Shutdown (`Node::shutdown`)
-Signal `watch` → drop the two `ZmqServer`s (their `Drop` stops the poller
-threads, so no new frames) → `raft.shutdown()` on meta + every partition → abort
-background tasks → drop `Storage` (flush/close). Graceful HTTP shutdown is wired
-to the same signal.
+Abort background loops → stop both ZMQ pollers (no new frames) →
+`raft.shutdown()` on meta + every partition → asynchronously drain already
+dispatched handlers → drop `Storage` (flush/close). Poller stopping is
+synchronous, but handler draining yields to Tokio so an in-flight request can
+finish on a single-worker runtime. Graceful HTTP shutdown is wired to the same
+signal.
 
 ## Example: client write path (once assembled)
 `Client` (DEALER) → target `control_addr` ROUTER → `ClientGateway` →
@@ -205,10 +211,15 @@ Built (M8):
   inserts a new `PartitionNode` at runtime.
 - The `runtime::Node` assembly, `Node::bootstrap` (resumable genesis), and the
   `dal run` binary wiring.
-- Background drivers: heartbeat emitter (durable incarnation), failure detector,
+- Background drivers: heartbeat emitter (replicated directory incarnation plus
+  durable process incarnation), dynamically activated failure detector, and
   rebalance/abort driver.
-- Operator CLI (`runtime/admin.rs`): `join`/`leave`/`abort-plan`/`status` send
-  typed control frames to the cluster and follow `NotLeader` hints. No `init` —
+- Authoritative `DirectoryQuery` discovery, durable registration binding,
+  monotonic address-book merging, and a shared process-identity fence covering
+  inbound dispatch and outbound Raft/control work.
+- Operator CLI (`runtime/admin.rs`): `join`/`leave`/`abort-plan`/`status`
+  discover live members, send typed control frames, and follow `NotLeader`
+  hints, with immutable descriptor endpoints only as fallback. No `init` —
   genesis is driven by `dal run`.
 - Partition teardown: the driver's reclaim pass stops and reclaims a group once
   committed placement excludes this node (`PartitionStarter::reclaim_partition`,
@@ -222,8 +233,8 @@ Built (M8):
   placement.
 - Meta-voter membership drain: the meta handle is shared/mutable
   (`MetaHandle`), `MetaStarter` starts/stops the meta group at runtime, and the
-  driver's meta-leader role drives a size-preserving replacement of a `Draining`
-  non-leader meta voter (`CreatePlan{Meta}` → `add_learner`/`change_voters` →
+  driver's meta-leader role drives a size-preserving replacement of an
+  ineligible non-leader meta voter (`CreatePlan{Meta}` → `add_learner`/`change_voters` →
   `FinalizePlan{Meta}`), self-referentially. The drained node reclaims its meta
   group after a current meta voter reports (over the network) a resolved
   placement excluding it.
@@ -235,6 +246,4 @@ restart re-hosting, and non-leader meta-voter replacement).
 Open (pre-v1 hardening, not new mechanism):
 - **Draining the current meta *leader*** — needs Raft leadership transfer; v1
   waits until leadership moves.
-- **Dynamic failure-detector start** on a node promoted to a meta voter at
-  runtime (not needed for drain correctness).
-- **Meta *removal* (shrink) drain** and load-aware placement (DESIGN §15).
+- **Meta *removal* (shrink) drain** (DESIGN §15).

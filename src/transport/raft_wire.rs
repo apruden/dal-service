@@ -11,7 +11,7 @@ use openraft::raft::{AppendEntriesResponse, InstallSnapshotResponse, VoteRespons
 use serde::{Deserialize, Serialize};
 
 use crate::meta::state_machine::MetaApplyResult;
-use crate::types::{DataConfigObservation, GroupId, MetaCommand, NodeId};
+use crate::types::{DataConfigObservation, GroupId, MetaCommand, NodeDirectoryEntry, NodeId};
 
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
@@ -30,7 +30,12 @@ pub type SnapshotReply =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatBody {
     pub node_id: NodeId,
+    /// Replicated directory incarnation authorizing this process as the
+    /// current identity for `node_id`.
     pub incarnation: u64,
+    /// Durable process epoch, allowing sequence numbers to restart without
+    /// letting an older concurrent process supersede the newer stream.
+    pub process_incarnation: u64,
     pub seq: u64,
 }
 
@@ -149,6 +154,20 @@ pub struct PlacementQueryBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementQueryReply {
     pub placement: Option<crate::types::Placement>,
+}
+
+/// Reply to `MsgType::DirectoryQuery`. Only `Value` is authoritative: it is
+/// produced after the local meta node passes ReadIndex. A follower's local
+/// directory is carried solely as a discovery hint so a caller that knows only
+/// that follower can resolve the current leader id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectoryQueryReply {
+    Value(Vec<NodeDirectoryEntry>),
+    NotLeader {
+        leader: Option<NodeId>,
+        directory_hint: Vec<NodeDirectoryEntry>,
+    },
+    Unavailable,
 }
 
 #[cfg(test)]
@@ -276,6 +295,7 @@ mod tests {
         let hb = HeartbeatBody {
             node_id: 3,
             incarnation: 2,
+            process_incarnation: 7,
             seq: 99,
         };
         assert_eq!(

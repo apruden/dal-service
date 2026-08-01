@@ -10,7 +10,9 @@ use dal::error::Error;
 use dal::keyspace;
 use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::storage::{StateMutation, Storage};
-use dal::types::{BootstrapGroup, GroupId, LogId, ServingState};
+use dal::types::{
+    BootstrapGroup, GroupId, LearnerAdmission, LogId, RegistrationBinding, ServingState,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -66,6 +68,46 @@ fn heartbeat_incarnation_advances_across_restarts() {
     }
     let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
     assert_eq!(s.next_heartbeat_incarnation().unwrap(), 3);
+}
+
+#[test]
+fn registration_binding_is_durable_and_monotonic() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    let first = RegistrationBinding {
+        cluster_id: 0xABCD,
+        node_id: 42,
+        control_addr: "control-1".into(),
+        bulk_addr: "bulk-1".into(),
+        directory_incarnation: 1,
+    };
+    s.record_registration_binding(&first).unwrap();
+    s.record_registration_binding(&first).unwrap();
+
+    let conflicting = RegistrationBinding {
+        control_addr: "control-conflict".into(),
+        ..first.clone()
+    };
+    assert!(matches!(
+        s.record_registration_binding(&conflicting),
+        Err(Error::Config(_))
+    ));
+
+    let second = RegistrationBinding {
+        control_addr: "control-2".into(),
+        bulk_addr: "bulk-2".into(),
+        directory_incarnation: 2,
+        ..first.clone()
+    };
+    s.record_registration_binding(&second).unwrap();
+    assert!(matches!(
+        s.record_registration_binding(&first),
+        Err(Error::Config(_))
+    ));
+    drop(s);
+
+    let reopened = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    assert_eq!(reopened.registration_binding().unwrap(), Some(second));
 }
 
 // ---- CF lifecycle ----------------------------------------------------------
@@ -171,6 +213,31 @@ fn group_start_requires_durable_admission_and_never_revives_non_serving() {
     assert!(s.authorize_group_start(G, 42).is_err());
     assert!(s.require_serving(G).is_err());
     assert!(!s.group_exists(G));
+}
+
+#[test]
+fn a_new_verified_plan_can_readmit_a_reclaimed_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    s.record_verified_learner_admission(&LearnerAdmission {
+        cluster_id: 0xABCD,
+        group: G,
+        plan_id: 10,
+    })
+    .unwrap();
+    s.authorize_group_start(G, 42).unwrap();
+    s.reclaim_group(G).unwrap();
+    assert_eq!(s.serving_state(G).unwrap(), Some(ServingState::NonServing));
+
+    s.record_verified_learner_admission(&LearnerAdmission {
+        cluster_id: 0xABCD,
+        group: G,
+        plan_id: 11,
+    })
+    .unwrap();
+    assert_eq!(s.serving_state(G).unwrap(), Some(ServingState::Serving));
+    s.authorize_group_start(G, 42).unwrap();
+    assert!(s.group_exists(G));
 }
 
 #[test]

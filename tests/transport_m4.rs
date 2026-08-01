@@ -96,8 +96,12 @@ proptest! {
 struct StaticRouting(Mutex<RoutingInfo>);
 
 impl RoutingSource for StaticRouting {
-    fn routing(&self) -> RoutingInfo {
-        self.0.lock().unwrap().clone()
+    fn routing(
+        &self,
+        _local_only: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RoutingInfo>> + Send + '_>> {
+        let info = self.0.lock().unwrap().clone();
+        Box::pin(async move { Some(info) })
     }
 }
 

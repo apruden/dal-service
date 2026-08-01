@@ -125,7 +125,11 @@ async fn bootstrap_write_and_linearizable_read() {
     ));
 
     let li = leader_idx(&nodes).unwrap();
-    match nodes[li].read(b"k", Consistency::Linearizable).await.unwrap() {
+    match nodes[li]
+        .read(b"k", Consistency::Linearizable)
+        .await
+        .unwrap()
+    {
         ReadOutcome::Value(Some((_, v))) => assert_eq!(v, b"v"),
         other => panic!("leader read returned {other:?}"),
     }
@@ -233,9 +237,10 @@ async fn isolated_replica_refuses_stale_read() {
     let li = leader_idx(&nodes).unwrap();
     let fi = (li + 1) % 3;
     // The follower has the value locally before we cut it off.
-    eventually("follower applied the write", || {
-        matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v")
-    })
+    eventually(
+        "follower applied the write",
+        || matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v"),
+    )
     .await;
 
     let others: Vec<u64> = VOTERS
@@ -307,8 +312,10 @@ async fn leader_failover_preserves_acknowledged_write() {
             .copied()
             .find(|&i| nodes[i].current_leader() == Some(nodes[i].node_id()));
         if let Some(li) = li
-            && let ReadOutcome::Value(Some((_, v))) =
-                nodes[li].read(b"k", Consistency::Linearizable).await.unwrap()
+            && let ReadOutcome::Value(Some((_, v))) = nodes[li]
+                .read(b"k", Consistency::Linearizable)
+                .await
+                .unwrap()
         {
             assert_eq!(v, b"v");
             served = true;
@@ -332,11 +339,14 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
         .collect();
     h.faults.isolate(nodes[old].node_id(), &others);
 
-    // The isolated ex-leader must not answer a linearizable read with a value:
-    // ReadIndex cannot reach a quorum, so it redirects or errors.
+    // The stale fast path must not trust an old leader's persistent self-vote;
+    // it performs a quorum barrier for `leader == self` and refuses.
     let mut safe = false;
     for _ in 0..200 {
-        match nodes[old].read(b"k", Consistency::Linearizable).await {
+        match nodes[old]
+            .read(b"k", Consistency::Stale { min_version: None })
+            .await
+        {
             Ok(ReadOutcome::Value(_)) => {}
             Ok(ReadOutcome::NotLeader { .. }) | Ok(ReadOutcome::TooStale { .. }) | Err(_) => {
                 safe = true;
@@ -346,6 +356,14 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(safe, "isolated old leader served a read without quorum");
+
+    // Membership reports use the same quorum fence. In particular, the old
+    // leader cannot later resolve an abort from its frozen local metrics after
+    // the surviving quorum has elected a replacement leader.
+    assert!(
+        nodes[old].confirmed_committed_config().await.is_err(),
+        "isolated old leader confirmed a stale membership"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

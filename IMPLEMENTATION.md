@@ -225,9 +225,10 @@ application (asserted via M2 sequence records).
 
 - The meta group reuses M3's storage/runtime with `GroupId::Meta`. Its state
   machine applies the meta command enum with all validation inside `apply`:
-  cluster record immutable; `CreatePlan` only if no existing plan and eligible
-  nodes suffice — a data-group target has exactly `R` distinct voters
-  differing from `voters` by one, a meta-group target is a same-size
+  cluster record immutable; `CreatePlan` only if no existing plan — a
+  data-group plan additionally requires at least `R` eligible nodes and its
+  target has exactly `R` distinct voters differing from `voters` by one, while
+  a meta-group target is a same-size
   single-voter replacement or a single-voter removal and never leaves fewer
   than 3 voters; `FinalizePlan` only with matching `plan_id`, group, exact
   target voter set, and a `DataConfigObservation` whose voter set exactly
@@ -270,7 +271,10 @@ application (asserted via M2 sequence records).
   actions. This permits safe meta-voter replacement before a directory entry is
   removed.
 - `MetaQuery` serves directory/placement/`P` as advisory follower reads;
-  `status` renders it.
+  `status` renders it. Runtime endpoint/incarnation authority is separate:
+  peer-control `DirectoryQuery` returns a directory value only after a meta
+  ReadIndex barrier; follower directory data may resolve its leader hint but is
+  never merged into an address book.
 
 **Gate:** balancer property tests (near-even counts, single-voter diff,
 determinism); plan-validation matrix inside the meta SM; crash/retry at every
@@ -336,8 +340,9 @@ records, CLI `leave`/`abort-plan`.
 - Drain: `leave` marks `Draining`, plans replace it everywhere, leadership
   transferred first, meta-voter removal precedes directory removal; the node
   reclaims CFs only after durably recording non-voter state.
-- Throttle: `max_concurrent_migrations` in the driver; ≤ 1 per partition is
-  structural (one plan).
+- Throttle: one data migration is allowed cluster-wide. The planner counts a
+  healthy in-flight plan's target voters as anticipated load, and suppresses
+  fresh work while an abort is unresolved.
 
 **Gate (ChannelNetwork):** crash + restart after every numbered step resumes
 to a consistent end state; planned learner dies mid-move → abort clears and a
@@ -397,34 +402,46 @@ config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
   `control_addr` (append/vote) and `bulk_addr` (snapshot) resolved from the meta
   directory over the DEALER pool. It replaces `ChannelNetworkFactory` at the
   `start_with_network` seam; consensus code is unchanged.
+- **Registration and address fencing.** `Storage` fsyncs the process's exact
+  `(cluster_id, node_id, control_addr, bulk_addr, directory_incarnation)`
+  registration before serving. Address-book merges ignore lower incarnations
+  and reject conflicting endpoints at an equal incarnation. An authoritative
+  self-entry that differs from the startup binding closes a shared one-way
+  process fence used by inbound dispatch, outbound Raft, heartbeats, failure
+  detection, rebalance, and dynamically started groups.
 - **`runtime::Node` assembly** (`runtime/node.rs`, startup sequence in
   RUNTIME_ARCHITECTURE.md): open storage → recover-or-bootstrap identity → start
   the meta group iff this node is a meta voter → start each hosted data partition
   into a shared, mutable `Arc<RwLock<HashMap<u16, PartitionNode>>>` registry →
   build routing + `ClientGateway` over that shared handle → assemble
   `RootDispatch` → bind control and bulk `ZmqServer`s → spawn background drivers.
-  `Node::bootstrap` drives resumable genesis from the descriptor; `Node::shutdown`
-  signals, drops the servers, shuts down every Raft, aborts tasks, and closes
-  storage.
+  `Node::bootstrap` drives resumable genesis from the descriptor, querying the
+  shared live address book rather than retaining descriptor-only meta endpoints.
+  `Node::shutdown` first stops inbound acceptance, shuts down every Raft, then
+  asynchronously drains already-dispatched handlers before storage is released.
 - **`RootDispatch` — the peer/operator-control dispatcher** (`runtime/dispatch.rs`):
   the inbound `Server` that splits on `MsgType::is_peer_control()`. Client frames
   (`ClientOp`, `MetaQuery`) go to the `ClientGateway`; peer/operator frames are
   served here — `RaftAppend`/`RaftVote`/`RaftSnapshot`, `DataConfigObservation`,
   `JoinRequest`, `LeaveRequest`, `AbortPlanRequest`, `BootstrapStatus`,
-  `PlacementQuery`, `Heartbeat`, and `BecomeLearner` (which starts a new hosted
-  partition through the rule-8 admission path). A client frame can never reach a
-  peer-control handler (rule 9).
+  `PlacementQuery`, `DirectoryQuery`, `Heartbeat`, and `BecomeLearner` (which
+  starts a new hosted partition through the rule-8 admission path). A client
+  frame can never reach a peer-control handler (rule 9).
 - **Background drivers** (`runtime/node.rs`, `runtime/rebalance.rs`): a heartbeat
-  emitter (durable incarnation + monotonic sequence, per §M6 failure detection); a
-  failure detector on meta voters that turns collected liveness evidence into
+  emitter (replicated directory incarnation + durable process incarnation +
+  monotonic sequence, per §M6 failure detection); a failure detector that becomes
+  active whenever the local node hosts meta and turns collected liveness evidence into
   `SetNodeState` transitions; and the rebalance/abort driver, which runs on *every*
   node so a partition's data-leader role can drive its own move and report
-  observations even on a non-meta-voter node.
-- **Durable heartbeat incarnation** (`storage/rocks.rs`,
-  `meta/failure.rs`): a monotonic incarnation allocated from storage once per
-  process start. The failure detector tracks `(incarnation, seq)`, so a restarted
-  process that resets its sequence to one is recognized as live immediately while
-  an old process cannot refresh liveness.
+  observations even on a non-meta-voter node. New planning and reclamation are
+  held behind a bootstrap readiness fence; the meta leader additionally confirms
+  each designated genesis data voter has initialized before it creates a plan.
+- **Heartbeat incarnation fencing** (`storage/rocks.rs`, `meta/failure.rs`): each
+  heartbeat carries the fixed, durable registration incarnation selected at
+  startup and a monotonic process incarnation allocated from storage once per
+  start. It never adopts an incarnation from a later address-book refresh. The
+  detector tracks both with the sequence, so restart may reset sequence to one
+  while an old process or pre-rejoin identity cannot refresh current liveness.
 - **Read-only HTTP admin plane** (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`):
   `GET /status` + `GET /health`, node-local and best-effort (never
   `ensure_linearizable`), a third inbound plane off the correctness path. Its
@@ -448,7 +465,8 @@ view. Plus: heartbeat incarnation persists and advances across restarts
 
 **Operator CLI** (`runtime/admin.rs`, `main.rs`): `join`, `leave`, `abort-plan`,
 and `status` are wired as thin ZMQ clients that send one typed control frame and
-render the reply, following `NotLeader` hints to the meta leader. `join`/`leave`/
+render the reply, discovering the live directory before falling back to the
+immutable descriptor and following `NotLeader` hints to the meta leader. `join`/`leave`/
 `abort-plan` submit to the meta group (`SubmitReply`); `status` reads any node's
 cached routing (`MetaQuery`). There is no `init` subcommand — genesis is driven by
 `dal run` from the `--cluster` descriptor.
@@ -460,8 +478,9 @@ has resolved (no in-flight plan) and the committed `voters` exclude it, it calls
 `PartitionStarter::reclaim_partition` — the inverse of `admit_learner`: unpublish
 the group, shut down its Raft runtime, then `Storage::reclaim_group` records
 `NonServing` durably *before* dropping the CFs (crash-safe, §7.4). The decision is
-read purely from committed meta state, so it is safe (the cluster has already
-committed a config without this node) and idempotent. `Node::start` skips any
+revalidated through a linearizable current meta member while holding the same
+lifecycle lock as learner admission, so a newer plan cannot race with deletion.
+The operation is idempotent. `Node::start` skips any
 group whose durable serving gate is `NonServing`, so a reclaimed node never
 re-hosts it on restart. A rolled-back plan leaves the node a voter, so it is not
 reclaimed.
@@ -488,7 +507,7 @@ hosting the meta group at runtime; `MetaStarter` is the meta-group analogue of
 `PartitionStarter` (`admit_meta_learner`/`resume_meta`/`reclaim_meta`), and a
 `BecomeLearner` frame addressed to the meta group routes to it. The rebalance
 driver's meta-leader role creates a `CreatePlan{group: Meta}` (SM-validated as a
-single-voter replacement, floor 3) for a `Draining` non-leader meta voter, then
+single-voter replacement, floor 3) for an ineligible non-leader meta voter, then
 the meta leader drives its *own* membership change (`add_learner` →
 `change_voters` → `FinalizePlan{Meta}`) — mirroring the data path via
 `reconcile`/`gate` over `MetaNode::committed_voter_set`. The drained node reclaims
@@ -498,8 +517,7 @@ so it cannot read the finalize locally. `Node::start` skips a durably `NonServin
 meta group on restart and resumes a meta group gained by an earlier promotion.
 **v1 limitation:** draining the current meta *leader* is not supported (it needs
 Raft leadership transfer); the plan simply waits until leadership moves. Follow-
-ups: leader drain, dynamic failure-detector start on a promoted node, meta
-*removal* (shrink) drain.
+ups: leader drain and meta *removal* (shrink) drain.
 
 ---
 

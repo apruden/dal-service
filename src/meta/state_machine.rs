@@ -235,19 +235,60 @@ impl MetaStateMachine {
         if self.cluster(s)?.is_none() {
             return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
         }
+        if node_id == 0 {
+            return Ok((invalid("node_id must be non-zero"), vec![]));
+        }
+        if control_addr.is_empty() || bulk_addr.is_empty() {
+            return Ok((invalid("node addresses must be non-empty"), vec![]));
+        }
+        if control_addr == bulk_addr {
+            return Ok((invalid("control_addr and bulk_addr must differ"), vec![]));
+        }
+        // Endpoint ownership is part of the replicated identity fence. Reject
+        // both same-lane and cross-lane collisions so two node ids can never be
+        // routed to the same socket.
+        if self.directory(s)?.iter().any(|other| {
+            other.node_id != node_id
+                && (other.control_addr == control_addr
+                    || other.bulk_addr == control_addr
+                    || other.control_addr == bulk_addr
+                    || other.bulk_addr == bulk_addr)
+        }) {
+            return Ok((
+                invalid("node addresses are already registered to another node"),
+                vec![],
+            ));
+        }
         let entry = match self.node(s, node_id)? {
-            Some(e) if e.control_addr == control_addr && e.bulk_addr == bulk_addr => {
-                return Ok((MetaApplyResult::NoOp, vec![]));
+            Some(mut e) if e.control_addr == control_addr && e.bulk_addr == bulk_addr => {
+                // A committed Down state is sticky against heartbeats, but an
+                // explicit RegisterNode is the operator-authorized rejoin. Even
+                // with unchanged addresses it must advance the incarnation so
+                // stale liveness evidence cannot cross the restart boundary.
+                if e.state != NodeState::Down {
+                    return Ok((MetaApplyResult::NoOp, vec![]));
+                }
+                let Some(incarnation) = e.incarnation.checked_add(1) else {
+                    return Ok((invalid("node incarnation exhausted"), vec![]));
+                };
+                e.state = NodeState::Active;
+                e.incarnation = incarnation;
+                e
             }
             // Re-register with a changed address is a rejoin: bump incarnation so
             // stale heartbeats for the old incarnation cannot reactivate it.
-            Some(e) => NodeDirectoryEntry {
-                node_id,
-                control_addr: control_addr.to_string(),
-                bulk_addr: bulk_addr.to_string(),
-                state: NodeState::Active,
-                incarnation: e.incarnation + 1,
-            },
+            Some(e) => {
+                let Some(incarnation) = e.incarnation.checked_add(1) else {
+                    return Ok((invalid("node incarnation exhausted"), vec![]));
+                };
+                NodeDirectoryEntry {
+                    node_id,
+                    control_addr: control_addr.to_string(),
+                    bulk_addr: bulk_addr.to_string(),
+                    state: NodeState::Active,
+                    incarnation,
+                }
+            }
             None => NodeDirectoryEntry {
                 node_id,
                 control_addr: control_addr.to_string(),
@@ -376,6 +417,9 @@ impl MetaStateMachine {
                 if added != 1 || removed != 1 {
                     return Ok((illegal("data move must change exactly one voter"), vec![]));
                 }
+                if self.eligible_count(s)? < config.r as usize {
+                    return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+                }
             }
             GroupId::Meta => {
                 if target.len() < MIN_META_VOTERS {
@@ -398,10 +442,6 @@ impl MetaStateMachine {
                 return Ok((reject(MetaReject::IneligibleTarget), vec![]));
             }
         }
-        if self.eligible_count(s)? < config.r as usize {
-            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
-        }
-
         let mut sorted: Vec<NodeId> = target.into_iter().collect();
         sorted.sort_unstable();
         placement.r#move = Some(MovePlan {

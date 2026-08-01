@@ -11,6 +11,7 @@ use rocksdb::{WriteBatch, WriteOptions};
 use crate::codec;
 use crate::error::Result;
 use crate::keyspace;
+use crate::perf::WriteStage;
 use crate::storage::rocks::Storage;
 use crate::types::{GroupId, LogId};
 
@@ -64,7 +65,10 @@ impl Storage {
 
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
-        self.db().write_opt(batch, &wo)?;
+        {
+            let _profile = crate::perf::timer(WriteStage::StateApplySynced);
+            self.db().write_opt(batch, &wo)?;
+        }
 
         // Crash boundary: the batch is durable. A crash here recovers to the
         // *new* last_applied with every mutation visible.
@@ -98,7 +102,10 @@ impl Storage {
 
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
-        self.db().write_opt(batch, &wo)?;
+        {
+            let _profile = crate::perf::timer(WriteStage::StateApplySynced);
+            self.db().write_opt(batch, &wo)?;
+        }
 
         crash_point("apply_state::after_write")?;
 

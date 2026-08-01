@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
 use crate::transport::Server;
@@ -24,6 +25,22 @@ use crate::transport::codec::Envelope;
 pub struct ZmqServer {
     running: Arc<AtomicBool>,
     poller: Option<JoinHandle<()>>,
+    active: Arc<ActiveHandlers>,
+}
+
+struct ActiveHandlers {
+    count: std::sync::atomic::AtomicUsize,
+    drained: Notify,
+}
+
+struct ActiveRequest(Arc<ActiveHandlers>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
 }
 
 fn zmq_io(e: zmq::Error) -> Error {
@@ -50,18 +67,32 @@ impl ZmqServer {
         let handle = Handle::current();
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = running.clone();
+        let active = Arc::new(ActiveHandlers {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            drained: Notify::new(),
+        });
+        let active_thread = active.clone();
         let (reply_tx, reply_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>)>();
 
         let poller = std::thread::Builder::new()
             .name(format!("zmq-router-{addr}"))
             .spawn(move || {
-                Self::poll_loop(socket, server, handle, running_thread, reply_tx, reply_rx)
+                Self::poll_loop(
+                    socket,
+                    server,
+                    handle,
+                    running_thread,
+                    active_thread,
+                    reply_tx,
+                    reply_rx,
+                )
             })
             .map_err(Error::Io)?;
 
         Ok(ZmqServer {
             running,
             poller: Some(poller),
+            active,
         })
     }
 
@@ -70,6 +101,7 @@ impl ZmqServer {
         server: Arc<S>,
         handle: Handle,
         running: Arc<AtomicBool>,
+        active: Arc<ActiveHandlers>,
         reply_tx: mpsc::Sender<(Vec<u8>, Vec<u8>)>,
         reply_rx: mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
     ) where
@@ -86,7 +118,10 @@ impl ZmqServer {
                     if let Ok(env) = Envelope::decode(&payload) {
                         let server = server.clone();
                         let tx = reply_tx.clone();
+                        active.count.fetch_add(1, Ordering::Release);
+                        let active = ActiveRequest(active.clone());
                         handle.spawn(async move {
+                            let _active = active;
                             let reply = server.serve(env).await;
                             let _ = tx.send((identity, reply.encode()));
                         });
@@ -100,26 +135,50 @@ impl ZmqServer {
 
     fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<(Vec<u8>, Vec<u8>)>) {
         while let Ok((identity, bytes)) = reply_rx.try_recv() {
-            let _ = socket.send_multipart([identity, bytes], 0);
+            // A disconnected or backpressured peer must never pin the sole
+            // socket-owner thread during shutdown.
+            let _ = socket.send_multipart([identity, bytes], zmq::DONTWAIT);
         }
     }
 
-    /// Stop the poller and wait for it to exit.
-    pub fn shutdown(mut self) {
-        self.stop();
-    }
-
-    fn stop(&mut self) {
+    /// Stop accepting new requests and join the socket-owner thread. Existing
+    /// async handlers continue running; callers may now shut down the services
+    /// those handlers are waiting on before draining them with [`Self::shutdown`].
+    pub fn stop_accepting(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.poller.take() {
             let _ = h.join();
+        }
+    }
+
+    /// Stop accepting and asynchronously wait for every already-dispatched
+    /// handler to exit. This must yield rather than block the Tokio worker: a
+    /// handler may itself need that worker to observe Raft shutdown or an I/O
+    /// timeout before it can release its active-request guard.
+    pub async fn shutdown(mut self) {
+        self.stop_accepting();
+        self.wait_for_handlers().await;
+    }
+
+    async fn wait_for_handlers(&self) {
+        loop {
+            // Subscribe before checking the count so a completion between the
+            // two operations leaves a notification permit for this waiter.
+            let notified = self.active.drained.notified();
+            if self.active.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 }
 
 impl Drop for ZmqServer {
     fn drop(&mut self) {
-        self.stop();
+        // Destructors cannot await. Stop accepting and join the socket owner,
+        // but never synchronously wait for Tokio tasks that may need the
+        // current runtime worker to make progress.
+        self.stop_accepting();
     }
 }
 

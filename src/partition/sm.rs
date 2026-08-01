@@ -12,7 +12,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::EntryPayload;
 use openraft::OptionalSend;
@@ -26,6 +26,7 @@ use crate::partition::raft_types::{
     read_err, write_err,
 };
 use crate::partition::state_machine::{ApplyResult, DataStateMachine, StateOverlay};
+use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::types::GroupId;
 
@@ -52,6 +53,10 @@ pub struct RocksStateMachine {
     storage: Arc<Storage>,
     group: GroupId,
     data: DataStateMachine,
+    /// OpenRaft builds snapshots on a task that runs concurrently with apply.
+    /// Every clone shares this lock so snapshot metadata and its state-CF scan
+    /// describe one applied prefix.
+    state_view: Arc<Mutex<()>>,
 }
 
 impl RocksStateMachine {
@@ -60,6 +65,7 @@ impl RocksStateMachine {
             storage,
             group,
             data: DataStateMachine::new(group),
+            state_view: Arc::new(Mutex::new(())),
         }
     }
 
@@ -110,7 +116,11 @@ impl RocksStateMachine {
         if let Some(log_id) = last_log_id {
             let applied: Applied = (Some(log_id), membership);
             self.storage
-                .apply_raft(self.group, &overlay.into_mutations(), &codec::encode(&applied))
+                .apply_raft(
+                    self.group,
+                    &overlay.into_mutations(),
+                    &codec::encode(&applied),
+                )
                 .map_err(write_err)?;
         }
         Ok(results)
@@ -150,6 +160,7 @@ impl RocksStateMachine {
     }
 
     fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
+        let _view = self.state_view.lock().unwrap();
         let (last_log_id, membership) = self.read_applied()?;
         let pairs = self.storage.scan_state(self.group).map_err(read_err)?;
         let data = codec::encode(&pairs);
@@ -189,6 +200,12 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let _profile = crate::perf::timer(WriteStage::StateApplyTotal);
+        // Clone the shared lock handle before acquiring it so the guard does
+        // not keep an immutable field borrow of `self` while the apply helper
+        // mutably borrows the state-machine wrapper.
+        let state_view = self.state_view.clone();
+        let _view = state_view.lock().unwrap();
         if coalesce_apply() {
             self.apply_coalesced(entries)
         } else {
@@ -211,6 +228,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
+        let _view = self.state_view.lock().unwrap();
         let bytes = (*snapshot).into_inner();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = codec::decode(&bytes).map_err(read_err)?;
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
@@ -233,3 +251,82 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
 const _: fn() = || {
     let _: Option<Node> = None;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::{CommittedLeaderId, EntryPayload};
+
+    use crate::types::{DataOp, DataRequest, IfVersion, MutationResult};
+
+    fn log_id(index: u64) -> LogId {
+        LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    fn entry(index: u64, sequence: u64, op: DataOp) -> Entry {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(DataRequest {
+                client_id: 7,
+                sequence,
+                op,
+            }),
+        }
+    }
+
+    #[test]
+    fn coalesced_batch_observes_same_client_and_same_key_predecessors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(0);
+        storage.ensure_group(group).unwrap();
+        let mut sm = RocksStateMachine::new(storage.clone(), group);
+
+        let results = sm
+            .apply_coalesced(vec![
+                entry(
+                    10,
+                    1,
+                    DataOp::Put {
+                        key: b"k".to_vec(),
+                        value: b"v1".to_vec(),
+                        if_version: None,
+                    },
+                ),
+                entry(
+                    11,
+                    2,
+                    DataOp::Put {
+                        key: b"k".to_vec(),
+                        value: b"v2".to_vec(),
+                        if_version: Some(IfVersion::Number(10)),
+                    },
+                ),
+                entry(
+                    12,
+                    3,
+                    DataOp::Delete {
+                        key: b"k".to_vec(),
+                        if_version: Some(IfVersion::Number(11)),
+                    },
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                ApplyResult::Decided(MutationResult::Applied { version: 10 }),
+                ApplyResult::Decided(MutationResult::Applied { version: 11 }),
+                ApplyResult::Decided(MutationResult::Applied { version: 12 }),
+            ]
+        );
+        assert_eq!(
+            DataStateMachine::new(group)
+                .get(storage.as_ref(), b"k")
+                .unwrap(),
+            None
+        );
+        assert_eq!(sm.read_applied().unwrap().0, Some(log_id(12)));
+    }
+}

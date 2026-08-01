@@ -1,7 +1,9 @@
 //! `RaftLogStorage` + `RaftLogReader` over `cf_log_<group>` (DESIGN §6, M3).
 //!
 //! Every append and vote save is fsync-durable before it is acknowledged; the
-//! leader only counts durable follower replies toward commit (DESIGN §2).
+//! leader only counts durable follower replies toward commit (DESIGN §2). The
+//! optional committed-position marker is WAL-written ahead of the atomic,
+//! durable state-machine apply that makes it durable before a client reply.
 //!
 //! The store is generic over the openraft type config `C` (blanket impls below),
 //! so the data groups and the meta group (M5) share one log implementation —
@@ -28,6 +30,7 @@ use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
 use crate::codec;
 use crate::partition::raft_types::{read_err, write_err};
+use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::types::GroupId;
 
@@ -85,6 +88,41 @@ impl RocksLogStore {
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
         wo
+    }
+
+    fn wal_wo() -> WriteOptions {
+        let mut wo = WriteOptions::default();
+        wo.set_sync(false);
+        wo
+    }
+
+    /// Rollback/A-B switch for the old fsync-per-committed-marker path.
+    ///
+    /// OpenRaft calls `save_committed()` immediately before dispatching the
+    /// committed entries to the state machine, and sends client responses only
+    /// after that apply returns. The apply is a sync write on this same DB, so
+    /// RocksDB's ordered WAL makes this earlier marker durable at that boundary.
+    fn committed_sync_enabled() -> bool {
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| {
+            matches!(
+                std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
+                Some("1") | Some("true") | Some("on")
+            )
+        })
+    }
+
+    /// Default-on rollback/A-B switch for asynchronous database-wide WAL
+    /// group commit. Read once per process so environment lookup never touches
+    /// the append hot path.
+    fn group_commit_enabled() -> bool {
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| {
+            !matches!(
+                std::env::var("DAL_LOG_GROUP_COMMIT").ok().as_deref(),
+                Some("0") | Some("false") | Some("off")
+            )
+        })
     }
 
     fn read_log_singleton<T: serde::de::DeserializeOwned>(
@@ -188,6 +226,7 @@ where
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+        let _profile = crate::perf::timer(WriteStage::SaveVoteSynced);
         self.storage
             .db()
             .put_cf_opt(&cf, KEY_VOTE, codec::encode(vote), &Self::sync_wo())
@@ -201,15 +240,25 @@ where
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+        let sync = Self::committed_sync_enabled();
+        let _profile = crate::perf::timer(if sync {
+            WriteStage::SaveCommittedSynced
+        } else {
+            WriteStage::SaveCommittedWal
+        });
+        let options = if sync {
+            Self::sync_wo()
+        } else {
+            Self::wal_wo()
+        };
         self.storage
             .db()
-            .put_cf_opt(
-                &cf,
-                KEY_COMMITTED,
-                codec::encode(&committed),
-                &Self::sync_wo(),
-            )
+            .put_cf_opt(&cf, KEY_COMMITTED, codec::encode(&committed), &options)
             .map_err(|e| write_err(e.into()))?;
+        // In deferred mode this WAL record need not be durable yet. OpenRaft
+        // explicitly permits `save_committed` to be a no-op when apply is
+        // durable. Startup takes max(committed, last_applied), and the next
+        // sync state apply flushes this marker before any client is answered.
         Ok(())
     }
 
@@ -231,15 +280,38 @@ where
     {
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         let mut batch = WriteBatch::default();
-        for entry in entries {
-            batch.put_cf(&cf, entry_key(entry.log_id.index), codec::encode(&entry));
+        let mut wal_bytes = 0usize;
+        {
+            let _profile = crate::perf::timer(WriteStage::LogEncode);
+            for entry in entries {
+                let key = entry_key(entry.log_id.index);
+                let value = codec::encode(&entry);
+                wal_bytes = wal_bytes.saturating_add(key.len().saturating_add(value.len()));
+                batch.put_cf(&cf, key, value);
+            }
         }
-        self.storage
-            .db()
-            .write_opt(batch, &Self::sync_wo())
-            .map_err(|e| write_err(e.into()))?;
-        // Entries are durable: signal completion.
-        callback.log_io_completed(Ok(()));
+        if Self::group_commit_enabled() {
+            let durable_wait = crate::perf::timer(WriteStage::WalDurabilityWait);
+            self.storage
+                .write_log_batch(
+                    batch,
+                    wal_bytes,
+                    Box::new(move |result| {
+                        drop(durable_wait);
+                        callback.log_io_completed(result);
+                    }),
+                )
+                .map_err(write_err)?;
+            // The entries are readable now. OpenRaft waits on the callback,
+            // which the group-commit worker completes after a durable WAL flush.
+        } else {
+            let _profile = crate::perf::timer(WriteStage::LogWriteSynced);
+            self.storage
+                .db()
+                .write_opt(batch, &Self::sync_wo())
+                .map_err(|error| write_err(error.into()))?;
+            callback.log_io_completed(Ok(()));
+        }
         Ok(())
     }
 

@@ -149,9 +149,7 @@ fn join(config: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    with_runtime(async move {
-        report("join", admin::join(zmq::Context::new(), &cfg).await)
-    })
+    with_runtime(async move { report("join", admin::join(zmq::Context::new(), &cfg).await) })
 }
 
 fn leave(cluster: &str, node: &str, seed: Option<&str>) -> ExitCode {

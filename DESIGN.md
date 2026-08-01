@@ -271,6 +271,13 @@ Implementation notes:
 - Applying a committed entry (`put`/`delete`) and advancing `last_applied` occur
   in **one atomic `WriteBatch`** against `cf_state_<group>`, so recovery never
   double-applies or skips. The same rule applies to all meta-state changes.
+- The optional OpenRaft committed-position marker is written to the WAL before
+  apply but does not require its own fsync. The following synchronous atomic
+  state apply on the same RocksDB instance makes that earlier marker durable
+  before a client response. `DAL_COMMITTED_SYNC=1` retains the original
+  fsync-per-marker path as a rollback mode. On recovery, OpenRaft reconciles a
+  stale or missing marker with the durable applied pointer; if the marker is
+  ahead, it replays the durable log to that committed prefix.
 - `delete` removes the key and its version record in the same atomic batch. No
   logical tombstone is kept: versions are log indexes and never repeat, so
   RocksDB deletion markers may compact freely without affecting CAS or
@@ -516,14 +523,21 @@ turning an old retry into a new write.
 ### 9.1 Failure detection
 - Each node sends periodic heartbeats to the meta group. (Per-partition Raft
   leaders already heartbeat their followers, so no separate peer-to-peer
-  detection layer exists.) Heartbeats carry a durable node incarnation and a
-  monotonically increasing sequence and are liveness evidence only; `Suspect`,
+  detection layer exists.) Heartbeats carry the replicated directory
+  incarnation, a durable process incarnation, and a monotonically increasing
+  sequence and are liveness evidence only; `Suspect`,
   `Down`, and reactivation are committed directory transitions. Missed
   heartbeats past `suspect_timeout` mark the node `Suspect`; after
   `down_timeout` the meta leader proposes `Down`, which takes effect only as a
   committed meta-group decision. A `Down` node becomes eligible again only
   through an explicit rejoin that passes an incarnation check — a stale or
   replayed heartbeat can never reactivate it.
+- A process fsyncs the exact directory registration it uses before serving and
+  keeps that directory incarnation fixed in every heartbeat. Only a
+  ReadIndex-fenced meta-leader directory response may update runtime routing.
+  Lower incarnations cannot regress an address book, equal incarnations cannot
+  change endpoints, and observing a different authoritative self-registration
+  fences all inbound and outbound participation until restart.
 - A simple timeout suffices because a false `Down` is safe: it can only trigger
   the fenced, learner-first replacement of §7.2, which cannot bypass data-Raft
   quorum. A false positive can cause needless data movement and temporarily
@@ -583,7 +597,8 @@ turning an old retry into a new write.
 - `msg_type` covers: `ClientOp`, `RaftAppend`, `RaftVote`, `RaftSnapshot`,
   `MigrationChunk`, `MetaQuery`, `Redirect`, `Heartbeat`, plus the
   peer-control types `BecomeLearner` and `DataConfigObservation`
-  (finalization/abort reports). Peer-control types are dispatched separately
+  (finalization/abort reports), and ReadIndex-fenced `DirectoryQuery`.
+  Peer-control types are dispatched separately
   from client operations; there is no generic "propose a meta command"
   message, so no client code path can submit `FinalizePlan` or `AbortReport`
   (§7.5).
@@ -691,7 +706,7 @@ single-partition implementation.
    a runnable process: the production ZeroMQ `RaftNetwork`, the `runtime::Node`
    startup/shutdown lifecycle, the peer/operator-control dispatcher, the
    background drivers (heartbeat, failure detection, rebalance/abort), a
-   durable heartbeat incarnation, a read-only HTTP `/status` plane, and the
+   directory-fenced durable heartbeat incarnation, a read-only HTTP `/status` plane, and the
    `dal run` binary. Adds no protocol; gated on the phase-6 behaviors holding
    over real sockets (a ZeroMQ three-node cluster serves ops, migrates on
    drain, rolls back a doomed plan, and marks a silent node `Down`).
@@ -700,7 +715,7 @@ The v1 *correctness* acceptance gate is phase 7: a three-node cluster completing
 the scenarios in §14 under fault injection, with no unsafe recovery command
 exercised. Phase 8 is the operable-binary layer on top; it inherits the same
 invariants over the production transport (see IMPLEMENTATION.md §2 M8 for its
-gate and the operator-CLI / partition-teardown items still open).
+gate).
 
 ---
 

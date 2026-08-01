@@ -7,29 +7,33 @@
 //! resumable genesis (meta initialize + seed, then each hosted data group's
 //! genesis) and is idempotent, so a restart re-runs it harmlessly.
 //!
-//! Scope (M8 slice): a static cluster derived from a [`BootstrapDescriptor`].
-//! The dynamic control loops — heartbeat-driven liveness and reconcile/rebalance
-//! — are a follow-up; membership here is the genesis placement.
+//! The bootstrap descriptor supplies immutable identity and genesis membership;
+//! heartbeat-driven liveness, fenced rebalance, reclamation, and live routing
+//! keep the running membership synchronized with committed meta state.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource};
-use crate::api::ops::RoutingInfo;
+use crate::api::ops::{RoutingInfo, RoutingQuery};
 use crate::config::{NodeConfig, RaftTuning, Timeouts};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
-use crate::meta::node::MetaNode;
+use crate::meta::node::{MetaNode, MetaRead};
 use crate::partition::node::PartitionNode;
 use crate::runtime::config_file::cluster_id_hex;
+use crate::runtime::directory::fetch_authoritative_directory;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
     ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusSource,
 };
+use crate::runtime::readiness::RuntimeReadiness;
 use crate::runtime::rebalance::RebalanceDriver;
 use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
@@ -38,11 +42,15 @@ use crate::transport::router::ZmqServer;
 use crate::transport::{
     Transport,
     codec::{Envelope, MsgType},
-    raft_wire::{BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody},
+    raft_wire::{
+        BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, PlacementQueryBody,
+        PlacementQueryReply,
+    },
 };
 use crate::types::{
     BootstrapGroup, ClusterConfig, ClusterId, GroupId, LearnerAdmission, LogId, MetaCommand,
-    NodeDirectoryEntry, NodeId, NodeState, Placement, ServingState,
+    NodeDirectoryEntry, NodeId, NodeState, PROTOCOL_VERSION, Placement, ProcessIdentityGate,
+    RegistrationBinding, ServingState,
 };
 
 /// How long [`Node::bootstrap`] waits for genesis to seed and replicate before
@@ -51,13 +59,29 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll cadence while waiting for genesis to complete.
 const BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 
-/// A routing snapshot fixed at genesis from the bootstrap descriptor. Routing is
-/// advisory (the serving gate is authority), so a static snapshot is sufficient
-/// for redirects and client `MetaQuery` replies until the reconcile loop lands.
-struct StaticRouting(RoutingInfo);
+/// The node's meta-group runtime, shared and mutable so a node can start hosting
+/// the meta group at runtime or stop after a drain.
+pub type MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>;
 
-impl StaticRouting {
-    fn from_descriptor(desc: &BootstrapDescriptor) -> StaticRouting {
+/// Live advisory routing. A meta host answers from its locally-applied state;
+/// another node proxies to a descriptor peer with a meta handle. The immutable
+/// descriptor remains only a bootstrap fallback while meta is unavailable.
+struct LiveRouting {
+    fallback: RoutingInfo,
+    meta: MetaHandle,
+    control: ZmqTransport,
+    addrs: AddrBook,
+    local_control: String,
+}
+
+impl LiveRouting {
+    fn from_descriptor(
+        desc: &BootstrapDescriptor,
+        meta: MetaHandle,
+        control: ZmqTransport,
+        addrs: AddrBook,
+        local_control: String,
+    ) -> LiveRouting {
         let directory = desc
             .directory
             .iter()
@@ -83,28 +107,95 @@ impl StaticRouting {
                 )
             })
             .collect();
-        StaticRouting(RoutingInfo {
-            cluster_id: desc.cluster_id,
-            p: desc.config.p,
-            hash_spec: desc.config.hash_spec,
+        LiveRouting {
+            fallback: RoutingInfo {
+                cluster_id: desc.cluster_id,
+                p: desc.config.p,
+                hash_spec: desc.config.hash_spec,
+                directory,
+                placements,
+            },
+            meta,
+            control,
+            addrs,
+            local_control,
+        }
+    }
+
+    fn local(&self) -> Option<RoutingInfo> {
+        let meta = self.meta.read().unwrap().clone()?;
+        let directory = meta.local_directory().ok()?;
+        if directory.is_empty() {
+            return None;
+        }
+        let placements: Vec<_> = (0..self.fallback.p)
+            .filter_map(|p| {
+                meta.local_placement(GroupId::Data(p))
+                    .ok()
+                    .flatten()
+                    .map(|placement| (p, placement))
+            })
+            .collect();
+        // A newly admitted meta learner is published before it has installed
+        // or replayed the cluster snapshot. Do not advertise that transient
+        // empty/partial view: proxy to a caught-up replica (or use the complete
+        // bootstrap fallback) until every invariant data placement is present.
+        if placements.len() != self.fallback.p as usize {
+            return None;
+        }
+        Some(RoutingInfo {
+            cluster_id: self.fallback.cluster_id,
+            p: self.fallback.p,
+            hash_spec: self.fallback.hash_spec,
             directory,
             placements,
         })
     }
 }
 
-impl RoutingSource for StaticRouting {
-    fn routing(&self) -> RoutingInfo {
-        self.0.clone()
+impl RoutingSource for LiveRouting {
+    fn routing(
+        &self,
+        local_only: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RoutingInfo>> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(local) = self.local() {
+                return Some(local);
+            }
+            if local_only {
+                return None;
+            }
+
+            let payload = crate::codec::encode(&RoutingQuery { local_only: true });
+            for addr in self.addrs.control_addrs() {
+                if addr == self.local_control.as_str() {
+                    continue;
+                }
+                let request = Envelope::new(
+                    self.fallback.cluster_id,
+                    MsgType::MetaQuery,
+                    GroupId::Meta,
+                    0,
+                    payload.clone(),
+                );
+                let Ok(reply) = self.control.call(&addr, request).await else {
+                    continue;
+                };
+                if reply.cluster_id != self.fallback.cluster_id
+                    || reply.msg_type != MsgType::MetaQuery
+                {
+                    continue;
+                }
+                if let Ok(info) = crate::codec::decode::<RoutingInfo>(&reply.payload)
+                    && info.cluster_id == self.fallback.cluster_id
+                {
+                    return Some(info);
+                }
+            }
+            Some(self.fallback.clone())
+        })
     }
 }
-
-/// The node's meta-group runtime, shared and mutable so a node can start hosting
-/// the meta group at runtime (a rebalance that makes it a meta voter) or stop
-/// hosting it after a drain. `None` when this node does not run the meta group.
-/// Every reader snapshots the inner `Option<Arc<MetaNode>>` before awaiting;
-/// the lock is never held across an `.await`.
-pub type MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>;
 
 pub struct Node {
     node_id: NodeId,
@@ -115,13 +206,18 @@ pub struct Node {
     partitions: PartitionMap,
     desc: BootstrapDescriptor,
     control: ZmqTransport,
-    meta_controls: Vec<String>,
+    /// Shared live address book. Bootstrap queries use the same discovery
+    /// candidates as steady-state control work; descriptor endpoints are only
+    /// initial hints and must not become a permanent bootstrap dependency.
+    addrs: AddrBook,
+    readiness: RuntimeReadiness,
+    identity_gate: ProcessIdentityGate,
     // Background control loops (heartbeat emitter, failure detector); aborted on
     // shutdown.
     tasks: Vec<JoinHandle<()>>,
     // Dropping these stops the poller threads and closes the sockets.
-    _control_srv: ZmqServer,
-    _bulk_srv: ZmqServer,
+    _control_srv: Option<ZmqServer>,
+    _bulk_srv: Option<ZmqServer>,
 }
 
 impl Node {
@@ -156,6 +252,11 @@ impl Node {
             cfg.cluster_id,
             cfg.node_id,
         )?);
+        let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
+        let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
+        let registration = resolve_registration_binding(&cfg, &desc, &storage, &control).await?;
+        let identity_gate = ProcessIdentityGate::default();
+        let readiness = RuntimeReadiness::default();
         let heartbeat_incarnation = storage.next_heartbeat_incarnation()?;
 
         let cluster = desc.config.clone();
@@ -209,15 +310,18 @@ impl Node {
         for d in &desc.directory {
             addrs.set(d.node_id, d.control_addr.clone(), d.bulk_addr.clone());
         }
-        let meta_controls: Vec<String> = desc
-            .directory
-            .iter()
-            .filter(|d| desc.meta_voters.contains(&d.node_id))
-            .map(|d| d.control_addr.clone())
-            .collect();
-
-        let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
-        let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
+        // Descriptor endpoints are discovery hints, not incarnation authority.
+        // Leaving their incarnation unset lets the first ReadIndex-fenced
+        // directory replace a stale immutable bootstrap address even when the
+        // replicated entry is still at incarnation one.
+        // A newly joined node is intentionally absent from the immutable
+        // bootstrap descriptor. It still needs its own address in the live book
+        // before the replicated directory refresh reaches it.
+        addrs.set(cfg.node_id, cfg.control_addr.clone(), cfg.bulk_addr.clone());
+        addrs.set_incarnation(cfg.node_id, registration.directory_incarnation);
+        for seed in &cfg.seeds {
+            addrs.add_control_seed(seed.clone());
+        }
         let tuning = RaftTuning::default();
 
         let meta = if is_meta_voter {
@@ -227,7 +331,8 @@ impl Node {
                 addrs.clone(),
                 control.clone(),
                 bulk.clone(),
-            );
+            )
+            .with_identity_gate(identity_gate.clone());
             Some(Arc::new(
                 MetaNode::start_with_network(cfg.node_id, storage.clone(), net, tuning).await?,
             ))
@@ -247,7 +352,8 @@ impl Node {
                 addrs.clone(),
                 control.clone(),
                 bulk.clone(),
-            );
+            )
+            .with_identity_gate(identity_gate.clone());
             let node =
                 PartitionNode::start_with_network(cfg.node_id, group, storage.clone(), net, tuning)
                     .await?;
@@ -255,7 +361,13 @@ impl Node {
         }
         let partitions: PartitionMap = Arc::new(RwLock::new(map));
 
-        let routing = Arc::new(StaticRouting::from_descriptor(&desc));
+        let routing = Arc::new(LiveRouting::from_descriptor(
+            &desc,
+            meta_handle.clone(),
+            control.clone(),
+            addrs.clone(),
+            cfg.control_addr.clone(),
+        ));
         let gateway = Arc::new(ClientGateway::new(
             cfg.cluster_id,
             cluster.p,
@@ -273,6 +385,10 @@ impl Node {
             bulk: bulk.clone(),
             tuning,
             partitions: partitions.clone(),
+            meta: meta_handle.clone(),
+            verification_timeout: cfg.timeouts.request.mul_f64(0.8),
+            lifecycle: AsyncMutex::new(()),
+            identity_gate: identity_gate.clone(),
         });
         let meta_starter = Arc::new(MetaStarter {
             node_id: cfg.node_id,
@@ -283,6 +399,9 @@ impl Node {
             bulk: bulk.clone(),
             tuning,
             meta: meta_handle.clone(),
+            verification_timeout: cfg.timeouts.request.mul_f64(0.8),
+            lifecycle: AsyncMutex::new(()),
+            identity_gate: identity_gate.clone(),
         });
 
         // Startup reconciliation (DESIGN §5.2): the genesis voters above come
@@ -313,15 +432,18 @@ impl Node {
             meta_starter.resume_meta().await?;
         }
 
-        let dispatch = Arc::new(RootDispatch::new(
-            cfg.cluster_id,
-            gateway,
-            meta_handle.clone(),
-            partitions.clone(),
-            heartbeats.clone(),
-            Some(starter.clone()),
-            Some(meta_starter.clone()),
-        ));
+        let dispatch = Arc::new(
+            RootDispatch::new(
+                cfg.cluster_id,
+                gateway,
+                meta_handle.clone(),
+                partitions.clone(),
+                heartbeats.clone(),
+                Some(starter.clone()),
+                Some(meta_starter.clone()),
+            )
+            .with_identity_gate(identity_gate.clone()),
+        );
 
         let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
         let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone())?;
@@ -329,24 +451,27 @@ impl Node {
         // Control loops: every node beats to the meta voters; the meta leader
         // turns the collected evidence into directory transitions.
         let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
+        let directory_timeout = cfg.timeouts.request;
         let hb_control = ZmqTransport::new(ctx.clone(), hb_interval);
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn(heartbeat_emitter(
-            cfg.node_id,
-            cfg.cluster_id,
+            registration.clone(),
             heartbeat_incarnation,
             hb_control,
-            meta_controls.clone(),
+            addrs.clone(),
             hb_interval,
+            identity_gate.clone(),
         )));
-        if let Some(meta) = &meta {
-            tasks.push(tokio::spawn(failure_detector(
-                meta.clone(),
-                heartbeats.clone(),
-                cfg.timeouts,
-                hb_interval,
-            )));
-        }
+        // Spawn on every node. The shared handle becomes populated if this node
+        // is promoted to a meta voter later, at which point it can immediately
+        // participate in failure detection and assume the leader role.
+        tasks.push(tokio::spawn(failure_detector(
+            meta_handle.clone(),
+            heartbeats.clone(),
+            cfg.timeouts,
+            hb_interval,
+            identity_gate.clone(),
+        )));
         // The rebalance driver runs on every node: its data-leader role must run
         // wherever a partition is led, including on non-meta-voter nodes (which
         // read the plan and report observations over the network).
@@ -354,13 +479,18 @@ impl Node {
             cfg.node_id,
             cfg.cluster_id,
             cluster.p,
+            cluster.r as usize,
+            desc.data_placements.iter().cloned().collect(),
             meta_handle.clone(),
             partitions.clone(),
             control.clone(),
             addrs.clone(),
-            meta_controls.clone(),
             starter,
             meta_starter,
+            directory_timeout,
+            registration,
+            identity_gate.clone(),
+            readiness.clone(),
         );
         tasks.push(tokio::spawn(driver.run()));
 
@@ -388,10 +518,12 @@ impl Node {
             partitions,
             desc,
             control,
-            meta_controls,
+            addrs,
+            readiness,
+            identity_gate,
             tasks,
-            _control_srv: control_srv,
-            _bulk_srv: bulk_srv,
+            _control_srv: Some(control_srv),
+            _bulk_srv: Some(bulk_srv),
         })
     }
 
@@ -400,6 +532,7 @@ impl Node {
     /// initializes it. Idempotent — a resumed node whose groups are already
     /// initialized does nothing.
     pub async fn bootstrap(&self) -> Result<()> {
+        self.require_identity_open()?;
         if let Some(meta) = self.meta() {
             let meta = &*meta;
             if !meta.is_initialized().await?
@@ -412,6 +545,7 @@ impl Node {
             // placement has replicated locally instead of failing startup.
             let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
             while !self.meta_seeded_locally(meta)? {
+                self.require_identity_open()?;
                 if meta.current_leader() == Some(self.node_id) {
                     bootstrap::seed_cluster_if_leader(meta, &self.desc).await?;
                 }
@@ -433,8 +567,16 @@ impl Node {
             let Some(node) = self.partitions.read().unwrap().get(p).cloned() else {
                 continue;
             };
+            // A restarted group has already established its membership through
+            // its durable Raft state. Its genesis placement may legitimately
+            // have changed, so only an uninitialized group waits for the exact
+            // descriptor placement before first initialization.
+            if node.is_initialized().await? {
+                continue;
+            }
             let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
             while !self.placement_seeded(*p, voters).await? {
+                self.require_identity_open()?;
                 if Instant::now() >= deadline {
                     return Err(crate::error::Error::Raft(format!(
                         "node {} timed out waiting for placement {p} to seed",
@@ -443,25 +585,33 @@ impl Node {
                 }
                 tokio::time::sleep(BOOTSTRAP_POLL).await;
             }
-            if !node.is_initialized().await? {
-                node.initialize(voters).await?;
-            }
+            node.initialize(voters).await?;
         }
+        self.readiness.mark_ready();
         Ok(())
+    }
+
+    fn require_identity_open(&self) -> Result<()> {
+        if self.identity_gate.is_open() {
+            Ok(())
+        } else {
+            Err(Error::Raft("local process identity is fenced".into()))
+        }
     }
 
     fn meta_seeded_locally(&self, meta: &MetaNode) -> Result<bool> {
         self.desc
             .data_placements
             .iter()
-            .try_fold(true, |ready, (p, voters)| {
+            .try_fold(true, |ready, (p, _voters)| {
                 if !ready {
                     return Ok(false);
                 }
-                Ok(matches!(
-                    meta.local_placement(GroupId::Data(*p))?,
-                    Some(placement) if placement.voters == *voters && placement.r#move.is_none()
-                ))
+                // Genesis is seeded once every descriptor partition has a
+                // placement. On restart that placement may legitimately have
+                // moved or carry an in-flight recovery plan, neither of which
+                // should make bootstrap replay the immutable descriptor.
+                Ok(meta.local_placement(GroupId::Data(*p))?.is_some())
             })
     }
 
@@ -473,17 +623,23 @@ impl Node {
 
     async fn placement_seeded(&self, partition: u16, voters: &[NodeId]) -> Result<bool> {
         if let Some(meta) = self.meta() {
-            return Ok(matches!(
-                meta.local_placement(GroupId::Data(partition))?,
-                Some(placement) if placement.voters == voters && placement.r#move.is_none()
-            ));
+            let placement = meta.local_placement(GroupId::Data(partition))?;
+            if placement
+                .as_ref()
+                .is_some_and(|placement| placement.r#move.is_some())
+            {
+                return Err(Error::Raft(format!(
+                    "data group {partition} has a move before genesis initialization"
+                )));
+            }
+            return Ok(placement.is_some_and(|placement| placement.voters == voters));
         }
 
         let body = BootstrapStatusBody {
             group: GroupId::Data(partition),
             voters: voters.to_vec(),
         };
-        for addr in &self.meta_controls {
+        for addr in self.addrs.control_addrs() {
             let request = Envelope::new(
                 self.desc.cluster_id,
                 MsgType::BootstrapStatus,
@@ -491,7 +647,7 @@ impl Node {
                 0,
                 crate::codec::encode(&body),
             );
-            let Ok(reply) = self.control.call(addr, request).await else {
+            let Ok(reply) = self.control.call(&addr, request).await else {
                 continue;
             };
             if reply.cluster_id != self.desc.cluster_id
@@ -501,6 +657,30 @@ impl Node {
             }
             if let Ok(BootstrapStatusReply { ready: true }) = crate::codec::decode(&reply.payload) {
                 return Ok(true);
+            }
+
+            // A move for an uninitialized genesis group cannot be reconciled:
+            // there is no data Raft configuration for the plan driver to
+            // change. Surface that invariant violation immediately instead of
+            // disguising it as an eventual bootstrap timeout.
+            let query = Envelope::new(
+                self.desc.cluster_id,
+                MsgType::PlacementQuery,
+                GroupId::Meta,
+                0,
+                crate::codec::encode(&PlacementQueryBody {
+                    group: GroupId::Data(partition),
+                }),
+            );
+            if let Ok(reply) = self.control.call(&addr, query).await
+                && let Ok(PlacementQueryReply {
+                    placement: Some(placement),
+                }) = crate::codec::decode(&reply.payload)
+                && placement.r#move.is_some()
+            {
+                return Err(Error::Raft(format!(
+                    "data group {partition} has a move before genesis initialization"
+                )));
             }
         }
         Ok(false)
@@ -567,19 +747,73 @@ impl Node {
         &self.cluster
     }
 
-    /// Gracefully stop: shut down every Raft group, then drop the inbound
-    /// servers (their `Drop` stops the poller threads).
-    pub async fn shutdown(self) -> Result<()> {
+    /// Cumulative RocksDB counters used by the opt-in write-path benchmark.
+    pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
+        // Every Raft group on this runtime shares this one node-local DB.
+        self.partitions
+            .read()
+            .unwrap()
+            .values()
+            .next()
+            .map(|node| node.rocks_counters())
+            .or_else(|| self.meta().map(|node| node.rocks_counters()))
+            .unwrap_or_default()
+    }
+
+    /// Gracefully stop inbound work and background loops, then shut down every
+    /// Raft group and release all storage owners before returning.
+    pub async fn shutdown(mut self) -> Result<()> {
         for task in &self.tasks {
             task.abort();
         }
-        if let Some(meta) = self.meta() {
-            meta.shutdown().await?;
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+
+        // First fence new inbound work, but do not wait for handlers yet: an
+        // already-dispatched client write may be blocked inside Raft and needs
+        // the Raft shutdown below to wake it. Waiting first creates a shutdown
+        // dependency cycle.
+        if let Some(server) = self._control_srv.as_mut() {
+            server.stop_accepting();
+        }
+        if let Some(server) = self._bulk_srv.as_mut() {
+            server.stop_accepting();
+        }
+
+        let mut first_error = None;
+        let meta = self.meta();
+        if let Some(node) = &meta
+            && let Err(error) = node.shutdown().await
+        {
+            first_error = Some(error);
         }
         let partitions: Vec<Arc<PartitionNode>> =
             self.partitions.read().unwrap().values().cloned().collect();
-        for node in partitions {
-            node.shutdown().await?;
+        for node in &partitions {
+            if let Err(error) = node.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        self.partitions.write().unwrap().clear();
+        *self.meta.write().unwrap() = None;
+        drop(partitions);
+        drop(meta);
+
+        // Raft waiters have now been released. Drain the handlers and drop the
+        // dispatcher's starter/storage handles so an immediate restart can
+        // reacquire RocksDB's LOCK deterministically.
+        if let Some(server) = self._control_srv.take() {
+            server.shutdown().await;
+        }
+        if let Some(server) = self._bulk_srv.take() {
+            server.shutdown().await;
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -654,6 +888,117 @@ impl StatusSource for NodeStatus {
     }
 }
 
+/// Read the authoritative placement before accepting a learner admission. A
+/// local meta leader performs ReadIndex directly; every other node asks the meta
+/// voters through `PlacementQuery`, whose handler also performs ReadIndex.
+async fn live_placement(
+    cluster_id: ClusterId,
+    group: GroupId,
+    meta: &MetaHandle,
+    control: &ZmqTransport,
+    addrs: &AddrBook,
+    verification_timeout: Duration,
+) -> Result<Placement> {
+    let local = { meta.read().unwrap().clone() };
+    if let Some(local) = local {
+        match local.read_placement(group).await {
+            Ok(MetaRead::Value(Some(placement))) => return Ok(placement),
+            Ok(MetaRead::Value(None)) | Ok(MetaRead::NotLeader { .. }) | Err(_) => {}
+        }
+    }
+
+    let payload = crate::codec::encode(&PlacementQueryBody { group });
+    let query = async {
+        let mut attempts: FuturesUnordered<_> = addrs
+            .control_addrs()
+            .into_iter()
+            .map(|addr| {
+                let request = Envelope::new(
+                    cluster_id,
+                    MsgType::PlacementQuery,
+                    GroupId::Meta,
+                    0,
+                    payload.clone(),
+                );
+                async move { control.call(&addr, request).await }
+            })
+            .collect();
+        while let Some(reply) = attempts.next().await {
+            let Ok(reply) = reply else {
+                continue;
+            };
+            if reply.cluster_id != cluster_id || reply.msg_type != MsgType::PlacementQuery {
+                continue;
+            }
+            if let Ok(PlacementQueryReply {
+                placement: Some(placement),
+            }) = crate::codec::decode::<PlacementQueryReply>(&reply.payload)
+            {
+                return Some(placement);
+            }
+        }
+        None
+    };
+    if let Ok(Some(placement)) = tokio::time::timeout(verification_timeout, query).await {
+        return Ok(placement);
+    }
+
+    Err(crate::error::Error::Raft(format!(
+        "no meta leader confirmed placement for {group:?}"
+    )))
+}
+
+struct LearnerPlanContext<'a> {
+    node_id: NodeId,
+    cluster_id: ClusterId,
+    meta: &'a MetaHandle,
+    control: &'a ZmqTransport,
+    addrs: &'a AddrBook,
+    verification_timeout: Duration,
+}
+
+async fn verify_learner_plan(
+    group: GroupId,
+    plan_id: u64,
+    context: LearnerPlanContext<'_>,
+) -> Result<()> {
+    let placement = live_placement(
+        context.cluster_id,
+        group,
+        context.meta,
+        context.control,
+        context.addrs,
+        context.verification_timeout,
+    )
+    .await?;
+    let Some(plan) = placement.r#move else {
+        return Err(crate::error::Error::Raft(format!(
+            "learner admission for {group:?} has no live plan"
+        )));
+    };
+    if plan.plan_id != plan_id {
+        return Err(crate::error::Error::Raft(format!(
+            "learner admission plan mismatch for {group:?}: expected {}, got {plan_id}",
+            plan.plan_id
+        )));
+    }
+    if plan.aborting {
+        return Err(crate::error::Error::Raft(format!(
+            "learner admission plan {plan_id} for {group:?} is aborting"
+        )));
+    }
+    let current = crate::types::voter_set(placement.voters);
+    let target = crate::types::voter_set(plan.target_voters);
+    let added: Vec<NodeId> = target.difference(&current).copied().collect();
+    if added != [context.node_id] {
+        return Err(crate::error::Error::Raft(format!(
+            "learner admission plan {plan_id} for {group:?} does not add node {}",
+            context.node_id
+        )));
+    }
+    Ok(())
+}
+
 /// Starts a data partition as a learner in response to a `BecomeLearner` frame
 /// (DESIGN §7.2). Holds exactly what starting a `PartitionNode` over the ZMQ
 /// network needs, plus the shared partition map to publish the new group into.
@@ -666,6 +1011,10 @@ pub struct PartitionStarter {
     bulk: ZmqTransport,
     tuning: RaftTuning,
     partitions: PartitionMap,
+    meta: MetaHandle,
+    verification_timeout: Duration,
+    lifecycle: AsyncMutex<()>,
+    identity_gate: ProcessIdentityGate,
 }
 
 impl PartitionStarter {
@@ -675,23 +1024,35 @@ impl PartitionStarter {
     /// learner, and publish it so the gateway and dispatcher can serve/route it.
     /// Idempotent: a group already hosted returns `Ok` without restarting.
     pub async fn admit_learner(&self, group: GroupId, plan_id: u64) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let GroupId::Data(partition) = group else {
             return Err(crate::error::Error::Raft(format!(
                 "cannot admit a learner for {group:?}"
             )));
         };
-        if self.partitions.read().unwrap().contains_key(&partition) {
-            return Ok(());
-        }
+        verify_learner_plan(
+            group,
+            plan_id,
+            LearnerPlanContext {
+                node_id: self.node_id,
+                cluster_id: self.cluster_id,
+                meta: &self.meta,
+                control: &self.control,
+                addrs: &self.addrs,
+                verification_timeout: self.verification_timeout,
+            },
+        )
+        .await?;
 
-        bootstrap::ensure_learner_admission(
-            &self.storage,
-            &LearnerAdmission {
+        self.storage
+            .record_verified_learner_admission(&LearnerAdmission {
                 cluster_id: self.cluster_id,
                 group,
                 plan_id,
-            },
-        )?;
+            })?;
+        if self.partitions.read().unwrap().contains_key(&partition) {
+            return Ok(());
+        }
         self.start_and_publish(partition).await
     }
 
@@ -703,6 +1064,7 @@ impl PartitionStarter {
     /// `authorize_group_start` refuses a group that has neither (the amnesia
     /// rule) or that was durably reclaimed. Idempotent.
     pub async fn resume_partition(&self, partition: u16) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.start_and_publish(partition).await
     }
 
@@ -722,7 +1084,8 @@ impl PartitionStarter {
             self.addrs.clone(),
             self.control.clone(),
             self.bulk.clone(),
-        );
+        )
+        .with_identity_gate(self.identity_gate.clone());
         let node = PartitionNode::start_with_network(
             self.node_id,
             group,
@@ -747,12 +1110,36 @@ impl PartitionStarter {
     /// `NonServing` before the drop so a crash mid-reclaim cannot leave
     /// servable-looking state. Idempotent — a partition not hosted returns `Ok`.
     pub async fn reclaim_partition(&self, partition: u16) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !self.partitions.read().unwrap().contains_key(&partition) {
+            return Ok(());
+        }
+
+        // The driver's placement read is only a prefilter. Revalidate while
+        // holding the admission/reclaim lifecycle lock so a stale reclaim
+        // decision cannot delete a replica that a newer plan has retained or
+        // is currently admitting. If a new plan appears after this check, its
+        // admission waits for reclaim and then starts from the durable marker.
+        let group = GroupId::Data(partition);
+        let placement = live_placement(
+            self.cluster_id,
+            group,
+            &self.meta,
+            &self.control,
+            &self.addrs,
+            self.verification_timeout,
+        )
+        .await?;
+        if placement.r#move.is_some() || placement.voters.contains(&self.node_id) {
+            return Ok(());
+        }
+
         let node = self.partitions.write().unwrap().remove(&partition);
         let Some(node) = node else {
             return Ok(());
         };
         node.shutdown().await?;
-        self.storage.reclaim_group(GroupId::Data(partition))?;
+        self.storage.reclaim_group(group)?;
         Ok(())
     }
 }
@@ -770,6 +1157,9 @@ pub struct MetaStarter {
     bulk: ZmqTransport,
     tuning: RaftTuning,
     meta: MetaHandle,
+    verification_timeout: Duration,
+    lifecycle: AsyncMutex<()>,
+    identity_gate: ProcessIdentityGate,
 }
 
 impl MetaStarter {
@@ -778,17 +1168,30 @@ impl MetaStarter {
     /// `MetaNode` as an uninitialized learner, and publish it. Idempotent — a
     /// node already hosting the meta group returns `Ok` without restarting.
     pub async fn admit_meta_learner(&self, plan_id: u64) -> Result<()> {
-        if self.meta.read().unwrap().is_some() {
-            return Ok(());
-        }
-        bootstrap::ensure_learner_admission(
-            &self.storage,
-            &LearnerAdmission {
+        let _lifecycle = self.lifecycle.lock().await;
+        verify_learner_plan(
+            GroupId::Meta,
+            plan_id,
+            LearnerPlanContext {
+                node_id: self.node_id,
+                cluster_id: self.cluster_id,
+                meta: &self.meta,
+                control: &self.control,
+                addrs: &self.addrs,
+                verification_timeout: self.verification_timeout,
+            },
+        )
+        .await?;
+
+        self.storage
+            .record_verified_learner_admission(&LearnerAdmission {
                 cluster_id: self.cluster_id,
                 group: GroupId::Meta,
                 plan_id,
-            },
-        )?;
+            })?;
+        if self.meta.read().unwrap().is_some() {
+            return Ok(());
+        }
         self.start_and_publish().await
     }
 
@@ -796,6 +1199,7 @@ impl MetaStarter {
     /// restart of a node promoted to a meta voter (startup reconciliation). Writes
     /// no admission record; `authorize_group_start` gates on the existing one.
     pub async fn resume_meta(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.start_and_publish().await
     }
 
@@ -812,7 +1216,8 @@ impl MetaStarter {
             self.addrs.clone(),
             self.control.clone(),
             self.bulk.clone(),
-        );
+        )
+        .with_identity_gate(self.identity_gate.clone());
         let node =
             MetaNode::start_with_network(self.node_id, self.storage.clone(), net, self.tuning)
                 .await?;
@@ -826,6 +1231,28 @@ impl MetaStarter {
     /// runtime, then durably record `NonServing` before dropping the CFs.
     /// Idempotent — a node not hosting the meta group returns `Ok`.
     pub async fn reclaim_meta(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.meta.read().unwrap().is_none() {
+            return Ok(());
+        }
+
+        // Revalidate after acquiring the same lock as meta learner admission.
+        // A removed node's local meta view can be frozen, so `live_placement`
+        // falls back to a quorum-serving current member before any local data
+        // is destroyed.
+        let placement = live_placement(
+            self.cluster_id,
+            GroupId::Meta,
+            &self.meta,
+            &self.control,
+            &self.addrs,
+            self.verification_timeout,
+        )
+        .await?;
+        if placement.r#move.is_some() || placement.voters.contains(&self.node_id) {
+            return Ok(());
+        }
+
         let node = self.meta.write().unwrap().take();
         let Some(node) = node else {
             return Ok(());
@@ -840,24 +1267,29 @@ impl MetaStarter {
 /// concurrent with a short timeout so one unreachable voter cannot stall the
 /// round and make this node look silent to the others (DESIGN §9.1).
 async fn heartbeat_emitter(
-    node_id: NodeId,
-    cluster_id: crate::types::ClusterId,
-    incarnation: u64,
+    registration: RegistrationBinding,
+    process_incarnation: u64,
     control: ZmqTransport,
-    meta_controls: Vec<String>,
+    addrs: AddrBook,
     interval: Duration,
+    identity_gate: ProcessIdentityGate,
 ) {
     let mut seq = 1u64;
     loop {
+        if !identity_gate.is_open() {
+            return;
+        }
         let body = HeartbeatBody {
-            node_id,
-            incarnation,
+            node_id: registration.node_id,
+            incarnation: registration.directory_incarnation,
+            process_incarnation,
             seq,
         };
         let payload = crate::codec::encode(&body);
-        let sends = meta_controls.iter().map(|addr| {
+        let control_addrs = addrs.control_addrs();
+        let sends = control_addrs.iter().map(|addr| {
             let env = Envelope::new(
-                cluster_id,
+                registration.cluster_id,
                 MsgType::Heartbeat,
                 GroupId::Meta,
                 0,
@@ -876,23 +1308,32 @@ async fn heartbeat_emitter(
 /// incarnation guard in the meta state machine rejects a transition against a
 /// rejoined node (DESIGN §9.1).
 async fn failure_detector(
-    meta: Arc<MetaNode>,
+    meta_handle: MetaHandle,
     tracker: Arc<Mutex<HeartbeatTracker>>,
     timeouts: Timeouts,
     interval: Duration,
+    identity_gate: ProcessIdentityGate,
 ) {
     loop {
+        if !identity_gate.is_open() {
+            return;
+        }
         tokio::time::sleep(interval).await;
+        let Some(meta) = ({ meta_handle.read().unwrap().clone() }) else {
+            continue;
+        };
         if meta.current_leader() != Some(meta.node_id()) {
             continue;
         }
         let Ok(directory) = meta.local_directory() else {
             continue;
         };
-        let states: Vec<(NodeId, NodeState)> =
-            directory.iter().map(|e| (e.node_id, e.state)).collect();
+        let states: Vec<(NodeId, NodeState, u64)> = directory
+            .iter()
+            .map(|e| (e.node_id, e.state, e.incarnation))
+            .collect();
         let transitions = {
-            let tracker = tracker.lock().unwrap();
+            let mut tracker = tracker.lock().unwrap();
             tracker.evaluate(now_ms(), &timeouts, &states)
         };
         for (node_id, state) in transitions {
@@ -912,6 +1353,114 @@ async fn failure_detector(
     }
 }
 
+/// Resolve and durably bind the exact replicated registration this process may
+/// use. Genesis descriptor entries are the sole offline exception: their first
+/// registration is deterministically incarnation one. Dynamic nodes and any
+/// endpoint change must be confirmed by a ReadIndex-fenced directory read.
+async fn resolve_registration_binding(
+    cfg: &NodeConfig,
+    desc: &BootstrapDescriptor,
+    storage: &Storage,
+    control: &ZmqTransport,
+) -> Result<RegistrationBinding> {
+    let previous = storage.registration_binding()?;
+    let endpoints_match = previous
+        .as_ref()
+        .is_some_and(|binding| binding.matches_endpoints(&cfg.control_addr, &cfg.bulk_addr));
+
+    // Prefer a live registration on restart, allowing an operator-authorized
+    // rejoin at a higher incarnation to take effect. If meta is unavailable,
+    // an exact durable endpoint binding remains sufficient to restart; it will
+    // be checked again by the authoritative refresh loop.
+    if endpoints_match {
+        let previous = previous.expect("checked as some above");
+        let seeds = cfg.seeds.iter().cloned().chain(
+            desc.directory
+                .iter()
+                .map(|entry| entry.control_addr.clone()),
+        );
+        let Ok(directory) =
+            fetch_authoritative_directory(control, cfg.cluster_id, seeds, cfg.timeouts.request)
+                .await
+        else {
+            return Ok(previous);
+        };
+        if !directory.iter().any(|entry| entry.node_id == cfg.node_id)
+            && previous.directory_incarnation == 1
+            && desc.directory.iter().any(|entry| {
+                entry.node_id == cfg.node_id
+                    && entry.control_addr == cfg.control_addr
+                    && entry.bulk_addr == cfg.bulk_addr
+            })
+        {
+            // Crash-recovery during genesis may observe ClusterInit before this
+            // node's deterministic RegisterNode entry has been applied.
+            return Ok(previous);
+        }
+        return bind_authoritative_registration(cfg, storage, directory);
+    }
+
+    // Fresh genesis data directories may start before a meta leader exists.
+    // RegisterNode during bootstrap deterministically creates incarnation one.
+    if previous.is_none()
+        && desc.directory.iter().any(|entry| {
+            entry.node_id == cfg.node_id
+                && entry.control_addr == cfg.control_addr
+                && entry.bulk_addr == cfg.bulk_addr
+        })
+    {
+        let binding = RegistrationBinding {
+            cluster_id: cfg.cluster_id,
+            node_id: cfg.node_id,
+            control_addr: cfg.control_addr.clone(),
+            bulk_addr: cfg.bulk_addr.clone(),
+            directory_incarnation: 1,
+        };
+        storage.record_registration_binding(&binding)?;
+        return Ok(binding);
+    }
+
+    let seeds = cfg.seeds.iter().cloned().chain(
+        desc.directory
+            .iter()
+            .map(|entry| entry.control_addr.clone()),
+    );
+    let directory =
+        fetch_authoritative_directory(control, cfg.cluster_id, seeds, cfg.timeouts.request).await?;
+    bind_authoritative_registration(cfg, storage, directory)
+}
+
+fn bind_authoritative_registration(
+    cfg: &NodeConfig,
+    storage: &Storage,
+    directory: Vec<NodeDirectoryEntry>,
+) -> Result<RegistrationBinding> {
+    let entry = directory
+        .into_iter()
+        .find(|entry| entry.node_id == cfg.node_id)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "node {} is not present in the authoritative directory; run dal join first",
+                cfg.node_id
+            ))
+        })?;
+    if entry.control_addr != cfg.control_addr || entry.bulk_addr != cfg.bulk_addr {
+        return Err(Error::Config(format!(
+            "node {} config endpoints do not match its authoritative registration",
+            cfg.node_id
+        )));
+    }
+    let binding = RegistrationBinding {
+        cluster_id: cfg.cluster_id,
+        node_id: cfg.node_id,
+        control_addr: entry.control_addr,
+        bulk_addr: entry.bulk_addr,
+        directory_incarnation: entry.incarnation,
+    };
+    storage.record_registration_binding(&binding)?;
+    Ok(binding)
+}
+
 fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Result<()> {
     cfg.validate()?;
     if cfg.cluster_id != desc.cluster_id || desc.config.cluster_id != desc.cluster_id {
@@ -919,18 +1468,10 @@ fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Res
             "node config and bootstrap descriptor disagree on cluster_id".into(),
         ));
     }
-    let Some(directory_entry) = desc.directory.iter().find(|d| d.node_id == cfg.node_id) else {
+    if desc.config.protocol_version != PROTOCOL_VERSION {
         return Err(crate::error::Error::Config(format!(
-            "node {} is not present in the bootstrap descriptor",
-            cfg.node_id
-        )));
-    };
-    if directory_entry.control_addr != cfg.control_addr
-        || directory_entry.bulk_addr != cfg.bulk_addr
-    {
-        return Err(crate::error::Error::Config(format!(
-            "node {} addresses do not match the bootstrap descriptor",
-            cfg.node_id
+            "bootstrap descriptor protocol version {} is incompatible with runtime version {PROTOCOL_VERSION}",
+            desc.config.protocol_version
         )));
     }
     Ok(())
@@ -976,20 +1517,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_config_outside_descriptor_before_opening_storage() {
-        let err = validate_node_descriptor(&config(9), &descriptor()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("not present in the bootstrap descriptor")
-        );
+    fn allows_config_for_a_dynamically_joined_node() {
+        let mut cfg = config(9);
+        cfg.control_addr = "tcp://node-9-control".into();
+        cfg.bulk_addr = "tcp://node-9-bulk".into();
+        assert!(validate_node_descriptor(&cfg, &descriptor()).is_ok());
     }
 
     #[test]
-    fn rejects_address_mismatch_before_opening_storage() {
+    fn defers_descriptor_address_change_to_live_registration_check() {
         let mut cfg = config(1);
         cfg.control_addr = "tcp://wrong-control".into();
-        let err = validate_node_descriptor(&cfg, &descriptor()).unwrap_err();
-        assert!(err.to_string().contains("addresses do not match"));
+        assert!(validate_node_descriptor(&cfg, &descriptor()).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_incompatible_protocol_descriptor() {
+        let mut desc = descriptor();
+        desc.config.protocol_version = PROTOCOL_VERSION - 1;
+        let err = validate_node_descriptor(&config(1), &desc).unwrap_err();
+        assert!(err.to_string().contains("protocol version"));
     }
 
     #[tokio::test]

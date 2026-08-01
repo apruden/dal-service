@@ -6,6 +6,7 @@
 //! deterministic.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use dal::transport::codec::{Envelope, MsgType};
@@ -13,6 +14,7 @@ use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::{ZmqServer, settle};
 use dal::transport::{Server, Transport};
 use dal::types::{ClusterId, GroupId};
+use tokio::sync::oneshot;
 
 const CID: ClusterId = 0x0000_0000_0000_0000_0000_0000_0000_0DA1;
 
@@ -29,6 +31,24 @@ impl Server for Echo {
             request.request_id,
             request.payload,
         )
+    }
+}
+
+struct Blocking {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl Server for Blocking {
+    async fn serve(&self, request: Envelope) -> Envelope {
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        request
     }
 }
 
@@ -53,5 +73,52 @@ async fn zmq_dealer_router_round_trip() {
     assert_eq!(reply.cluster_id, CID);
     assert_eq!(reply.payload, payload);
 
-    server.shutdown();
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_yields_while_an_inflight_handler_finishes() {
+    let ctx = zmq::Context::new();
+    let addr = "inproc://m4-zmq-async-shutdown";
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = ZmqServer::bind(
+        ctx.clone(),
+        addr,
+        Arc::new(Blocking {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(Some(release_rx)),
+        }),
+    )
+    .unwrap();
+    settle();
+
+    let transport = ZmqTransport::new(ctx, Duration::from_secs(2));
+    let request = tokio::spawn(async move {
+        transport
+            .call(
+                addr,
+                Envelope::new(CID, MsgType::MetaQuery, GroupId::Meta, 1, Vec::new()),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("handler was never dispatched")
+        .expect("handler start signal dropped");
+
+    let mut shutdown = tokio::spawn(server.shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown returned before the active handler completed"
+    );
+
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("shutdown blocked the current-thread runtime")
+        .expect("shutdown task panicked");
+    request.abort();
 }

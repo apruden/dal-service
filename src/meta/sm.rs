@@ -8,7 +8,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, StorageError};
@@ -20,6 +20,7 @@ use crate::meta::raft_types::{
 };
 use crate::meta::state_machine::{MetaApplyResult, MetaStateMachine};
 use crate::partition::raft_types::{read_err, write_err};
+use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::types::GroupId;
 
@@ -29,6 +30,9 @@ type Applied = (Option<LogId>, StoredMembership);
 pub struct MetaRaftStateMachine {
     storage: Arc<Storage>,
     sm: Arc<MetaStateMachine>,
+    /// Shared by the live state machine and every snapshot-builder clone. This
+    /// is required because OpenRaft builds snapshots concurrently with apply.
+    state_view: Arc<Mutex<()>>,
 }
 
 impl MetaRaftStateMachine {
@@ -36,6 +40,7 @@ impl MetaRaftStateMachine {
         MetaRaftStateMachine {
             storage,
             sm: Arc::new(MetaStateMachine::new()),
+            state_view: Arc::new(Mutex::new(())),
         }
     }
 
@@ -47,6 +52,7 @@ impl MetaRaftStateMachine {
     }
 
     fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
+        let _view = self.state_view.lock().unwrap();
         let (last_log_id, membership) = self.read_applied()?;
         let pairs = self.storage.scan_state(GroupId::Meta).map_err(read_err)?;
         let data = codec::encode(&pairs);
@@ -86,6 +92,8 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let _profile = crate::perf::timer(WriteStage::StateApplyTotal);
+        let _view = self.state_view.lock().unwrap();
         let (_, mut membership) = self.read_applied()?;
         let mut results = Vec::new();
 
@@ -127,6 +135,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
+        let _view = self.state_view.lock().unwrap();
         let bytes = (*snapshot).into_inner();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = codec::decode(&bytes).map_err(read_err)?;
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());

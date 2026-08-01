@@ -8,10 +8,13 @@
 //! plan or membership change.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use crate::api::ops::{
-    ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, WriteReply, check_partition,
+    ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, RoutingQuery, WriteReply,
+    check_partition,
 };
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
@@ -26,7 +29,10 @@ use crate::types::{ClusterId, DataOp, GroupId, HashSpec, IfVersion};
 /// The source of a client's routing snapshot (DESIGN §8.1). In M4 a fixed
 /// implementation answers this; M5 backs it with the meta group's placement map.
 pub trait RoutingSource: Send + Sync {
-    fn routing(&self) -> RoutingInfo;
+    fn routing(
+        &self,
+        local_only: bool,
+    ) -> Pin<Box<dyn Future<Output = Option<RoutingInfo>> + Send + '_>>;
 }
 
 /// A gateway fronting the partitions this node hosts.
@@ -67,8 +73,12 @@ impl ClientGateway {
     }
 
     /// The candidate voter set for a partition, from the routing snapshot.
-    fn candidates(&self, partition: u16) -> Vec<u64> {
-        self.routing.routing().candidates(partition)
+    async fn candidates(&self, partition: u16) -> Vec<u64> {
+        self.routing
+            .routing(false)
+            .await
+            .map(|r| r.candidates(partition))
+            .unwrap_or_default()
     }
 
     async fn handle_client_op(&self, env: &Envelope) -> ClientReply {
@@ -93,7 +103,7 @@ impl ClientGateway {
             return ClientReply::Redirect(Redirect {
                 cluster_id: self.cluster_id,
                 leader: None,
-                candidates: self.candidates(partition),
+                candidates: self.candidates(partition).await,
             });
         };
 
@@ -121,7 +131,7 @@ impl ClientGateway {
                     Ok(WriteOutcome::NotLeader { leader }) => ClientReply::Redirect(Redirect {
                         cluster_id: self.cluster_id,
                         leader,
-                        candidates: self.candidates(partition),
+                        candidates: self.candidates(partition).await,
                     }),
                     Err(e) => ClientReply::Error(format!("write failed: {e}")),
                 }
@@ -134,7 +144,7 @@ impl ClientGateway {
                     ClientReply::Redirect(Redirect {
                         cluster_id: self.cluster_id,
                         leader,
-                        candidates: self.candidates(partition),
+                        candidates: self.candidates(partition).await,
                     })
                 }
                 Err(e) => ClientReply::Error(format!("read failed: {e}")),
@@ -166,7 +176,17 @@ impl Server for ClientGateway {
 
         match request.msg_type {
             MsgType::MetaQuery => {
-                let info = self.routing.routing();
+                let local_only = codec::decode::<RoutingQuery>(&request.payload)
+                    .map(|q| q.local_only)
+                    .unwrap_or(false);
+                let Some(info) = self.routing.routing(local_only).await else {
+                    return self.reply(
+                        MsgType::MetaQuery,
+                        GroupId::Meta,
+                        request.request_id,
+                        Vec::new(),
+                    );
+                };
                 self.reply(
                     MsgType::MetaQuery,
                     GroupId::Meta,

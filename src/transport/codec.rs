@@ -58,6 +58,10 @@ pub enum MsgType {
     /// Peer-control: read a group's committed meta placement. Lets a data leader
     /// that is not a meta voter drive its own move (§7).
     PlacementQuery = 14,
+    /// Peer-control: fetch the node directory through a meta ReadIndex barrier.
+    /// Unlike `MetaQuery`, this reply is authoritative and may update the
+    /// runtime address book and process registration binding.
+    DirectoryQuery = 15,
 }
 
 impl MsgType {
@@ -78,6 +82,7 @@ impl MsgType {
             12 => MsgType::AbortPlanRequest,
             13 => MsgType::BootstrapStatus,
             14 => MsgType::PlacementQuery,
+            15 => MsgType::DirectoryQuery,
             _ => return None,
         })
     }
@@ -104,6 +109,10 @@ impl MsgType {
             | MsgType::AbortPlanRequest
             | MsgType::BootstrapStatus
             | MsgType::PlacementQuery => 4 * KIB,
+            // Directory entries contain operator-supplied endpoint strings and
+            // scale with cluster size. Keep the control-plane bound explicit
+            // without constraining it to the tiny command-body limit.
+            MsgType::DirectoryQuery => 4 * MIB,
         }
     }
 
@@ -125,6 +134,7 @@ impl MsgType {
                 | MsgType::AbortPlanRequest
                 | MsgType::BootstrapStatus
                 | MsgType::PlacementQuery
+                | MsgType::DirectoryQuery
         )
     }
 }
@@ -391,6 +401,7 @@ mod tests {
         assert!(MsgType::JoinRequest.is_peer_control());
         assert!(MsgType::LeaveRequest.is_peer_control());
         assert!(MsgType::AbortPlanRequest.is_peer_control());
+        assert!(MsgType::DirectoryQuery.is_peer_control());
         assert!(!MsgType::ClientOp.is_peer_control());
         assert!(!MsgType::MetaQuery.is_peer_control());
     }
@@ -401,6 +412,7 @@ mod tests {
             MsgType::JoinRequest,
             MsgType::LeaveRequest,
             MsgType::AbortPlanRequest,
+            MsgType::DirectoryQuery,
         ] {
             let e = env(t, GroupId::Meta, b"body".to_vec());
             assert_eq!(e, Envelope::decode(&e.encode()).unwrap());

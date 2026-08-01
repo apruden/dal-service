@@ -84,10 +84,13 @@ impl PeerConn {
 
     fn submit(&self, out: Outbound) -> Result<()> {
         self.tx.try_send(out).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => io_err(ErrorKind::WouldBlock, "ZeroMQ peer queue is full"),
-            mpsc::TrySendError::Disconnected(_) => {
-                io_err(ErrorKind::ConnectionAborted, "ZeroMQ peer connection stopped")
+            mpsc::TrySendError::Full(_) => {
+                io_err(ErrorKind::WouldBlock, "ZeroMQ peer queue is full")
             }
+            mpsc::TrySendError::Disconnected(_) => io_err(
+                ErrorKind::ConnectionAborted,
+                "ZeroMQ peer connection stopped",
+            ),
         })?;
         // A single byte nudges the poll loop; a dropped nudge (HWM/DONTWAIT) is
         // harmless because the queued request is still drained on the next
@@ -220,8 +223,10 @@ fn conn_loop(
                         }
                         Err(_) => {
                             socket_faulted = true;
-                            let _ = reply
-                                .send(Err(io_err(ErrorKind::ConnectionAborted, "ZeroMQ send failed")));
+                            let _ = reply.send(Err(io_err(
+                                ErrorKind::ConnectionAborted,
+                                "ZeroMQ send failed",
+                            )));
                         }
                     },
                     _ => {

@@ -142,19 +142,15 @@ pub fn load_init_descriptor(path: &Path) -> Result<BootstrapDescriptor> {
         .collect();
     // Determinism: descriptor bytes must not depend on file entry order.
     directory.sort_by_key(|e| e.node_id);
-    for w in directory.windows(2) {
-        let addrs = [
-            &w[0].control_addr,
-            &w[0].bulk_addr,
-            &w[1].control_addr,
-            &w[1].bulk_addr,
-        ];
-        let distinct: std::collections::BTreeSet<_> = addrs.iter().collect();
-        if distinct.len() != addrs.len() {
-            return Err(Error::Config(format!(
-                "nodes {} and {} share an address",
-                w[0].node_id, w[1].node_id
-            )));
+    let mut address_owner = std::collections::HashMap::new();
+    for entry in &directory {
+        for address in [&entry.control_addr, &entry.bulk_addr] {
+            if let Some(previous) = address_owner.insert(address.as_str(), entry.node_id) {
+                return Err(Error::Config(format!(
+                    "nodes {previous} and {} share address {address}",
+                    entry.node_id
+                )));
+            }
         }
     }
 
@@ -326,6 +322,11 @@ mod tests {
     #[test]
     fn init_rejects_duplicate_addr() {
         let json = init_json().replace("tcp://127.0.0.1:5021", "tcp://127.0.0.1:5011");
+        let f = write_tmp(&json);
+        assert!(load_init_descriptor(f.path()).is_err());
+
+        // Non-adjacent node ids must also be compared globally.
+        let json = init_json().replace("tcp://127.0.0.1:5031", "tcp://127.0.0.1:5011");
         let f = write_tmp(&json);
         assert!(load_init_descriptor(f.path()).is_err());
     }

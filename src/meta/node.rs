@@ -108,6 +108,10 @@ impl MetaNode {
         &self.raft
     }
 
+    pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
+        self.storage.rocks_counters()
+    }
+
     /// Bootstrap the meta group with its initial voter set (DESIGN §3.1).
     pub async fn initialize(&self, voters: &[NodeId]) -> Result<()> {
         let members: BTreeMap<NodeId, Node> =
@@ -176,6 +180,20 @@ impl MetaNode {
         (log_id, voters)
     }
 
+    /// Confirm leadership with ReadIndex before observing the committed
+    /// membership. This fences configuration reports from a stale former meta
+    /// leader after leadership or quorum has moved elsewhere.
+    pub async fn confirmed_committed_config(
+        &self,
+    ) -> Result<(Option<crate::types::LogId>, Vec<NodeId>)> {
+        self.storage.require_serving(GroupId::Meta)?;
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| Error::Raft(format!("confirm committed membership: {e}")))?;
+        Ok(self.committed_config())
+    }
+
     /// The committed voter set as a comparable set (learners ignored).
     pub fn committed_voter_set(&self) -> std::collections::BTreeSet<NodeId> {
         self.committed_config().1.into_iter().collect()
@@ -233,6 +251,14 @@ impl MetaNode {
         .await
     }
 
+    /// Read the complete directory after a ReadIndex barrier. This is the
+    /// authoritative source for runtime endpoint/incarnation state; callers
+    /// must not substitute the advisory `MetaQuery` follower view.
+    pub async fn read_directory(&self) -> Result<MetaRead<Vec<NodeDirectoryEntry>>> {
+        let storage = self.storage.clone();
+        self.linearizable(move || scan_directory(&storage)).await
+    }
+
     /// Local (non-linearizable) reads for tests and startup reconciliation.
     pub fn local_placement(&self, group: GroupId) -> Result<Option<Placement>> {
         self.storage
@@ -247,13 +273,7 @@ impl MetaNode {
     /// Every node-directory entry from committed local state (non-linearizable),
     /// used by the failure detector to evaluate liveness across the cluster.
     pub fn local_directory(&self) -> Result<Vec<NodeDirectoryEntry>> {
-        let prefix = keyspace::meta_node_prefix();
-        self.storage
-            .scan_state(GroupId::Meta)?
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| crate::codec::decode(&v).map_err(crate::error::Error::codec))
-            .collect()
+        scan_directory(&self.storage)
     }
 
     pub fn applied_index(&self) -> Option<u64> {
@@ -270,4 +290,14 @@ impl MetaNode {
             .await
             .map_err(|e| Error::Raft(format!("shutdown: {e}")))
     }
+}
+
+fn scan_directory(storage: &Storage) -> Result<Vec<NodeDirectoryEntry>> {
+    let prefix = keyspace::meta_node_prefix();
+    storage
+        .scan_state(GroupId::Meta)?
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, v)| crate::codec::decode(&v).map_err(crate::error::Error::codec))
+        .collect()
 }

@@ -19,6 +19,7 @@ use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
 use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
 use crate::partition::sm::RocksStateMachine;
 use crate::partition::state_machine::{ApplyResult, DataStateMachine};
+use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::types::{Consistency, DataRequest, GroupId, Version};
 
@@ -36,11 +37,15 @@ pub enum WriteOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Value(Option<(Version, Vec<u8>)>),
-    NotLeader { leader: Option<NodeId> },
+    NotLeader {
+        leader: Option<NodeId>,
+    },
     /// A stale read was refused: this replica is not currently attached to a
     /// leader, or is behind the caller's `min_version`. Retry a fresher
     /// candidate (DESIGN §8.3, §15).
-    TooStale { leader: Option<NodeId> },
+    TooStale {
+        leader: Option<NodeId>,
+    },
 }
 
 pub struct PartitionNode {
@@ -124,6 +129,10 @@ impl PartitionNode {
         &self.raft
     }
 
+    pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
+        self.storage.rocks_counters()
+    }
+
     /// Bootstrap this group with the given voter set (DESIGN §3.1). Idempotent
     /// per openraft: a second call on an initialized group errors.
     pub async fn initialize(&self, voters: &[NodeId]) -> Result<()> {
@@ -178,6 +187,21 @@ impl PartitionNode {
         (log_id, voters)
     }
 
+    /// Confirm leadership with ReadIndex before observing the committed
+    /// membership. Configuration observations are used to resolve replicated
+    /// move plans, so a deposed or partitioned former leader must not be able
+    /// to report its stale local membership to the meta group.
+    pub async fn confirmed_committed_config(
+        &self,
+    ) -> Result<(Option<crate::types::LogId>, Vec<NodeId>)> {
+        self.storage.require_serving(self.group)?;
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| Error::Raft(format!("confirm committed membership: {e}")))?;
+        Ok(self.committed_config())
+    }
+
     /// The committed voter set as a comparable set (learners ignored).
     pub fn committed_voter_set(&self) -> std::collections::BTreeSet<NodeId> {
         self.committed_config().1.into_iter().collect()
@@ -186,6 +210,7 @@ impl PartitionNode {
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
         self.storage.require_serving(self.group)?;
+        let _profile = crate::perf::timer(WriteStage::RaftClientWrite);
         match self.raft.client_write(req).await {
             Ok(resp) => Ok(WriteOutcome::Applied(resp.data)),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
@@ -209,7 +234,9 @@ impl PartitionNode {
         let min_version = match consistency {
             Consistency::Linearizable => {
                 return match self.raft.ensure_linearizable().await {
-                    Ok(_) => Ok(ReadOutcome::Value(self.data.get(self.storage.as_ref(), key)?)),
+                    Ok(_) => Ok(ReadOutcome::Value(
+                        self.data.get(self.storage.as_ref(), key)?,
+                    )),
                     Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                         Ok(ReadOutcome::NotLeader {
                             leader: f.leader_id,
@@ -221,14 +248,34 @@ impl PartitionNode {
             Consistency::Stale { min_version } => min_version,
         };
 
-        // Bounded-staleness guard: an isolated replica loses its leader after
-        // the election timeout, so no known leader means "not recently attached
-        // to a quorum" — refuse rather than serve unboundedly-old data. This is
-        // coarse (a merely-slow follower still passes); a precise lag bound
-        // needs a metric openraft does not expose cleanly today.
+        // Only committed voters may serve follower reads. Learner admission opens
+        // the durable process gate before catch-up, and a removed voter is
+        // reclaimed asynchronously, so the process gate alone is not authority
+        // for this weaker read path.
+        if !self.committed_voter_set().contains(&self.node_id) {
+            return Ok(ReadOutcome::TooStale {
+                leader: self.current_leader(),
+            });
+        }
+
+        // An isolated follower eventually starts an election and loses its
+        // committed-leader view. An isolated leader does not, so `Some(self)` is
+        // not freshness evidence: require a quorum barrier before letting the
+        // leader use the stale fast path.
         let leader = self.current_leader();
         if leader.is_none() {
             return Ok(ReadOutcome::TooStale { leader: None });
+        }
+        if leader == Some(self.node_id) {
+            match self.raft.ensure_linearizable().await {
+                Ok(_) => {}
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
+                    return Ok(ReadOutcome::TooStale {
+                        leader: f.leader_id,
+                    });
+                }
+                Err(_) => return Ok(ReadOutcome::TooStale { leader }),
+            }
         }
         // Read-your-writes / monotonic: the replica must have caught up to the
         // version the caller last observed.
@@ -238,7 +285,9 @@ impl PartitionNode {
             return Ok(ReadOutcome::TooStale { leader });
         }
         // No ReadIndex, no fsync: just this replica's locally-applied state.
-        Ok(ReadOutcome::Value(self.data.get(self.storage.as_ref(), key)?))
+        Ok(ReadOutcome::Value(
+            self.data.get(self.storage.as_ref(), key)?,
+        ))
     }
 
     /// Read this node's *local* applied value for a key, bypassing the serving
