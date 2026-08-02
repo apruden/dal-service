@@ -12,7 +12,7 @@ use rocksdb::{WriteBatch, WriteOptions};
 use crate::codec;
 use crate::error::Result;
 use crate::keyspace;
-use crate::partition::log_store::{KEY_COMMITTED, committed_sync_enabled};
+use crate::partition::log_store::KEY_COMMITTED;
 use crate::perf::WriteStage;
 use crate::storage::rocks::Storage;
 use crate::types::{GroupId, LogId};
@@ -107,9 +107,7 @@ impl Storage {
     ) -> Result<()> {
         let batch = {
             let cf = self.state_cf(group)?;
-            let log_cf = (!committed_sync_enabled())
-                .then(|| self.log_cf(group))
-                .transpose()?;
+            let log_cf = self.log_cf(group)?;
 
             let mut batch = WriteBatch::default();
             for m in mutations {
@@ -119,12 +117,10 @@ impl Storage {
                 }
             }
             batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
-            if let Some(log_cf) = log_cf {
-                // Persist the optional recovery hint with exactly the state
-                // prefix it describes. Cross-CF WriteBatch atomicity prevents
-                // the two recovery pointers from disagreeing.
-                batch.put_cf(&log_cf, KEY_COMMITTED, committed_record);
-            }
+            // Persist the optional recovery hint with exactly the state prefix
+            // it describes. Cross-CF WriteBatch atomicity prevents the two
+            // recovery pointers from disagreeing.
+            batch.put_cf(&log_cf, KEY_COMMITTED, committed_record);
             batch
         };
 

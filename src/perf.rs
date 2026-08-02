@@ -48,8 +48,6 @@ pub enum WriteStage {
     WalFlush,
     LogWriteSynced,
     SaveVoteSynced,
-    SaveCommittedWal,
-    SaveCommittedSynced,
     StateApplyTotal,
     StateApplyCapacityWait,
     StateApplyWalWrite,
@@ -57,7 +55,7 @@ pub enum WriteStage {
     StateApplySynced,
 }
 
-const STAGES: [WriteStage; 41] = [
+const STAGES: [WriteStage; 39] = [
     WriteStage::ClientTransportCall,
     WriteStage::ClientGatewayHandle,
     WriteStage::RaftClientWrite,
@@ -92,8 +90,6 @@ const STAGES: [WriteStage; 41] = [
     WriteStage::WalFlush,
     WriteStage::LogWriteSynced,
     WriteStage::SaveVoteSynced,
-    WriteStage::SaveCommittedWal,
-    WriteStage::SaveCommittedSynced,
     WriteStage::StateApplyTotal,
     WriteStage::StateApplyCapacityWait,
     WriteStage::StateApplyWalWrite,
@@ -138,8 +134,6 @@ impl WriteStage {
             Self::WalFlush => "WAL flush_wal(true)",
             Self::LogWriteSynced => "log sync write",
             Self::SaveVoteSynced => "vote sync write",
-            Self::SaveCommittedWal => "committed WAL write",
-            Self::SaveCommittedSynced => "committed sync write",
             Self::StateApplyTotal => "state apply total",
             Self::StateApplyCapacityWait => "state capacity wait",
             Self::StateApplyWalWrite => "state non-sync write",

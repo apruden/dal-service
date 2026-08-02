@@ -61,17 +61,6 @@ fn entry_index(key: &[u8]) -> Option<u64> {
     }
 }
 
-/// Rollback/A-B switch for the old fsync-per-committed-marker path.
-pub(crate) fn committed_sync_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        matches!(
-            std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        )
-    })
-}
-
 /// Bounds shared by both trait impls: `C` carries `u64` node ids, `BasicNode`
 /// nodes, the default `Entry<C>`, and that entry must (de)serialize.
 trait GroupConfig:
@@ -227,26 +216,12 @@ where
         self.read_log_singleton(&KEY_VOTE)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
-        if committed_sync_enabled() {
-            let cf = self.storage.log_cf(self.group).map_err(write_err)?;
-            let _profile = crate::perf::timer(WriteStage::SaveCommittedSynced);
-            self.storage
-                .db()
-                .put_cf_opt(
-                    &cf,
-                    KEY_COMMITTED,
-                    codec::encode(&committed),
-                    &Self::sync_wo(),
-                )
-                .map_err(|e| write_err(e.into()))?;
-        } else {
-            // The state machine folds its final applied LogId into the same
-            // cross-CF batch as the applied pointer and business mutations.
-            // OpenRaft permits this method to be a no-op for a durable state
-            // machine; a crash before apply therefore needs no marker.
-            crate::perf::record_committed_marker_folded();
-        }
+    async fn save_committed(&mut self, _committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
+        // The state machine folds its final applied LogId into the same cross-CF
+        // batch as the applied pointer and business mutations. OpenRaft permits
+        // this method to be a no-op for a durable state machine; a crash before
+        // apply therefore needs no marker.
+        crate::perf::record_committed_marker_folded();
         Ok(())
     }
 

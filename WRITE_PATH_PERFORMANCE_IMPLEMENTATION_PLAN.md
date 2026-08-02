@@ -2,9 +2,9 @@
 
 Date: 2026-08-01
 
-Status: in progress — the shared-transport benchmark topology and
-event-driven ROUTER delivery are implemented; their release benchmark/soak
-acceptance gates remain pending. Reply-count admission and peer-control
+Status: in progress — the shared-transport benchmark topology is implemented;
+the event-driven ROUTER candidate was removed after failing its release
+performance gate. Reply-count admission and peer-control
 reservation and benchmark-visible saturation counters are implemented;
 reply-byte reservation and startup-validated limit configuration are
 implemented; deterministic saturation coverage is in place, while stress
@@ -25,8 +25,8 @@ randomized A/B order.
 The immediate rollback comparison completed with a 1,977 concurrent-write/s
 median (p50/p95/p99 7.66/11.35/15.77 ms), versus the event-driven candidate's
 1,240/s and 6.40/41.40/54.09 ms. The candidate therefore fails the no-more-than
-5% regression gate and is now opt-in through `DAL_EVENT_DRIVEN_ROUTER=1`; the
-timeout-driven loop remains the default. The trials were not randomized, so
+5% regression gate and has been removed; the timeout-driven loop is the only
+implementation. The trials were not randomized, so
 they are not a final causal attribution, but the regression is large enough to
 block default rollout.
 
@@ -226,9 +226,8 @@ nonblocking; queued replies remain the source of truth.
   starve completed replies.
 - Keep every socket send nonblocking. Count `EAGAIN` and other send failures;
   never pin the sole socket thread on one peer.
-- Keep the old timeout-driven loop behind `DAL_EVENT_DRIVEN_ROUTER=0` until the
-  new path passes correctness, stress, and soak gates. Default the candidate on
-  only for benchmark A/B initially.
+- The event-driven candidate was removed after failing its performance gate;
+  retain the timeout-driven loop as the only implementation.
 - Preserve the existing opt-in client and Raft reply-queue timers.
 
 ### Race conditions to cover explicitly
@@ -475,13 +474,13 @@ cargo test --release --test benchmark_e2e \
 ```
 
 Run unprofiled candidate and rollback trials with identical workload settings.
-For transport work, compare `DAL_EVENT_DRIVEN_ROUTER=1` and `0`. For benchmark
-topology, compare shared transport with `DAL_BENCH_TRANSPORT_PER_CLIENT=1`.
+For benchmark topology, compare shared transport with
+`DAL_BENCH_TRANSPORT_PER_CLIENT=1`.
 
 ## Delivery sequence
 
 1. Land benchmark transport sharing and error counters.
-2. Land event-driven ROUTER wakeup behind a rollback flag.
+2. Evaluate event-driven ROUTER wakeup (completed; removed after regression).
 3. Land bounded admission/replies and peer-control reservation.
 4. Re-profile and optimize only the measured residual transport stage.
 5. Run the WAL batching matrix; keep the current policy unless a candidate

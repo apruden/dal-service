@@ -362,8 +362,7 @@ compete with or duplicate RocksDB's native write grouping.
 - Adaptive collection flushes a truly lone write immediately. Once a second
   active writer is observed, that flush cycle uses the bounded 200 microsecond
   window to retain concurrent batching.
-- `DAL_COMMITTED_SYNC=1` restores the old synchronous marker write,
-  `DAL_UNIFIED_DURABILITY=0` restores synchronous state apply, and
+- `DAL_UNIFIED_DURABILITY=0` restores synchronous state apply, and
   `DAL_ADAPTIVE_DURABILITY=0` restores the fixed collection window.
 - Profiling reports each benchmark phase separately and records log/state
   writes per durability flush, state batch entries/mutations/bytes, and folded
@@ -414,8 +413,8 @@ marker is ahead.
 
 The same ext4 three-node benchmark used for Phase 3 was run in alternating
 order three times per mode, with `DAL_APPLY_COALESCE=1` and
-`DAL_LOG_GROUP_COMMIT=1` fixed. The baseline used `DAL_COMMITTED_SYNC=1`; the
-candidate used the default `DAL_COMMITTED_SYNC=0`. Data directories were under
+`DAL_LOG_GROUP_COMMIT=1` fixed. The baseline used the former synchronous-marker
+implementation; the candidate folded the marker into state apply. Data directories were under
 `/home/alex/dal-bench` on `/dev/nvme0n1p2` (ext4). Each trial completed 1,000
 sequential writes and reads plus 6,000 operations in every concurrent phase,
 with no terminal failure.
@@ -445,16 +444,15 @@ One matched profiled run per mode explains the improvement:
 This meets the Phase 4 performance criteria: it removes one measured
 critical-path fsync, improves sequential p50/p99 by 13.8%/26.4%, and improves
 concurrent throughput and tail latency. Read-only results remain within normal
-trial variance. Keep `DAL_COMMITTED_SYNC=1` as the immediate rollback until
-long-running crash/soak validation is complete.
+trial variance. The synchronous-marker rollback path was subsequently removed.
 
-Reproduction command (run three alternating trials for each flag value):
+The synchronous-marker comparison is historical; the current tree contains
+only the folded-marker implementation. Run the current benchmark with:
 
 ```text
 DAL_BENCH_DIR=<durable-ext4-directory> \
 DAL_APPLY_COALESCE=1 \
 DAL_LOG_GROUP_COMMIT=1 \
-DAL_COMMITTED_SYNC=<0-or-1> \
 cargo test --release --test benchmark_e2e \
   end_to_end_benchmark_three_nodes -- --ignored --nocapture
 ```
@@ -504,10 +502,9 @@ The adaptive policy also recovers the sequential latency that a fixed
 collection window gave up.
 
 The full all-target/all-feature suite passes in both the default mode and the
-complete rollback configuration. The compatibility switches are independent:
+remaining rollback configuration. The compatibility switches are independent:
 
 ```text
-DAL_COMMITTED_SYNC=1 \
 DAL_UNIFIED_DURABILITY=0 \
 DAL_ADAPTIVE_DURABILITY=0 \
 cargo test --all-targets --all-features -- --test-threads=1
@@ -704,8 +701,8 @@ transport waiting no longer dominate.
 ## Rollout and feature flags
 
 - Keep separate flags for asynchronous log durability, unified state
-  durability, committed-marker folding, adaptive collection, event-driven
-  reconciliation, and read batching until each has passed crash, stress, and
+  durability, adaptive collection, event-driven reconciliation, and read
+  batching until each has passed crash, stress, and
   soak gates.
 - Emit the active performance-mode configuration at startup and in `/status`.
 - Do not allow a mixed cluster to select incompatible durability or wire

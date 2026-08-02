@@ -292,8 +292,8 @@ Implementation notes:
   may open the process-epoch gate only through its quorum read barrier. Clients
   encountering a still-fenced follower are redirected to a fresher candidate.
 - A lone write flushes immediately; observing concurrency activates a bounded
-  200 microsecond collection window. `DAL_COMMITTED_SYNC=1`,
-  `DAL_UNIFIED_DURABILITY=0`, `DAL_ADAPTIVE_DURABILITY=0`, and leaving
+  200 microsecond collection window. `DAL_UNIFIED_DURABILITY=0`,
+  `DAL_ADAPTIVE_DURABILITY=0`, and leaving
   `DAL_ASYNC_MATERIALIZED_STATE` unset retain the durable rollback paths. On
   recovery, the folded marker and applied state describe exactly the same
   locally durable prefix; acknowledged entries beyond that prefix remain in

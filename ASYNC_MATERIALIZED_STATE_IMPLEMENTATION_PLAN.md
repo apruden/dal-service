@@ -232,20 +232,8 @@ entry can observe state.
 
 ### 3. Committed-position strategy
 
-Implement the transition in two modes:
-
-#### Correctness-oracle mode
-
-Initially run asynchronous state apply with `DAL_COMMITTED_SYNC=1`. OpenRaft
-sync-durably saves `C` before invoking state apply. On restart, its storage
-helper replays `D+1..C`. This mode may retain a second fsync and is not the
-performance target; it isolates and validates asynchronous state, replay, and
-purge correctness.
-
-#### Final fast mode
-
 Keep `save_committed` optional and fold the recovery hint into the same batch as
-the applied state, as today. Therefore recovered `committed_hint == D` for the
+the applied state. Therefore recovered `committed_hint == D` for the
 atomic recovered prefix. Do not claim that this hint is the cluster's complete
 pre-crash `C`.
 
@@ -385,8 +373,7 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
   replay from recovered `D` reproduces the reference state through `C`.
 - Run OpenRaft 0.9.24's storage suite, including committed-log reapply, against
   the RocksDB log/state implementation.
-- Add configuration validation for async state, committed-marker mode, and the
-  recovery-serving fence.
+- Add configuration validation for async state and the recovery-serving fence.
 
 ### Exit criteria
 
@@ -432,7 +419,8 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
 - Retain one atomic batch for mutations, sequence result, membership, applied
   record, and recovery hint.
 - Keep meta-group calls on the existing durable wait.
-- Enable this phase only with the sync-durable committed marker.
+- Keep this phase opt-in and do not deploy it without the recovery-serving
+  fence.
 
 ### Tests
 
@@ -510,16 +498,13 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
 - No client-facing path can observe state reversion after restart.
 - Recovery makes progress without requiring a new user mutation.
 
-## Phase 5: Enable final fast committed-hint mode for data groups
+## Phase 5: Validate committed-hint mode for data groups
 
 ### Implementation
 
-- Switch data groups from sync-durable `save_committed` to the atomic
-  applied-aligned recovery hint.
-- Keep the synchronous committed-marker path as an independent rollback and
-  correctness-oracle mode.
+- Keep the atomic applied-aligned recovery hint for data groups.
 - Add startup assertions that recovered `committed_hint` and applied state
-  match exactly in fast mode.
+  match exactly.
 - Keep all meta-group state and committed-position behavior synchronous.
 
 ### Crash matrix
@@ -607,8 +592,7 @@ control-plane authority.
 
 - Unit-test the durability worker with separate visible and durable fake maps.
 - Property-test the `C/A/D/P` transition model with crash at every transition.
-- Run OpenRaft's storage conformance suite in both synchronous-committed and
-  folded-hint modes where applicable.
+- Run OpenRaft's storage conformance suite against the folded-hint mode.
 - Verify full-`LogId` monotonicity across terms, not only indexes.
 
 ### Real RocksDB crash tests
@@ -651,11 +635,10 @@ log durability remains unchanged.
 ## Rollout and rollback
 
 1. Land the tracker and metrics with synchronous behavior.
-2. Enable async data state plus sync-durable committed marker in tests and one
-   canary cluster.
-3. Enable the recovery-serving fence while state is still synchronous; verify
+2. Enable the recovery-serving fence while state is still synchronous; verify
    it cannot be bypassed and measure recovery availability.
-4. Enable folded-hint fast mode for data groups on a small canary after every
+3. Enable async data state with the folded hint in tests.
+4. Enable async data state for data groups on a small canary after every
    voter advertises fence capability.
 5. Expand only while `A-D`, replay, log growth, snapshot waits, and stale-read
    refusals remain bounded.

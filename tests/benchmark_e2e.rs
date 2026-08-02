@@ -32,11 +32,6 @@
 //!   DAL_LOG_GROUP_COMMIT=0 ... (baseline: synchronous fsync per log append)
 //!   DAL_LOG_GROUP_COMMIT=1 ... (database-wide group commit, default)
 //!
-//! To A/B committed-marker fsync coalescing, run twice with the other modes
-//! fixed:
-//!   DAL_COMMITTED_SYNC=1 ... (baseline: synchronous marker write)
-//!   DAL_COMMITTED_SYNC=0 ... (marker is folded into state apply, default)
-//!
 //! To A/B the unified log/state durability worker:
 //!   DAL_UNIFIED_DURABILITY=0 ... (state apply uses sync=true directly)
 //!   DAL_UNIFIED_DURABILITY=1 ... (state joins database-wide flushes, default)
@@ -323,10 +318,6 @@ async fn end_to_end_benchmark_three_nodes() {
         std::env::var("DAL_LOG_GROUP_COMMIT").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     );
-    let committed_sync = matches!(
-        std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
-    );
     let unified_durability = !matches!(
         std::env::var("DAL_UNIFIED_DURABILITY").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
@@ -371,14 +362,7 @@ async fn end_to_end_benchmark_three_nodes() {
             "synchronous fsync per append"
         },
     );
-    println!(
-        "  committed marker: {} (DAL_COMMITTED_SYNC)",
-        if committed_sync {
-            "synchronous fsync per update"
-        } else {
-            "folded into atomic state apply"
-        },
-    );
+    println!("  committed marker: folded into atomic state apply");
     println!(
         "  state durability: {} (DAL_UNIFIED_DURABILITY)",
         if unified_durability {
@@ -502,10 +486,9 @@ async fn end_to_end_benchmark_three_nodes() {
     profile_phase("concurrent stale read", &nodes, &mut rocks_before);
     let router = router_counters();
     println!(
-        "  ROUTER: admission-rejections={}, max-active={}, wakes={}, reply-sends={}, reply-EAGAIN={}, reply-failures={}",
+        "  ROUTER: admission-rejections={}, max-active={}, reply-sends={}, reply-EAGAIN={}, reply-failures={}",
         router.admission_rejections,
         router.max_active_handlers,
-        router.wake_attempts,
         router.reply_sends,
         router.reply_send_eagain,
         router.reply_send_failures,

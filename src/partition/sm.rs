@@ -292,7 +292,7 @@ mod tests {
     use openraft::{CommittedLeaderId, EntryPayload};
     use std::time::Duration;
 
-    use crate::partition::log_store::{RocksLogStore, committed_sync_enabled};
+    use crate::partition::log_store::RocksLogStore;
     use crate::types::{DataOp, DataRequest, IfVersion, MutationResult};
 
     fn log_id(index: u64) -> LogId {
@@ -365,14 +365,12 @@ mod tests {
             None
         );
         assert_eq!(sm.read_applied().unwrap().0, Some(log_id(12)));
-        if !committed_sync_enabled() {
-            let mut log_store = RocksLogStore::new(storage, group);
-            let committed =
-                <RocksLogStore as RaftLogStorage<TypeConfig>>::read_committed(&mut log_store)
-                    .await
-                    .unwrap();
-            assert_eq!(committed, Some(log_id(12)));
-        }
+        let mut log_store = RocksLogStore::new(storage, group);
+        let committed =
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::read_committed(&mut log_store)
+                .await
+                .unwrap();
+        assert_eq!(committed, Some(log_id(12)));
     }
 
     #[tokio::test]
