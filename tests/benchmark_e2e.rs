@@ -16,6 +16,10 @@
 //!   DAL_BENCH_OPS         (default 6000) total ops in each concurrent phase
 //!   DAL_BENCH_DIR          (default OS temp directory) parent for RocksDB dirs;
 //!                          set this explicitly to a durable filesystem
+//!   DAL_BENCH_TRANSPORT_PER_CLIENT=1 creates one ZMQ transport per concurrent
+//!                          client. The default shares one production-shaped
+//!                          transport across all benchmark clients.
+//!   DAL_BENCH_TRIAL_ID     labels output from a reproducible benchmark trial.
 //!
 //! To A/B the Raft-apply fsync coalescing, run this benchmark twice:
 //!   DAL_APPLY_COALESCE=0 ...  (baseline: one fsync per committed entry)
@@ -31,7 +35,13 @@
 //! To A/B committed-marker fsync coalescing, run twice with the other modes
 //! fixed:
 //!   DAL_COMMITTED_SYNC=1 ... (baseline: synchronous marker write)
-//!   DAL_COMMITTED_SYNC=0 ... (marker is flushed by state apply, default)
+//!   DAL_COMMITTED_SYNC=0 ... (marker is folded into state apply, default)
+//!
+//! To A/B the unified log/state durability worker:
+//!   DAL_UNIFIED_DURABILITY=0 ... (state apply uses sync=true directly)
+//!   DAL_UNIFIED_DURABILITY=1 ... (state joins database-wide flushes, default)
+//! Adaptive collection is default; `DAL_ADAPTIVE_DURABILITY=0` restores the
+//! fixed collection window.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +54,7 @@ use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
 use dal::perf::RocksCounters;
 use dal::runtime::node::Node;
 use dal::transport::dealer::ZmqTransport;
-use dal::transport::router::settle;
+use dal::transport::router::{counters as router_counters, settle};
 use dal::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
 
 const CID: ClusterId = 0x0000_0000_0000_0000_0000_0000_0000_0DA1;
@@ -90,6 +100,24 @@ fn rocks_counters(nodes: &[Arc<Node>]) -> RocksCounters {
     })
 }
 
+fn profile_phase(label: &str, nodes: &[Arc<Node>], rocks_before: &mut RocksCounters) {
+    let Some(report) = dal::perf::write_path_report() else {
+        return;
+    };
+    println!("\n--- profile phase: {label} ---");
+    print!("{report}");
+    let current = rocks_counters(nodes);
+    let rocks = current.saturating_sub(*rocks_before);
+    println!(
+        "  RocksDB: WAL syncs={}, WAL bytes={:.2} MiB, write-stall={:.2}ms",
+        rocks.wal_syncs,
+        rocks.wal_bytes as f64 / (1024.0 * 1024.0),
+        rocks.stall_micros as f64 / 1_000.0,
+    );
+    *rocks_before = current;
+    dal::perf::reset_write_path();
+}
+
 fn descriptor(p: u16) -> BootstrapDescriptor {
     let directory = VOTERS
         .iter()
@@ -132,8 +160,7 @@ fn node_config(id: NodeId, dir: PathBuf) -> NodeConfig {
     }
 }
 
-fn client(ctx: &zmq::Context, client_id: u128) -> Client<ZmqTransport> {
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(5));
+fn client(transport: ZmqTransport, client_id: u128) -> Client<ZmqTransport> {
     Client::new(
         CID,
         client_id,
@@ -142,6 +169,13 @@ fn client(ctx: &zmq::Context, client_id: u128) -> Client<ZmqTransport> {
             .map(|&v| format!("inproc://{PREFIX}-ctrl-{v}"))
             .collect(),
         transport,
+    )
+}
+
+fn env_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -265,6 +299,8 @@ async fn end_to_end_benchmark_three_nodes() {
     let concurrent_ops = env_usize("DAL_BENCH_OPS", 6000);
 
     let ctx = zmq::Context::new();
+    let shared_transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(5));
+    let transport_per_client = env_enabled("DAL_BENCH_TRANSPORT_PER_CLIENT");
     let desc = descriptor(partitions);
     let (dirs, data_root, explicit_data_root) = benchmark_dirs(3);
 
@@ -272,11 +308,11 @@ async fn end_to_end_benchmark_three_nodes() {
     let nodes = start_cluster(&ctx, &desc, &dirs).await;
     let boot_elapsed = boot.elapsed();
 
-    let writer = client(&ctx, 1);
+    let writer = client(shared_transport.clone(), 1);
     let warm = Instant::now();
     warm_up(&writer, partitions).await;
     let warm_elapsed = warm.elapsed();
-    let rocks_before = rocks_counters(&nodes);
+    let mut rocks_before = rocks_counters(&nodes);
     dal::perf::reset_write_path();
 
     let coalesce = !matches!(
@@ -291,8 +327,25 @@ async fn end_to_end_benchmark_three_nodes() {
         std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
         Some("1") | Some("true") | Some("on")
     );
+    let unified_durability = !matches!(
+        std::env::var("DAL_UNIFIED_DURABILITY").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+    let adaptive_durability = !matches!(
+        std::env::var("DAL_ADAPTIVE_DURABILITY").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
 
     println!("\n=== dal end-to-end benchmark (3 nodes over ZeroMQ inproc) ===");
+    println!(
+        "  transport mode: {} | trial: {}",
+        if transport_per_client {
+            "one transport per client"
+        } else {
+            "one shared transport"
+        },
+        std::env::var("DAL_BENCH_TRIAL_ID").unwrap_or_else(|_| "unset".into()),
+    );
     println!(
         "  cluster: 3 nodes, R=3, {partitions} partitions, value={VALUE_BYTES}B | boot {:.2}s, warm-up {:.2}s",
         boot_elapsed.as_secs_f64(),
@@ -323,7 +376,23 @@ async fn end_to_end_benchmark_three_nodes() {
         if committed_sync {
             "synchronous fsync per update"
         } else {
-            "WAL write; fsync coalesced with state apply"
+            "folded into atomic state apply"
+        },
+    );
+    println!(
+        "  state durability: {} (DAL_UNIFIED_DURABILITY)",
+        if unified_durability {
+            "shared database-wide worker"
+        } else {
+            "synchronous state write"
+        },
+    );
+    println!(
+        "  durability collection: {} (DAL_ADAPTIVE_DURABILITY)",
+        if adaptive_durability {
+            "adaptive"
+        } else {
+            "fixed window"
         },
     );
     println!("  ------------------------------------------------------------------------------");
@@ -339,6 +408,7 @@ async fn end_to_end_benchmark_three_nodes() {
         wl.push(start.elapsed());
     }
     Stats::from("seq write (1 client)", wl, t0.elapsed()).print();
+    profile_phase("sequential write", &nodes, &mut rocks_before);
 
     // Phase 2 — sequential read latency for the keys just written.
     let mut rl = Vec::with_capacity(reads);
@@ -351,6 +421,7 @@ async fn end_to_end_benchmark_three_nodes() {
         rl.push(start.elapsed());
     }
     Stats::from("seq read  (1 client)", rl, t0.elapsed()).print();
+    profile_phase("sequential linearizable read", &nodes, &mut rocks_before);
 
     // Phase 2b — sequential stale (eventually-consistent) read latency for the
     // same keys. Skips ReadIndex, so no quorum round trip; compare against the
@@ -365,37 +436,80 @@ async fn end_to_end_benchmark_three_nodes() {
         sl.push(start.elapsed());
     }
     Stats::from("seq stale read (1 client)", sl, t0.elapsed()).print();
+    profile_phase("sequential stale read", &nodes, &mut rocks_before);
 
     // Phase 3 — concurrent write throughput across many clients.
     let per_client = concurrent_ops.div_ceil(clients);
-    let cw = run_concurrent(&ctx, clients, per_client, Workload::Write, 1_000).await;
+    let cw = run_concurrent(
+        &ctx,
+        &shared_transport,
+        transport_per_client,
+        clients,
+        per_client,
+        Workload::Write,
+        1_000,
+    )
+    .await;
     Stats::from(&format!("conc write ({clients} clients)"), cw.0, cw.1).print();
+    profile_phase("concurrent write", &nodes, &mut rocks_before);
 
     // Phase 4 — concurrent mixed 50/50 read/write throughput. Distinct client_id
     // base so fresh streams don't collide with phase 3's idempotency records.
-    let cm = run_concurrent(&ctx, clients, per_client, Workload::Mixed, 1_000_000).await;
+    let cm = run_concurrent(
+        &ctx,
+        &shared_transport,
+        transport_per_client,
+        clients,
+        per_client,
+        Workload::Mixed,
+        1_000_000,
+    )
+    .await;
     Stats::from(&format!("conc mixed ({clients} clients)"), cm.0, cm.1).print();
+    profile_phase("concurrent mixed", &nodes, &mut rocks_before);
 
     // Phase 5 — concurrent linearizable read throughput over the phase-1 seq
     // keys. Every read funnels to its partition leader via ReadIndex.
-    let cr = run_concurrent_reads(&ctx, clients, per_client, writes, false, 2_000_000).await;
+    let cr = run_concurrent_reads(
+        &ctx,
+        &shared_transport,
+        transport_per_client,
+        clients,
+        per_client,
+        writes,
+        false,
+        2_000_000,
+    )
+    .await;
     Stats::from(&format!("conc read  ({clients} clients)"), cr.0, cr.1).print();
+    profile_phase("concurrent linearizable read", &nodes, &mut rocks_before);
 
     // Phase 6 — concurrent stale read throughput over the same keys. Reads
     // spread across all three replicas and skip the quorum round trip; this is
     // the phase that shows the eventually-consistent path's headroom.
-    let cs = run_concurrent_reads(&ctx, clients, per_client, writes, true, 3_000_000).await;
+    let cs = run_concurrent_reads(
+        &ctx,
+        &shared_transport,
+        transport_per_client,
+        clients,
+        per_client,
+        writes,
+        true,
+        3_000_000,
+    )
+    .await;
     Stats::from(&format!("conc stale read ({clients} clients)"), cs.0, cs.1).print();
-    if let Some(report) = dal::perf::write_path_report() {
-        print!("{report}");
-        let rocks = rocks_counters(&nodes).saturating_sub(rocks_before);
-        println!(
-            "  RocksDB: WAL syncs={}, WAL bytes={:.2} MiB, write-stall={:.2}ms",
-            rocks.wal_syncs,
-            rocks.wal_bytes as f64 / (1024.0 * 1024.0),
-            rocks.stall_micros as f64 / 1_000.0,
-        );
-    }
+    profile_phase("concurrent stale read", &nodes, &mut rocks_before);
+    let router = router_counters();
+    println!(
+        "  ROUTER: admission-rejections={}, max-active={}, wakes={}, reply-sends={}, reply-EAGAIN={}, reply-failures={}",
+        router.admission_rejections,
+        router.max_active_handlers,
+        router.wake_attempts,
+        router.reply_sends,
+        router.reply_send_eagain,
+        router.reply_send_failures,
+    );
     println!("  ==============================================================================\n");
 
     for n in nodes {
@@ -439,6 +553,8 @@ async fn retry_get(cl: &Client<ZmqTransport>, key: &[u8]) {
 /// distinct keys, and return every op's latency plus the aggregate wall time.
 async fn run_concurrent(
     ctx: &zmq::Context,
+    shared_transport: &ZmqTransport,
+    transport_per_client: bool,
     clients: usize,
     per_client: usize,
     workload: Workload,
@@ -446,7 +562,12 @@ async fn run_concurrent(
 ) -> (Vec<Duration>, Duration) {
     let mut clients_to_run = Vec::with_capacity(clients);
     for c in 0..clients {
-        let cl = client(ctx, id_base + c as u128);
+        let transport = if transport_per_client {
+            ZmqTransport::new(ctx.clone(), Duration::from_secs(5))
+        } else {
+            shared_transport.clone()
+        };
+        let cl = client(transport, id_base + c as u128);
         // Warm this client's routing cache outside the timed section so a cold
         // MetaQuery or first redirect does not distort steady-state results.
         let _ = cl.get(format!("{PREFIX}-warm-0-0").as_bytes()).await;
@@ -496,8 +617,11 @@ async fn run_concurrent(
 /// phase-1 sequential keys (which are already present on every replica). With
 /// `stale` set, each read uses the eventually-consistent path (`stale_get`,
 /// spread across replicas); otherwise it uses the linearizable path.
+#[allow(clippy::too_many_arguments)]
 async fn run_concurrent_reads(
     ctx: &zmq::Context,
+    shared_transport: &ZmqTransport,
+    transport_per_client: bool,
     clients: usize,
     per_client: usize,
     writes: usize,
@@ -506,7 +630,12 @@ async fn run_concurrent_reads(
 ) -> (Vec<Duration>, Duration) {
     let mut clients_to_run = Vec::with_capacity(clients);
     for c in 0..clients {
-        let cl = client(ctx, id_base + c as u128);
+        let transport = if transport_per_client {
+            ZmqTransport::new(ctx.clone(), Duration::from_secs(5))
+        } else {
+            shared_transport.clone()
+        };
+        let cl = client(transport, id_base + c as u128);
         let _ = cl.get(format!("{PREFIX}-warm-0-0").as_bytes()).await;
         clients_to_run.push((c, cl));
     }

@@ -2,8 +2,8 @@
 //!
 //! Every append and vote save is fsync-durable before it is acknowledged; the
 //! leader only counts durable follower replies toward commit (DESIGN §2). The
-//! optional committed-position marker is WAL-written ahead of the atomic,
-//! durable state-machine apply that makes it durable before a client reply.
+//! optional committed-position marker is folded into the same atomic,
+//! durable state-machine batch as the applied pointer.
 //!
 //! The store is generic over the openraft type config `C` (blanket impls below),
 //! so the data groups and the meta group (M5) share one log implementation —
@@ -41,7 +41,7 @@ type Vote = openraft::Vote<Nid>;
 
 const KEY_VOTE: [u8; 2] = [0x00, b'v'];
 const KEY_PURGED: [u8; 2] = [0x00, b'p'];
-const KEY_COMMITTED: [u8; 2] = [0x00, b'c'];
+pub(crate) const KEY_COMMITTED: [u8; 2] = [0x00, b'c'];
 const ENTRY_PREFIX: u8 = 0x01;
 /// One past the entry prefix, used to seek the reverse iterator to the end.
 const ENTRY_PREFIX_END: u8 = 0x02;
@@ -59,6 +59,17 @@ fn entry_index(key: &[u8]) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Rollback/A-B switch for the old fsync-per-committed-marker path.
+pub(crate) fn committed_sync_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        )
+    })
 }
 
 /// Bounds shared by both trait impls: `C` carries `u64` node ids, `BasicNode`
@@ -88,28 +99,6 @@ impl RocksLogStore {
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
         wo
-    }
-
-    fn wal_wo() -> WriteOptions {
-        let mut wo = WriteOptions::default();
-        wo.set_sync(false);
-        wo
-    }
-
-    /// Rollback/A-B switch for the old fsync-per-committed-marker path.
-    ///
-    /// OpenRaft calls `save_committed()` immediately before dispatching the
-    /// committed entries to the state machine, and sends client responses only
-    /// after that apply returns. The apply is a sync write on this same DB, so
-    /// RocksDB's ordered WAL makes this earlier marker durable at that boundary.
-    fn committed_sync_enabled() -> bool {
-        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *FLAG.get_or_init(|| {
-            matches!(
-                std::env::var("DAL_COMMITTED_SYNC").ok().as_deref(),
-                Some("1") | Some("true") | Some("on")
-            )
-        })
     }
 
     /// Default-on rollback/A-B switch for asynchronous database-wide WAL
@@ -239,26 +228,25 @@ where
     }
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
-        let cf = self.storage.log_cf(self.group).map_err(write_err)?;
-        let sync = Self::committed_sync_enabled();
-        let _profile = crate::perf::timer(if sync {
-            WriteStage::SaveCommittedSynced
+        if committed_sync_enabled() {
+            let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+            let _profile = crate::perf::timer(WriteStage::SaveCommittedSynced);
+            self.storage
+                .db()
+                .put_cf_opt(
+                    &cf,
+                    KEY_COMMITTED,
+                    codec::encode(&committed),
+                    &Self::sync_wo(),
+                )
+                .map_err(|e| write_err(e.into()))?;
         } else {
-            WriteStage::SaveCommittedWal
-        });
-        let options = if sync {
-            Self::sync_wo()
-        } else {
-            Self::wal_wo()
-        };
-        self.storage
-            .db()
-            .put_cf_opt(&cf, KEY_COMMITTED, codec::encode(&committed), &options)
-            .map_err(|e| write_err(e.into()))?;
-        // In deferred mode this WAL record need not be durable yet. OpenRaft
-        // explicitly permits `save_committed` to be a no-op when apply is
-        // durable. Startup takes max(committed, last_applied), and the next
-        // sync state apply flushes this marker before any client is answered.
+            // The state machine folds its final applied LogId into the same
+            // cross-CF batch as the applied pointer and business mutations.
+            // OpenRaft permits this method to be a no-op for a durable state
+            // machine; a crash before apply therefore needs no marker.
+            crate::perf::record_committed_marker_folded();
+        }
         Ok(())
     }
 
@@ -278,10 +266,10 @@ where
         I: IntoIterator<Item = openraft::Entry<C>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let cf = self.storage.log_cf(self.group).map_err(write_err)?;
-        let mut batch = WriteBatch::default();
-        let mut wal_bytes = 0usize;
-        {
+        let (batch, wal_bytes) = {
+            let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+            let mut batch = WriteBatch::default();
+            let mut wal_bytes = 0usize;
             let _profile = crate::perf::timer(WriteStage::LogEncode);
             for entry in entries {
                 let key = entry_key(entry.log_id.index);
@@ -289,7 +277,8 @@ where
                 wal_bytes = wal_bytes.saturating_add(key.len().saturating_add(value.len()));
                 batch.put_cf(&cf, key, value);
             }
-        }
+            (batch, wal_bytes)
+        };
         if Self::group_commit_enabled() {
             let durable_wait = crate::perf::timer(WriteStage::WalDurabilityWait);
             self.storage
@@ -301,6 +290,7 @@ where
                         callback.log_io_completed(result);
                     }),
                 )
+                .await
                 .map_err(write_err)?;
             // The entries are readable now. OpenRaft waits on the callback,
             // which the group-commit worker completes after a durable WAL flush.
@@ -331,6 +321,12 @@ where
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
+        // A snapshot/purge boundary may only discard the replay source after
+        // the materialized state through the same log id is WAL-durable.
+        self.storage
+            .wait_state_durable(self.group, &log_id)
+            .await
+            .map_err(write_err)?;
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         // Record the purge point first so recovery never re-reads purged logs.
         self.storage
@@ -347,5 +343,54 @@ where
             .delete_cf_opt(&cf, entry_key(log_id.index), &Self::sync_wo())
             .map_err(|e| write_err(e.into()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::CommittedLeaderId;
+    use std::time::Duration;
+
+    use crate::partition::raft_types::TypeConfig;
+
+    fn log_id(index: u64) -> LogId {
+        LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    #[tokio::test]
+    async fn purge_waits_for_the_same_materialized_prefix_to_be_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Arc::new(Storage::open_async_test(dir.path(), Duration::from_millis(200)).unwrap());
+        let group = GroupId::Data(4);
+        storage.ensure_group(group).unwrap();
+        let target = log_id(6);
+
+        let mut purger = RocksLogStore::new(storage.clone(), group);
+        let purge = tokio::spawn(async move {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::purge(&mut purger, target).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!purge.is_finished());
+
+        let cf = storage.state_cf(group).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, b"state-key", b"state-value");
+        let wal_bytes = batch.size_in_bytes();
+        storage
+            .write_state_batch(group, target, 1, batch, wal_bytes)
+            .await
+            .unwrap();
+
+        // Visibility alone must not release purge.
+        assert!(!purge.is_finished());
+        purge.await.unwrap().unwrap();
+        let mut reader = RocksLogStore::new(storage.clone(), group);
+        let purged = <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut reader)
+            .await
+            .unwrap()
+            .last_purged_log_id;
+        assert_eq!(purged, Some(target));
     }
 }

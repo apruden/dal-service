@@ -18,6 +18,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::api::ops::{ClientReply, ClientRequest, RoutingInfo, WriteReply};
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::perf::WriteStage;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::types::{
@@ -421,7 +422,10 @@ impl<T: Transport> Client<T> {
                     self.next_request_id(),
                     payload.clone(),
                 );
-                let Ok(reply_env) = self.transport.call(&addr, env).await else {
+                let transport_call = crate::perf::timer(WriteStage::ClientTransportCall);
+                let reply = self.transport.call(&addr, env).await;
+                drop(transport_call);
+                let Ok(reply_env) = reply else {
                     // Unreachable/timeout: try the next candidate.
                     continue;
                 };

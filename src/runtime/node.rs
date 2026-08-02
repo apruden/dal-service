@@ -848,6 +848,7 @@ impl StatusSource for NodeStatus {
                 .map(|(&partition, node)| {
                     let committed = node.committed_voter_set();
                     let leader = node.current_leader();
+                    let materialized = node.materialized_state_status();
                     let role = if leader == Some(self.node_id) {
                         Role::Leader
                     } else if committed.contains(&self.node_id) {
@@ -868,6 +869,12 @@ impl StatusSource for NodeStatus {
                         role,
                         leader,
                         applied: node.applied_index(),
+                        materialized_visible: materialized.visible.map(|log_id| log_id.index),
+                        materialized_durable: materialized.durable.map(|log_id| log_id.index),
+                        materialized_pending_entries: materialized.pending_entries,
+                        materialized_pending_bytes: materialized.pending_bytes,
+                        materialized_recovery_ready: materialized.recovery_ready,
+                        materialized_failed: materialized.failed.is_some(),
                         committed_voters: committed.into_iter().collect(),
                         serving: node.is_serving(),
                         plan,
@@ -1139,7 +1146,7 @@ impl PartitionStarter {
             return Ok(());
         };
         node.shutdown().await?;
-        self.storage.reclaim_group(group)?;
+        self.storage.reclaim_group_durable(group).await?;
         Ok(())
     }
 }
@@ -1258,7 +1265,7 @@ impl MetaStarter {
             return Ok(());
         };
         node.shutdown().await?;
-        self.storage.reclaim_group(GroupId::Meta)?;
+        self.storage.reclaim_group_durable(GroupId::Meta).await?;
         Ok(())
     }
 }

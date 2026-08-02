@@ -25,6 +25,7 @@ use openraft::{BasicNode, RaftTypeConfig};
 use serde::Serialize;
 
 use crate::codec;
+use crate::perf::WriteStage;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{AppendReply, SnapshotReply, VoteReply};
@@ -265,6 +266,8 @@ where
         rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
+        let _profile = matches!(self.group, GroupId::Data(_))
+            .then(|| crate::perf::timer(WriteStage::RaftAppendTransportCall));
         if !self.identity_gate.is_open() {
             return Err(unreachable(self.target, "local process identity is fenced"));
         }

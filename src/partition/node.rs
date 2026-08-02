@@ -133,6 +133,10 @@ impl PartitionNode {
         self.storage.rocks_counters()
     }
 
+    pub(crate) fn materialized_state_status(&self) -> crate::storage::ApplyDurabilitySnapshot {
+        self.storage.state_durability(self.group)
+    }
+
     /// Bootstrap this group with the given voter set (DESIGN §3.1). Idempotent
     /// per openraft: a second call on an initialized group errors.
     pub async fn initialize(&self, voters: &[NodeId]) -> Result<()> {
@@ -199,6 +203,7 @@ impl PartitionNode {
             .ensure_linearizable()
             .await
             .map_err(|e| Error::Raft(format!("confirm committed membership: {e}")))?;
+        self.storage.mark_state_recovery_ready(self.group);
         Ok(self.committed_config())
     }
 
@@ -212,7 +217,10 @@ impl PartitionNode {
         self.storage.require_serving(self.group)?;
         let _profile = crate::perf::timer(WriteStage::RaftClientWrite);
         match self.raft.client_write(req).await {
-            Ok(resp) => Ok(WriteOutcome::Applied(resp.data)),
+            Ok(resp) => {
+                self.storage.mark_state_recovery_ready(self.group);
+                Ok(WriteOutcome::Applied(resp.data))
+            }
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                 Ok(WriteOutcome::NotLeader {
                     leader: f.leader_id,
@@ -234,9 +242,12 @@ impl PartitionNode {
         let min_version = match consistency {
             Consistency::Linearizable => {
                 return match self.raft.ensure_linearizable().await {
-                    Ok(_) => Ok(ReadOutcome::Value(
-                        self.data.get(self.storage.as_ref(), key)?,
-                    )),
+                    Ok(_) => {
+                        self.storage.mark_state_recovery_ready(self.group);
+                        Ok(ReadOutcome::Value(
+                            self.data.get(self.storage.as_ref(), key)?,
+                        ))
+                    }
                     Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                         Ok(ReadOutcome::NotLeader {
                             leader: f.leader_id,
@@ -268,7 +279,7 @@ impl PartitionNode {
         }
         if leader == Some(self.node_id) {
             match self.raft.ensure_linearizable().await {
-                Ok(_) => {}
+                Ok(_) => self.storage.mark_state_recovery_ready(self.group),
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                     return Ok(ReadOutcome::TooStale {
                         leader: f.leader_id,
@@ -276,6 +287,15 @@ impl PartitionNode {
                 }
                 Err(_) => return Ok(ReadOutcome::TooStale { leader }),
             }
+        }
+        // Async state can recover behind the pre-crash visible prefix. A
+        // follower must observe a post-start committed apply before serving
+        // local state; a leader opens the same gate with the quorum barrier
+        // above.
+        if self.storage.state_apply_is_async(self.group)
+            && !self.storage.state_recovery_ready(self.group)
+        {
+            return Ok(ReadOutcome::TooStale { leader });
         }
         // Read-your-writes / monotonic: the replica must have caught up to the
         // version the caller last observed.

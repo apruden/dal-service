@@ -20,6 +20,7 @@
 //! layer up in [`crate::api`], where `P` and the decoded key are available.
 
 use crate::types::{ClusterId, GroupId, PROTOCOL_VERSION};
+use std::time::Instant;
 
 const HEADER_LEN: usize = 36;
 
@@ -215,6 +216,7 @@ impl Envelope {
     /// in. Payloads are trusted to be within limits here; the receiver enforces
     /// them on decode.
     pub fn encode(&self) -> Vec<u8> {
+        let profiled = crate::perf::write_path_enabled().then(Instant::now);
         let mut buf = Vec::with_capacity(HEADER_LEN + self.payload.len());
         buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         buf.extend_from_slice(&self.cluster_id.to_le_bytes());
@@ -228,6 +230,9 @@ impl Envelope {
         buf.extend_from_slice(&self.request_id.to_le_bytes());
         buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.payload);
+        if let Some(started) = profiled {
+            crate::perf::record_envelope(self.msg_type, true, started.elapsed(), buf.len());
+        }
         buf
     }
 
@@ -245,6 +250,7 @@ impl Envelope {
     /// structural length, version, msg type, group tag, then the size limit —
     /// all before the payload is read out.
     pub fn decode(bytes: &[u8]) -> Result<Envelope, FrameError> {
+        let profiled = crate::perf::write_path_enabled().then(Instant::now);
         if bytes.len() < HEADER_LEN {
             return Err(FrameError::Truncated {
                 need: HEADER_LEN,
@@ -294,13 +300,17 @@ impl Envelope {
             });
         }
 
-        Ok(Envelope {
+        let envelope = Envelope {
             cluster_id,
             msg_type,
             group_id,
             request_id,
             payload: bytes[HEADER_LEN..end].to_vec(),
-        })
+        };
+        if let Some(started) = profiled {
+            crate::perf::record_envelope(msg_type, false, started.elapsed(), bytes.len());
+        }
+        Ok(envelope)
     }
 }
 

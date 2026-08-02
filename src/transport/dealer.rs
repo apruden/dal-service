@@ -28,6 +28,8 @@ use tokio::sync::oneshot;
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::Envelope;
+use crate::transport::codec::MsgType;
+use crate::types::GroupId;
 
 /// Bounds the burst of not-yet-dispatched requests held for one peer. The I/O
 /// thread drains this almost immediately, so it fills only under extreme load;
@@ -46,10 +48,18 @@ fn io_err(kind: ErrorKind, msg: &str) -> Error {
     Error::Io(std::io::Error::new(kind, msg))
 }
 
-type ReplyTx = oneshot::Sender<Result<Vec<u8>>>;
+struct Inbound {
+    frame: Vec<u8>,
+    received_at: Option<Instant>,
+}
+
+type ReplyTx = oneshot::Sender<Result<Inbound>>;
 
 struct Outbound {
     id: u64,
+    msg_type: MsgType,
+    group_id: GroupId,
+    enqueued_at: Option<Instant>,
     frame: Vec<u8>,
     reply: ReplyTx,
 }
@@ -168,7 +178,7 @@ fn conn_loop(
     rx: mpsc::Receiver<Outbound>,
 ) {
     let mut dealer = open_socket(&ctx, &addr).ok();
-    let mut pending: HashMap<u64, (Instant, ReplyTx)> = HashMap::new();
+    let mut pending: HashMap<u64, (Instant, MsgType, GroupId, ReplyTx)> = HashMap::new();
     let poll_timeout = SWEEP_INTERVAL.as_millis() as i64;
 
     loop {
@@ -198,9 +208,20 @@ fn conn_loop(
                     Ok(mut parts) => {
                         if let Some(frame) = parts.pop()
                             && let Some(id) = Envelope::peek_request_id(&frame)
-                            && let Some((_, tx)) = pending.remove(&id)
+                            && let Some((sent_at, msg_type, group_id, tx)) = pending.remove(&id)
                         {
-                            let _ = tx.send(Ok(frame));
+                            if crate::perf::write_path_enabled()
+                                && let Some(class) =
+                                    crate::perf::transport_profile_class(msg_type, group_id)
+                            {
+                                let stage = class.stage(
+                                    crate::perf::WriteStage::ClientDealerRoundTrip,
+                                    crate::perf::WriteStage::RaftDealerRoundTrip,
+                                );
+                                crate::perf::record_duration(stage, sent_at.elapsed());
+                            }
+                            let received_at = crate::perf::write_path_enabled().then(Instant::now);
+                            let _ = tx.send(Ok(Inbound { frame, received_at }));
                         }
                     }
                     Err(zmq::Error::EAGAIN) => break,
@@ -216,10 +237,27 @@ fn conn_loop(
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(Outbound { id, frame, reply }) => match dealer.as_ref() {
+                Ok(Outbound {
+                    id,
+                    msg_type,
+                    group_id,
+                    enqueued_at,
+                    frame,
+                    reply,
+                }) => match dealer.as_ref() {
                     Some(d) if !socket_faulted => match d.send(frame, zmq::DONTWAIT) {
                         Ok(()) => {
-                            pending.insert(id, (Instant::now(), reply));
+                            if let Some(started) = enqueued_at
+                                && let Some(class) =
+                                    crate::perf::transport_profile_class(msg_type, group_id)
+                            {
+                                let stage = class.stage(
+                                    crate::perf::WriteStage::ClientDealerQueueWait,
+                                    crate::perf::WriteStage::RaftDealerQueueWait,
+                                );
+                                crate::perf::record_duration(stage, started.elapsed());
+                            }
+                            pending.insert(id, (Instant::now(), msg_type, group_id, reply));
                         }
                         Err(_) => {
                             socket_faulted = true;
@@ -248,7 +286,7 @@ fn conn_loop(
         // everything outstanding so the layer above retries a fresh candidate.
         if socket_faulted {
             dealer = None;
-            for (_, (_, tx)) in pending.drain() {
+            for (_, (_, _, _, tx)) in pending.drain() {
                 let _ = tx.send(Err(io_err(
                     ErrorKind::ConnectionAborted,
                     "ZeroMQ peer connection reset",
@@ -260,18 +298,18 @@ fn conn_loop(
         let now = Instant::now();
         let expired: Vec<u64> = pending
             .iter()
-            .filter(|(_, (started, _))| now.duration_since(*started) >= timeout)
+            .filter(|(_, (started, _, _, _))| now.duration_since(*started) >= timeout)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            if let Some((_, tx)) = pending.remove(&id) {
+            if let Some((_, _, _, tx)) = pending.remove(&id) {
                 let _ = tx.send(Err(io_err(ErrorKind::TimedOut, "ZeroMQ request timed out")));
             }
         }
 
         // The transport was dropped: fail any stragglers and stop.
         if disconnected {
-            for (_, (_, tx)) in pending.drain() {
+            for (_, (_, _, _, tx)) in pending.drain() {
                 let _ = tx.send(Err(io_err(
                     ErrorKind::ConnectionAborted,
                     "ZeroMQ transport shut down",
@@ -287,10 +325,15 @@ impl Transport for ZmqTransport {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = request;
         request.request_id = id;
+        let msg_type = request.msg_type;
+        let group_id = request.group_id;
 
         let (tx, rx) = oneshot::channel();
         self.inner.peer(addr).submit(Outbound {
             id,
+            msg_type,
+            group_id,
+            enqueued_at: crate::perf::write_path_enabled().then(Instant::now),
             frame: request.encode(),
             reply: tx,
         })?;
@@ -301,6 +344,33 @@ impl Transport for ZmqTransport {
             )
         })??;
 
-        Envelope::decode(&reply).map_err(Error::codec)
+        if let Some(started) = reply.received_at
+            && let Some(class) = crate::perf::transport_profile_class(msg_type, group_id)
+        {
+            let stage = class.stage(
+                crate::perf::WriteStage::ClientDealerWaiterResume,
+                crate::perf::WriteStage::RaftDealerWaiterResume,
+            );
+            crate::perf::record_duration(stage, started.elapsed());
+        }
+
+        Envelope::decode(&reply.frame).map_err(Error::codec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ZmqTransport;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn clone_shares_the_peer_connection_directory() {
+        let transport = ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1));
+        let clone = transport.clone();
+        assert!(Arc::ptr_eq(&transport.inner, &clone.inner));
+
+        let independent = ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1));
+        assert!(!Arc::ptr_eq(&transport.inner, &independent.inner));
     }
 }

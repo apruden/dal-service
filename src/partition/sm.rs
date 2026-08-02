@@ -12,13 +12,14 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::StorageError;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use tokio::sync::Mutex;
 
 use crate::codec;
 use crate::partition::raft_types::{
@@ -77,12 +78,15 @@ impl RocksStateMachine {
     }
 
     /// Coalesced apply: decide every entry against a [`StateOverlay`] so later
-    /// entries see earlier ones, then commit the whole batch in a single
-    /// fsync-durable write with `last_applied` set to the final entry. Atomic and
-    /// crash-safe: a crash before the write recovers to the previous
+    /// entries see earlier ones, then commit the whole batch in one atomic write
+    /// with `last_applied` set to the final entry. Atomic and crash-safe: a
+    /// crash before durability recovers to the previous durable
     /// `last_applied`, and Raft re-delivers the same contiguous, deterministic
     /// batch (idempotent via the per-client sequence records).
-    fn apply_coalesced<I>(&mut self, entries: I) -> Result<Vec<ApplyResult>, StorageError<NodeId>>
+    async fn apply_coalesced<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<ApplyResult>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -111,24 +115,33 @@ impl RocksStateMachine {
         }
 
         // Persist once. Even a batch of only Blank/Membership entries (no state
-        // mutations) must still advance the durable applied state, so the write
-        // is keyed on having seen any entry, not on there being mutations.
+        // mutations) must still advance the applied state, so the write is
+        // keyed on having seen any entry, not on there being mutations.
         if let Some(log_id) = last_log_id {
             let applied: Applied = (Some(log_id), membership);
+            let committed = codec::encode(&Some(log_id));
+            let mutations = overlay.into_mutations();
             self.storage
                 .apply_raft(
                     self.group,
-                    &overlay.into_mutations(),
+                    &mutations,
+                    log_id,
                     &codec::encode(&applied),
+                    &committed,
+                    results.len(),
                 )
+                .await
                 .map_err(write_err)?;
         }
         Ok(results)
     }
 
-    /// Original apply: one fsync-durable write per entry. Retained as the
+    /// Original apply: one atomic write per entry. Retained as the
     /// `DAL_APPLY_COALESCE=0` baseline for benchmarking the coalesced path.
-    fn apply_per_entry<I>(&mut self, entries: I) -> Result<Vec<ApplyResult>, StorageError<NodeId>>
+    async fn apply_per_entry<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<ApplyResult>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -151,17 +164,32 @@ impl RocksStateMachine {
             };
 
             let applied: Applied = (Some(log_id), membership.clone());
+            let committed = codec::encode(&Some(log_id));
             self.storage
-                .apply_raft(self.group, &muts, &codec::encode(&applied))
+                .apply_raft(
+                    self.group,
+                    &muts,
+                    log_id,
+                    &codec::encode(&applied),
+                    &committed,
+                    1,
+                )
+                .await
                 .map_err(write_err)?;
             results.push(result);
         }
         Ok(results)
     }
 
-    fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
-        let _view = self.state_view.lock().unwrap();
+    async fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
+        let _view = self.state_view.lock().await;
         let (last_log_id, membership) = self.read_applied()?;
+        if let Some(log_id) = &last_log_id {
+            self.storage
+                .wait_state_durable(self.group, log_id)
+                .await
+                .map_err(write_err)?;
+        }
         let pairs = self.storage.scan_state(self.group).map_err(read_err)?;
         let data = codec::encode(&pairs);
         let snapshot_id = match &last_log_id {
@@ -182,7 +210,7 @@ impl RocksStateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for RocksStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError<NodeId>> {
-        self.build_snapshot_now()
+        self.build_snapshot_now().await
     }
 }
 
@@ -205,11 +233,11 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         // not keep an immutable field borrow of `self` while the apply helper
         // mutably borrows the state-machine wrapper.
         let state_view = self.state_view.clone();
-        let _view = state_view.lock().unwrap();
+        let _view = state_view.lock().await;
         if coalesce_apply() {
-            self.apply_coalesced(entries)
+            self.apply_coalesced(entries).await
         } else {
-            self.apply_per_entry(entries)
+            self.apply_per_entry(entries).await
         }
     }
 
@@ -228,13 +256,18 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        let _view = self.state_view.lock().unwrap();
+        let _view = self.state_view.lock().await;
         let bytes = (*snapshot).into_inner();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = codec::decode(&bytes).map_err(read_err)?;
+        self.storage
+            .validate_state_install(self.group, meta.last_log_id.as_ref())
+            .map_err(write_err)?;
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
         self.storage
             .install_state(self.group, &pairs, &codec::encode(&applied))
             .map_err(write_err)?;
+        self.storage
+            .record_state_installed(self.group, meta.last_log_id);
         Ok(())
     }
 
@@ -243,7 +276,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         if last_log_id.is_none() {
             return Ok(None);
         }
-        Ok(Some(self.build_snapshot_now()?))
+        Ok(Some(self.build_snapshot_now().await?))
     }
 }
 
@@ -255,8 +288,11 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::storage::RaftLogStorage;
     use openraft::{CommittedLeaderId, EntryPayload};
+    use std::time::Duration;
 
+    use crate::partition::log_store::{RocksLogStore, committed_sync_enabled};
     use crate::types::{DataOp, DataRequest, IfVersion, MutationResult};
 
     fn log_id(index: u64) -> LogId {
@@ -274,8 +310,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn coalesced_batch_observes_same_client_and_same_key_predecessors() {
+    #[tokio::test]
+    async fn coalesced_batch_observes_same_client_and_same_key_predecessors() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(dir.path()).unwrap());
         let group = GroupId::Data(0);
@@ -311,6 +347,7 @@ mod tests {
                     },
                 ),
             ])
+            .await
             .unwrap();
 
         assert_eq!(
@@ -328,5 +365,44 @@ mod tests {
             None
         );
         assert_eq!(sm.read_applied().unwrap().0, Some(log_id(12)));
+        if !committed_sync_enabled() {
+            let mut log_store = RocksLogStore::new(storage, group);
+            let committed =
+                <RocksLogStore as RaftLogStorage<TypeConfig>>::read_committed(&mut log_store)
+                    .await
+                    .unwrap();
+            assert_eq!(committed, Some(log_id(12)));
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_waits_until_its_visible_applied_prefix_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Arc::new(Storage::open_async_test(dir.path(), Duration::from_millis(200)).unwrap());
+        let group = GroupId::Data(5);
+        storage.ensure_group(group).unwrap();
+        let mut sm = RocksStateMachine::new(storage.clone(), group);
+        sm.apply_coalesced(vec![entry(
+            10,
+            1,
+            DataOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                if_version: None,
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(storage.state_durability(group).durable, None);
+
+        let mut builder = sm.clone();
+        let snapshot = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!snapshot.is_finished());
+
+        let snapshot = snapshot.await.unwrap().unwrap();
+        assert_eq!(snapshot.meta.last_log_id, Some(log_id(10)));
+        assert_eq!(storage.state_durability(group).durable, Some(log_id(10)));
     }
 }

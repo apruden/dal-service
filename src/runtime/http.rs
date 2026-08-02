@@ -50,6 +50,15 @@ pub struct PartitionStatus {
     pub role: Role,
     pub leader: Option<NodeId>,
     pub applied: Option<u64>,
+    /// Highest state-machine entry visible to reads in this process.
+    pub materialized_visible: Option<u64>,
+    /// Highest state-machine entry covered by a completed RocksDB WAL flush.
+    pub materialized_durable: Option<u64>,
+    pub materialized_pending_entries: usize,
+    pub materialized_pending_bytes: usize,
+    /// Whether this process epoch may serve local/stale state after recovery.
+    pub materialized_recovery_ready: bool,
+    pub materialized_failed: bool,
     pub committed_voters: Vec<NodeId>,
     pub serving: bool,
     pub plan: Option<PlanStatus>,
@@ -108,6 +117,12 @@ mod tests {
                     role: Role::Leader,
                     leader: Some(7),
                     applied: Some(10),
+                    materialized_visible: Some(10),
+                    materialized_durable: Some(9),
+                    materialized_pending_entries: 1,
+                    materialized_pending_bytes: 128,
+                    materialized_recovery_ready: true,
+                    materialized_failed: false,
                     committed_voters: vec![7, 8, 9],
                     serving: true,
                     plan: None,

@@ -8,17 +8,138 @@
 //! are drained from a channel, not awaited inline.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Error, Result};
 use crate::transport::Server;
 use crate::transport::codec::Envelope;
+use crate::transport::codec::MsgType;
+
+/// Do not let a continuous inbound stream prevent completed handlers from
+/// returning replies. The socket-owner loop drains replies before every burst.
+const INBOUND_BURST: usize = 64;
+const MAX_HANDLERS: usize = 1024;
+const MAX_CLIENT_HANDLERS: usize = 768;
+const REPLY_BUDGET_MIB: usize = 512;
+const MIB: usize = 1024 * 1024;
+
+struct RouterLimits {
+    total_handlers: usize,
+    client_handlers: usize,
+    reply_budget_mib: usize,
+}
+
+impl RouterLimits {
+    fn from_env() -> Result<Self> {
+        let total_handlers = env_limit("DAL_ROUTER_MAX_HANDLERS", MAX_HANDLERS)?;
+        let client_handlers = env_limit("DAL_ROUTER_MAX_CLIENT_HANDLERS", MAX_CLIENT_HANDLERS)?;
+        let reply_budget_mib = env_limit("DAL_ROUTER_REPLY_BUDGET_MIB", REPLY_BUDGET_MIB)?;
+        if client_handlers >= total_handlers {
+            return Err(Error::Config(
+                "DAL_ROUTER_MAX_CLIENT_HANDLERS must be less than DAL_ROUTER_MAX_HANDLERS".into(),
+            ));
+        }
+        Ok(Self {
+            total_handlers,
+            client_handlers,
+            reply_budget_mib,
+        })
+    }
+}
+
+/// Context-scoped inproc wake endpoints must be unique, including when a test
+/// creates multiple independent servers in one shared context.
+static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
+static ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static WAKE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static REPLY_SENDS: AtomicU64 = AtomicU64::new(0);
+static REPLY_SEND_EAGAIN: AtomicU64 = AtomicU64::new(0);
+static REPLY_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_HANDLER_MAX: AtomicUsize = AtomicUsize::new(0);
+
+/// Process-wide ROUTER scheduling counters, suitable for benchmark reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouterCounters {
+    pub admission_rejections: u64,
+    pub wake_attempts: u64,
+    pub reply_sends: u64,
+    pub reply_send_eagain: u64,
+    pub reply_send_failures: u64,
+    pub max_active_handlers: usize,
+}
+
+pub fn counters() -> RouterCounters {
+    RouterCounters {
+        admission_rejections: ADMISSION_REJECTIONS.load(Ordering::Relaxed),
+        wake_attempts: WAKE_ATTEMPTS.load(Ordering::Relaxed),
+        reply_sends: REPLY_SENDS.load(Ordering::Relaxed),
+        reply_send_eagain: REPLY_SEND_EAGAIN.load(Ordering::Relaxed),
+        reply_send_failures: REPLY_SEND_FAILURES.load(Ordering::Relaxed),
+        max_active_handlers: ACTIVE_HANDLER_MAX.load(Ordering::Relaxed),
+    }
+}
+
+struct PendingReply {
+    identity: Vec<u8>,
+    bytes: Vec<u8>,
+    queued_at: Option<Instant>,
+    queue_stage: Option<crate::perf::WriteStage>,
+    send_stage: Option<crate::perf::WriteStage>,
+    _permit: HeldAdmission,
+}
+
+#[derive(Clone)]
+struct Admission {
+    total: Arc<Semaphore>,
+    clients: Arc<Semaphore>,
+    reply_bytes: Arc<Semaphore>,
+}
+
+struct HeldAdmission {
+    _total: OwnedSemaphorePermit,
+    _client: Option<OwnedSemaphorePermit>,
+    _reply_bytes: OwnedSemaphorePermit,
+}
+
+impl Admission {
+    fn try_acquire(&self, peer: bool, max_reply_bytes: usize) -> Option<HeldAdmission> {
+        let total = self.total.clone().try_acquire_owned().ok()?;
+        let mib = max_reply_bytes.div_ceil(MIB).max(1) as u32;
+        let reply_bytes = self.reply_bytes.clone().try_acquire_many_owned(mib).ok()?;
+        if peer {
+            Some(HeldAdmission {
+                _total: total,
+                _client: None,
+                _reply_bytes: reply_bytes,
+            })
+        } else {
+            let client = self.clients.clone().try_acquire_owned().ok()?;
+            Some(HeldAdmission {
+                _total: total,
+                _client: Some(client),
+                _reply_bytes: reply_bytes,
+            })
+        }
+    }
+}
+
+fn max_reply_bytes(msg_type: MsgType) -> usize {
+    // Request and reply limits differ materially for Raft replication: append
+    // requests can be large batches, but their acknowledgements are tiny.
+    // Reserve the reply envelope's actual maximum shape, not the request's.
+    match msg_type {
+        MsgType::ClientOp => MsgType::ClientOp.max_payload() + 36,
+        MsgType::DirectoryQuery => MsgType::DirectoryQuery.max_payload() + 36,
+        MsgType::Redirect => MsgType::Redirect.max_payload() + 36,
+        _ => 4 * 1024 + 36,
+    }
+}
 
 /// A bound inbound endpoint. Dropping it stops the poller thread and closes the
 /// socket.
@@ -26,6 +147,9 @@ pub struct ZmqServer {
     running: Arc<AtomicBool>,
     poller: Option<JoinHandle<()>>,
     active: Arc<ActiveHandlers>,
+    /// The sending side is used only to wake the socket owner. Queued replies
+    /// remain the source of truth, so wake bytes may safely coalesce.
+    waker: Arc<Mutex<zmq::Socket>>,
 }
 
 struct ActiveHandlers {
@@ -47,6 +171,34 @@ fn zmq_io(e: zmq::Error) -> Error {
     Error::Io(std::io::Error::other(format!("zmq: {e}")))
 }
 
+fn event_driven_router_enabled() -> bool {
+    matches!(
+        std::env::var("DAL_EVENT_DRIVEN_ROUTER").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+fn env_limit(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| Error::Config(format!("{name} must be a positive integer"))),
+        Err(_) => Ok(default),
+    }
+}
+
+fn wake(waker: &Mutex<zmq::Socket>) {
+    // A PAIR wake is a level-triggered hint: if its HWM is full, an earlier
+    // unread wake is already enough to make the socket owner drain the reply
+    // channel. Never block a Tokio handler on this nudge.
+    WAKE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if let Ok(waker) = waker.lock() {
+        let _ = waker.send(&[1u8][..], zmq::DONTWAIT);
+    }
+}
+
 impl ZmqServer {
     /// Bind `addr` on a `ROUTER` socket and serve inbound frames with `server`,
     /// spawning handler futures on the current Tokio runtime. Must be called
@@ -55,14 +207,28 @@ impl ZmqServer {
     where
         S: Server + 'static,
     {
+        let limits = RouterLimits::from_env()?;
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
-        // The poller owns the socket, while handlers complete on Tokio. Bound
-        // the wait so a completed reply is flushed promptly even when no new
-        // request arrives. One millisecond avoids the former 50 ms tail while
-        // keeping this single-owner design simple and portable.
-        socket.set_rcvtimeo(1).map_err(zmq_io)?;
+        let event_driven = event_driven_router_enabled();
+        // The event-driven path is an explicit benchmark candidate. Retain the
+        // timeout loop by default until it clears the release A/B gate.
+        if !event_driven {
+            socket.set_rcvtimeo(1).map_err(zmq_io)?;
+        }
         socket.bind(addr).map_err(zmq_io)?;
+
+        let wake_id = WAKE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let wake_addr = format!("inproc://dal-router-wake-{wake_id}");
+        // Bind before connect: inproc endpoints are context-local and require
+        // the bind side to exist first.
+        let wake_rx = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        wake_rx.set_linger(0).map_err(zmq_io)?;
+        wake_rx.bind(&wake_addr).map_err(zmq_io)?;
+        let wake_tx = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        wake_tx.set_linger(0).map_err(zmq_io)?;
+        wake_tx.connect(&wake_addr).map_err(zmq_io)?;
+        let waker = Arc::new(Mutex::new(wake_tx));
 
         let handle = Handle::current();
         let running = Arc::new(AtomicBool::new(true));
@@ -72,7 +238,13 @@ impl ZmqServer {
             drained: Notify::new(),
         });
         let active_thread = active.clone();
-        let (reply_tx, reply_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>)>();
+        let admission = Admission {
+            total: Arc::new(Semaphore::new(limits.total_handlers)),
+            clients: Arc::new(Semaphore::new(limits.client_handlers)),
+            reply_bytes: Arc::new(Semaphore::new(limits.reply_budget_mib)),
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<PendingReply>(limits.total_handlers);
+        let thread_waker = waker.clone();
 
         let poller = std::thread::Builder::new()
             .name(format!("zmq-router-{addr}"))
@@ -85,6 +257,10 @@ impl ZmqServer {
                     active_thread,
                     reply_tx,
                     reply_rx,
+                    admission,
+                    wake_rx,
+                    thread_waker,
+                    event_driven,
                 )
             })
             .map_err(Error::Io)?;
@@ -93,51 +269,186 @@ impl ZmqServer {
             running,
             poller: Some(poller),
             active,
+            waker,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn poll_loop<S>(
         socket: zmq::Socket,
         server: Arc<S>,
         handle: Handle,
         running: Arc<AtomicBool>,
         active: Arc<ActiveHandlers>,
-        reply_tx: mpsc::Sender<(Vec<u8>, Vec<u8>)>,
-        reply_rx: mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
+        reply_tx: mpsc::SyncSender<PendingReply>,
+        reply_rx: mpsc::Receiver<PendingReply>,
+        admission: Admission,
+        wake_rx: zmq::Socket,
+        waker: Arc<Mutex<zmq::Socket>>,
+        event_driven: bool,
     ) where
         S: Server + 'static,
     {
         while running.load(Ordering::Relaxed) {
-            Self::flush_replies(&socket, &reply_rx);
-            match socket.recv_multipart(0) {
-                Ok(mut parts) if parts.len() >= 2 => {
-                    // ROUTER delivers [identity, payload]; extra frames are
-                    // ignored (we frame one payload per message).
-                    let payload = parts.pop().unwrap();
-                    let identity = parts.remove(0);
-                    if let Ok(env) = Envelope::decode(&payload) {
-                        let server = server.clone();
-                        let tx = reply_tx.clone();
-                        active.count.fetch_add(1, Ordering::Release);
-                        let active = ActiveRequest(active.clone());
-                        handle.spawn(async move {
-                            let _active = active;
-                            let reply = server.serve(env).await;
-                            let _ = tx.send((identity, reply.encode()));
-                        });
-                    }
+            if !event_driven {
+                Self::flush_replies(&socket, &reply_rx);
+                if let Ok(parts) = socket.recv_multipart(0) {
+                    Self::dispatch(
+                        parts, &server, &handle, &active, &reply_tx, &waker, &admission,
+                    );
                 }
-                // Timeout (EAGAIN) or a malformed short message: loop.
-                _ => {}
+                continue;
+            }
+
+            // The only blocking operation in the normal path. A queued reply
+            // always sends a wake after it becomes visible.
+            let mut items = [
+                socket.as_poll_item(zmq::POLLIN),
+                wake_rx.as_poll_item(zmq::POLLIN),
+            ];
+            let _ = zmq::poll(&mut items, -1);
+            while wake_rx.recv_bytes(zmq::DONTWAIT).is_ok() {}
+
+            // Drain before accepting another bounded inbound burst. This also
+            // makes the reply channel authoritative across every wake race.
+            Self::flush_replies(&socket, &reply_rx);
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            for _ in 0..INBOUND_BURST {
+                match socket.recv_multipart(zmq::DONTWAIT) {
+                    Ok(parts) => Self::dispatch(
+                        parts, &server, &handle, &active, &reply_tx, &waker, &admission,
+                    ),
+                    Err(zmq::Error::EAGAIN) => break,
+                    Err(_) => break,
+                }
             }
         }
     }
 
-    fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<(Vec<u8>, Vec<u8>)>) {
-        while let Ok((identity, bytes)) = reply_rx.try_recv() {
+    fn dispatch<S>(
+        mut parts: Vec<Vec<u8>>,
+        server: &Arc<S>,
+        handle: &Handle,
+        active: &Arc<ActiveHandlers>,
+        reply_tx: &mpsc::SyncSender<PendingReply>,
+        waker: &Arc<Mutex<zmq::Socket>>,
+        admission: &Admission,
+    ) where
+        S: Server + 'static,
+    {
+        let received_at = crate::perf::write_path_enabled().then(Instant::now);
+        if parts.len() < 2 {
+            return;
+        }
+        // ROUTER delivers [identity, payload]; extra frames are ignored (we
+        // frame one payload per message).
+        let payload = parts.pop().expect("checked multipart length");
+        let identity = parts.remove(0);
+        let Ok(env) = Envelope::decode(&payload) else {
+            return;
+        };
+        let max_reply_bytes = max_reply_bytes(env.msg_type);
+        let Some(permit) = admission.try_acquire(env.msg_type.is_peer_control(), max_reply_bytes)
+        else {
+            ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let profile_class = crate::perf::write_path_enabled()
+            .then(|| crate::perf::transport_profile_class(env.msg_type, env.group_id))
+            .flatten();
+        let queue_stage = profile_class.map(|class| {
+            class.stage(
+                crate::perf::WriteStage::ClientReplyQueueWait,
+                crate::perf::WriteStage::RaftReplyQueueWait,
+            )
+        });
+        let schedule_stage = profile_class.map(|class| {
+            class.stage(
+                crate::perf::WriteStage::ClientRouterSchedule,
+                crate::perf::WriteStage::RaftRouterSchedule,
+            )
+        });
+        let enqueue_stage = profile_class.map(|class| {
+            class.stage(
+                crate::perf::WriteStage::ClientReplyEnqueue,
+                crate::perf::WriteStage::RaftReplyEnqueue,
+            )
+        });
+        let handler_stage = profile_class.map(|class| {
+            class.stage(
+                crate::perf::WriteStage::ClientRouterHandler,
+                crate::perf::WriteStage::RaftRouterHandler,
+            )
+        });
+        let send_stage = profile_class.map(|class| {
+            class.stage(
+                crate::perf::WriteStage::ClientRouterSend,
+                crate::perf::WriteStage::RaftRouterSend,
+            )
+        });
+        let server = server.clone();
+        let tx = reply_tx.clone();
+        let waker = waker.clone();
+        let active_now = active.count.fetch_add(1, Ordering::Release) + 1;
+        ACTIVE_HANDLER_MAX.fetch_max(active_now, Ordering::Relaxed);
+        let active = ActiveRequest(active.clone());
+        handle.spawn(async move {
+            let _active = active;
+            if let (Some(stage), Some(started)) = (schedule_stage, received_at) {
+                crate::perf::record_duration(stage, started.elapsed());
+            }
+            let handler_started = handler_stage.map(|_| Instant::now());
+            let reply = server.serve(env).await;
+            if let (Some(stage), Some(started)) = (handler_stage, handler_started) {
+                crate::perf::record_duration(stage, started.elapsed());
+            }
+            let reply_completed_at = crate::perf::write_path_enabled().then(Instant::now);
+            let bytes = reply.encode();
+            let queued_at = crate::perf::write_path_enabled().then(Instant::now);
+            if tx
+                .try_send(PendingReply {
+                    identity,
+                    bytes,
+                    queued_at,
+                    queue_stage,
+                    send_stage,
+                    _permit: permit,
+                })
+                .is_ok()
+            {
+                if let (Some(stage), Some(started)) = (enqueue_stage, reply_completed_at) {
+                    crate::perf::record_duration(stage, started.elapsed());
+                }
+                wake(&waker);
+            }
+        });
+    }
+
+    fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<PendingReply>) {
+        while let Ok(reply) = reply_rx.try_recv() {
+            if let (Some(stage), Some(started)) = (reply.queue_stage, reply.queued_at) {
+                crate::perf::record_duration(stage, started.elapsed());
+            }
+            let send_started = reply.send_stage.map(|_| Instant::now());
             // A disconnected or backpressured peer must never pin the sole
             // socket-owner thread during shutdown.
-            let _ = socket.send_multipart([identity, bytes], zmq::DONTWAIT);
+            match socket.send_multipart([reply.identity, reply.bytes], zmq::DONTWAIT) {
+                Ok(()) => {
+                    REPLY_SENDS.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    REPLY_SEND_EAGAIN.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    REPLY_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if let (Some(stage), Some(started)) = (reply.send_stage, send_started) {
+                crate::perf::record_duration(stage, started.elapsed());
+            }
         }
     }
 
@@ -146,6 +457,7 @@ impl ZmqServer {
     /// those handlers are waiting on before draining them with [`Self::shutdown`].
     pub fn stop_accepting(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        wake(&self.waker);
         if let Some(h) = self.poller.take() {
             let _ = h.join();
         }
@@ -187,4 +499,45 @@ impl Drop for ZmqServer {
 /// tests before the first request.
 pub fn settle() {
     std::thread::sleep(Duration::from_millis(50));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admission(total: usize, clients: usize, reply_mib: usize) -> Admission {
+        Admission {
+            total: Arc::new(Semaphore::new(total)),
+            clients: Arc::new(Semaphore::new(clients)),
+            reply_bytes: Arc::new(Semaphore::new(reply_mib)),
+        }
+    }
+
+    #[test]
+    fn peer_control_uses_capacity_reserved_from_clients() {
+        let admission = admission(2, 1, 8);
+        let client = admission
+            .try_acquire(false, 1)
+            .expect("first client admitted");
+        assert!(admission.try_acquire(false, 1).is_none());
+
+        let peer = admission
+            .try_acquire(true, 1)
+            .expect("peer control must use reserved capacity");
+        assert!(admission.try_acquire(true, 1).is_none());
+        drop(peer);
+        drop(client);
+        assert!(admission.try_acquire(false, 1).is_some());
+    }
+
+    #[test]
+    fn reply_byte_reservation_is_held_until_admission_drops() {
+        let admission = admission(2, 2, 2);
+        let held = admission
+            .try_acquire(false, 2 * MIB)
+            .expect("two-MiB reservation admitted");
+        assert!(admission.try_acquire(false, 1).is_none());
+        drop(held);
+        assert!(admission.try_acquire(false, 1).is_some());
+    }
 }

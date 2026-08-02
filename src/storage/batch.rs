@@ -1,16 +1,18 @@
 //! The one helper that applies state-machine mutations and advances
-//! `last_applied` in a single fsync-durable `WriteBatch` (DESIGN §6).
+//! `last_applied` in a single atomic RocksDB `WriteBatch` (DESIGN §6).
 //!
-//! Every applier — data and meta — goes through [`Storage::apply_state`]. Doing
-//! the mutation and the `last_applied` bump in one atomic batch is what makes
-//! recovery a clean prefix replay: a crash either loses the whole entry or
-//! keeps all of it, never a fraction.
+//! Every applier — data and meta — goes through this module. Doing the mutation,
+//! committed marker, and `last_applied` bump in one atomic batch is what makes
+//! recovery a clean prefix replay. Raft batches use the database-wide
+//! durability worker and data groups may complete at visibility; the legacy M2
+//! helper and meta state remain synchronously durable.
 
 use rocksdb::{WriteBatch, WriteOptions};
 
 use crate::codec;
 use crate::error::Result;
 use crate::keyspace;
+use crate::partition::log_store::{KEY_COMMITTED, committed_sync_enabled};
 use crate::perf::WriteStage;
 use crate::storage::rocks::Storage;
 use crate::types::{GroupId, LogId};
@@ -34,10 +36,23 @@ fn crash_point(_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Default-on shared log/state durability scheduling. Set
+/// `DAL_UNIFIED_DURABILITY=0` to restore a synchronous state-apply write while
+/// retaining the log coordinator.
+fn unified_durability_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        !matches!(
+            std::env::var("DAL_UNIFIED_DURABILITY").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 impl Storage {
     /// Atomically apply `mutations` to `cf_state_<group>` and set the group's
-    /// `last_applied`, fsync-durable. Either the whole batch survives a crash
-    /// or none of it does.
+    /// `last_applied`, fsync-durable. This is the legacy M2 helper; OpenRaft
+    /// state uses [`Self::apply_raft`].
     pub fn apply_state(
         &self,
         group: GroupId,
@@ -79,32 +94,54 @@ impl Storage {
 
     /// The Raft state machine's atomic apply (M3): business mutations plus the
     /// opaque Raft applied-state blob (openraft `LogId` + membership) in one
-    /// fsync-durable batch. Shares the same crash boundaries as
-    /// [`Self::apply_state`].
-    pub fn apply_raft(
+    /// atomic batch. Shares the same write boundaries as [`Self::apply_state`],
+    /// with durability completion tracked separately for async data groups.
+    pub async fn apply_raft(
         &self,
         group: GroupId,
         mutations: &[StateMutation],
+        applied_log_id: openraft::LogId<u64>,
         applied_record: &[u8],
+        committed_record: &[u8],
+        applied_entries: usize,
     ) -> Result<()> {
-        let cf = self.state_cf(group)?;
+        let batch = {
+            let cf = self.state_cf(group)?;
+            let log_cf = (!committed_sync_enabled())
+                .then(|| self.log_cf(group))
+                .transpose()?;
 
-        let mut batch = WriteBatch::default();
-        for m in mutations {
-            match m {
-                StateMutation::Put { key, value } => batch.put_cf(&cf, key, value),
-                StateMutation::Delete { key } => batch.delete_cf(&cf, key),
+            let mut batch = WriteBatch::default();
+            for m in mutations {
+                match m {
+                    StateMutation::Put { key, value } => batch.put_cf(&cf, key, value),
+                    StateMutation::Delete { key } => batch.delete_cf(&cf, key),
+                }
             }
-        }
-        batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
+            batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
+            if let Some(log_cf) = log_cf {
+                // Persist the optional recovery hint with exactly the state
+                // prefix it describes. Cross-CF WriteBatch atomicity prevents
+                // the two recovery pointers from disagreeing.
+                batch.put_cf(&log_cf, KEY_COMMITTED, committed_record);
+            }
+            batch
+        };
+
+        let wal_bytes = batch.size_in_bytes();
+        crate::perf::record_apply_batch(applied_entries, mutations.len(), wal_bytes);
 
         crash_point("apply_state::before_write")?;
 
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        {
+        if unified_durability_enabled() {
+            self.write_state_batch(group, applied_log_id, applied_entries, batch, wal_bytes)
+                .await?;
+        } else {
+            let mut wo = WriteOptions::default();
+            wo.set_sync(true);
             let _profile = crate::perf::timer(WriteStage::StateApplySynced);
             self.db().write_opt(batch, &wo)?;
+            self.record_state_sync(group, applied_log_id);
         }
 
         crash_point("apply_state::after_write")?;

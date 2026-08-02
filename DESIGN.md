@@ -257,8 +257,10 @@ meta group.
 Implementation notes:
 - We implement openraft's `RaftLogStorage` and `RaftStateMachine` traits over
   these CFs. Every voter makes a log append and associated term/vote state
-  durable with `WriteOptions{ sync: true }` before replying success to the
-  leader. The leader only counts those durable replies toward commit.
+  durable before replying success to the leader. Log batches normally use the
+  database-wide durability worker described below; votes retain direct
+  `WriteOptions{ sync: true }` writes. The leader only counts durable replies
+  toward commit.
 - **Snapshots** are produced as a manifest of immutable, checksummed SST files
   plus the exact last-applied `LogId` and membership/config state. Installation
   stages files in a unique directory, verifies every checksum, fsyncs the
@@ -271,13 +273,31 @@ Implementation notes:
 - Applying a committed entry (`put`/`delete`) and advancing `last_applied` occur
   in **one atomic `WriteBatch`** against `cf_state_<group>`, so recovery never
   double-applies or skips. The same rule applies to all meta-state changes.
-- The optional OpenRaft committed-position marker is written to the WAL before
-  apply but does not require its own fsync. The following synchronous atomic
-  state apply on the same RocksDB instance makes that earlier marker durable
-  before a client response. `DAL_COMMITTED_SYNC=1` retains the original
-  fsync-per-marker path as a rollback mode. On recovery, OpenRaft reconciles a
-  stale or missing marker with the durable applied pointer; if the marker is
-  ahead, it replays the durable log to that committed prefix.
+- The optional OpenRaft committed-position marker is folded into the same
+  cross-CF `WriteBatch` as the applied pointer and business mutations. The
+  database-wide durability worker WAL-writes atomic log and state batches,
+  groups currently active work across Raft groups, and completes Raft log
+  callbacks only after one `flush_wal(true)`. State apply is sync-durable by
+  default. With `DAL_ASYNC_MATERIALIZED_STATE=1`, a data-group apply completes
+  after its atomic batch is visible and the worker advances a separate durable
+  watermark after the shared WAL flush. Pending requests and bytes remain
+  reserved until that flush, so dirty state is bounded. Meta-group apply stays
+  synchronous in both modes.
+- In asynchronous materialized-state mode, snapshot build and log purge wait
+  until the snapshot/purge point is at or below the durable-applied watermark;
+  group reclamation first rejects new applies and drains all pending state.
+  Any WAL write/flush failure poisons the database-scoped tracker and closes
+  client serving. A restarted data group initially refuses follower-local
+  stale reads until it visibly applies a post-start committed entry; a leader
+  may open the process-epoch gate only through its quorum read barrier. Clients
+  encountering a still-fenced follower are redirected to a fresher candidate.
+- A lone write flushes immediately; observing concurrency activates a bounded
+  200 microsecond collection window. `DAL_COMMITTED_SYNC=1`,
+  `DAL_UNIFIED_DURABILITY=0`, `DAL_ADAPTIVE_DURABILITY=0`, and leaving
+  `DAL_ASYNC_MATERIALIZED_STATE` unset retain the durable rollback paths. On
+  recovery, the folded marker and applied state describe exactly the same
+  locally durable prefix; acknowledged entries beyond that prefix remain in
+  the majority-durable Raft logs for replay.
 - `delete` removes the key and its version record in the same atomic batch. No
   logical tombstone is kept: versions are log indexes and never repeat, so
   RocksDB deletion markers may compact freely without affecting CAS or

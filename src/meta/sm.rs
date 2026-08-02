@@ -8,10 +8,11 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, StorageError};
+use tokio::sync::Mutex;
 
 use crate::codec;
 use crate::meta::raft_types::{
@@ -51,9 +52,15 @@ impl MetaRaftStateMachine {
         }
     }
 
-    fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
-        let _view = self.state_view.lock().unwrap();
+    async fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
+        let _view = self.state_view.lock().await;
         let (last_log_id, membership) = self.read_applied()?;
+        if let Some(log_id) = &last_log_id {
+            self.storage
+                .wait_state_durable(GroupId::Meta, log_id)
+                .await
+                .map_err(write_err)?;
+        }
         let pairs = self.storage.scan_state(GroupId::Meta).map_err(read_err)?;
         let data = codec::encode(&pairs);
         let snapshot_id = match &last_log_id {
@@ -74,7 +81,7 @@ impl MetaRaftStateMachine {
 
 impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStateMachine {
     async fn build_snapshot(&mut self) -> Result<Snapshot, StorageError<NodeId>> {
-        self.build_snapshot_now()
+        self.build_snapshot_now().await
     }
 }
 
@@ -93,7 +100,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         I::IntoIter: OptionalSend,
     {
         let _profile = crate::perf::timer(WriteStage::StateApplyTotal);
-        let _view = self.state_view.lock().unwrap();
+        let _view = self.state_view.lock().await;
         let (_, mut membership) = self.read_applied()?;
         let mut results = Vec::new();
 
@@ -112,8 +119,17 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
             };
 
             let applied: Applied = (Some(log_id), membership.clone());
+            let committed = codec::encode(&Some(log_id));
             self.storage
-                .apply_raft(GroupId::Meta, &muts, &codec::encode(&applied))
+                .apply_raft(
+                    GroupId::Meta,
+                    &muts,
+                    log_id,
+                    &codec::encode(&applied),
+                    &committed,
+                    1,
+                )
+                .await
                 .map_err(write_err)?;
             results.push(result);
         }
@@ -135,13 +151,18 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        let _view = self.state_view.lock().unwrap();
+        let _view = self.state_view.lock().await;
         let bytes = (*snapshot).into_inner();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = codec::decode(&bytes).map_err(read_err)?;
+        self.storage
+            .validate_state_install(GroupId::Meta, meta.last_log_id.as_ref())
+            .map_err(write_err)?;
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
         self.storage
             .install_state(GroupId::Meta, &pairs, &codec::encode(&applied))
             .map_err(write_err)?;
+        self.storage
+            .record_state_installed(GroupId::Meta, meta.last_log_id);
         Ok(())
     }
 
@@ -150,6 +171,6 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         if last_log_id.is_none() {
             return Ok(None);
         }
-        Ok(Some(self.build_snapshot_now()?))
+        Ok(Some(self.build_snapshot_now().await?))
     }
 }

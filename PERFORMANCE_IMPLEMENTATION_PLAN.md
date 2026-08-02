@@ -19,11 +19,11 @@ back independently. Optimizations must not be accepted from an in-memory or
    At `P=128, R=3`, this is about 3,413 meta ReadIndex operations per second,
    before address refresh, genesis checks, meta reclamation, or client work.
 2. With `DAL_LOG_GROUP_COMMIT=0`, RocksDB log fsync calls execute directly
-   inside async OpenRaft storage methods. Phase 3 moves Raft log flushes to a
-   database-wide worker when enabled. Phase 4 removes the committed marker's
-   independent fsync by default, but its WAL append, vote writes,
-   state-machine apply, and lifecycle operations still execute synchronously
-   on the async path.
+   inside async OpenRaft storage methods. The default Phase 3/4 path instead
+   sends log and state-machine batches through one bounded database worker,
+   folds the committed marker into state apply, and releases callbacks only
+   after a shared WAL flush. Vote writes and lifecycle operations still
+   execute synchronously on the async path.
 3. The inbound ROUTER notices completed replies through a 1 ms receive timeout.
    The delay can recur on the client and Raft RPC legs of one operation.
 4. Redirects and routing queries can rebuild and serialize the complete routing
@@ -203,20 +203,21 @@ Every phase must preserve these invariants:
 
 - Add one durability coordinator per RocksDB instance.
 - In `RaftLogStorage::append`:
-  1. encode the entries and write them to RocksDB/WAL without a synchronous
-     fsync, making them readable before returning;
-  2. enqueue the highest covered log-I/O point and `LogFlushed` callback;
-  3. let the coordinator group pending appends across Raft groups;
-  4. execute one `flush_wal(true)` for the database-wide batch;
-  5. complete all callbacks covered by that flush, in order.
+  1. encode and enqueue the entries for the bounded database worker;
+  2. let the worker write the batch to RocksDB/WAL without synchronous fsync;
+  3. signal append-return only after entries are readable;
+  4. group currently active log and state batches across Raft groups;
+  5. execute one `flush_wal(true)` for the database-wide batch;
+  6. complete every covered `LogFlushed` callback and state waiter in order.
 - Bound the coordinator queue and bytes. Apply backpressure before accepting
   unbounded log data.
 - Define failure semantics precisely: a failed WAL flush completes every
   covered callback with an error and prevents a later successful callback from
   overtaking it.
-- Move blocking state-machine apply, snapshot, CF lifecycle, purge, and
-  truncate operations onto a bounded storage executor. Keep short cached point
-  reads synchronous only if measurement shows they do not starve Tokio.
+- State-machine apply writes now use the bounded database worker. Snapshot, CF
+  lifecycle, purge, and truncate remain candidates for the same executor. Keep
+  short cached point reads synchronous only if measurement shows they do not
+  starve Tokio.
 - Avoid one independent unbounded blocking task per partition. Executor
   concurrency should match the storage device and preserve per-group ordering.
 - Retain the current per-apply entry coalescing and add equivalent coalescing to
@@ -350,41 +351,49 @@ compete with or duplicate RocksDB's native write grouping.
 
 ### Implementation
 
-- `save_committed` now writes the marker to the normal RocksDB WAL with
-  `sync=false`. OpenRaft immediately follows it by applying the committed
-  entries, and `apply_raft` performs a `sync=true` atomic write on the same
-  RocksDB instance. RocksDB's ordered WAL therefore makes the earlier marker
-  durable at the state-apply boundary without a separate fsync.
-- `DAL_COMMITTED_SYNC=1` restores the old synchronous marker write for rollback
-  and A/B testing. Deferred marker durability is the default.
-- The opt-in write-path profile distinguishes `committed WAL write` from
-  `committed sync write`, and the benchmark reports the active marker mode.
+- In the default mode, `save_committed` is the optional no-op allowed by
+  OpenRaft for a durable state machine. `apply_raft` writes the final applied
+  LogId as the committed marker in the same atomic cross-column-family batch as
+  the applied pointer, membership, business mutations, and idempotency records.
+- The database worker now owns both log and Raft-state non-sync writes. State
+  apply asynchronously waits for the same `flush_wal(true)` that releases log
+  callbacks, allowing one physical sync to cover multiple groups and both
+  kinds of durable work.
+- Adaptive collection flushes a truly lone write immediately. Once a second
+  active writer is observed, that flush cycle uses the bounded 200 microsecond
+  window to retain concurrent batching.
+- `DAL_COMMITTED_SYNC=1` restores the old synchronous marker write,
+  `DAL_UNIFIED_DURABILITY=0` restores synchronous state apply, and
+  `DAL_ADAPTIVE_DURABILITY=0` restores the fixed collection window.
+- Profiling reports each benchmark phase separately and records log/state
+  writes per durability flush, state batch entries/mutations/bytes, and folded
+  marker counts.
 - Never weaken vote durability or follower log durability.
 - Keep the final state-machine mutation, idempotency record, membership, and
   applied pointer atomic and durable before replying to the client.
 
 The crash states are:
 
-1. Before the marker WAL write completes, neither the new marker nor its apply
-   is acknowledged. Recovery starts from the previous durable applied prefix.
-2. After the non-sync marker write but before apply, a machine crash may lose
-   the marker. This is valid: OpenRaft explicitly makes `save_committed`
-   optional when state-machine apply is durable. If another DB sync preserved
-   the marker first, startup sees `committed > last_applied` and replays the
-   already-durable Raft log through that point.
-3. During the state write, RocksDB recovers either the prior state or the whole
-   new atomic state batch. A successful sync also covers the earlier marker WAL
-   record. Blank and membership-only batches still write the applied record, so
-   they supply the same durability boundary even without a business mutation.
+1. Before the worker writes the state batch, recovery starts from the previous
+   durable applied prefix and no client has been acknowledged.
+2. After the non-sync batch write but before the shared flush, its atomic
+   contents may be visible to the running process but no state waiter or client
+   response is released. A machine crash either loses that WAL suffix or
+   recovers the whole RocksDB WriteBatch; it cannot recover a partial mutation
+   or a marker/applied mismatch.
+3. After `flush_wal(true)`, every earlier collected batch is durable. Only then
+   are state waiters and log callbacks completed. Blank and membership-only
+   entries still write the marker and applied record even without a business
+   mutation.
 4. After apply returns, the business mutation, idempotency record, membership,
-   applied pointer, and earlier committed marker are durable. OpenRaft sends the
-   client response only after this point. A crash before delivery is handled by
-   the existing idempotent client retry.
+   committed marker, and applied pointer are durable. OpenRaft sends the client
+   response only after this point. A crash before delivery is handled by the
+   existing idempotent retry.
 
-On startup OpenRaft reads both pointers, takes the durable `last_applied` when
-it is ahead of a stale/missing committed marker, and reapplies the durable log
-when the committed marker is ahead. Thus every recoverable state is a clean
-prefix and no acknowledged write depends on the deferred marker alone.
+On startup the marker and applied pointer from a completed default-mode apply
+name the same prefix. OpenRaft still reconciles old-format data by taking a
+newer durable `last_applied` or replaying a durable log when an older committed
+marker is ahead.
 
 ### Tests
 
@@ -449,6 +458,109 @@ DAL_COMMITTED_SYNC=<0-or-1> \
 cargo test --release --test benchmark_e2e \
   end_to_end_benchmark_three_nodes -- --ignored --nocapture
 ```
+
+### Unified durability follow-up (2026-08-01)
+
+The next profile showed that the remaining state-apply sync writes competed
+with the log coordinator and prevented cross-kind batching. The default path
+therefore now submits both log and state batches to one database worker, folds
+the committed marker directly into the state batch, and uses adaptive
+collection: a lone request flushes immediately, while observed concurrency
+opens the bounded 200 microsecond collection window.
+
+The previous deferred-marker implementation and the unified candidate were
+run on the same ext4 filesystem with the workload and data sizes above. These
+are medians of three unprofiled candidate trials compared with the checked-in
+three-trial deferred-marker median:
+
+| Workload | Previous throughput | Unified throughput | Throughput change | Previous p50 / p95 / p99 | Unified p50 / p95 / p99 |
+|---|---:|---:|---:|---:|---:|
+| Sequential write | 153 ops/s | 167 ops/s | +9.2% | 6.88 / 7.30 / 7.62 ms | 5.93 / 7.18 / 7.40 ms |
+| Concurrent write | 824 ops/s | 1,874 ops/s | +127.4% | 18.15 / 30.23 / 37.32 ms | 7.81 / 12.24 / 16.20 ms |
+| Concurrent mixed 50/50 | 1,493 ops/s | 3,452 ops/s | +131.2% | 9.62 / 23.00 / 28.23 ms | 4.81 / 9.50 / 12.49 ms |
+| Sequential linearizable read | 406 ops/s | 409 ops/s | +0.7% | 2.67 / 3.19 / 3.38 ms | 2.67 / 3.21 / 3.37 ms |
+
+One phase-separated profiled candidate run, compared with a fresh profile of
+the previous default, explains the gain. Counts aggregate the three nodes and
+the 10,000 successful writes in the sequential, concurrent-write, and
+mixed-workload phases; stage timings overlap and profiling itself perturbs
+throughput.
+
+| Stage/counter | Previous deferred-marker path | Unified durability path |
+|---|---:|---:|
+| Committed-marker persistence | 27,355 standalone non-sync writes | 27,532 markers folded into state batches |
+| State persistence | 27,356 separate `sync=true` writes | 27,532 worker-owned non-sync writes |
+| Durability writes | log only, 1.62 callbacks/flush | 28,222 log + 27,532 state, 3.25 writes/flush |
+| Physical RocksDB WAL syncs | 39,118 | 17,158 (-56.1%) |
+| Physical WAL syncs/client write | 3.91 | 1.72 |
+| Raft `client_write` mean | 16.179 ms | 6.413 ms (-60.4%) |
+| RocksDB write-stall time | 0 ms | 0 ms |
+
+In the unified concurrent phases, the worker's state batch write averaged
+38.7--39.6 microseconds, state durability wait averaged 1.577--1.589 ms, and
+the shared flush averaged about 0.91 ms. This identifies WAL durability—not
+encoding or the RocksDB batch write itself—as the remaining write-path cost.
+The adaptive policy also recovers the sequential latency that a fixed
+collection window gave up.
+
+The full all-target/all-feature suite passes in both the default mode and the
+complete rollback configuration. The compatibility switches are independent:
+
+```text
+DAL_COMMITTED_SYNC=1 \
+DAL_UNIFIED_DURABILITY=0 \
+DAL_ADAPTIVE_DURABILITY=0 \
+cargo test --all-targets --all-features -- --test-threads=1
+```
+
+To reproduce the candidate benchmark, set `DAL_BENCH_DIR` to a durable
+filesystem and leave all three switches unset. Use
+`DAL_PROFILE_WRITE_PATH=1` for per-phase stage and RocksDB counters; profiling
+runs are diagnostic and should not be used as throughput acceptance trials.
+
+### Transport-attribution follow-up (2026-08-01)
+
+The next phase-separated profile added timers around the client transport and
+gateway, data-Raft AppendEntries transport and handler, and the interval from a
+completed handler entering the ROUTER reply queue until the socket-owner thread
+drains it. The same ext4/NVMe benchmark used 1,000 sequential writes, 6,000
+concurrent writes, and 6,000 mixed operations with 16 clients. These numbers
+are diagnostic results from one profiled run, not acceptance throughput.
+
+| Stage | Sequential write mean | Concurrent write mean |
+|---|---:|---:|
+| End-to-end client operation | 5.98 ms | 7.43 ms |
+| Client transport call | 5.959 ms | 7.406 ms |
+| Client gateway handler | 4.916 ms | 6.518 ms |
+| Raft `client_write` | 4.880 ms | 6.517 ms |
+| Client ROUTER reply queue | 0.596 ms | 0.566 ms |
+| Data-Raft append transport | 1.777 ms | 1.724 ms |
+| Data-Raft append handler | 0.607 ms | 0.918 ms |
+| Data-Raft ROUTER reply queue | 0.697 ms | 0.509 ms |
+| Shared WAL flush | 0.972 ms | 0.888 ms |
+| State durability wait | 1.301 ms | 1.538 ms |
+
+For the sequential phase, transport outside the handler cost 1.043 ms on the
+client leg and 1.169 ms on an average data-Raft append leg. The periodic ROUTER
+reply drain directly accounted for 57% and 60% of those gaps, respectively.
+The nearly identical roughly 0.45 ms residual on both legs includes outbound
+handoff/wakeup, inbound dispatch, frame work, socket send/receive, and runtime
+scheduling; it should be split further after removing the known polling delay.
+
+Storage is still durability-bound: sequential WAL flushes averaged 0.972 ms,
+while log encoding averaged 9 microseconds, log/state non-sync writes averaged
+89/105 microseconds, capacity waits stayed below 1 microsecond, and RocksDB
+reported zero write-stall time. Under concurrency the worker grouped 32,804 log
+and state writes into 6,900 flushes (4.75 writes per flush), versus effectively
+one worker write per flush in the sequential phase. Apply batches still held
+only 1.11 entries on average, but their non-sync write cost is too small to
+prioritize ahead of transport and WAL durability.
+
+This makes Phase 2's event-driven ROUTER reply delivery the next software
+bottleneck to remove. It imposes about 0.6--0.7 ms on each idle reply leg and
+also sits on Raft quorum traffic. WAL sync latency remains the primary storage
+floor; collection-window or apply-batch tuning should be evaluated only with an
+A/B showing that any additional queueing improves the durability/latency trade.
 
 ## Phase 5: Cache and index routing
 
@@ -591,9 +703,10 @@ transport waiting no longer dominate.
 
 ## Rollout and feature flags
 
-- Keep separate flags for asynchronous log durability, committed-marker
-  coalescing, event-driven reconciliation, and read batching until each has
-  passed crash, stress, and soak gates.
+- Keep separate flags for asynchronous log durability, unified state
+  durability, committed-marker folding, adaptive collection, event-driven
+  reconciliation, and read batching until each has passed crash, stress, and
+  soak gates.
 - Emit the active performance-mode configuration at startup and in `/status`.
 - Do not allow a mixed cluster to select incompatible durability or wire
   semantics. Purely local scheduling/caching modes may roll out node by node;

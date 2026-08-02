@@ -6,7 +6,7 @@
 //! install and CF reclamation.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
@@ -19,7 +19,8 @@ use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyspace;
 use crate::perf::{RocksCounters, WriteStage};
-use crate::storage::durability::{DurabilityConfig, OnDurable, WalDurability};
+use crate::storage::apply_durability::{ApplyDurabilityRegistry, ApplyDurabilitySnapshot};
+use crate::storage::durability::{DurabilityConfig, DurabilityKind, OnDurable, WalDurability};
 use crate::types::{
     BootstrapGroup, ClusterId, GroupId, LearnerAdmission, LogId, NodeId, RegistrationBinding,
     ServingState,
@@ -28,6 +29,11 @@ use crate::types::{
 /// MultiThreaded so CFs can be created/dropped through `&self` while other
 /// threads read — the runtime pattern for on-line rebalancing (DESIGN §6).
 type Db = DBWithThreadMode<MultiThreaded>;
+type RaftLogId = openraft::LogId<u64>;
+type RaftApplied = (
+    Option<RaftLogId>,
+    openraft::StoredMembership<u64, openraft::BasicNode>,
+);
 
 /// The node identity record persisted in the default CF. Opening a data dir
 /// whose identity mismatches the config is a hard error (DESIGN §12.1).
@@ -41,12 +47,10 @@ pub struct Storage {
     // Drop the coordinator first: it drains callbacks and joins its worker
     // before the final RocksDB handle is released.
     durability: WalDurability,
+    apply_durability: Arc<ApplyDurabilityRegistry>,
     db: Arc<Db>,
     profile_options: Option<Options>,
     path: PathBuf,
-    /// Orders each non-sync WAL write with registration of its durability
-    /// callback. The worker itself never takes this lock while flushing.
-    log_append_gate: Mutex<()>,
 }
 
 fn sync_write() -> WriteOptions {
@@ -65,6 +69,20 @@ impl Storage {
         path: impl AsRef<Path>,
         durability_config: DurabilityConfig,
     ) -> Result<Storage> {
+        let async_data_state = matches!(
+            std::env::var("DAL_ASYNC_MATERIALIZED_STATE")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on")
+        );
+        Self::open_with_options(path, durability_config, async_data_state)
+    }
+
+    fn open_with_options(
+        path: impl AsRef<Path>,
+        durability_config: DurabilityConfig,
+        async_data_state: bool,
+    ) -> Result<Storage> {
         let path = path.as_ref().to_path_buf();
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -81,19 +99,58 @@ impl Storage {
             .collect();
 
         let db = Arc::new(Db::open_cf_descriptors(&opts, &path, descriptors)?);
+        let apply_durability = Arc::new(ApplyDurabilityRegistry::new(async_data_state));
+        let write_db = db.clone();
         let flush_db = db.clone();
-        let durability = WalDurability::with_config(durability_config, move || {
-            flush_db
-                .flush_wal(true)
-                .map_err(|error| std::io::Error::other(error.to_string()))
-        })?;
+        let write_health = apply_durability.clone();
+        let flush_health = apply_durability.clone();
+        let mut wal_options = WriteOptions::default();
+        wal_options.set_sync(false);
+        let durability = WalDurability::with_config(
+            durability_config,
+            move |batch| {
+                let result = write_db
+                    .write_opt(batch, &wal_options)
+                    .map_err(|error| std::io::Error::other(error.to_string()));
+                if let Err(error) = &result {
+                    write_health.fail_all(format!("database WAL write failed: {error}"));
+                }
+                result
+            },
+            move || {
+                let result = flush_db
+                    .flush_wal(true)
+                    .map_err(|error| std::io::Error::other(error.to_string()));
+                if let Err(error) = &result {
+                    flush_health.fail_all(format!("WAL flush failed: {error}"));
+                }
+                result
+            },
+        )?;
         Ok(Storage {
             durability,
+            apply_durability,
             db,
             profile_options: crate::perf::write_path_enabled().then_some(opts),
             path,
-            log_append_gate: Mutex::new(()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_async_test(
+        path: impl AsRef<Path>,
+        flush_delay: std::time::Duration,
+    ) -> Result<Storage> {
+        Self::open_with_options(
+            path,
+            DurabilityConfig {
+                max_pending_requests: 8,
+                max_pending_bytes: 1_024 * 1_024,
+                max_batch_delay: flush_delay,
+                adaptive_batching: false,
+            },
+            true,
+        )
     }
 
     /// Open and bind identity: on a fresh dir persist `(cluster_id, node_id)`;
@@ -227,16 +284,21 @@ impl Storage {
                 self.db.create_cf(&name, &Options::default())?;
             }
         }
+        self.apply_durability
+            .register(group, self.recovered_raft_applied(group)?);
         Ok(())
     }
 
     /// Idempotently drop both CFs for a group (reclamation, DESIGN §7.4).
     pub fn drop_group(&self, group: GroupId) -> Result<()> {
+        self.apply_durability.begin_close(group);
+        self.apply_durability.ensure_drained(group)?;
         for name in [group.cf_log(), group.cf_state()] {
             if self.db.cf_handle(&name).is_some() {
                 self.db.drop_cf(&name)?;
             }
         }
+        self.apply_durability.remove(group);
         Ok(())
     }
 
@@ -254,14 +316,16 @@ impl Storage {
     /// open. This is checked on every serving path so a concurrent reclaim or
     /// administrative stop cannot leave a live runtime answering requests.
     pub fn require_serving(&self, group: GroupId) -> Result<()> {
-        if self.serving_state(group)? == Some(ServingState::Serving) {
-            Ok(())
-        } else {
-            Err(Error::Raft(format!(
+        if self.serving_state(group)? != Some(ServingState::Serving) {
+            return Err(Error::Raft(format!(
                 "group {:?} is not permitted to serve on this node",
                 group
-            )))
+            )));
         }
+        if let Some(error) = self.apply_durability.snapshot(group).failed {
+            return Err(Error::Io(std::io::Error::other(error)));
+        }
+        Ok(())
     }
 
     /// Reclaim a removed group's local data (DESIGN §7.4): record `NonServing`
@@ -272,6 +336,16 @@ impl Storage {
         self.set_serving_state(group, ServingState::NonServing)?;
         self.drop_group(group)?;
         Ok(())
+    }
+
+    /// Async reclamation fence used by the runtime. Once closing begins, new
+    /// state applies are rejected; already visible applies must become durable
+    /// before either column family can be dropped.
+    pub async fn reclaim_group_durable(&self, group: GroupId) -> Result<()> {
+        self.set_serving_state(group, ServingState::NonServing)?;
+        self.apply_durability.begin_close(group);
+        self.apply_durability.drain(group).await?;
+        self.drop_group(group)
     }
 
     /// Persist an admission that has just been verified against a live,
@@ -385,10 +459,10 @@ impl Storage {
         }
     }
 
-    /// Write a Raft log batch to the WAL without syncing it, then register its
-    /// callback with the database-wide group-commit worker. The callback is
-    /// never completed successfully until `flush_wal(true)` covers this write.
-    pub(crate) fn write_log_batch(
+    /// Ask the database worker to WAL-write a Raft log batch. Return once the
+    /// entries are readable; complete `callback` only after the shared durable
+    /// flush covers them.
+    pub(crate) async fn write_log_batch(
         &self,
         batch: rocksdb::WriteBatch,
         wal_bytes: usize,
@@ -400,22 +474,141 @@ impl Storage {
             let _profile = crate::perf::timer(WriteStage::WalCapacityWait);
             self.durability.reserve(wal_bytes)?
         };
-        let _append = {
-            let _profile = crate::perf::timer(WriteStage::WalAppendLockWait);
-            self.log_append_gate
-                .lock()
-                .map_err(|_| std::io::Error::other("Raft log append lock poisoned"))?
-        };
-
-        let mut options = WriteOptions::default();
-        options.set_sync(false);
-        {
-            let _profile = crate::perf::timer(WriteStage::WalWriteUnsynced);
-            self.db.write_opt(batch, &options)?;
-        }
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
         self.durability
-            .submit(reservation, callback)
+            .submit(
+                reservation,
+                batch,
+                DurabilityKind::Log,
+                Some(Box::new(move |result| {
+                    let _ = written_tx.send(result);
+                })),
+                callback,
+            )
+            .map_err(Error::Io)?;
+        written_rx
+            .await
+            .map_err(|_| Error::Io(std::io::Error::other("database write worker stopped")))?
             .map_err(Error::Io)
+    }
+
+    /// Enqueue an atomic state-machine batch. Data groups may return at the
+    /// RocksDB-visible boundary when async materialization is enabled; meta
+    /// groups and the default mode continue to wait for WAL durability.
+    pub(crate) async fn write_state_batch(
+        &self,
+        group: GroupId,
+        log_id: RaftLogId,
+        applied_entries: usize,
+        batch: rocksdb::WriteBatch,
+        wal_bytes: usize,
+    ) -> Result<()> {
+        let reservation = {
+            let _profile = crate::perf::timer(WriteStage::StateApplyCapacityWait);
+            self.durability.reserve(wal_bytes)?
+        };
+        self.apply_durability
+            .begin(group, applied_entries, wal_bytes)?;
+
+        let written_tracker = self.apply_durability.clone();
+        let written_log_id = log_id;
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+        let durable_tracker = self.apply_durability.clone();
+        let submit_result = self.durability.submit(
+            reservation,
+            batch,
+            DurabilityKind::State,
+            Some(Box::new(move |result| {
+                match &result {
+                    Ok(()) => written_tracker.visible(group, written_log_id),
+                    Err(error) => {
+                        written_tracker.cancel(group, applied_entries, wal_bytes, error.to_string())
+                    }
+                }
+                let _ = written_tx.send(result);
+            })),
+            Box::new(move |result| {
+                match &result {
+                    Ok(()) => durable_tracker.durable(group, log_id, applied_entries, wal_bytes),
+                    Err(error) => {
+                        durable_tracker.cancel(group, applied_entries, wal_bytes, error.to_string())
+                    }
+                }
+                let _ = durable_tx.send(result);
+            }),
+        );
+        if let Err(error) = submit_result {
+            self.apply_durability
+                .cancel(group, applied_entries, wal_bytes, error.to_string());
+            return Err(Error::Io(error));
+        }
+
+        match written_rx.await {
+            Ok(result) => result.map_err(Error::Io)?,
+            Err(_) => {
+                let error = "database write worker stopped".to_string();
+                self.apply_durability
+                    .cancel(group, applied_entries, wal_bytes, error.clone());
+                return Err(Error::Io(std::io::Error::other(error)));
+            }
+        }
+
+        if self.apply_durability.async_for(group) {
+            return Ok(());
+        }
+
+        let _wait = crate::perf::timer(WriteStage::StateApplyDurabilityWait);
+        match durable_rx.await {
+            Ok(result) => result.map_err(Error::Io),
+            Err(_) => {
+                let error = "database durability worker stopped".to_string();
+                self.apply_durability
+                    .cancel(group, applied_entries, wal_bytes, error.clone());
+                Err(Error::Io(std::io::Error::other(error)))
+            }
+        }
+    }
+
+    pub(crate) fn state_apply_is_async(&self, group: GroupId) -> bool {
+        self.apply_durability.async_for(group)
+    }
+
+    pub(crate) fn record_state_sync(&self, group: GroupId, log_id: RaftLogId) {
+        self.apply_durability.visible(group, log_id);
+        self.apply_durability.durable(group, log_id, 0, 0);
+    }
+
+    pub(crate) async fn wait_state_durable(
+        &self,
+        group: GroupId,
+        log_id: &RaftLogId,
+    ) -> Result<()> {
+        self.apply_durability.wait_durable(group, log_id).await
+    }
+
+    pub(crate) fn state_durability(&self, group: GroupId) -> ApplyDurabilitySnapshot {
+        self.apply_durability.snapshot(group)
+    }
+
+    pub(crate) fn state_recovery_ready(&self, group: GroupId) -> bool {
+        self.apply_durability.recovery_ready(group)
+    }
+
+    pub(crate) fn mark_state_recovery_ready(&self, group: GroupId) {
+        self.apply_durability.mark_recovery_ready(group);
+    }
+
+    pub(crate) fn record_state_installed(&self, group: GroupId, log_id: Option<RaftLogId>) {
+        self.apply_durability.installed(group, log_id);
+    }
+
+    pub(crate) fn validate_state_install(
+        &self,
+        group: GroupId,
+        log_id: Option<&RaftLogId>,
+    ) -> Result<()> {
+        self.apply_durability.validate_install(group, log_id)
     }
 
     // ---- state-CF reads (writes go through the batch helper) ---------------
@@ -488,11 +681,20 @@ impl Storage {
         )));
         Ok(())
     }
+
+    fn recovered_raft_applied(&self, group: GroupId) -> Result<Option<RaftLogId>> {
+        let Some(bytes) = self.raft_applied(group)? else {
+            return Ok(None);
+        };
+        let (last_applied, _membership): RaftApplied = codec::decode(&bytes)?;
+        Ok(last_applied)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::CommittedLeaderId;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -501,11 +703,16 @@ mod tests {
             max_pending_requests: 8,
             max_pending_bytes: 1_024,
             max_batch_delay: delay,
+            adaptive_batching: false,
         }
     }
 
-    #[test]
-    fn log_batch_is_readable_before_its_durable_callback() {
+    fn raft_log_id(term: u64, index: u64) -> RaftLogId {
+        RaftLogId::new(CommittedLeaderId::new(term, 1), index)
+    }
+
+    #[tokio::test]
+    async fn log_batch_is_readable_before_its_durable_callback() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
             Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(100)))
@@ -516,6 +723,7 @@ mod tests {
 
         storage
             .write_log_batch(batch, 18, Box::new(move |result| tx.send(result).unwrap()))
+            .await
             .unwrap();
 
         assert_eq!(storage.db().get(b"log-key").unwrap().unwrap(), b"log-value");
@@ -523,8 +731,8 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
     }
 
-    #[test]
-    fn dropping_storage_durably_drains_pending_log_callbacks() {
+    #[tokio::test]
+    async fn dropping_storage_durably_drains_pending_log_callbacks() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
             Storage::open_with_durability(dir.path(), delayed_config(Duration::from_secs(10)))
@@ -534,6 +742,7 @@ mod tests {
         batch.put(b"shutdown-key", b"shutdown-value");
         storage
             .write_log_batch(batch, 26, Box::new(move |result| tx.send(result).unwrap()))
+            .await
             .unwrap();
 
         drop(storage);
@@ -544,5 +753,96 @@ mod tests {
             reopened.db().get(b"shutdown-key").unwrap().unwrap(),
             b"shutdown-value"
         );
+    }
+
+    #[tokio::test]
+    async fn async_data_state_returns_visible_before_wal_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open_with_options(
+            dir.path(),
+            delayed_config(Duration::from_millis(250)),
+            true,
+        )
+        .unwrap();
+        let group = GroupId::Data(7);
+        storage.ensure_group(group).unwrap();
+        let cf = storage.state_cf(group).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"state-key", b"state-value");
+        let wal_bytes = batch.size_in_bytes();
+        let log_id = raft_log_id(2, 11);
+
+        storage
+            .write_state_batch(group, log_id, 1, batch, wal_bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_state(group, b"state-key").unwrap().unwrap(),
+            b"state-value"
+        );
+        let visible = storage.state_durability(group);
+        assert_eq!(visible.visible, Some(log_id));
+        assert_eq!(visible.durable, None);
+        assert_eq!(visible.pending_entries, 1);
+
+        storage.wait_state_durable(group, &log_id).await.unwrap();
+        let durable = storage.state_durability(group);
+        assert_eq!(durable.durable, Some(log_id));
+        assert_eq!(durable.pending_entries, 0);
+        assert_eq!(durable.pending_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn meta_state_stays_synchronous_when_async_data_state_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::open_with_options(dir.path(), delayed_config(Duration::from_millis(50)), true)
+                .unwrap();
+        storage.ensure_group(GroupId::Meta).unwrap();
+        let cf = storage.state_cf(GroupId::Meta).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"meta-key", b"meta-value");
+        let wal_bytes = batch.size_in_bytes();
+        let log_id = raft_log_id(1, 4);
+
+        storage
+            .write_state_batch(GroupId::Meta, log_id, 1, batch, wal_bytes)
+            .await
+            .unwrap();
+
+        let state = storage.state_durability(GroupId::Meta);
+        assert_eq!(state.visible, Some(log_id));
+        assert_eq!(state.durable, Some(log_id));
+        assert_eq!(state.pending_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn reclaim_refuses_to_drop_a_group_with_an_unflushed_state_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open_with_options(
+            dir.path(),
+            delayed_config(Duration::from_millis(250)),
+            true,
+        )
+        .unwrap();
+        let group = GroupId::Data(9);
+        storage.ensure_group(group).unwrap();
+        let cf = storage.state_cf(group).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"state-key", b"state-value");
+        let wal_bytes = batch.size_in_bytes();
+        let log_id = raft_log_id(3, 8);
+        storage
+            .write_state_batch(group, log_id, 1, batch, wal_bytes)
+            .await
+            .unwrap();
+
+        assert!(storage.reclaim_group(group).is_err());
+        assert!(storage.group_exists(group));
+
+        storage.wait_state_durable(group, &log_id).await.unwrap();
+        storage.reclaim_group(group).unwrap();
+        assert!(!storage.group_exists(group));
     }
 }

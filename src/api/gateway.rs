@@ -18,6 +18,7 @@ use crate::api::ops::{
 };
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
+use crate::perf::WriteStage;
 use crate::transport::Server;
 
 /// The set of data partitions a node currently hosts, shared between the gateway
@@ -82,6 +83,7 @@ impl ClientGateway {
     }
 
     async fn handle_client_op(&self, env: &Envelope) -> ClientReply {
+        let _profile = crate::perf::timer(WriteStage::ClientGatewayHandle);
         let req: ClientRequest = match codec::decode(&env.payload) {
             Ok(r) => r,
             Err(e) => return ClientReply::Refused(format!("malformed ClientOp: {e}")),

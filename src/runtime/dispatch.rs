@@ -18,6 +18,7 @@ use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::{MetaNode, ProposeOutcome};
 use crate::meta::raft_types::MetaTypeConfig;
 use crate::partition::raft_types::TypeConfig;
+use crate::perf::WriteStage;
 use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
@@ -161,6 +162,7 @@ impl RootDispatch {
                 let raft = node.raft();
                 match req.msg_type {
                     MsgType::RaftAppend => {
+                        let _profile = crate::perf::timer(WriteStage::RaftAppendHandle);
                         let Ok(rpc) =
                             codec::decode::<AppendEntriesRequest<TypeConfig>>(&req.payload)
                         else {
