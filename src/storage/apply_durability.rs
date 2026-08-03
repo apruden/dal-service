@@ -6,8 +6,10 @@
 //! purge, snapshots, reads after restart, and CF reclamation can fence on the
 //! boundary they actually require.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use openraft::LogId;
 use tokio::sync::Notify;
@@ -17,14 +19,62 @@ use crate::types::GroupId;
 
 type RaftLogId = LogId<u64>;
 
+static NEXT_RECOVERY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ApplyDurabilityLimits {
+    pub(crate) max_pending_entries: usize,
+    pub(crate) max_pending_bytes: usize,
+    pub(crate) max_dirty_age: Duration,
+}
+
+impl Default for ApplyDurabilityLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_entries: 4_096,
+            max_pending_bytes: 64 * 1024 * 1024,
+            max_dirty_age: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DurabilityWaitKind {
+    #[cfg(test)]
+    General,
+    Purge,
+    Snapshot,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ApplyDurabilitySnapshot {
     pub(crate) visible: Option<RaftLogId>,
     pub(crate) durable: Option<RaftLogId>,
     pub(crate) pending_entries: usize,
     pub(crate) pending_bytes: usize,
+    pub(crate) oldest_pending_ms: Option<u64>,
+    pub(crate) last_flush_latency_ms: Option<u64>,
+    pub(crate) max_flush_latency_ms: u64,
+    pub(crate) flush_failures: u64,
     pub(crate) recovery_ready: bool,
+    pub(crate) recovery_epoch: u64,
+    pub(crate) recovery_target: Option<RaftLogId>,
+    pub(crate) recovery_attempts: u64,
+    pub(crate) recovery_duration_ms: Option<u64>,
+    pub(crate) replayed_entries: u64,
+    pub(crate) purge_waits: u64,
+    pub(crate) purge_wait_ms: u64,
+    pub(crate) snapshot_waits: u64,
+    pub(crate) snapshot_wait_ms: u64,
     pub(crate) failed: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingApply {
+    log_id: RaftLogId,
+    entries: usize,
+    bytes: usize,
+    started: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -34,7 +84,21 @@ struct GroupState {
     startup_applied: Option<RaftLogId>,
     pending_entries: usize,
     pending_bytes: usize,
+    pending: VecDeque<PendingApply>,
+    last_flush_latency_ms: Option<u64>,
+    max_flush_latency_ms: u64,
+    flush_failures: u64,
     recovery_ready: bool,
+    recovery_epoch: u64,
+    recovery_target: Option<RaftLogId>,
+    recovery_attempts: u64,
+    recovery_started: Option<Instant>,
+    recovery_duration_ms: Option<u64>,
+    replayed_entries: u64,
+    purge_waits: u64,
+    purge_wait_ms: u64,
+    snapshot_waits: u64,
+    snapshot_wait_ms: u64,
     closing: bool,
     failed: Option<String>,
 }
@@ -53,6 +117,8 @@ impl GroupTracker {
                 durable: recovered,
                 startup_applied: recovered,
                 recovery_ready,
+                recovery_epoch: NEXT_RECOVERY_EPOCH.fetch_add(1, Ordering::Relaxed),
+                recovery_started: (!recovery_ready).then(Instant::now),
                 ..GroupState::default()
             }),
             changed: Notify::new(),
@@ -66,12 +132,34 @@ impl GroupTracker {
             durable: state.durable,
             pending_entries: state.pending_entries,
             pending_bytes: state.pending_bytes,
+            oldest_pending_ms: state
+                .pending
+                .front()
+                .map(|pending| millis(pending.started.elapsed())),
+            last_flush_latency_ms: state.last_flush_latency_ms,
+            max_flush_latency_ms: state.max_flush_latency_ms,
+            flush_failures: state.flush_failures,
             recovery_ready: state.recovery_ready,
+            recovery_epoch: state.recovery_epoch,
+            recovery_target: state.recovery_target,
+            recovery_attempts: state.recovery_attempts,
+            recovery_duration_ms: state.recovery_duration_ms,
+            replayed_entries: state.replayed_entries,
+            purge_waits: state.purge_waits,
+            purge_wait_ms: state.purge_wait_ms,
+            snapshot_waits: state.snapshot_waits,
+            snapshot_wait_ms: state.snapshot_wait_ms,
             failed: state.failed.clone(),
         }
     }
 
-    fn begin(&self, entries: usize, bytes: usize) -> Result<()> {
+    fn begin(
+        &self,
+        log_id: RaftLogId,
+        entries: usize,
+        bytes: usize,
+        limits: ApplyDurabilityLimits,
+    ) -> Result<bool> {
         let mut state = self.state.lock().unwrap();
         if let Some(error) = &state.failed {
             return Err(Error::Io(std::io::Error::other(error.clone())));
@@ -81,45 +169,81 @@ impl GroupTracker {
                 "materialized-state durability tracker is closing".into(),
             ));
         }
+        let empty = state.pending.is_empty();
+        let entries_fit =
+            empty || state.pending_entries.saturating_add(entries) <= limits.max_pending_entries;
+        let bytes_fit =
+            empty || state.pending_bytes.saturating_add(bytes) <= limits.max_pending_bytes;
+        if !entries_fit || !bytes_fit {
+            return Ok(false);
+        }
         state.pending_entries = state.pending_entries.saturating_add(entries);
         state.pending_bytes = state.pending_bytes.saturating_add(bytes);
-        Ok(())
+        state.pending.push_back(PendingApply {
+            log_id,
+            entries,
+            bytes,
+            started: Instant::now(),
+        });
+        Ok(true)
     }
 
     fn visible(&self, log_id: RaftLogId) {
         let mut state = self.state.lock().unwrap();
+        let previous_visible = state.visible;
         if let Err(error) = advance(&mut state.visible, &log_id)
             && state.failed.is_none()
         {
             state.failed = Some(error.to_string());
         }
-        if index_of(&state.visible) > index_of(&state.startup_applied) {
-            // Any post-start apply was delivered as committed by the current
-            // Raft runtime. It is sufficient to prevent serving the reverted
-            // startup prefix. A leader ReadIndex may also open this explicitly.
-            state.recovery_ready = true;
+        if !state.recovery_ready {
+            let previous = index_of(&previous_visible).unwrap_or(0);
+            let startup = index_of(&state.startup_applied).unwrap_or(0);
+            if log_id.index > previous.max(startup) {
+                state.replayed_entries = state
+                    .replayed_entries
+                    .saturating_add(log_id.index - previous.max(startup));
+            }
         }
         drop(state);
         self.changed.notify_waiters();
     }
 
-    fn durable(&self, log_id: RaftLogId, entries: usize, bytes: usize) {
+    fn durable(&self, log_id: RaftLogId) {
         let mut state = self.state.lock().unwrap();
         if let Err(error) = advance(&mut state.durable, &log_id)
             && state.failed.is_none()
         {
             state.failed = Some(error.to_string());
         }
-        state.pending_entries = state.pending_entries.saturating_sub(entries);
-        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        if let Some(position) = state
+            .pending
+            .iter()
+            .position(|pending| pending.log_id == log_id)
+            && let Some(pending) = state.pending.remove(position)
+        {
+            state.pending_entries = state.pending_entries.saturating_sub(pending.entries);
+            state.pending_bytes = state.pending_bytes.saturating_sub(pending.bytes);
+            let latency = millis(pending.started.elapsed());
+            state.last_flush_latency_ms = Some(latency);
+            state.max_flush_latency_ms = state.max_flush_latency_ms.max(latency);
+        }
         drop(state);
         self.changed.notify_waiters();
     }
 
-    fn cancel(&self, entries: usize, bytes: usize, error: String) {
+    fn cancel(&self, log_id: RaftLogId, error: String) {
         let mut state = self.state.lock().unwrap();
-        state.pending_entries = state.pending_entries.saturating_sub(entries);
-        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        if let Some(position) = state
+            .pending
+            .iter()
+            .position(|pending| pending.log_id == log_id)
+            && let Some(pending) = state.pending.remove(position)
+        {
+            state.pending_entries = state.pending_entries.saturating_sub(pending.entries);
+            state.pending_bytes = state.pending_bytes.saturating_sub(pending.bytes);
+        }
+        state.flush_failures = state.flush_failures.saturating_add(1);
         if state.failed.is_none() {
             state.failed = Some(error);
         }
@@ -136,7 +260,7 @@ impl GroupTracker {
         self.changed.notify_waiters();
     }
 
-    fn installed(&self, log_id: Option<RaftLogId>) {
+    fn installed(&self, log_id: Option<RaftLogId>, requires_fence: bool) {
         let mut state = self.state.lock().unwrap();
         if let Some(log_id) = log_id {
             let visible_result = advance(&mut state.visible, &log_id);
@@ -147,14 +271,55 @@ impl GroupTracker {
                 state.failed = Some(error.to_string());
             }
         }
-        state.recovery_ready = true;
+        state.startup_applied = log_id;
+        state.recovery_epoch = NEXT_RECOVERY_EPOCH.fetch_add(1, Ordering::Relaxed);
+        state.recovery_ready = !requires_fence;
+        state.recovery_target = None;
+        state.recovery_started = requires_fence.then(Instant::now);
+        state.recovery_duration_ms = None;
         drop(state);
         self.changed.notify_waiters();
     }
 
-    fn mark_recovery_ready(&self) {
-        self.state.lock().unwrap().recovery_ready = true;
+    fn begin_recovery_attempt(&self, target: Option<RaftLogId>) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+        state.recovery_target = target;
+        state.recovery_epoch
+    }
+
+    fn mark_recovery_ready(&self, epoch: u64, target: Option<&RaftLogId>) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.recovery_epoch != epoch || state.closing {
+            return Err(Error::Raft(
+                "stale materialized-state recovery fence".into(),
+            ));
+        }
+        if let Some(error) = &state.failed {
+            return Err(Error::Io(std::io::Error::other(error.clone())));
+        }
+        if let Some(target) = target
+            && !reaches(&state.visible, target)?
+        {
+            return Err(Error::Raft(format!(
+                "materialized state has not reached recovery target {target}"
+            )));
+        }
+        state.recovery_ready = true;
+        state.recovery_target = target.copied();
+        state.recovery_duration_ms = state.recovery_started.map(|at| millis(at.elapsed()));
+        drop(state);
         self.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn dirty_expired(&self, max_age: Duration) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .pending
+            .front()
+            .is_some_and(|pending| pending.started.elapsed() >= max_age)
     }
 
     fn validate_install(&self, target: Option<&RaftLogId>) -> Result<()> {
@@ -211,6 +376,39 @@ impl GroupTracker {
         }
     }
 
+    async fn wait_visible(&self, target: &RaftLogId) -> Result<()> {
+        loop {
+            let notified = self.changed.notified();
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(error) = &state.failed {
+                    return Err(Error::Io(std::io::Error::other(error.clone())));
+                }
+                if reaches(&state.visible, target)? {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn record_wait(&self, kind: DurabilityWaitKind, elapsed: Duration) {
+        let mut state = self.state.lock().unwrap();
+        let elapsed = millis(elapsed);
+        match kind {
+            #[cfg(test)]
+            DurabilityWaitKind::General => {}
+            DurabilityWaitKind::Purge => {
+                state.purge_waits = state.purge_waits.saturating_add(1);
+                state.purge_wait_ms = state.purge_wait_ms.saturating_add(elapsed);
+            }
+            DurabilityWaitKind::Snapshot => {
+                state.snapshot_waits = state.snapshot_waits.saturating_add(1);
+                state.snapshot_wait_ms = state.snapshot_wait_ms.saturating_add(elapsed);
+            }
+        }
+    }
+
     async fn drain(&self) -> Result<()> {
         loop {
             let notified = self.changed.notified();
@@ -235,15 +433,44 @@ pub(crate) struct ApplyDurabilityRegistry {
     groups: Mutex<HashMap<GroupId, Arc<GroupTracker>>>,
     failed: Mutex<Option<String>>,
     async_data_state: bool,
+    limits: ApplyDurabilityLimits,
 }
 
 impl ApplyDurabilityRegistry {
+    #[cfg(test)]
     pub(crate) fn new(async_data_state: bool) -> Self {
+        Self::with_limits(async_data_state, ApplyDurabilityLimits::default())
+    }
+
+    pub(crate) fn with_limits(async_data_state: bool, limits: ApplyDurabilityLimits) -> Self {
         Self {
             groups: Mutex::new(HashMap::new()),
             failed: Mutex::new(None),
             async_data_state,
+            limits,
         }
+    }
+
+    pub(crate) fn spawn_watchdog(registry: &Arc<Self>) -> std::io::Result<()> {
+        let weak: Weak<Self> = Arc::downgrade(registry);
+        let interval = registry
+            .limits
+            .max_dirty_age
+            .checked_div(4)
+            .unwrap_or(Duration::from_millis(10))
+            .clamp(Duration::from_millis(10), Duration::from_millis(100));
+        std::thread::Builder::new()
+            .name("dal-state-lag-watchdog".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    registry.expire_dirty();
+                }
+            })
+            .map(|_| ())
     }
 
     pub(crate) fn async_for(&self, group: GroupId) -> bool {
@@ -282,23 +509,38 @@ impl ApplyDurabilityRegistry {
     }
 
     pub(crate) fn snapshot(&self, group: GroupId) -> ApplyDurabilitySnapshot {
+        self.expire_dirty();
         self.tracker(group).snapshot()
     }
 
-    pub(crate) fn begin(&self, group: GroupId, entries: usize, bytes: usize) -> Result<()> {
-        self.tracker(group).begin(entries, bytes)
+    pub(crate) async fn begin(
+        &self,
+        group: GroupId,
+        log_id: RaftLogId,
+        entries: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let tracker = self.tracker(group);
+        loop {
+            self.expire_dirty();
+            let notified = tracker.changed.notified();
+            if tracker.begin(log_id, entries, bytes, self.limits)? {
+                return Ok(());
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn visible(&self, group: GroupId, log_id: RaftLogId) {
         self.tracker(group).visible(log_id);
     }
 
-    pub(crate) fn durable(&self, group: GroupId, log_id: RaftLogId, entries: usize, bytes: usize) {
-        self.tracker(group).durable(log_id, entries, bytes);
+    pub(crate) fn durable(&self, group: GroupId, log_id: RaftLogId) {
+        self.tracker(group).durable(log_id);
     }
 
-    pub(crate) fn cancel(&self, group: GroupId, entries: usize, bytes: usize, error: String) {
-        self.tracker(group).cancel(entries, bytes, error.clone());
+    pub(crate) fn cancel(&self, group: GroupId, log_id: RaftLogId, error: String) {
+        self.tracker(group).cancel(log_id, error.clone());
         self.fail_all(error);
     }
 
@@ -314,8 +556,21 @@ impl ApplyDurabilityRegistry {
         }
     }
 
-    pub(crate) async fn wait_durable(&self, group: GroupId, target: &RaftLogId) -> Result<()> {
-        self.tracker(group).wait_durable(target).await
+    pub(crate) async fn wait_durable(
+        &self,
+        group: GroupId,
+        target: &RaftLogId,
+        kind: DurabilityWaitKind,
+    ) -> Result<()> {
+        let tracker = self.tracker(group);
+        let started = Instant::now();
+        let result = tracker.wait_durable(target).await;
+        tracker.record_wait(kind, started.elapsed());
+        result
+    }
+
+    pub(crate) async fn wait_visible(&self, group: GroupId, target: &RaftLogId) -> Result<()> {
+        self.tracker(group).wait_visible(target).await
     }
 
     pub(crate) async fn drain(&self, group: GroupId) -> Result<()> {
@@ -327,7 +582,7 @@ impl ApplyDurabilityRegistry {
     }
 
     pub(crate) fn installed(&self, group: GroupId, log_id: Option<RaftLogId>) {
-        self.tracker(group).installed(log_id);
+        self.tracker(group).installed(log_id, self.async_for(group));
     }
 
     pub(crate) fn validate_install(
@@ -342,8 +597,39 @@ impl ApplyDurabilityRegistry {
         self.tracker(group).snapshot().recovery_ready
     }
 
-    pub(crate) fn mark_recovery_ready(&self, group: GroupId) {
-        self.tracker(group).mark_recovery_ready();
+    pub(crate) fn begin_recovery_attempt(&self, group: GroupId, target: Option<RaftLogId>) -> u64 {
+        self.tracker(group).begin_recovery_attempt(target)
+    }
+
+    pub(crate) fn mark_recovery_ready(
+        &self,
+        group: GroupId,
+        epoch: u64,
+        target: Option<&RaftLogId>,
+    ) -> Result<()> {
+        self.tracker(group).mark_recovery_ready(epoch, target)
+    }
+
+    fn expire_dirty(&self) {
+        if self.failed.lock().unwrap().is_some() {
+            return;
+        }
+        let expired = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(group, tracker)| {
+                tracker
+                    .dirty_expired(self.limits.max_dirty_age)
+                    .then_some(*group)
+            });
+        if let Some(group) = expired {
+            self.fail_all(format!(
+                "materialized state for {group:?} exceeded dirty-age limit of {} ms",
+                self.limits.max_dirty_age.as_millis()
+            ));
+        }
     }
 
     pub(crate) fn ensure_drained(&self, group: GroupId) -> Result<()> {
@@ -366,6 +652,10 @@ impl ApplyDurabilityRegistry {
     pub(crate) fn remove(&self, group: GroupId) {
         self.groups.lock().unwrap().remove(&group);
     }
+}
+
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 fn index_of(log_id: &Option<RaftLogId>) -> Option<u64> {
@@ -425,22 +715,29 @@ mod tests {
         let group = GroupId::Data(1);
         registry.register(group, Some(log_id(1, 3)));
 
-        registry.begin(group, 2, 100).unwrap();
+        registry.begin(group, log_id(1, 5), 2, 100).await.unwrap();
         registry.visible(group, log_id(1, 5));
         let visible = registry.snapshot(group);
         assert_eq!(visible.visible, Some(log_id(1, 5)));
         assert_eq!(visible.durable, Some(log_id(1, 3)));
-        assert!(visible.recovery_ready);
+        assert!(!visible.recovery_ready);
+        let epoch = registry.begin_recovery_attempt(group, Some(log_id(1, 5)));
+        registry
+            .mark_recovery_ready(group, epoch, Some(&log_id(1, 5)))
+            .unwrap();
 
-        registry.durable(group, log_id(1, 5), 2, 100);
-        registry.wait_durable(group, &log_id(1, 5)).await.unwrap();
+        registry.durable(group, log_id(1, 5));
+        registry
+            .wait_durable(group, &log_id(1, 5), DurabilityWaitKind::General)
+            .await
+            .unwrap();
         let durable = registry.snapshot(group);
         assert_eq!(durable.durable, Some(log_id(1, 5)));
         assert_eq!(durable.pending_entries, 0);
         assert_eq!(durable.pending_bytes, 0);
 
         registry.installed(group, Some(log_id(2, 8)));
-        registry.durable(group, log_id(1, 6), 0, 0);
+        registry.durable(group, log_id(1, 6));
         assert_eq!(registry.snapshot(group).durable, Some(log_id(2, 8)));
     }
 
@@ -449,11 +746,16 @@ mod tests {
         let registry = ApplyDurabilityRegistry::new(true);
         let group = GroupId::Data(1);
         registry.register(group, Some(log_id(1, 3)));
-        assert!(registry.wait_durable(group, &log_id(2, 3)).await.is_err());
+        assert!(
+            registry
+                .wait_durable(group, &log_id(2, 3), DurabilityWaitKind::General)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn global_failure_poison_applies_to_groups_registered_later() {
+    #[tokio::test]
+    async fn global_failure_poison_applies_to_groups_registered_later() {
         let registry = ApplyDurabilityRegistry::new(true);
         registry.fail_all("flush failed".into());
         let group = GroupId::Data(2);
@@ -461,7 +763,7 @@ mod tests {
 
         let state = registry.snapshot(group);
         assert_eq!(state.failed.as_deref(), Some("flush failed"));
-        assert!(registry.begin(group, 1, 10).is_err());
+        assert!(registry.begin(group, log_id(1, 2), 1, 10).await.is_err());
     }
 
     #[tokio::test]
@@ -469,15 +771,39 @@ mod tests {
         let registry = ApplyDurabilityRegistry::new(true);
         let group = GroupId::Data(3);
         registry.register(group, None);
-        registry.begin(group, 1, 10).unwrap();
+        registry.begin(group, log_id(1, 1), 1, 10).await.unwrap();
         registry.begin_close(group);
 
-        assert!(registry.begin(group, 1, 10).is_err());
+        assert!(registry.begin(group, log_id(1, 2), 1, 10).await.is_err());
         assert!(registry.ensure_drained(group).is_err());
         registry.visible(group, log_id(1, 1));
-        registry.durable(group, log_id(1, 1), 1, 10);
+        registry.durable(group, log_id(1, 1));
         registry.drain(group).await.unwrap();
         registry.ensure_drained(group).unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_group_byte_limit_blocks_until_the_oldest_batch_is_durable() {
+        let registry = Arc::new(ApplyDurabilityRegistry::with_limits(
+            true,
+            ApplyDurabilityLimits {
+                max_pending_entries: 10,
+                max_pending_bytes: 100,
+                max_dirty_age: Duration::from_secs(2),
+            },
+        ));
+        let group = GroupId::Data(6);
+        registry.register(group, None);
+        registry.begin(group, log_id(1, 1), 1, 80).await.unwrap();
+
+        let blocked_registry = registry.clone();
+        let blocked =
+            tokio::spawn(async move { blocked_registry.begin(group, log_id(1, 2), 1, 80).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!blocked.is_finished());
+        registry.durable(group, log_id(1, 1));
+        blocked.await.unwrap().unwrap();
+        registry.durable(group, log_id(1, 2));
     }
 
     #[test]
@@ -507,6 +833,28 @@ mod tests {
                 .is_err()
         );
         assert!(registry.validate_install(group, None).is_err());
+    }
+
+    #[test]
+    fn snapshot_install_invalidates_an_inflight_recovery_epoch() {
+        let registry = ApplyDurabilityRegistry::new(true);
+        let group = GroupId::Data(5);
+        registry.register(group, Some(log_id(2, 8)));
+        let old_epoch = registry.begin_recovery_attempt(group, Some(log_id(2, 8)));
+
+        registry.installed(group, Some(log_id(3, 12)));
+        assert!(
+            registry
+                .mark_recovery_ready(group, old_epoch, Some(&log_id(2, 8)))
+                .is_err()
+        );
+        assert!(!registry.snapshot(group).recovery_ready);
+
+        let current_epoch = registry.begin_recovery_attempt(group, Some(log_id(3, 12)));
+        registry
+            .mark_recovery_ready(group, current_epoch, Some(&log_id(3, 12)))
+            .unwrap();
+        assert!(registry.snapshot(group).recovery_ready);
     }
 
     proptest! {

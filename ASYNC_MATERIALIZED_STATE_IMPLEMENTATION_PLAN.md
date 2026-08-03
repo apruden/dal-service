@@ -1,13 +1,18 @@
 # Async Materialized State Implementation Plan
 
-Date: 2026-08-02
+Date: 2026-08-03
 
-Status: implementation in progress — opt-in core and durability fences landed;
-process-kill crash matrix and follower recovery-fence RPC remain rollout gates
+Status: complete for new clusters — asynchronous data-group materialization is
+default-on; meta state remains synchronous; `DAL_SYNC_MATERIALIZED_STATE=1`
+is the emergency override
 
-## Implementation progress (2026-08-02)
+Scope: clusters and their data are always created by one current binary.
+Mixed-version operation, migration, and old-log replay compatibility are not
+requirements.
 
-Implemented behind `DAL_ASYNC_MATERIALIZED_STATE=1`:
+## Implementation progress (2026-08-03)
+
+Implemented as the data-group default:
 
 - per-group visible/durable applied watermarks and bounded pending accounting;
 - data-state completion after RocksDB visibility, with meta state still waiting
@@ -15,21 +20,22 @@ Implemented behind `DAL_ASYNC_MATERIALIZED_STATE=1`:
 - database-wide fail-closed propagation on WAL write or flush failure;
 - durable-prefix fences for snapshot build and log purge;
 - close-before-drain fencing for group reclamation;
-- process-epoch stale-read fencing, leader ReadIndex opening, and
-  snapshot-install recovery integration;
-- `/status` visibility for the materialized visible/durable indices, pending
-  entries/bytes, recovery readiness, and failure state;
-- focused ordering tests plus the existing all-target/all-feature suite in both
-  default and selected async-state configurations.
-
-Still required before enabling by default:
-
-- the leader-fenced follower recovery RPC described in Phase 4, so a caught-up
-  restarted follower can reopen stale reads without waiting for a new applied
-  entry;
-- process-kill tests that deliberately lose the `A-D` suffix, the full seeded
-  crash matrix, and mixed-version capability negotiation;
-- canary measurements and rollout gates.
+- process-epoch stale-read fencing plus a leader ReadIndex recovery RPC carrying
+  the quorum target, leader term, and committed membership identity;
+- snapshot-install epoch invalidation and leadership/membership race checks;
+- per-group dirty-entry, dirty-byte, and dirty-age limits with backpressure and
+  a fail-closed watchdog;
+- `/status` visibility for watermarks, lag age, flush latency/failure, recovery
+  attempts/target/duration, replay count, purge/snapshot waits, and retained-log
+  growth; `/health` returns unavailable after materialization failure;
+- deterministic `A-D` loss across follower, leader, follower-majority, and
+  full-cluster scopes, abrupt child-process exit/reopen, snapshot transfer,
+  purge/reclamation cuts, and recovery races;
+- delayed, reordered, and duplicate Raft delivery plus a 100-seed leader-crash
+  campaign checked for linearizability, exactly-once, no acknowledged write
+  loss, and stale-read minimum-version safety;
+- complete all-target/all-feature suites in default-on and synchronous-override
+  modes, plus release benchmarks with write-path profiling.
 
 ## Objective
 
@@ -42,9 +48,9 @@ result before returning to OpenRaft, but the state WAL may become durable
 shortly afterward. If the node loses that not-yet-durable state, it reconstructs
 the exact state and idempotency results from retained committed log entries.
 
-This plan applies to data groups first. The meta group remains synchronously
-durable until the data-group implementation has passed the crash, replay,
-snapshot, membership, and rolling-upgrade gates in this document.
+This plan applies to data groups. The meta group remains synchronously durable
+after the data-group implementation passes the crash, replay, snapshot, and
+membership gates in this document.
 
 ## Non-goals
 
@@ -419,8 +425,8 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
 - Retain one atomic batch for mutations, sequence result, membership, applied
   record, and recovery hint.
 - Keep meta-group calls on the existing durable wait.
-- Keep this phase opt-in and do not deploy it without the recovery-serving
-  fence.
+- Keep this phase opt-in until the recovery-serving fence is complete; the
+  default-on cut happens only after the later recovery and operations gates.
 
 ### Tests
 
@@ -469,7 +475,7 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
 ### Implementation
 
 - Add the per-group process-epoch readiness state.
-- Add the internal leader-fenced data read/recovery RPC and capability bit.
+- Add the internal leader-fenced data read/recovery RPC.
 - Close stale serving at every group start.
 - Open readiness only after a quorum-fenced target is visibly applied in the
   same epoch and membership/serving authority still matches.
@@ -551,17 +557,13 @@ all three nodes:
   flush, and log growth caused by a stalled `D`.
 - On graceful shutdown and before an incompatible binary upgrade, force
   `D == A` for every group.
-- Version state-machine command/replay semantics, or require backward-compatible
-  evaluation of retained log entries. A new binary must not reinterpret an old
-  CAS/idempotency entry differently.
-- Require recovery-fence capability on all voters before enabling fast mode in
-  a rolling deployment. An older leader causes stale reads to remain closed,
-  not to bypass the fence.
+- New-cluster scope deliberately excludes mixed-version voters, rolling binary
+  replacement, and retained-log evaluation by a different binary version.
 
 ### Exit criteria
 
 - Storage failure is operator-visible and fail-closed.
-- A rolling downgrade to synchronous apply can drain dirty state without data
+- The synchronous emergency override drains dirty state without data
   conversion.
 - Replay compatibility is covered across the oldest supported on-disk/log
   version.
@@ -634,15 +636,16 @@ log durability remains unchanged.
 
 ## Rollout and rollback
 
-1. Land the tracker and metrics with synchronous behavior.
-2. Enable the recovery-serving fence while state is still synchronous; verify
-   it cannot be bypassed and measure recovery availability.
-3. Enable async data state with the folded hint in tests.
-4. Enable async data state for data groups on a small canary after every
-   voter advertises fence capability.
-5. Expand only while `A-D`, replay, log growth, snapshot waits, and stale-read
-   refusals remain bounded.
-6. Keep meta state synchronous.
+1. Every newly created cluster starts with async data-group state and
+   synchronous meta state.
+2. Observe `A-D`, dirty age/bytes, replay, recovery duration, retained-log
+   growth, snapshot/purge waits, stale-read refusals, and `/health` from first
+   traffic.
+3. If a materialization alert fires, stop new traffic, set
+   `DAL_SYNC_MATERIALIZED_STATE=1`, drain until `D == A`, and restart the new
+   cluster synchronously.
+4. A storage instance that cannot drain remains non-serving and is rebuilt from
+   a healthy Raft replica or snapshot; purge is never forced past `D`.
 
 Rollback to synchronous state apply requires no on-disk migration. Stop new
 apply, drain until `D == A`, then restart/flip the mode. If a node cannot drain

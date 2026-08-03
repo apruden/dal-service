@@ -156,6 +156,31 @@ pub struct PlacementQueryReply {
     pub placement: Option<crate::types::Placement>,
 }
 
+/// `MsgType::DataRecoveryFence` — a restarted voter asks the current data-group
+/// leader for a quorum-confirmed applied target. The requester remains fenced
+/// until its visible materialized state reaches the target in the same local
+/// recovery epoch and the leader/membership identity still matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFenceRequest {
+    pub requester: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFence {
+    pub leader: NodeId,
+    pub leader_term: u64,
+    pub membership_log_id: Option<openraft::LogId<NodeId>>,
+    pub voters: Vec<NodeId>,
+    pub target: Option<openraft::LogId<NodeId>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryFenceReply {
+    Fence(RecoveryFence),
+    NotLeader { leader: Option<NodeId> },
+    Rejected(String),
+}
+
 /// Reply to `MsgType::DirectoryQuery`. Only `Value` is authoritative: it is
 /// produced after the local meta node passes ReadIndex. A follower's local
 /// directory is carried solely as a discovery hint so a caller that knows only
@@ -334,6 +359,18 @@ mod tests {
         assert_eq!(
             reply,
             codec::decode::<SubmitReply>(&codec::encode(&reply)).unwrap()
+        );
+
+        let fence = RecoveryFenceReply::Fence(RecoveryFence {
+            leader: 2,
+            leader_term: 4,
+            membership_log_id: Some(log_id(4, 20)),
+            voters: vec![1, 2, 3],
+            target: Some(log_id(4, 24)),
+        });
+        assert_eq!(
+            fence,
+            codec::decode::<RecoveryFenceReply>(&codec::encode(&fence)).unwrap()
         );
     }
 }

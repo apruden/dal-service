@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -66,6 +67,9 @@ impl<C: RaftTypeConfig<NodeId = Nid>> Registry<C> {
 #[derive(Clone, Default)]
 pub struct Faults {
     blocked: Arc<Mutex<HashSet<(Nid, Nid)>>>,
+    delays: Arc<Mutex<HashMap<(Nid, Nid), Duration>>>,
+    duplicated: Arc<Mutex<HashSet<(Nid, Nid)>>>,
+    reordered: Arc<Mutex<HashMap<(Nid, Nid), u64>>>,
 }
 
 impl Faults {
@@ -75,6 +79,23 @@ impl Faults {
 
     pub fn unblock(&self, from: Nid, to: Nid) {
         self.blocked.lock().unwrap().remove(&(from, to));
+    }
+
+    /// Delay every RPC on a directional link.
+    pub fn delay(&self, from: Nid, to: Nid, duration: Duration) {
+        self.delays.lock().unwrap().insert((from, to), duration);
+    }
+
+    /// Deliver every AppendEntries RPC twice. Raft must treat the duplicate as
+    /// idempotent and apply each committed entry only once.
+    pub fn duplicate(&self, from: Nid, to: Nid) {
+        self.duplicated.lock().unwrap().insert((from, to));
+    }
+
+    /// Delay alternating RPCs on a link so concurrently issued messages can
+    /// arrive in the opposite order.
+    pub fn reorder(&self, from: Nid, to: Nid) {
+        self.reordered.lock().unwrap().insert((from, to), 0);
     }
 
     /// Fully isolate a node in both directions.
@@ -87,10 +108,35 @@ impl Faults {
 
     pub fn heal(&self) {
         self.blocked.lock().unwrap().clear();
+        self.delays.lock().unwrap().clear();
+        self.duplicated.lock().unwrap().clear();
+        self.reordered.lock().unwrap().clear();
     }
 
     fn is_blocked(&self, from: Nid, to: Nid) -> bool {
         self.blocked.lock().unwrap().contains(&(from, to))
+    }
+
+    fn is_duplicated(&self, from: Nid, to: Nid) -> bool {
+        self.duplicated.lock().unwrap().contains(&(from, to))
+    }
+
+    fn delay_for(&self, from: Nid, to: Nid) -> Option<Duration> {
+        let explicit = self.delays.lock().unwrap().get(&(from, to)).copied();
+        let reorder = self
+            .reordered
+            .lock()
+            .unwrap()
+            .get_mut(&(from, to))
+            .and_then(|sequence| {
+                *sequence = sequence.saturating_add(1);
+                (*sequence % 2 == 1).then_some(Duration::from_millis(40))
+            });
+        match (explicit, reorder) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
+        }
     }
 }
 
@@ -120,8 +166,10 @@ impl<C: RaftTypeConfig<NodeId = Nid>> ChannelNetworkFactory<C> {
     }
 }
 
-impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetworkFactory<C>
-    for ChannelNetworkFactory<C>
+impl<C> RaftNetworkFactory<C> for ChannelNetworkFactory<C>
+where
+    C: RaftTypeConfig<NodeId = Nid, Node = Node>,
+    C::Entry: Clone,
 {
     type Network = ChannelNetwork<C>;
 
@@ -164,7 +212,11 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> ChannelNetwork<C> {
     }
 }
 
-impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNetwork<C> {
+impl<C> RaftNetwork<C> for ChannelNetwork<C>
+where
+    C: RaftTypeConfig<NodeId = Nid, Node = Node>,
+    C::Entry: Clone,
+{
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<C>,
@@ -173,10 +225,16 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
         }
+        if let Some(delay) = self.faults.delay_for(self.local, self.target) {
+            tokio::time::sleep(delay).await;
+        }
         let raft = self
             .registry
             .get(self.target)
             .ok_or_else(|| self.target_gone())?;
+        if self.faults.is_duplicated(self.local, self.target) {
+            let _ = raft.append_entries(rpc.clone()).await;
+        }
         raft.append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -189,6 +247,9 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
     ) -> Result<VoteResponse<Nid>, RPCError<Nid, Node, RaftError<Nid>>> {
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
+        }
+        if let Some(delay) = self.faults.delay_for(self.local, self.target) {
+            tokio::time::sleep(delay).await;
         }
         let raft = self
             .registry
@@ -209,6 +270,9 @@ impl<C: RaftTypeConfig<NodeId = Nid, Node = Node>> RaftNetwork<C> for ChannelNet
     > {
         if self.faults.is_blocked(self.local, self.target) {
             return Err(self.link_down());
+        }
+        if let Some(delay) = self.faults.delay_for(self.local, self.target) {
+            tokio::time::sleep(delay).await;
         }
         let raft = self
             .registry

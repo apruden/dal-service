@@ -321,7 +321,7 @@ where
         // A snapshot/purge boundary may only discard the replay source after
         // the materialized state through the same log id is WAL-durable.
         self.storage
-            .wait_state_durable(self.group, &log_id)
+            .wait_state_durable_for_purge(self.group, &log_id)
             .await
             .map_err(write_err)?;
         #[cfg(test)]
@@ -518,6 +518,9 @@ mod tests {
             .unwrap()
             .last_purged_log_id;
         assert_eq!(purged, Some(target));
+        let materialized = storage.state_durability(group);
+        assert_eq!(materialized.purge_waits, 1);
+        assert!(materialized.purge_wait_ms >= 100);
     }
 
     #[tokio::test]

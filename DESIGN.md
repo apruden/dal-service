@@ -277,24 +277,29 @@ Implementation notes:
   cross-CF `WriteBatch` as the applied pointer and business mutations. The
   database-wide durability worker WAL-writes atomic log and state batches,
   groups currently active work across Raft groups, and completes Raft log
-  callbacks only after one `flush_wal(true)`. State apply is sync-durable by
-  default. With `DAL_ASYNC_MATERIALIZED_STATE=1`, a data-group apply completes
-  after its atomic batch is visible and the worker advances a separate durable
-  watermark after the shared WAL flush. Pending requests and bytes remain
-  reserved until that flush, so dirty state is bounded. Meta-group apply stays
-  synchronous in both modes.
+  callbacks only after one `flush_wal(true)`. Data-group state apply completes
+  after its atomic batch is visible by default, and the worker advances a
+  separate durable watermark after the shared WAL flush. Per-group dirty
+  entries, bytes, and age are bounded; later apply is backpressured and an
+  expired dirty-age limit poisons storage closed. Meta-group apply always stays
+  synchronous. `DAL_SYNC_MATERIALIZED_STATE=1` is the emergency synchronous
+  override.
 - In asynchronous materialized-state mode, snapshot build and log purge wait
   until the snapshot/purge point is at or below the durable-applied watermark;
   group reclamation first rejects new applies and drains all pending state.
   Any WAL write/flush failure poisons the database-scoped tracker and closes
   client serving. A restarted data group initially refuses follower-local
-  stale reads until it visibly applies a post-start committed entry; a leader
-  may open the process-epoch gate only through its quorum read barrier. Clients
-  encountering a still-fenced follower are redirected to a fresher candidate.
+  stale reads. The current leader performs a quorum read barrier and returns a
+  recovery target containing its term and committed membership identity; the
+  follower opens only after its visible state reaches that target in the same
+  local recovery epoch and the identity is revalidated. Snapshot install starts
+  a new epoch, so an older in-flight fence cannot open the replacement state.
+  Clients encountering a still-fenced follower are redirected to a fresher
+  candidate.
 - A lone write flushes immediately; observing concurrency activates a bounded
   200 microsecond collection window. `DAL_UNIFIED_DURABILITY=0`,
-  `DAL_ADAPTIVE_DURABILITY=0`, and leaving
-  `DAL_ASYNC_MATERIALIZED_STATE` unset retain the durable rollback paths. On
+  `DAL_ADAPTIVE_DURABILITY=0`, and `DAL_SYNC_MATERIALIZED_STATE=1` retain the
+  durable rollback paths. On
   recovery, the folded marker and applied state describe exactly the same
   locally durable prefix; acknowledged entries beyond that prefix remain in
   the majority-durable Raft logs for replay.

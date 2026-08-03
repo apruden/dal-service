@@ -21,6 +21,7 @@ use crate::partition::sm::RocksStateMachine;
 use crate::partition::state_machine::{ApplyResult, DataStateMachine};
 use crate::perf::WriteStage;
 use crate::storage::Storage;
+use crate::transport::raft_wire::{RecoveryFence, RecoveryFenceReply};
 use crate::types::{Consistency, DataRequest, GroupId, Version};
 
 /// Outcome of a write submitted through the serving gate.
@@ -182,11 +183,17 @@ impl PartitionNode {
     /// The committed membership: its log id and the effective voter set. During
     /// joint consensus the voter set is the union of both configs (DESIGN §5.2).
     pub fn committed_config(&self) -> (Option<crate::types::LogId>, Vec<NodeId>) {
+        let (log_id, voters) = self.committed_config_identity();
+        let log_id = log_id.map(|l| crate::types::LogId::new(l.leader_id.term, l.index));
+        (log_id, voters)
+    }
+
+    fn committed_config_identity(
+        &self,
+    ) -> (Option<crate::partition::raft_types::LogId>, Vec<NodeId>) {
         let metrics = self.raft.metrics();
         let sm = metrics.borrow().membership_config.clone();
-        let log_id = sm
-            .log_id()
-            .map(|l| crate::types::LogId::new(l.leader_id.term, l.index));
+        let log_id = *sm.log_id();
         let voters = sm.membership().voter_ids().collect();
         (log_id, voters)
     }
@@ -199,12 +206,117 @@ impl PartitionNode {
         &self,
     ) -> Result<(Option<crate::types::LogId>, Vec<NodeId>)> {
         self.storage.require_serving(self.group)?;
-        self.raft
+        let target = self
+            .raft
             .ensure_linearizable()
             .await
             .map_err(|e| Error::Raft(format!("confirm committed membership: {e}")))?;
-        self.storage.mark_state_recovery_ready(self.group);
+        self.open_state_recovery(target)?;
         Ok(self.committed_config())
+    }
+
+    fn open_state_recovery(
+        &self,
+        target: Option<crate::partition::raft_types::LogId>,
+    ) -> Result<()> {
+        if !self.storage.state_apply_is_async(self.group)
+            || self.storage.state_recovery_ready(self.group)
+        {
+            return Ok(());
+        }
+        let epoch = self.storage.begin_state_recovery(self.group, target);
+        self.storage
+            .mark_state_recovery_ready(self.group, epoch, target.as_ref())
+    }
+
+    /// Issue a current-leader, quorum-confirmed recovery target to a restarted
+    /// voter. The caller must still validate this identity after catching up.
+    pub async fn issue_recovery_fence(&self, requester: NodeId) -> RecoveryFenceReply {
+        if let Err(error) = self.storage.require_serving(self.group) {
+            return RecoveryFenceReply::Rejected(error.to_string());
+        }
+        if self.current_leader() != Some(self.node_id) {
+            return RecoveryFenceReply::NotLeader {
+                leader: self.current_leader(),
+            };
+        }
+        let target = match self.raft.ensure_linearizable().await {
+            Ok(target) => target,
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                return RecoveryFenceReply::NotLeader {
+                    leader: forward.leader_id,
+                };
+            }
+            Err(error) => return RecoveryFenceReply::Rejected(error.to_string()),
+        };
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow().clone();
+        if metrics.current_leader != Some(self.node_id) {
+            return RecoveryFenceReply::NotLeader {
+                leader: metrics.current_leader,
+            };
+        }
+        let (membership_log_id, voters) = self.committed_config_identity();
+        if !voters.contains(&requester) {
+            return RecoveryFenceReply::Rejected(format!(
+                "node {requester} is not a committed voter of {:?}",
+                self.group
+            ));
+        }
+        RecoveryFenceReply::Fence(RecoveryFence {
+            leader: self.node_id,
+            leader_term: metrics.current_term,
+            membership_log_id,
+            voters,
+            target,
+        })
+    }
+
+    /// Apply a leader-issued recovery target to this process epoch. Readiness
+    /// opens only after the exact target is visible and leader/membership
+    /// identity still matches, preventing old in-flight fences from crossing a
+    /// leadership or configuration change.
+    pub async fn apply_recovery_fence(&self, fence: &RecoveryFence) -> Result<()> {
+        self.storage.require_serving(self.group)?;
+        if !self.storage.state_apply_is_async(self.group) {
+            return Ok(());
+        }
+        if self.storage.state_recovery_ready(self.group) {
+            return Ok(());
+        }
+        let epoch = self.storage.begin_state_recovery(self.group, fence.target);
+        self.validate_recovery_fence(fence)?;
+        if let Some(target) = &fence.target {
+            self.storage.wait_state_visible(self.group, target).await?;
+        }
+        self.validate_recovery_fence(fence)?;
+        self.storage
+            .mark_state_recovery_ready(self.group, epoch, fence.target.as_ref())
+    }
+
+    fn validate_recovery_fence(&self, fence: &RecoveryFence) -> Result<()> {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow().clone();
+        if metrics.current_leader != Some(fence.leader) || metrics.current_term != fence.leader_term
+        {
+            return Err(Error::Raft(format!(
+                "recovery fence leader changed: expected {} term {}, observed {:?} term {}",
+                fence.leader, fence.leader_term, metrics.current_leader, metrics.current_term
+            )));
+        }
+        let (membership_log_id, voters) = self.committed_config_identity();
+        if membership_log_id != fence.membership_log_id || voters != fence.voters {
+            return Err(Error::Raft(
+                "recovery fence membership changed while catch-up was in flight".into(),
+            ));
+        }
+        if !voters.contains(&self.node_id) {
+            return Err(Error::Raft(format!(
+                "node {} is not a committed voter of {:?}",
+                self.node_id, self.group
+            )));
+        }
+        Ok(())
     }
 
     /// The committed voter set as a comparable set (learners ignored).
@@ -218,7 +330,7 @@ impl PartitionNode {
         let _profile = crate::perf::timer(WriteStage::RaftClientWrite);
         match self.raft.client_write(req).await {
             Ok(resp) => {
-                self.storage.mark_state_recovery_ready(self.group);
+                self.open_state_recovery(Some(resp.log_id))?;
                 Ok(WriteOutcome::Applied(resp.data))
             }
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
@@ -242,8 +354,8 @@ impl PartitionNode {
         let min_version = match consistency {
             Consistency::Linearizable => {
                 return match self.raft.ensure_linearizable().await {
-                    Ok(_) => {
-                        self.storage.mark_state_recovery_ready(self.group);
+                    Ok(target) => {
+                        self.open_state_recovery(target)?;
                         Ok(ReadOutcome::Value(
                             self.data.get(self.storage.as_ref(), key)?,
                         ))
@@ -279,7 +391,7 @@ impl PartitionNode {
         }
         if leader == Some(self.node_id) {
             match self.raft.ensure_linearizable().await {
-                Ok(_) => self.storage.mark_state_recovery_ready(self.group),
+                Ok(target) => self.open_state_recovery(target)?,
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                     return Ok(ReadOutcome::TooStale {
                         leader: f.leader_id,
@@ -499,6 +611,42 @@ mod tests {
         panic!("no active leader accepted request {req:?}");
     }
 
+    async fn fence_node(nodes: &[PartitionNode], target: usize) {
+        for _ in 0..200 {
+            if let Some(leader) = leader_idx(nodes)
+                && let RecoveryFenceReply::Fence(fence) = nodes[leader]
+                    .issue_recovery_fence(nodes[target].node_id())
+                    .await
+                && nodes[target].apply_recovery_fence(&fence).await.is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "recovery fence did not open node {}",
+            nodes[target].node_id()
+        );
+    }
+
+    async fn fence_active_node(nodes: &[Option<PartitionNode>], target: usize) {
+        for _ in 0..240 {
+            if let Some(leader) = active_leader_idx(nodes) {
+                let leader_node = nodes[leader].as_ref().unwrap();
+                let target_node = nodes[target].as_ref().unwrap();
+                if let RecoveryFenceReply::Fence(fence) = leader_node
+                    .issue_recovery_fence(target_node.node_id())
+                    .await
+                    && target_node.apply_recovery_fence(&fence).await.is_ok()
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("recovery fence did not open active node {target}");
+    }
+
     #[derive(Clone)]
     struct DurablePrefix {
         state: Vec<(Vec<u8>, Vec<u8>)>,
@@ -710,7 +858,8 @@ mod tests {
 
         // Retain an acknowledged value across a follower restart. Async state
         // starts every process epoch fenced even when the recovered state is
-        // fully durable; a subsequent committed apply reopens stale reads.
+        // fully durable; a leader-fenced target reopens stale reads without a
+        // subsequent user mutation.
         let retained = write_to_leader(&nodes, &put(6, b"retained", b"value", None)).await;
         let retained_version = match retained {
             ApplyResult::Decided(MutationResult::Applied { version }) => version,
@@ -763,18 +912,27 @@ mod tests {
             ReadOutcome::TooStale { .. }
         ));
 
+        fence_node(&nodes, follower).await;
+        assert!(storages[follower].state_recovery_ready(TEST_GROUP));
+        assert_eq!(
+            nodes[follower]
+                .read(b"retained", Consistency::Stale { min_version: None })
+                .await
+                .unwrap(),
+            ReadOutcome::Value(Some((retained_version, b"value".to_vec())))
+        );
+
         let after_restart =
             write_to_leader(&nodes, &put(7, b"after-restart", b"ready", None)).await;
         assert!(matches!(
             after_restart,
             ApplyResult::Decided(MutationResult::Applied { .. })
         ));
-        eventually("restarted follower recovery gate opens", || {
-            storages[follower].state_recovery_ready(TEST_GROUP)
-                && matches!(
-                    nodes[follower].local_get(b"after-restart").unwrap(),
-                    Some((_, ref value)) if value == b"ready"
-                )
+        eventually("restarted follower applies later write", || {
+            matches!(
+                nodes[follower].local_get(b"after-restart").unwrap(),
+                Some((_, ref value)) if value == b"ready"
+            )
         })
         .await;
         assert_eq!(
@@ -813,6 +971,148 @@ mod tests {
 
         for idx in survivors {
             nodes[idx].shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_fence_rejects_leadership_and_membership_races() {
+        // A fence from an isolated old leader cannot open a follower after a
+        // higher-term replacement is elected.
+        let cluster = AsyncCluster::new();
+        let mut nodes = Vec::new();
+        for idx in 0..3 {
+            nodes.push(cluster.start(idx).await.0);
+        }
+        nodes[0].initialize(&VOTERS).await.unwrap();
+        eventually("leader election", || leader_idx(&nodes).is_some()).await;
+        let _ = write_to_leader(&nodes, &put(1, b"race", b"value", None)).await;
+        let old_leader = leader_idx(&nodes).unwrap();
+        let target = (0..nodes.len()).find(|&idx| idx != old_leader).unwrap();
+        let old_fence = match nodes[old_leader]
+            .issue_recovery_fence(nodes[target].node_id())
+            .await
+        {
+            RecoveryFenceReply::Fence(fence) => fence,
+            other => panic!("leader did not issue recovery fence: {other:?}"),
+        };
+        let peers: Vec<_> = VOTERS
+            .iter()
+            .copied()
+            .filter(|id| *id != nodes[old_leader].node_id())
+            .collect();
+        cluster.faults.isolate(nodes[old_leader].node_id(), &peers);
+        eventually("replacement leader", || {
+            nodes.iter().enumerate().any(|(idx, node)| {
+                idx != old_leader && node.current_leader() == Some(node.node_id())
+            })
+        })
+        .await;
+        assert!(
+            nodes[target]
+                .apply_recovery_fence(&old_fence)
+                .await
+                .is_err()
+        );
+        cluster.faults.heal();
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+
+        // A fence naming an old committed configuration is invalid after the
+        // requester observes a newer configuration, even when it remains a
+        // voter in that configuration.
+        let cluster = AsyncCluster::new();
+        let mut nodes = Vec::new();
+        for idx in 0..3 {
+            nodes.push(cluster.start(idx).await.0);
+        }
+        nodes[0].initialize(&VOTERS).await.unwrap();
+        eventually("leader election", || leader_idx(&nodes).is_some()).await;
+        let leader = leader_idx(&nodes).unwrap();
+        let target = (0..nodes.len()).find(|&idx| idx != leader).unwrap();
+        let removed = (0..nodes.len())
+            .find(|&idx| idx != leader && idx != target)
+            .unwrap();
+        let fence = match nodes[leader]
+            .issue_recovery_fence(nodes[target].node_id())
+            .await
+        {
+            RecoveryFenceReply::Fence(fence) => fence,
+            other => panic!("leader did not issue recovery fence: {other:?}"),
+        };
+        let retained: Vec<_> = VOTERS
+            .iter()
+            .copied()
+            .filter(|id| *id != nodes[removed].node_id())
+            .collect();
+        nodes[leader].change_voters(&retained).await.unwrap();
+        eventually("retained voter observes new membership", || {
+            nodes[target].committed_voter_set()
+                == retained
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+        })
+        .await;
+        assert!(nodes[target].apply_recovery_fence(&fence).await.is_err());
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_state_converges_with_delay_reorder_and_duplicate_delivery() {
+        let cluster = AsyncCluster::new();
+        let mut nodes = Vec::new();
+        for idx in 0..3 {
+            nodes.push(cluster.start(idx).await.0);
+        }
+        nodes[0].initialize(&VOTERS).await.unwrap();
+        eventually("leader election", || leader_idx(&nodes).is_some()).await;
+        let leader = leader_idx(&nodes).unwrap();
+        let followers: Vec<_> = (0..nodes.len()).filter(|&idx| idx != leader).collect();
+        let leader_id = nodes[leader].node_id();
+        cluster
+            .faults
+            .duplicate(leader_id, nodes[followers[0]].node_id());
+        cluster
+            .faults
+            .reorder(leader_id, nodes[followers[0]].node_id());
+        cluster.faults.delay(
+            leader_id,
+            nodes[followers[1]].node_id(),
+            Duration::from_millis(5),
+        );
+
+        let mut last = None;
+        for sequence in 1..=20 {
+            let value = format!("value-{sequence}").into_bytes();
+            let request = put(sequence, b"faulted", &value, None);
+            last = Some((
+                request.clone(),
+                value,
+                write_to_leader(&nodes, &request).await,
+            ));
+        }
+        let (last_request, last_value, last_result) = last.unwrap();
+        assert_eq!(
+            write_to_leader(&nodes, &last_request).await,
+            match last_result {
+                ApplyResult::Decided(result) => ApplyResult::Replayed(result),
+                other => panic!("unexpected final apply result: {other:?}"),
+            }
+        );
+        cluster.faults.heal();
+        eventually("faulted replicas converge", || {
+            nodes.iter().all(|node| {
+                node.local_get(b"faulted")
+                    .unwrap()
+                    .is_some_and(|(_, ref value)| value == &last_value)
+            })
+        })
+        .await;
+        for node in nodes {
+            node.shutdown().await.unwrap();
         }
     }
 
@@ -937,6 +1237,9 @@ mod tests {
                 })
             })
             .await;
+            for &idx in &targets {
+                fence_active_node(&nodes, idx).await;
+            }
             eventually("replayed replicas pass their recovery fence", || {
                 targets.iter().all(|&idx| {
                     storages[idx]

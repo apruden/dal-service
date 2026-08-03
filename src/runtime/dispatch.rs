@@ -25,7 +25,7 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LearnerReply, LeaveBody, ObservationBody,
-    PlacementQueryBody, PlacementQueryReply, SubmitReply,
+    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest, SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
 
@@ -115,6 +115,7 @@ impl RootDispatch {
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
             MsgType::PlacementQuery => self.serve_placement_query(req).await,
             MsgType::DirectoryQuery => self.serve_directory_query(req).await,
+            MsgType::DataRecoveryFence => self.serve_recovery_fence(req).await,
             MsgType::Heartbeat => self.serve_heartbeat(req),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
             // Client/reply types are handled before reaching serve_control (or
@@ -315,6 +316,25 @@ impl RootDispatch {
             _ => None,
         };
         self.reply(&req, codec::encode(&PlacementQueryReply { placement }))
+    }
+
+    async fn serve_recovery_fence(&self, req: Envelope) -> Envelope {
+        let reply = match (
+            req.group_id,
+            codec::decode::<RecoveryFenceRequest>(&req.payload),
+        ) {
+            (GroupId::Data(partition), Ok(body)) => {
+                let node = self.partitions.read().unwrap().get(&partition).cloned();
+                match node {
+                    Some(node) => node.issue_recovery_fence(body.requester).await,
+                    None => RecoveryFenceReply::Rejected(format!(
+                        "partition {partition} is not hosted on this node"
+                    )),
+                }
+            }
+            _ => RecoveryFenceReply::Rejected("malformed recovery-fence request".into()),
+        };
+        self.reply(&req, codec::encode(&reply))
     }
 
     /// Return an authoritative directory only from the current meta leader

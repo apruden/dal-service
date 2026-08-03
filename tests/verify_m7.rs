@@ -13,6 +13,7 @@ use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::partition::{ApplyResult, TypeConfig};
 use dal::storage::Storage;
+use dal::transport::raft_wire::RecoveryFenceReply;
 use dal::types::{
     BootstrapGroup, Consistency, DataOp, DataRequest, GroupId, IfVersion, KeyPresence,
     MutationResult,
@@ -112,6 +113,36 @@ async fn do_read(s: &Shared, key: &[u8]) -> Option<Option<(u64, Vec<u8>)>> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     None
+}
+
+async fn stale_read_observer(s: Arc<Shared>) {
+    for _ in 0..24 {
+        for key_index in 0..KEYS {
+            let key = key_bytes(key_index);
+            let min_version = s
+                .acked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(acked_key, version)| (acked_key == &key).then_some(*version))
+                .max();
+            for (idx, node) in s.nodes.iter().enumerate() {
+                if !s.alive[idx].load(Ordering::SeqCst) {
+                    continue;
+                }
+                if let Ok(ReadOutcome::Value(value)) =
+                    node.read(&key, Consistency::Stale { min_version }).await
+                    && let (Some(minimum), Some((observed, _))) = (min_version, value)
+                {
+                    assert!(
+                        observed >= minimum,
+                        "stale read returned version {observed} below requested {minimum}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// One client: a mix of puts (mostly unconditional, some create-only) and reads
@@ -242,6 +273,37 @@ async fn run_once(seed: u64) {
     });
     await_leader(&shared).await;
 
+    // Open every process epoch through the same leader-issued quorum target
+    // used in production before exercising follower-local reads.
+    let leader = shared.leader().unwrap();
+    for target in 0..shared.nodes.len() {
+        let fence = match shared.nodes[leader]
+            .issue_recovery_fence(shared.nodes[target].node_id())
+            .await
+        {
+            RecoveryFenceReply::Fence(fence) => fence,
+            other => panic!("verification leader did not issue recovery fence: {other:?}"),
+        };
+        shared.nodes[target]
+            .apply_recovery_fence(&fence)
+            .await
+            .unwrap();
+    }
+
+    // Every seeded history now includes duplicate AppendEntries delivery,
+    // alternating reordering delay, and a separately delayed follower.
+    let followers: Vec<_> = (0..shared.nodes.len())
+        .filter(|&idx| idx != leader)
+        .collect();
+    let leader_id = shared.nodes[leader].node_id();
+    faults.duplicate(leader_id, shared.nodes[followers[0]].node_id());
+    faults.reorder(leader_id, shared.nodes[followers[0]].node_id());
+    faults.delay(
+        leader_id,
+        shared.nodes[followers[1]].node_id(),
+        Duration::from_millis(3),
+    );
+
     // Fault injection: after a short delay, crash the current leader once. The
     // surviving 2/3 keeps quorum, so acknowledged writes must not be lost.
     let fault = {
@@ -266,9 +328,11 @@ async fn run_once(seed: u64) {
             async move { client(s, 0xC000 + c, rng).await },
         ));
     }
+    let stale_observer = tokio::spawn(stale_read_observer(shared.clone()));
     for t in tasks {
         t.await.unwrap();
     }
+    stale_observer.await.unwrap();
     fault.await.unwrap();
 
     check_oracles(&shared).await;

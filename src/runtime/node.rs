@@ -44,7 +44,7 @@ use crate::transport::{
     codec::{Envelope, MsgType},
     raft_wire::{
         BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, PlacementQueryBody,
-        PlacementQueryReply,
+        PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
     },
 };
 use crate::types::{
@@ -493,6 +493,15 @@ impl Node {
             readiness.clone(),
         );
         tasks.push(tokio::spawn(driver.run()));
+        tasks.push(tokio::spawn(recovery_fence_driver(
+            cfg.node_id,
+            cfg.cluster_id,
+            partitions.clone(),
+            control.clone(),
+            addrs.clone(),
+            directory_timeout,
+            identity_gate.clone(),
+        )));
 
         // Read-only HTTP admin plane. Its listener was bound before runtime
         // assembly; the serving task is aborted on shutdown with the other
@@ -819,6 +828,77 @@ impl Node {
     }
 }
 
+/// Reopen async follower-local reads without waiting for a user mutation. Each
+/// hosted partition independently obtains a current-leader quorum fence and
+/// applies it only if the local term, membership, and recovery epoch still
+/// match after catch-up.
+async fn recovery_fence_driver(
+    node_id: NodeId,
+    cluster_id: ClusterId,
+    partitions: PartitionMap,
+    control: ZmqTransport,
+    addrs: AddrBook,
+    request_timeout: Duration,
+    identity_gate: ProcessIdentityGate,
+) {
+    let poll = Duration::from_millis(100);
+    loop {
+        if !identity_gate.is_open() {
+            return;
+        }
+        let nodes: Vec<Arc<PartitionNode>> = partitions.read().unwrap().values().cloned().collect();
+        let mut recoveries = FuturesUnordered::new();
+        for node in nodes {
+            let materialized = node.materialized_state_status();
+            if materialized.recovery_ready || materialized.failed.is_some() {
+                continue;
+            }
+            let Some(leader) = node.current_leader() else {
+                continue;
+            };
+            let control = control.clone();
+            let addrs = addrs.clone();
+            recoveries.push(async move {
+                let reply = if leader == node_id {
+                    node.issue_recovery_fence(node_id).await
+                } else {
+                    let Some(addr) = addrs.control(leader) else {
+                        return;
+                    };
+                    let request = Envelope::new(
+                        cluster_id,
+                        MsgType::DataRecoveryFence,
+                        node.group(),
+                        0,
+                        crate::codec::encode(&RecoveryFenceRequest { requester: node_id }),
+                    );
+                    let Ok(envelope) = control.call(&addr, request).await else {
+                        return;
+                    };
+                    if envelope.cluster_id != cluster_id
+                        || envelope.msg_type != MsgType::DataRecoveryFence
+                        || envelope.group_id != node.group()
+                    {
+                        return;
+                    }
+                    let Ok(reply) = crate::codec::decode::<RecoveryFenceReply>(&envelope.payload)
+                    else {
+                        return;
+                    };
+                    reply
+                };
+                if let RecoveryFenceReply::Fence(fence) = reply {
+                    let _ =
+                        tokio::time::timeout(request_timeout, node.apply_recovery_fence(&fence))
+                            .await;
+                }
+            });
+        }
+        while recoveries.next().await.is_some() {}
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// Builds the read-only `/status` snapshot from node-local state. Holds the same
 /// shared handles as the node, so the HTTP task sees live partition membership.
 struct NodeStatus {
@@ -849,6 +929,15 @@ impl StatusSource for NodeStatus {
                     let committed = node.committed_voter_set();
                     let leader = node.current_leader();
                     let materialized = node.materialized_state_status();
+                    let last_log_index = node.raft().metrics().borrow().last_log_index;
+                    let retained_log_entries = match (
+                        last_log_index,
+                        materialized.durable.map(|log_id| log_id.index),
+                    ) {
+                        (Some(last), Some(durable)) => last.saturating_sub(durable),
+                        (Some(last), None) => last.saturating_add(1),
+                        (None, _) => 0,
+                    };
                     let role = if leader == Some(self.node_id) {
                         Role::Leader
                     } else if committed.contains(&self.node_id) {
@@ -873,7 +962,23 @@ impl StatusSource for NodeStatus {
                         materialized_durable: materialized.durable.map(|log_id| log_id.index),
                         materialized_pending_entries: materialized.pending_entries,
                         materialized_pending_bytes: materialized.pending_bytes,
+                        materialized_oldest_pending_ms: materialized.oldest_pending_ms,
+                        materialized_last_flush_latency_ms: materialized.last_flush_latency_ms,
+                        materialized_max_flush_latency_ms: materialized.max_flush_latency_ms,
+                        materialized_flush_failures: materialized.flush_failures,
                         materialized_recovery_ready: materialized.recovery_ready,
+                        materialized_recovery_epoch: materialized.recovery_epoch,
+                        materialized_recovery_target: materialized
+                            .recovery_target
+                            .map(|log_id| log_id.index),
+                        materialized_recovery_attempts: materialized.recovery_attempts,
+                        materialized_recovery_duration_ms: materialized.recovery_duration_ms,
+                        materialized_replayed_entries: materialized.replayed_entries,
+                        materialized_purge_waits: materialized.purge_waits,
+                        materialized_purge_wait_ms: materialized.purge_wait_ms,
+                        materialized_snapshot_waits: materialized.snapshot_waits,
+                        materialized_snapshot_wait_ms: materialized.snapshot_wait_ms,
+                        materialized_retained_log_entries: retained_log_entries,
                         materialized_failed: materialized.failed.is_some(),
                         committed_voters: committed.into_iter().collect(),
                         serving: node.is_serving(),

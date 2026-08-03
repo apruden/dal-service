@@ -15,6 +15,7 @@ use dal::partition::ApplyResult;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use dal::storage::Storage;
+use dal::transport::raft_wire::RecoveryFenceReply;
 use dal::types::{BootstrapGroup, Consistency, DataOp, DataRequest, GroupId, MutationResult};
 
 use tempfile::TempDir;
@@ -114,6 +115,21 @@ async fn bootstrapped() -> (Harness, Vec<PartitionNode>) {
     (h, nodes)
 }
 
+async fn fence_follower(nodes: &[PartitionNode], target: usize) {
+    for _ in 0..200 {
+        if let Some(leader) = leader_idx(nodes)
+            && let RecoveryFenceReply::Fence(fence) = nodes[leader]
+                .issue_recovery_fence(nodes[target].node_id())
+                .await
+            && nodes[target].apply_recovery_fence(&fence).await.is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("follower recovery fence did not open");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_write_and_linearizable_read() {
     let (_h, nodes) = bootstrapped().await;
@@ -162,6 +178,7 @@ async fn follower_serves_stale_read() {
             && nodes[fi].current_leader().is_some()
     })
     .await;
+    fence_follower(&nodes, fi).await;
 
     // Under linearizable this same follower redirects (see the read test above);
     // a stale read serves it locally with no ReadIndex.

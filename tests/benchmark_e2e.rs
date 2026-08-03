@@ -38,9 +38,10 @@
 //! Adaptive collection is default; `DAL_ADAPTIVE_DURABILITY=0` restores the
 //! fixed collection window.
 //!
-//! To measure async materialized state, keep the unified worker enabled and run:
-//!   DAL_ASYNC_MATERIALIZED_STATE=0 ... (apply waits for state WAL durability)
-//!   DAL_ASYNC_MATERIALIZED_STATE=1 ... (apply returns after state visibility)
+//! Async data-group materialization is the default. To measure the synchronous
+//! emergency mode, keep the unified worker enabled and run:
+//!   default ...                         (apply returns after state visibility)
+//!   DAL_SYNC_MATERIALIZED_STATE=1 ...  (apply waits for state WAL durability)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -330,8 +331,14 @@ async fn end_to_end_benchmark_three_nodes() {
         std::env::var("DAL_ADAPTIVE_DURABILITY").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     );
-    let async_materialized_state =
-        unified_durability && env_enabled("DAL_ASYNC_MATERIALIZED_STATE");
+    let sync_materialized_state = env_enabled("DAL_SYNC_MATERIALIZED_STATE")
+        || matches!(
+            std::env::var("DAL_ASYNC_MATERIALIZED_STATE")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false") | Some("off")
+        );
+    let async_materialized_state = unified_durability && !sync_materialized_state;
 
     println!("\n=== dal end-to-end benchmark (3 nodes over ZeroMQ inproc) ===");
     println!(
@@ -386,7 +393,7 @@ async fn end_to_end_benchmark_three_nodes() {
         },
     );
     println!(
-        "  materialized-state reply: {} (DAL_ASYNC_MATERIALIZED_STATE)",
+        "  materialized-state reply: {} (default async; DAL_SYNC_MATERIALIZED_STATE=1 overrides)",
         if async_materialized_state {
             "after visibility; WAL durability is asynchronous"
         } else {

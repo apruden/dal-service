@@ -577,14 +577,30 @@ async fn http_status_reports_node_local_view() {
         h.await.unwrap().unwrap();
     }
 
-    // /health is a bare liveness probe.
+    // /health fails closed if asynchronous materialization reports a storage
+    // failure; the healthy cluster starts available.
     let health = http_get(&http_addr, "/health");
     assert!(health.starts_with("HTTP/1.1 200"), "health: {health}");
 
-    // /status reports node 1's local view: it runs meta and hosts partition 0.
-    let raw = http_get(&http_addr, "/status");
-    let body = raw.split_once("\r\n\r\n").expect("http body").1;
-    let status: ClusterStatus = serde_json::from_str(body).unwrap();
+    // /status reports node 1's local view. The production recovery driver must
+    // obtain a leader-issued quorum target for this process epoch even when no
+    // user mutation is needed to make progress.
+    let mut ready_status = None;
+    for _ in 0..40 {
+        let raw = http_get(&http_addr, "/status");
+        let body = raw.split_once("\r\n\r\n").expect("http body").1;
+        let status: ClusterStatus = serde_json::from_str(body).unwrap();
+        if status
+            .partitions
+            .iter()
+            .any(|partition| partition.partition == 0 && partition.materialized_recovery_ready)
+        {
+            ready_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = ready_status.expect("recovery-fence driver did not open partition 0");
     assert_eq!(status.node_id, 1);
     assert!(status.meta.is_some(), "node 1 runs the meta group");
     let p0 = status

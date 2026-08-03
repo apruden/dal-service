@@ -63,6 +63,9 @@ pub enum MsgType {
     /// Unlike `MetaQuery`, this reply is authoritative and may update the
     /// runtime address book and process registration binding.
     DirectoryQuery = 15,
+    /// Peer-control: obtain a quorum-fenced recovery target from the current
+    /// data-group leader before reopening follower-local reads.
+    DataRecoveryFence = 16,
 }
 
 impl MsgType {
@@ -84,6 +87,7 @@ impl MsgType {
             13 => MsgType::BootstrapStatus,
             14 => MsgType::PlacementQuery,
             15 => MsgType::DirectoryQuery,
+            16 => MsgType::DataRecoveryFence,
             _ => return None,
         })
     }
@@ -114,6 +118,7 @@ impl MsgType {
             // scale with cluster size. Keep the control-plane bound explicit
             // without constraining it to the tiny command-body limit.
             MsgType::DirectoryQuery => 4 * MIB,
+            MsgType::DataRecoveryFence => 4 * KIB,
         }
     }
 
@@ -136,6 +141,7 @@ impl MsgType {
                 | MsgType::BootstrapStatus
                 | MsgType::PlacementQuery
                 | MsgType::DirectoryQuery
+                | MsgType::DataRecoveryFence
         )
     }
 }
@@ -423,6 +429,7 @@ mod tests {
             MsgType::LeaveRequest,
             MsgType::AbortPlanRequest,
             MsgType::DirectoryQuery,
+            MsgType::DataRecoveryFence,
         ] {
             let e = env(t, GroupId::Meta, b"body".to_vec());
             assert_eq!(e, Envelope::decode(&e.encode()).unwrap());

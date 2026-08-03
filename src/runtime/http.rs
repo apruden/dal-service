@@ -56,8 +56,22 @@ pub struct PartitionStatus {
     pub materialized_durable: Option<u64>,
     pub materialized_pending_entries: usize,
     pub materialized_pending_bytes: usize,
+    pub materialized_oldest_pending_ms: Option<u64>,
+    pub materialized_last_flush_latency_ms: Option<u64>,
+    pub materialized_max_flush_latency_ms: u64,
+    pub materialized_flush_failures: u64,
     /// Whether this process epoch may serve local/stale state after recovery.
     pub materialized_recovery_ready: bool,
+    pub materialized_recovery_epoch: u64,
+    pub materialized_recovery_target: Option<u64>,
+    pub materialized_recovery_attempts: u64,
+    pub materialized_recovery_duration_ms: Option<u64>,
+    pub materialized_replayed_entries: u64,
+    pub materialized_purge_waits: u64,
+    pub materialized_purge_wait_ms: u64,
+    pub materialized_snapshot_waits: u64,
+    pub materialized_snapshot_wait_ms: u64,
+    pub materialized_retained_log_entries: u64,
     pub materialized_failed: bool,
     pub committed_voters: Vec<NodeId>,
     pub serving: bool,
@@ -88,8 +102,19 @@ async fn status(State(src): State<Arc<dyn StatusSource>>) -> Json<ClusterStatus>
     Json(src.status())
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(
+    State(src): State<Arc<dyn StatusSource>>,
+) -> (axum::http::StatusCode, &'static str) {
+    if src
+        .status()
+        .partitions
+        .iter()
+        .any(|partition| partition.materialized_failed)
+    {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "failed")
+    } else {
+        (axum::http::StatusCode::OK, "ok")
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +146,21 @@ mod tests {
                     materialized_durable: Some(9),
                     materialized_pending_entries: 1,
                     materialized_pending_bytes: 128,
+                    materialized_oldest_pending_ms: Some(4),
+                    materialized_last_flush_latency_ms: Some(3),
+                    materialized_max_flush_latency_ms: 7,
+                    materialized_flush_failures: 0,
                     materialized_recovery_ready: true,
+                    materialized_recovery_epoch: 2,
+                    materialized_recovery_target: Some(10),
+                    materialized_recovery_attempts: 1,
+                    materialized_recovery_duration_ms: Some(5),
+                    materialized_replayed_entries: 2,
+                    materialized_purge_waits: 1,
+                    materialized_purge_wait_ms: 2,
+                    materialized_snapshot_waits: 1,
+                    materialized_snapshot_wait_ms: 3,
+                    materialized_retained_log_entries: 1,
                     materialized_failed: false,
                     committed_voters: vec![7, 8, 9],
                     serving: true,
@@ -129,6 +168,15 @@ mod tests {
                 }],
                 directory: Vec::new(),
             }
+        }
+    }
+
+    struct FailedStatus;
+    impl StatusSource for FailedStatus {
+        fn status(&self) -> ClusterStatus {
+            let mut status = StubStatus.status();
+            status.partitions[0].materialized_failed = true;
+            status
         }
     }
 
@@ -140,6 +188,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_fails_closed_with_materialization_failure() {
+        let app = router(Arc::new(FailedStatus));
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -57,7 +57,7 @@ impl MetaRaftStateMachine {
         let (last_log_id, membership) = self.read_applied()?;
         if let Some(log_id) = &last_log_id {
             self.storage
-                .wait_state_durable(GroupId::Meta, log_id)
+                .wait_state_durable_for_snapshot(GroupId::Meta, log_id)
                 .await
                 .map_err(write_err)?;
         }

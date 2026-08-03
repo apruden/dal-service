@@ -186,7 +186,7 @@ impl RocksStateMachine {
         let (last_log_id, membership) = self.read_applied()?;
         if let Some(log_id) = &last_log_id {
             self.storage
-                .wait_state_durable(self.group, log_id)
+                .wait_state_durable_for_snapshot(self.group, log_id)
                 .await
                 .map_err(write_err)?;
         }
@@ -401,6 +401,63 @@ mod tests {
 
         let snapshot = snapshot.await.unwrap().unwrap();
         assert_eq!(snapshot.meta.last_log_id, Some(log_id(10)));
-        assert_eq!(storage.state_durability(group).durable, Some(log_id(10)));
+        let materialized = storage.state_durability(group);
+        assert_eq!(materialized.durable, Some(log_id(10)));
+        assert_eq!(materialized.snapshot_waits, 1);
+        assert!(materialized.snapshot_wait_ms >= 100);
+    }
+
+    #[tokio::test]
+    async fn snapshot_transfer_from_a_dirty_source_installs_a_durable_fenced_prefix() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(
+            Storage::open_async_test(source_dir.path(), Duration::from_millis(150)).unwrap(),
+        );
+        let group = GroupId::Data(6);
+        source.ensure_group(group).unwrap();
+        let mut source_sm = RocksStateMachine::new(source.clone(), group);
+        source_sm
+            .apply_coalesced(vec![entry(
+                20,
+                1,
+                DataOp::Put {
+                    key: b"snapshot-key".to_vec(),
+                    value: b"snapshot-value".to_vec(),
+                    if_version: None,
+                },
+            )])
+            .await
+            .unwrap();
+        let before = source.state_durability(group);
+        assert!(before.visible > before.durable);
+
+        let mut builder = source_sm.clone();
+        let snapshot = builder.build_snapshot().await.unwrap();
+        assert_eq!(source.state_durability(group).durable, Some(log_id(20)));
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = Arc::new(
+            Storage::open_async_test(target_dir.path(), Duration::from_millis(150)).unwrap(),
+        );
+        target.ensure_group(group).unwrap();
+        let mut target_sm = RocksStateMachine::new(target.clone(), group);
+        target_sm
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            DataStateMachine::new(group)
+                .get(target.as_ref(), b"snapshot-key")
+                .unwrap(),
+            Some((20, b"snapshot-value".to_vec()))
+        );
+        let installed = target.state_durability(group);
+        assert_eq!(installed.visible, Some(log_id(20)));
+        assert_eq!(installed.durable, Some(log_id(20)));
+        assert!(
+            !installed.recovery_ready,
+            "snapshot installation must still require a current leader fence"
+        );
     }
 }
