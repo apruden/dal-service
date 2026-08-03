@@ -37,12 +37,6 @@ type RaftApplied = (
     openraft::StoredMembership<u64, openraft::BasicNode>,
 );
 
-fn async_data_state_enabled(async_setting: Option<&str>, sync_override: Option<&str>) -> bool {
-    let enabled = |value: Option<&str>| matches!(value, Some("1") | Some("true") | Some("on"));
-    let disabled = |value: Option<&str>| matches!(value, Some("0") | Some("false") | Some("off"));
-    !enabled(sync_override) && !disabled(async_setting)
-}
-
 /// The node identity record persisted in the default CF. Opening a data dir
 /// whose identity mismatches the config is a hard error (DESIGN §12.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,33 +71,12 @@ impl Storage {
         path: impl AsRef<Path>,
         durability_config: DurabilityConfig,
     ) -> Result<Storage> {
-        let async_setting = std::env::var("DAL_ASYNC_MATERIALIZED_STATE").ok();
-        let sync_override = std::env::var("DAL_SYNC_MATERIALIZED_STATE").ok();
-        // New clusters use asynchronous data-group materialization by default.
-        // Meta state remains synchronous in `ApplyDurabilityRegistry::async_for`.
-        // Operators retain an explicit, no-migration synchronous escape hatch.
-        let async_data_state =
-            async_data_state_enabled(async_setting.as_deref(), sync_override.as_deref());
-        Self::open_with_options(path, durability_config, async_data_state)
-    }
-
-    fn open_with_options(
-        path: impl AsRef<Path>,
-        durability_config: DurabilityConfig,
-        async_data_state: bool,
-    ) -> Result<Storage> {
-        Self::open_with_limits(
-            path,
-            durability_config,
-            async_data_state,
-            ApplyDurabilityLimits::default(),
-        )
+        Self::open_with_limits(path, durability_config, ApplyDurabilityLimits::default())
     }
 
     fn open_with_limits(
         path: impl AsRef<Path>,
         durability_config: DurabilityConfig,
-        async_data_state: bool,
         apply_limits: ApplyDurabilityLimits,
     ) -> Result<Storage> {
         let path = path.as_ref().to_path_buf();
@@ -122,10 +95,7 @@ impl Storage {
             .collect();
 
         let db = Arc::new(Db::open_cf_descriptors(&opts, &path, descriptors)?);
-        let apply_durability = Arc::new(ApplyDurabilityRegistry::with_limits(
-            async_data_state,
-            apply_limits,
-        ));
+        let apply_durability = Arc::new(ApplyDurabilityRegistry::with_limits(apply_limits));
         ApplyDurabilityRegistry::spawn_watchdog(&apply_durability)?;
         let write_db = db.clone();
         let flush_db = db.clone();
@@ -164,11 +134,11 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_async_test(
+    pub(crate) fn open_delayed_test(
         path: impl AsRef<Path>,
         flush_delay: std::time::Duration,
     ) -> Result<Storage> {
-        Self::open_with_options(
+        Self::open_with_durability(
             path,
             DurabilityConfig {
                 max_pending_requests: 8,
@@ -176,13 +146,7 @@ impl Storage {
                 max_batch_delay: flush_delay,
                 adaptive_batching: false,
             },
-            true,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open_sync_test(path: impl AsRef<Path>) -> Result<Storage> {
-        Self::open_with_options(path, DurabilityConfig::default(), false)
     }
 
     #[cfg(test)]
@@ -191,7 +155,7 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_async_limited_test(
+    pub(crate) fn open_limited_test(
         path: impl AsRef<Path>,
         flush_delay: std::time::Duration,
         limits: ApplyDurabilityLimits,
@@ -204,7 +168,6 @@ impl Storage {
                 max_batch_delay: flush_delay,
                 adaptive_batching: false,
             },
-            true,
             limits,
         )
     }
@@ -548,9 +511,8 @@ impl Storage {
             .map_err(Error::Io)
     }
 
-    /// Enqueue an atomic state-machine batch. Data groups may return at the
-    /// RocksDB-visible boundary when async materialization is enabled; meta
-    /// groups and the explicit synchronous override wait for WAL durability.
+    /// Enqueue an atomic state-machine batch. Data groups return at the
+    /// RocksDB-visible boundary; meta groups wait for WAL durability.
     pub(crate) async fn write_state_batch(
         &self,
         group: GroupId,
@@ -606,7 +568,7 @@ impl Storage {
             }
         }
 
-        if self.apply_durability.async_for(group) {
+        if matches!(group, GroupId::Data(_)) {
             return Ok(());
         }
 
@@ -621,10 +583,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn state_apply_is_async(&self, group: GroupId) -> bool {
-        self.apply_durability.async_for(group)
-    }
-
+    #[cfg(test)]
     pub(crate) fn record_state_sync(&self, group: GroupId, log_id: RaftLogId) {
         self.apply_durability.visible(group, log_id);
         self.apply_durability.durable(group, log_id);
@@ -803,16 +762,6 @@ mod tests {
         RaftLogId::new(CommittedLeaderId::new(term, 1), index)
     }
 
-    #[test]
-    fn async_data_state_is_default_on_with_explicit_sync_override() {
-        assert!(async_data_state_enabled(None, None));
-        assert!(async_data_state_enabled(Some("1"), None));
-        assert!(!async_data_state_enabled(Some("0"), None));
-        assert!(!async_data_state_enabled(None, Some("1")));
-        assert!(async_data_state_enabled(None, Some("0")));
-        assert!(!async_data_state_enabled(Some("1"), Some("true")));
-    }
-
     #[tokio::test]
     async fn log_batch_is_readable_before_its_durable_callback() {
         let dir = tempfile::tempdir().unwrap();
@@ -858,14 +807,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_data_state_returns_visible_before_wal_durability() {
+    async fn data_state_returns_visible_before_wal_durability() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_with_options(
-            dir.path(),
-            delayed_config(Duration::from_millis(250)),
-            true,
-        )
-        .unwrap();
+        let storage =
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(250)))
+                .unwrap();
         let group = GroupId::Data(7);
         storage.ensure_group(group).unwrap();
         let cf = storage.state_cf(group).unwrap();
@@ -896,10 +842,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_state_stays_synchronous_when_async_data_state_is_enabled() {
+    async fn meta_state_stays_synchronous() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
-            Storage::open_with_options(dir.path(), delayed_config(Duration::from_millis(50)), true)
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(50)))
                 .unwrap();
         storage.ensure_group(GroupId::Meta).unwrap();
         let cf = storage.state_cf(GroupId::Meta).unwrap();
@@ -922,12 +868,9 @@ mod tests {
     #[tokio::test]
     async fn reclaim_refuses_to_drop_a_group_with_an_unflushed_state_apply() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_with_options(
-            dir.path(),
-            delayed_config(Duration::from_millis(250)),
-            true,
-        )
-        .unwrap();
+        let storage =
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(250)))
+                .unwrap();
         let group = GroupId::Data(9);
         storage.ensure_group(group).unwrap();
         let cf = storage.state_cf(group).unwrap();
@@ -952,12 +895,8 @@ mod tests {
     async fn async_reclamation_closes_admission_and_waits_for_state_durability() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(
-            Storage::open_with_options(
-                dir.path(),
-                delayed_config(Duration::from_millis(200)),
-                true,
-            )
-            .unwrap(),
+            Storage::open_with_durability(dir.path(), delayed_config(Duration::from_millis(200)))
+                .unwrap(),
         );
         let group = GroupId::Data(10);
         storage.ensure_group(group).unwrap();
@@ -995,7 +934,7 @@ mod tests {
     async fn per_group_dirty_limit_backpressures_until_flush() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(
-            Storage::open_async_limited_test(
+            Storage::open_limited_test(
                 dir.path(),
                 Duration::from_millis(200),
                 ApplyDurabilityLimits {
@@ -1045,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn dirty_age_watchdog_fails_storage_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_async_limited_test(
+        let storage = Storage::open_limited_test(
             dir.path(),
             Duration::from_millis(500),
             ApplyDurabilityLimits {
@@ -1088,7 +1027,7 @@ mod tests {
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
-            let storage = Storage::open_async_test(&path, Duration::from_secs(10)).unwrap();
+            let storage = Storage::open_delayed_test(&path, Duration::from_secs(10)).unwrap();
             let group = GroupId::Data(13);
             storage.ensure_group(group).unwrap();
             let state_cf = storage.state_cf(group).unwrap();
@@ -1126,7 +1065,7 @@ mod tests {
             .unwrap();
         assert_eq!(status.code(), Some(86));
 
-        let storage = Storage::open_sync_test(dir.path()).unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
         let group = GroupId::Data(13);
         storage.ensure_group(group).unwrap();
         let state = storage.get_state(group, b"business").unwrap();

@@ -32,16 +32,10 @@
 //!   DAL_LOG_GROUP_COMMIT=0 ... (baseline: synchronous fsync per log append)
 //!   DAL_LOG_GROUP_COMMIT=1 ... (database-wide group commit, default)
 //!
-//! To A/B the unified log/state durability worker:
-//!   DAL_UNIFIED_DURABILITY=0 ... (state apply uses sync=true directly)
-//!   DAL_UNIFIED_DURABILITY=1 ... (state joins database-wide flushes, default)
+//! State apply always uses the shared durability worker. Data-group apply
+//! returns after state visibility; meta-group apply waits for WAL durability.
 //! Adaptive collection is default; `DAL_ADAPTIVE_DURABILITY=0` restores the
 //! fixed collection window.
-//!
-//! Async data-group materialization is the default. To measure the synchronous
-//! emergency mode, keep the unified worker enabled and run:
-//!   default ...                         (apply returns after state visibility)
-//!   DAL_SYNC_MATERIALIZED_STATE=1 ...  (apply waits for state WAL durability)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -323,22 +317,10 @@ async fn end_to_end_benchmark_three_nodes() {
         std::env::var("DAL_LOG_GROUP_COMMIT").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     );
-    let unified_durability = !matches!(
-        std::env::var("DAL_UNIFIED_DURABILITY").ok().as_deref(),
-        Some("0") | Some("false") | Some("off")
-    );
     let adaptive_durability = !matches!(
         std::env::var("DAL_ADAPTIVE_DURABILITY").ok().as_deref(),
         Some("0") | Some("false") | Some("off")
     );
-    let sync_materialized_state = env_enabled("DAL_SYNC_MATERIALIZED_STATE")
-        || matches!(
-            std::env::var("DAL_ASYNC_MATERIALIZED_STATE")
-                .ok()
-                .as_deref(),
-            Some("0") | Some("false") | Some("off")
-        );
-    let async_materialized_state = unified_durability && !sync_materialized_state;
 
     println!("\n=== dal end-to-end benchmark (3 nodes over ZeroMQ inproc) ===");
     println!(
@@ -376,14 +358,7 @@ async fn end_to_end_benchmark_three_nodes() {
         },
     );
     println!("  committed marker: folded into atomic state apply");
-    println!(
-        "  state durability: {} (DAL_UNIFIED_DURABILITY)",
-        if unified_durability {
-            "shared database-wide worker"
-        } else {
-            "synchronous state write"
-        },
-    );
+    println!("  state durability: shared database-wide worker");
     println!(
         "  durability collection: {} (DAL_ADAPTIVE_DURABILITY)",
         if adaptive_durability {
@@ -392,14 +367,7 @@ async fn end_to_end_benchmark_three_nodes() {
             "fixed window"
         },
     );
-    println!(
-        "  materialized-state reply: {} (default async; DAL_SYNC_MATERIALIZED_STATE=1 overrides)",
-        if async_materialized_state {
-            "after visibility; WAL durability is asynchronous"
-        } else {
-            "after WAL durability"
-        },
-    );
+    println!("  materialized-state reply: after visibility; WAL durability is asynchronous");
     println!("  ------------------------------------------------------------------------------");
 
     // Phase 1 — sequential write latency from a single client.

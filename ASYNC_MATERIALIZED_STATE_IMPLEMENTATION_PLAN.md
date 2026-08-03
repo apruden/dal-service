@@ -3,8 +3,8 @@
 Date: 2026-08-03
 
 Status: complete for new clusters — asynchronous data-group materialization is
-default-on; meta state remains synchronous; `DAL_SYNC_MATERIALIZED_STATE=1`
-is the emergency override
+unconditional; meta state remains synchronous; there is no runtime
+materialization feature flag
 
 Scope: clusters and their data are always created by one current binary.
 Mixed-version operation, migration, and old-log replay compatibility are not
@@ -12,7 +12,7 @@ requirements.
 
 ## Implementation progress (2026-08-03)
 
-Implemented as the data-group default:
+Implemented as the data-group policy:
 
 - per-group visible/durable applied watermarks and bounded pending accounting;
 - data-state completion after RocksDB visibility, with meta state still waiting
@@ -34,8 +34,8 @@ Implemented as the data-group default:
 - delayed, reordered, and duplicate Raft delivery plus a 100-seed leader-crash
   campaign checked for linearizability, exactly-once, no acknowledged write
   loss, and stale-read minimum-version safety;
-- complete all-target/all-feature suites in default-on and synchronous-override
-  modes, plus release benchmarks with write-path profiling.
+- complete all-target/all-feature suites, plus release benchmarks with
+  write-path profiling.
 
 ## Objective
 
@@ -425,8 +425,8 @@ wait for `D` rather than accumulating an unbounded replay/log-retention gap.
 - Retain one atomic batch for mutations, sequence result, membership, applied
   record, and recovery hint.
 - Keep meta-group calls on the existing durable wait.
-- Keep this phase opt-in until the recovery-serving fence is complete; the
-  default-on cut happens only after the later recovery and operations gates.
+- Do not deploy this phase until the recovery-serving fence and the later
+  recovery and operations gates are complete.
 
 ### Tests
 
@@ -563,10 +563,8 @@ all three nodes:
 ### Exit criteria
 
 - Storage failure is operator-visible and fail-closed.
-- The synchronous emergency override drains dirty state without data
-  conversion.
-- Replay compatibility is covered across the oldest supported on-disk/log
-  version.
+- Graceful shutdown drains dirty state without data conversion.
+- Deterministic replay is covered for logs written by the current binary.
 
 ## Phase 7: Meta-group evaluation
 
@@ -634,30 +632,28 @@ enabled. Performance is not a correctness gate, but the profile must confirm
 that client responses no longer wait for `StateApplyDurabilityWait` and that
 log durability remains unchanged.
 
-## Rollout and rollback
+## Operations and recovery
 
-1. Every newly created cluster starts with async data-group state and
-   synchronous meta state.
+1. Every data group uses async materialized state and every meta group uses
+   synchronous materialized state.
 2. Observe `A-D`, dirty age/bytes, replay, recovery duration, retained-log
    growth, snapshot/purge waits, stale-read refusals, and `/health` from first
    traffic.
-3. If a materialization alert fires, stop new traffic, set
-   `DAL_SYNC_MATERIALIZED_STATE=1`, drain until `D == A`, and restart the new
-   cluster synchronously.
+3. If a materialization-lag alert fires, stop new traffic and drain until
+   `D == A` before restarting the node.
 4. A storage instance that cannot drain remains non-serving and is rebuilt from
    a healthy Raft replica or snapshot; purge is never forced past `D`.
 
-Rollback to synchronous state apply requires no on-disk migration. Stop new
-apply, drain until `D == A`, then restart/flip the mode. If a node cannot drain
-because storage failed, leave it non-serving and recover it from a healthy
-Raft replica or snapshot; never force purge or mark its state durable.
+There is no synchronous data-state mode. If a node cannot drain because storage
+failed, leave it non-serving and recover it from a healthy Raft replica or
+snapshot; never force purge or mark its state durable.
 
 ## Final acceptance criteria
 
 - Raft log and vote fsync behavior is byte-for-byte and callback-for-callback
   unchanged.
 - The state machine returns only after atomic visibility, but not after WAL
-  durability, for enabled data groups.
+  durability, for data groups.
 - Every purged index is less than or equal to the locally durable applied
   index.
 - Every locally built snapshot represents a durable state prefix.

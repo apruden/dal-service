@@ -377,7 +377,7 @@ mod tests {
     async fn snapshot_waits_until_its_visible_applied_prefix_is_durable() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
-            Arc::new(Storage::open_async_test(dir.path(), Duration::from_millis(200)).unwrap());
+            Arc::new(Storage::open_delayed_test(dir.path(), Duration::from_millis(200)).unwrap());
         let group = GroupId::Data(5);
         storage.ensure_group(group).unwrap();
         let mut sm = RocksStateMachine::new(storage.clone(), group);
@@ -411,7 +411,7 @@ mod tests {
     async fn snapshot_transfer_from_a_dirty_source_installs_a_durable_fenced_prefix() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = Arc::new(
-            Storage::open_async_test(source_dir.path(), Duration::from_millis(150)).unwrap(),
+            Storage::open_delayed_test(source_dir.path(), Duration::from_millis(150)).unwrap(),
         );
         let group = GroupId::Data(6);
         source.ensure_group(group).unwrap();
@@ -437,7 +437,7 @@ mod tests {
 
         let target_dir = tempfile::tempdir().unwrap();
         let target = Arc::new(
-            Storage::open_async_test(target_dir.path(), Duration::from_millis(150)).unwrap(),
+            Storage::open_delayed_test(target_dir.path(), Duration::from_millis(150)).unwrap(),
         );
         target.ensure_group(group).unwrap();
         let mut target_sm = RocksStateMachine::new(target.clone(), group);

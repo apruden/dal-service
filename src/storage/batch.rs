@@ -4,7 +4,7 @@
 //! Every applier — data and meta — goes through this module. Doing the mutation,
 //! committed marker, and `last_applied` bump in one atomic batch is what makes
 //! recovery a clean prefix replay. Raft batches use the database-wide
-//! durability worker and data groups may complete at visibility; the legacy M2
+//! durability worker and data groups complete at visibility; the legacy M2
 //! helper and meta state remain synchronously durable.
 
 use rocksdb::{WriteBatch, WriteOptions};
@@ -34,19 +34,6 @@ fn crash_point(_name: &str) -> Result<()> {
         std::io::Error::other(format!("injected crash at {_name}"))
     )));
     Ok(())
-}
-
-/// Default-on shared log/state durability scheduling. Set
-/// `DAL_UNIFIED_DURABILITY=0` to restore a synchronous state-apply write while
-/// retaining the log coordinator.
-fn unified_durability_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        !matches!(
-            std::env::var("DAL_UNIFIED_DURABILITY").ok().as_deref(),
-            Some("0") | Some("false") | Some("off")
-        )
-    })
 }
 
 impl Storage {
@@ -129,16 +116,8 @@ impl Storage {
 
         crash_point("apply_state::before_write")?;
 
-        if unified_durability_enabled() {
-            self.write_state_batch(group, applied_log_id, applied_entries, batch, wal_bytes)
-                .await?;
-        } else {
-            let mut wo = WriteOptions::default();
-            wo.set_sync(true);
-            let _profile = crate::perf::timer(WriteStage::StateApplySynced);
-            self.db().write_opt(batch, &wo)?;
-            self.record_state_sync(group, applied_log_id);
-        }
+        self.write_state_batch(group, applied_log_id, applied_entries, batch, wal_bytes)
+            .await?;
 
         crash_point("apply_state::after_write")?;
 

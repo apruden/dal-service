@@ -87,6 +87,11 @@ impl PartitionNode {
     where
         NF: RaftNetworkFactory<TypeConfig>,
     {
+        if !matches!(group, GroupId::Data(_)) {
+            return Err(Error::Config(
+                "PartitionNode requires a data-group id".into(),
+            ));
+        }
         storage.authorize_group_start(group, node_id)?;
 
         let config = Config {
@@ -219,9 +224,7 @@ impl PartitionNode {
         &self,
         target: Option<crate::partition::raft_types::LogId>,
     ) -> Result<()> {
-        if !self.storage.state_apply_is_async(self.group)
-            || self.storage.state_recovery_ready(self.group)
-        {
+        if self.storage.state_recovery_ready(self.group) {
             return Ok(());
         }
         let epoch = self.storage.begin_state_recovery(self.group, target);
@@ -278,9 +281,6 @@ impl PartitionNode {
     /// leadership or configuration change.
     pub async fn apply_recovery_fence(&self, fence: &RecoveryFence) -> Result<()> {
         self.storage.require_serving(self.group)?;
-        if !self.storage.state_apply_is_async(self.group) {
-            return Ok(());
-        }
         if self.storage.state_recovery_ready(self.group) {
             return Ok(());
         }
@@ -404,9 +404,7 @@ impl PartitionNode {
         // follower must observe a post-start committed apply before serving
         // local state; a leader opens the same gate with the quorum barrier
         // above.
-        if self.storage.state_apply_is_async(self.group)
-            && !self.storage.state_recovery_ready(self.group)
-        {
+        if !self.storage.state_recovery_ready(self.group) {
             return Ok(ReadOutcome::TooStale { leader });
         }
         // Read-your-writes / monotonic: the replica must have caught up to the
@@ -495,7 +493,7 @@ mod tests {
             // boundary deterministic instead of racing a production-speed
             // sub-millisecond flush.
             let storage = Arc::new(
-                Storage::open_async_test(self.dirs[idx].path(), Duration::from_millis(250))
+                Storage::open_delayed_test(self.dirs[idx].path(), Duration::from_millis(250))
                     .unwrap(),
             );
             storage
@@ -749,7 +747,6 @@ mod tests {
         let mut storages = Vec::new();
         for idx in 0..3 {
             let (node, storage) = cluster.start(idx).await;
-            assert!(storage.state_apply_is_async(TEST_GROUP));
             assert!(!storage.state_recovery_ready(TEST_GROUP));
             nodes.push(node);
             storages.push(storage);

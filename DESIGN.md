@@ -278,13 +278,12 @@ Implementation notes:
   database-wide durability worker WAL-writes atomic log and state batches,
   groups currently active work across Raft groups, and completes Raft log
   callbacks only after one `flush_wal(true)`. Data-group state apply completes
-  after its atomic batch is visible by default, and the worker advances a
+  after its atomic batch is visible, and the worker advances a
   separate durable watermark after the shared WAL flush. Per-group dirty
   entries, bytes, and age are bounded; later apply is backpressured and an
   expired dirty-age limit poisons storage closed. Meta-group apply always stays
-  synchronous. `DAL_SYNC_MATERIALIZED_STATE=1` is the emergency synchronous
-  override.
-- In asynchronous materialized-state mode, snapshot build and log purge wait
+  synchronous. This data/meta policy has no runtime feature flag.
+- For data-group materialized state, snapshot build and log purge wait
   until the snapshot/purge point is at or below the durable-applied watermark;
   group reclamation first rejects new applies and drains all pending state.
   Any WAL write/flush failure poisons the database-scoped tracker and closes
@@ -297,12 +296,10 @@ Implementation notes:
   Clients encountering a still-fenced follower are redirected to a fresher
   candidate.
 - A lone write flushes immediately; observing concurrency activates a bounded
-  200 microsecond collection window. `DAL_UNIFIED_DURABILITY=0`,
-  `DAL_ADAPTIVE_DURABILITY=0`, and `DAL_SYNC_MATERIALIZED_STATE=1` retain the
-  durable rollback paths. On
-  recovery, the folded marker and applied state describe exactly the same
-  locally durable prefix; acknowledged entries beyond that prefix remain in
-  the majority-durable Raft logs for replay.
+  200 microsecond collection window. `DAL_ADAPTIVE_DURABILITY=0` retains the
+  fixed-window diagnostic path. On recovery, the folded marker and applied
+  state describe exactly the same locally durable prefix; acknowledged entries
+  beyond that prefix remain in the majority-durable Raft logs for replay.
 - `delete` removes the key and its version record in the same atomic batch. No
   logical tombstone is kept: versions are log indexes and never repeat, so
   RocksDB deletion markers may compact freely without affecting CAS or

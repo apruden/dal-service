@@ -1,9 +1,9 @@
 //! Database-wide RocksDB write and WAL durability coordination.
 //!
 //! A single bounded worker owns non-sync Raft log and state-machine writes for
-//! one RocksDB instance. Log append and default async data-state apply return
+//! one RocksDB instance. Log append and data-state apply return
 //! after the worker has made their batches readable. Log `LogFlushed`
-//! callbacks, state durability trackers, and emergency synchronous state-apply waiters
+//! callbacks, state durability trackers, and synchronous meta-state waiters
 //! complete only after one `flush_wal(true)` covers the collected writes.
 
 use std::io;

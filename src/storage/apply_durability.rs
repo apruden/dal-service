@@ -432,21 +432,19 @@ impl GroupTracker {
 pub(crate) struct ApplyDurabilityRegistry {
     groups: Mutex<HashMap<GroupId, Arc<GroupTracker>>>,
     failed: Mutex<Option<String>>,
-    async_data_state: bool,
     limits: ApplyDurabilityLimits,
 }
 
 impl ApplyDurabilityRegistry {
     #[cfg(test)]
-    pub(crate) fn new(async_data_state: bool) -> Self {
-        Self::with_limits(async_data_state, ApplyDurabilityLimits::default())
+    pub(crate) fn new() -> Self {
+        Self::with_limits(ApplyDurabilityLimits::default())
     }
 
-    pub(crate) fn with_limits(async_data_state: bool, limits: ApplyDurabilityLimits) -> Self {
+    pub(crate) fn with_limits(limits: ApplyDurabilityLimits) -> Self {
         Self {
             groups: Mutex::new(HashMap::new()),
             failed: Mutex::new(None),
-            async_data_state,
             limits,
         }
     }
@@ -473,12 +471,8 @@ impl ApplyDurabilityRegistry {
             .map(|_| ())
     }
 
-    pub(crate) fn async_for(&self, group: GroupId) -> bool {
-        self.async_data_state && matches!(group, GroupId::Data(_))
-    }
-
     pub(crate) fn register(&self, group: GroupId, recovered: Option<RaftLogId>) {
-        let recovery_ready = !self.async_for(group);
+        let recovery_ready = matches!(group, GroupId::Meta);
         let failure = self.failed.lock().unwrap().clone();
         let tracker = self
             .groups
@@ -493,7 +487,7 @@ impl ApplyDurabilityRegistry {
     }
 
     fn tracker(&self, group: GroupId) -> Arc<GroupTracker> {
-        let recovery_ready = !self.async_for(group);
+        let recovery_ready = matches!(group, GroupId::Meta);
         let failure = self.failed.lock().unwrap().clone();
         let tracker = self
             .groups
@@ -582,7 +576,8 @@ impl ApplyDurabilityRegistry {
     }
 
     pub(crate) fn installed(&self, group: GroupId, log_id: Option<RaftLogId>) {
-        self.tracker(group).installed(log_id, self.async_for(group));
+        self.tracker(group)
+            .installed(log_id, matches!(group, GroupId::Data(_)));
     }
 
     pub(crate) fn validate_install(
@@ -711,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn visible_and_durable_are_independent_and_monotonic() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         let group = GroupId::Data(1);
         registry.register(group, Some(log_id(1, 3)));
 
@@ -743,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn mismatch_at_same_index_is_corruption() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         let group = GroupId::Data(1);
         registry.register(group, Some(log_id(1, 3)));
         assert!(
@@ -756,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_failure_poison_applies_to_groups_registered_later() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         registry.fail_all("flush failed".into());
         let group = GroupId::Data(2);
         registry.register(group, Some(log_id(1, 1)));
@@ -768,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_rejects_new_applies_and_allows_existing_ones_to_drain() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         let group = GroupId::Data(3);
         registry.register(group, None);
         registry.begin(group, log_id(1, 1), 1, 10).await.unwrap();
@@ -785,7 +780,6 @@ mod tests {
     #[tokio::test]
     async fn per_group_byte_limit_blocks_until_the_oldest_batch_is_durable() {
         let registry = Arc::new(ApplyDurabilityRegistry::with_limits(
-            true,
             ApplyDurabilityLimits {
                 max_pending_entries: 10,
                 max_pending_bytes: 100,
@@ -808,7 +802,7 @@ mod tests {
 
     #[test]
     fn snapshot_install_may_advance_but_never_replace_with_an_older_prefix() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         let group = GroupId::Data(4);
         registry.register(group, Some(log_id(2, 8)));
 
@@ -837,7 +831,7 @@ mod tests {
 
     #[test]
     fn snapshot_install_invalidates_an_inflight_recovery_epoch() {
-        let registry = ApplyDurabilityRegistry::new(true);
+        let registry = ApplyDurabilityRegistry::new();
         let group = GroupId::Data(5);
         registry.register(group, Some(log_id(2, 8)));
         let old_epoch = registry.begin_recovery_attempt(group, Some(log_id(2, 8)));

@@ -466,7 +466,7 @@ mod tests {
         ) -> Result<(tempfile::TempDir, ConformanceLogStore, RocksStateMachine), StorageError<NodeId>>
         {
             let dir = tempfile::tempdir().map_err(|error| write_err(error.into()))?;
-            let storage = Arc::new(Storage::open_sync_test(dir.path()).map_err(write_err)?);
+            let storage = Arc::new(Storage::open(dir.path()).map_err(write_err)?);
             let group = GroupId::Data(0);
             storage.ensure_group(group).map_err(write_err)?;
             let log_store = ConformanceLogStore {
@@ -488,7 +488,7 @@ mod tests {
     async fn purge_waits_for_the_same_materialized_prefix_to_be_durable() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
-            Arc::new(Storage::open_async_test(dir.path(), Duration::from_millis(200)).unwrap());
+            Arc::new(Storage::open_delayed_test(dir.path(), Duration::from_millis(200)).unwrap());
         let group = GroupId::Data(4);
         storage.ensure_group(group).unwrap();
         let target = log_id(6);
@@ -527,7 +527,7 @@ mod tests {
     async fn flush_failure_while_purge_waits_preserves_marker_and_logs() {
         let dir = tempfile::tempdir().unwrap();
         let storage =
-            Arc::new(Storage::open_async_test(dir.path(), Duration::from_secs(5)).unwrap());
+            Arc::new(Storage::open_delayed_test(dir.path(), Duration::from_secs(5)).unwrap());
         let group = GroupId::Data(8);
         storage.ensure_group(group).unwrap();
         let target = log_id(6);
@@ -571,7 +571,7 @@ mod tests {
             PurgeTestCut::RangeDelete,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let storage = Arc::new(Storage::open_sync_test(dir.path()).unwrap());
+            let storage = Arc::new(Storage::open(dir.path()).unwrap());
             let group = GroupId::Data(11);
             storage.ensure_group(group).unwrap();
             let target = log_id(6);

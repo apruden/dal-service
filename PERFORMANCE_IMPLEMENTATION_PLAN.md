@@ -362,7 +362,7 @@ compete with or duplicate RocksDB's native write grouping.
 - Adaptive collection flushes a truly lone write immediately. Once a second
   active writer is observed, that flush cycle uses the bounded 200 microsecond
   window to retain concurrent batching.
-- `DAL_UNIFIED_DURABILITY=0` restores synchronous state apply, and
+- State apply always uses the unified durability worker;
   `DAL_ADAPTIVE_DURABILITY=0` restores the fixed collection window.
 - Profiling reports each benchmark phase separately and records log/state
   writes per durability flush, state batch entries/mutations/bytes, and folded
@@ -501,17 +501,16 @@ encoding or the RocksDB batch write itself—as the remaining write-path cost.
 The adaptive policy also recovers the sequential latency that a fixed
 collection window gave up.
 
-The full all-target/all-feature suite passes in both the default mode and the
-remaining rollback configuration. The compatibility switches are independent:
+The full all-target/all-feature suite passes with the unified durability path.
+The remaining collection-policy diagnostic switch is independent:
 
 ```text
-DAL_UNIFIED_DURABILITY=0 \
 DAL_ADAPTIVE_DURABILITY=0 \
 cargo test --all-targets --all-features -- --test-threads=1
 ```
 
 To reproduce the candidate benchmark, set `DAL_BENCH_DIR` to a durable
-filesystem and leave all three switches unset. Use
+filesystem and leave the tuning switches unset. Use
 `DAL_PROFILE_WRITE_PATH=1` for per-phase stage and RocksDB counters; profiling
 runs are diagnostic and should not be used as throughput acceptance trials.
 
