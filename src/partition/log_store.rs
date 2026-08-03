@@ -46,6 +46,28 @@ const ENTRY_PREFIX: u8 = 0x01;
 /// One past the entry prefix, used to seek the reverse iterator to the end.
 const ENTRY_PREFIX_END: u8 = 0x02;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PurgeTestCut {
+    DurableWait,
+    Marker,
+    RangeDelete,
+}
+
+#[cfg(test)]
+static PURGE_TEST_CUT: std::sync::Mutex<Option<(GroupId, PurgeTestCut)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn fail_at_purge_test_cut(group: GroupId, cut: PurgeTestCut) -> Result<(), StorageError<Nid>> {
+    if *PURGE_TEST_CUT.lock().unwrap() == Some((group, cut)) {
+        return Err(write_err(crate::error::Error::Io(std::io::Error::other(
+            format!("injected purge crash at {cut:?}"),
+        ))));
+    }
+    Ok(())
+}
+
 fn entry_key(index: u64) -> [u8; 9] {
     let mut k = [0u8; 9];
     k[0] = ENTRY_PREFIX;
@@ -302,17 +324,23 @@ where
             .wait_state_durable(self.group, &log_id)
             .await
             .map_err(write_err)?;
+        #[cfg(test)]
+        fail_at_purge_test_cut(self.group, PurgeTestCut::DurableWait)?;
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         // Record the purge point first so recovery never re-reads purged logs.
         self.storage
             .db()
             .put_cf_opt(&cf, KEY_PURGED, codec::encode(&log_id), &Self::sync_wo())
             .map_err(|e| write_err(e.into()))?;
+        #[cfg(test)]
+        fail_at_purge_test_cut(self.group, PurgeTestCut::Marker)?;
         // Delete entries with index <= log_id.index (end-exclusive + explicit last).
         self.storage
             .db()
             .delete_range_cf(&cf, entry_key(0), entry_key(log_id.index))
             .map_err(|e| write_err(e.into()))?;
+        #[cfg(test)]
+        fail_at_purge_test_cut(self.group, PurgeTestCut::RangeDelete)?;
         self.storage
             .db()
             .delete_cf_opt(&cf, entry_key(log_id.index), &Self::sync_wo())
@@ -325,12 +353,135 @@ where
 mod tests {
     use super::*;
     use openraft::CommittedLeaderId;
+    use openraft::OptionalSend;
+    use openraft::storage::LogFlushed;
+    use openraft::testing::{StoreBuilder, Suite};
+    use std::fmt::Debug;
+    use std::ops::RangeBounds;
     use std::time::Duration;
 
-    use crate::partition::raft_types::TypeConfig;
+    use crate::partition::raft_types::{Entry, NodeId, TypeConfig};
+    use crate::partition::sm::RocksStateMachine;
 
     fn log_id(index: u64) -> LogId {
         LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    /// OpenRaft's generic suite invokes `purge()` independently of state apply.
+    /// DAL deliberately strengthens that contract by requiring D>=purge target,
+    /// so this adapter establishes the precondition before delegating every
+    /// other byte of behavior to the production log store.
+    #[derive(Clone)]
+    struct ConformanceLogStore {
+        inner: RocksLogStore,
+        storage: Arc<Storage>,
+        group: GroupId,
+    }
+
+    impl RaftLogReader<TypeConfig> for ConformanceLogStore {
+        async fn try_get_log_entries<RB>(
+            &mut self,
+            range: RB,
+        ) -> Result<Vec<Entry>, StorageError<NodeId>>
+        where
+            RB: RangeBounds<u64> + Clone + Debug + OptionalSend,
+        {
+            <RocksLogStore as RaftLogReader<TypeConfig>>::try_get_log_entries(
+                &mut self.inner,
+                range,
+            )
+            .await
+        }
+    }
+
+    impl RaftLogStorage<TypeConfig> for ConformanceLogStore {
+        type LogReader = Self;
+
+        async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut self.inner).await
+        }
+
+        async fn get_log_reader(&mut self) -> Self::LogReader {
+            self.clone()
+        }
+
+        async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<NodeId>> {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::save_vote(&mut self.inner, vote).await
+        }
+
+        async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError<NodeId>> {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::read_vote(&mut self.inner).await
+        }
+
+        async fn save_committed(
+            &mut self,
+            _committed: Option<LogId>,
+        ) -> Result<(), StorageError<NodeId>> {
+            // DAL's production store exposes an applied-aligned lower-bound
+            // hint rather than the exact value passed to save_committed(). The
+            // generic suite has no representation for that extension, so test
+            // the trait's explicitly supported "optional API absent" mode;
+            // focused async-loss tests exercise the production hint itself.
+            Ok(())
+        }
+
+        async fn read_committed(&mut self) -> Result<Option<LogId>, StorageError<NodeId>> {
+            Ok(None)
+        }
+
+        async fn append<I>(
+            &mut self,
+            entries: I,
+            callback: LogFlushed<TypeConfig>,
+        ) -> Result<(), StorageError<NodeId>>
+        where
+            I: IntoIterator<Item = Entry> + OptionalSend,
+            I::IntoIter: OptionalSend,
+        {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::append(
+                &mut self.inner,
+                entries,
+                callback,
+            )
+            .await
+        }
+
+        async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError<NodeId>> {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::truncate(&mut self.inner, log_id).await
+        }
+
+        async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<NodeId>> {
+            self.storage.record_state_sync(self.group, log_id);
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::purge(&mut self.inner, log_id).await
+        }
+    }
+
+    struct RocksStoreBuilder;
+
+    impl StoreBuilder<TypeConfig, ConformanceLogStore, RocksStateMachine, tempfile::TempDir>
+        for RocksStoreBuilder
+    {
+        async fn build(
+            &self,
+        ) -> Result<(tempfile::TempDir, ConformanceLogStore, RocksStateMachine), StorageError<NodeId>>
+        {
+            let dir = tempfile::tempdir().map_err(|error| write_err(error.into()))?;
+            let storage = Arc::new(Storage::open_sync_test(dir.path()).map_err(write_err)?);
+            let group = GroupId::Data(0);
+            storage.ensure_group(group).map_err(write_err)?;
+            let log_store = ConformanceLogStore {
+                inner: RocksLogStore::new(storage.clone(), group),
+                storage: storage.clone(),
+                group,
+            };
+            let state_machine = RocksStateMachine::new(storage, group);
+            Ok((dir, log_store, state_machine))
+        }
+    }
+
+    #[test]
+    fn passes_openraft_storage_conformance_suite() {
+        Suite::test_all(RocksStoreBuilder).unwrap();
     }
 
     #[tokio::test]
@@ -367,5 +518,111 @@ mod tests {
             .unwrap()
             .last_purged_log_id;
         assert_eq!(purged, Some(target));
+    }
+
+    #[tokio::test]
+    async fn flush_failure_while_purge_waits_preserves_marker_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Arc::new(Storage::open_async_test(dir.path(), Duration::from_secs(5)).unwrap());
+        let group = GroupId::Data(8);
+        storage.ensure_group(group).unwrap();
+        let target = log_id(6);
+        let log_cf = storage.log_cf(group).unwrap();
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        for index in 1..=target.index {
+            storage
+                .db()
+                .put_cf_opt(&log_cf, entry_key(index), format!("log-{index}"), &options)
+                .unwrap();
+        }
+
+        let mut purger = RocksLogStore::new(storage.clone(), group);
+        let purge = tokio::spawn(async move {
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::purge(&mut purger, target).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!purge.is_finished());
+
+        storage.fail_durability_test("injected state WAL flush failure");
+        assert!(purge.await.unwrap().is_err());
+        assert!(storage.db().get_cf(&log_cf, KEY_PURGED).unwrap().is_none());
+        for index in 1..=target.index {
+            assert_eq!(
+                storage
+                    .db()
+                    .get_cf(&log_cf, entry_key(index))
+                    .unwrap()
+                    .unwrap(),
+                format!("log-{index}").as_bytes(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_crash_boundaries_are_safe_and_retryable() {
+        for cut in [
+            PurgeTestCut::DurableWait,
+            PurgeTestCut::Marker,
+            PurgeTestCut::RangeDelete,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(Storage::open_sync_test(dir.path()).unwrap());
+            let group = GroupId::Data(11);
+            storage.ensure_group(group).unwrap();
+            let target = log_id(6);
+            storage.record_state_sync(group, target);
+            let log_cf = storage.log_cf(group).unwrap();
+            let mut options = WriteOptions::default();
+            options.set_sync(true);
+            for index in 1..=target.index {
+                storage
+                    .db()
+                    .put_cf_opt(&log_cf, entry_key(index), format!("log-{index}"), &options)
+                    .unwrap();
+            }
+
+            *PURGE_TEST_CUT.lock().unwrap() = Some((group, cut));
+            let mut log_store = RocksLogStore::new(storage.clone(), group);
+            let result =
+                <RocksLogStore as RaftLogStorage<TypeConfig>>::purge(&mut log_store, target).await;
+            *PURGE_TEST_CUT.lock().unwrap() = None;
+            assert!(result.is_err(), "{cut:?} did not stop purge");
+
+            let marker = storage.db().get_cf(&log_cf, KEY_PURGED).unwrap();
+            match cut {
+                PurgeTestCut::DurableWait => assert!(marker.is_none()),
+                PurgeTestCut::Marker | PurgeTestCut::RangeDelete => {
+                    assert_eq!(
+                        crate::codec::decode::<LogId>(&marker.unwrap()).unwrap(),
+                        target
+                    );
+                }
+            }
+
+            // Retrying the requested purge is idempotent regardless of which
+            // durable marker/range-delete prefix the interrupted attempt left.
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::purge(&mut log_store, target)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::codec::decode::<LogId>(
+                    &storage.db().get_cf(&log_cf, KEY_PURGED).unwrap().unwrap()
+                )
+                .unwrap(),
+                target
+            );
+            for index in 1..=target.index {
+                assert!(
+                    storage
+                        .db()
+                        .get_cf(&log_cf, entry_key(index))
+                        .unwrap()
+                        .is_none(),
+                    "{cut:?}: log {index} survived retry"
+                );
+            }
+        }
     }
 }

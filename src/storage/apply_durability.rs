@@ -413,6 +413,7 @@ fn reaches(current: &Option<RaftLogId>, target: &RaftLogId) -> Result<bool> {
 mod tests {
     use super::*;
     use openraft::CommittedLeaderId;
+    use proptest::prelude::*;
 
     fn log_id(term: u64, index: u64) -> RaftLogId {
         RaftLogId::new(CommittedLeaderId::new(term, 1), index)
@@ -506,5 +507,92 @@ mod tests {
                 .is_err()
         );
         assert!(registry.validate_install(group, None).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn capd_crash_model_preserves_prefix_and_replay_invariants(
+            transitions in prop::collection::vec(0u8..10, 1..512)
+        ) {
+            let mut l = 0u64;
+            let mut c = 0u64;
+            let mut a = 0u64;
+            let mut d = 0u64;
+            let mut p = 0u64;
+            let mut snapshot = 0u64;
+            let mut visible_state = 0u64;
+            let mut durable_state = 0u64;
+
+            // Entry i deterministically contributes i to the reference state.
+            let prefix = |index: u64| index.saturating_mul(index + 1) / 2;
+
+            for transition in transitions {
+                match transition {
+                    // Append a locally durable Raft entry.
+                    0 => l = l.saturating_add(1),
+                    // Learn one more committed entry already present locally.
+                    1 if c < l => c += 1,
+                    // Apply one committed entry to visible materialized state.
+                    2 if a < c => {
+                        a += 1;
+                        visible_state = prefix(a);
+                    }
+                    // Complete one more state-WAL durability boundary.
+                    3 if d < a => {
+                        d += 1;
+                        durable_state = prefix(d);
+                    }
+                    // Purge is admitted only through the durable prefix.
+                    4 if p < d => p += 1,
+                    // Snapshot publication first drains through captured A.
+                    5 => {
+                        d = a;
+                        durable_state = visible_state;
+                        snapshot = a;
+                    }
+                    // Power loss discards (D,A]. The retained log suffix must
+                    // reproduce the exact reference state through true C.
+                    6 => {
+                        a = d;
+                        visible_state = durable_state;
+                        prop_assert_eq!(visible_state, prefix(d));
+                        prop_assert!(p <= d, "replay source was purged above D");
+                        let mut replayed = durable_state;
+                        for index in (d + 1)..=c {
+                            replayed = replayed.saturating_add(index);
+                        }
+                        prop_assert_eq!(replayed, prefix(c));
+                    }
+                    // A current leader re-establishes C and drives replay.
+                    7 => {
+                        a = c;
+                        visible_state = prefix(c);
+                    }
+                    // An attempted visible-only purge must be refused.
+                    8 => {
+                        let requested = a;
+                        if requested <= d {
+                            p = p.max(requested);
+                        }
+                    }
+                    // A compact steady-state transition.
+                    9 => {
+                        l = l.saturating_add(1);
+                        c = l;
+                        a = c;
+                        visible_state = prefix(a);
+                    }
+                    _ => {}
+                }
+
+                prop_assert!(p <= d, "P={p} exceeded D={d}");
+                prop_assert!(d <= a, "D={d} exceeded A={a}");
+                prop_assert!(a <= c, "A={a} exceeded C={c}");
+                prop_assert!(c <= l, "C={c} exceeded L={l}");
+                prop_assert!(snapshot <= d);
+                prop_assert_eq!(visible_state, prefix(a));
+                prop_assert_eq!(durable_state, prefix(d));
+            }
+        }
     }
 }

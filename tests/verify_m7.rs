@@ -272,6 +272,16 @@ async fn run_once(seed: u64) {
     fault.await.unwrap();
 
     check_oracles(&shared).await;
+
+    // A multi-seed stress run creates a fresh RocksDB/Raft cluster per seed.
+    // Explicitly stop every survivor and remove registry-held Raft handles so
+    // file descriptors and background tasks do not accumulate across seeds.
+    for (idx, node) in shared.nodes.iter().enumerate() {
+        if shared.alive[idx].swap(false, Ordering::SeqCst) {
+            node.shutdown().await.unwrap();
+        }
+        registry.remove(node.node_id());
+    }
 }
 
 async fn check_oracles(s: &Shared) {
@@ -311,7 +321,22 @@ async fn check_oracles(s: &Shared) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn oracles_hold_under_leader_crash_multiple_seeds() {
-    for seed in [1u64, 7, 42, 1337] {
+    let seeds = match std::env::var("DAL_VERIFY_SEEDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(count) if count > 0 => {
+            let start = std::env::var("DAL_VERIFY_SEED_START")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            (start..start.saturating_add(count)).collect()
+        }
+        Some(_) => panic!("DAL_VERIFY_SEEDS must be greater than zero"),
+        None => vec![1u64, 7, 42, 1337],
+    };
+    for seed in seeds {
+        eprintln!("verification seed: {seed}");
         run_once(seed).await;
     }
 }

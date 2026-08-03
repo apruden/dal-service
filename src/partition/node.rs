@@ -340,3 +340,625 @@ impl PartitionNode {
             .map_err(|e| Error::Raft(format!("shutdown: {e}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rocksdb::{WriteBatch, WriteOptions};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::meta::bootstrap::ensure_bootstrap_group;
+    use crate::partition::log_store::KEY_COMMITTED;
+    use crate::partition::network::{Faults, Registry};
+    use crate::storage::Identity;
+    use crate::types::{
+        BootstrapGroup, DataOp, DataRequest, IfVersion, KeyPresence, MutationResult,
+    };
+
+    const CLUSTER_ID: u128 = 0xDA1;
+    const TEST_GROUP: GroupId = GroupId::Data(0);
+    const VOTERS: [NodeId; 3] = [1, 2, 3];
+
+    struct AsyncCluster {
+        dirs: Vec<TempDir>,
+        registry: Registry<TypeConfig>,
+        faults: Faults,
+    }
+
+    impl AsyncCluster {
+        fn new() -> Self {
+            Self {
+                dirs: (0..3).map(|_| tempfile::tempdir().unwrap()).collect(),
+                registry: Registry::default(),
+                faults: Faults::default(),
+            }
+        }
+
+        async fn start(&self, idx: usize) -> (PartitionNode, Arc<Storage>) {
+            let node_id = VOTERS[idx];
+            // The long, fixed collection window makes the client-visible A>D
+            // boundary deterministic instead of racing a production-speed
+            // sub-millisecond flush.
+            let storage = Arc::new(
+                Storage::open_async_test(self.dirs[idx].path(), Duration::from_millis(250))
+                    .unwrap(),
+            );
+            storage
+                .set_identity(Identity {
+                    cluster_id: CLUSTER_ID,
+                    node_id,
+                })
+                .unwrap();
+            ensure_bootstrap_group(
+                &storage,
+                &BootstrapGroup {
+                    cluster_id: CLUSTER_ID,
+                    group: TEST_GROUP,
+                    members: VOTERS.to_vec(),
+                },
+            )
+            .unwrap();
+            let node = PartitionNode::start(
+                node_id,
+                TEST_GROUP,
+                storage.clone(),
+                self.registry.clone(),
+                self.faults.clone(),
+            )
+            .await
+            .unwrap();
+            (node, storage)
+        }
+    }
+
+    fn request(client_id: u128, sequence: u64, op: DataOp) -> DataRequest {
+        DataRequest {
+            client_id,
+            sequence,
+            op,
+        }
+    }
+
+    fn put(sequence: u64, key: &[u8], value: &[u8], if_version: Option<IfVersion>) -> DataRequest {
+        request(
+            7,
+            sequence,
+            DataOp::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                if_version,
+            },
+        )
+    }
+
+    fn delete(sequence: u64, key: &[u8], if_version: Option<IfVersion>) -> DataRequest {
+        request(
+            7,
+            sequence,
+            DataOp::Delete {
+                key: key.to_vec(),
+                if_version,
+            },
+        )
+    }
+
+    async fn eventually<F: Fn() -> bool>(what: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn leader_idx(nodes: &[PartitionNode]) -> Option<usize> {
+        let leader = nodes.iter().find_map(PartitionNode::current_leader)?;
+        nodes.iter().position(|node| node.node_id() == leader)
+    }
+
+    async fn write_to_leader(nodes: &[PartitionNode], req: &DataRequest) -> ApplyResult {
+        for _ in 0..200 {
+            if let Some(idx) = leader_idx(nodes) {
+                match nodes[idx].write(req.clone()).await {
+                    Ok(WriteOutcome::Applied(result)) => return result,
+                    Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no leader accepted request {req:?}");
+    }
+
+    fn active_leader_idx(nodes: &[Option<PartitionNode>]) -> Option<usize> {
+        let leader = nodes
+            .iter()
+            .flatten()
+            .find_map(PartitionNode::current_leader)?;
+        nodes
+            .iter()
+            .position(|node| node.as_ref().is_some_and(|node| node.node_id() == leader))
+    }
+
+    async fn write_to_active_leader(
+        nodes: &[Option<PartitionNode>],
+        req: &DataRequest,
+    ) -> ApplyResult {
+        for _ in 0..240 {
+            if let Some(idx) = active_leader_idx(nodes) {
+                match nodes[idx].as_ref().unwrap().write(req.clone()).await {
+                    Ok(WriteOutcome::Applied(result)) => return result,
+                    Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no active leader accepted request {req:?}");
+    }
+
+    #[derive(Clone)]
+    struct DurablePrefix {
+        state: Vec<(Vec<u8>, Vec<u8>)>,
+        committed: Option<Vec<u8>>,
+    }
+
+    fn capture_durable_prefix(storage: &Storage) -> DurablePrefix {
+        let log_cf = storage.log_cf(TEST_GROUP).unwrap();
+        DurablePrefix {
+            state: storage.scan_state(TEST_GROUP).unwrap(),
+            committed: storage.db().get_cf(&log_cf, KEY_COMMITTED).unwrap(),
+        }
+    }
+
+    /// Model the disk image after a power failure discards every state write
+    /// above D. Raft log/vote records are deliberately left untouched; only the
+    /// materialized state and its applied-aligned committed hint are rewound.
+    fn restore_durable_prefix(path: &std::path::Path, prefix: &DurablePrefix) {
+        let storage = Storage::open(path).unwrap();
+        storage.ensure_group(TEST_GROUP).unwrap();
+        let state_cf = storage.state_cf(TEST_GROUP).unwrap();
+        let log_cf = storage.log_cf(TEST_GROUP).unwrap();
+        let mut batch = WriteBatch::default();
+        for item in storage
+            .db()
+            .iterator_cf(&state_cf, rocksdb::IteratorMode::Start)
+        {
+            let (key, _) = item.unwrap();
+            batch.delete_cf(&state_cf, key);
+        }
+        for (key, value) in &prefix.state {
+            batch.put_cf(&state_cf, key, value);
+        }
+        match &prefix.committed {
+            Some(committed) => batch.put_cf(&log_cf, KEY_COMMITTED, committed),
+            None => batch.delete_cf(&log_cf, KEY_COMMITTED),
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        storage.db().write_opt(batch, &options).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CrashScope {
+        Follower,
+        Leader,
+        FollowerMajority,
+        FullCluster,
+    }
+
+    impl CrashScope {
+        fn suffix(self, baseline_version: u64) -> DataRequest {
+            match self {
+                Self::Follower => put(2, b"put-after-D", b"put-value", None),
+                Self::Leader => put(
+                    2,
+                    b"baseline",
+                    b"must-not-apply",
+                    Some(IfVersion::Number(baseline_version + 1)),
+                ),
+                Self::FollowerMajority => {
+                    delete(2, b"baseline", Some(IfVersion::Number(baseline_version)))
+                }
+                Self::FullCluster => put(
+                    2,
+                    b"baseline",
+                    b"updated",
+                    Some(IfVersion::Number(baseline_version)),
+                ),
+            }
+        }
+
+        fn targets(self, leader: usize) -> Vec<usize> {
+            let followers: Vec<_> = (0..VOTERS.len()).filter(|&idx| idx != leader).collect();
+            match self {
+                Self::Follower => vec![followers[0]],
+                Self::Leader => vec![leader],
+                Self::FollowerMajority => followers,
+                Self::FullCluster => (0..VOTERS.len()).collect(),
+            }
+        }
+
+        fn expected_state(self, mutation: MutationResult) -> (&'static [u8], Option<Vec<u8>>) {
+            match self {
+                Self::Follower => (b"put-after-D", Some(b"put-value".to_vec())),
+                Self::Leader => (b"baseline", Some(b"baseline-value".to_vec())),
+                Self::FollowerMajority => (b"baseline", None),
+                Self::FullCluster => {
+                    assert!(matches!(mutation, MutationResult::Applied { .. }));
+                    (b"baseline", Some(b"updated".to_vec()))
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_state_cluster_operations_are_visible_ordered_replayed_and_recovered() {
+        let cluster = AsyncCluster::new();
+        let mut nodes = Vec::new();
+        let mut storages = Vec::new();
+        for idx in 0..3 {
+            let (node, storage) = cluster.start(idx).await;
+            assert!(storage.state_apply_is_async(TEST_GROUP));
+            assert!(!storage.state_recovery_ready(TEST_GROUP));
+            nodes.push(node);
+            storages.push(storage);
+        }
+
+        nodes[0].initialize(&VOTERS).await.unwrap();
+        eventually("leader election", || leader_idx(&nodes).is_some()).await;
+
+        // A successful reply is allowed at visibility, before the state WAL
+        // flush. The same process must already read that value and its sequence
+        // result, while the durable watermark remains behind.
+        let first = put(1, b"key", b"one", None);
+        let first_result = write_to_leader(&nodes, &first).await;
+        let first_version = match first_result {
+            ApplyResult::Decided(MutationResult::Applied { version }) => version,
+            other => panic!("unexpected initial put result: {other:?}"),
+        };
+        let leader = leader_idx(&nodes).unwrap();
+        let state = storages[leader].state_durability(TEST_GROUP);
+        assert_eq!(
+            state.visible.map(|log_id| log_id.index),
+            Some(first_version)
+        );
+        assert!(state.durable.map(|log_id| log_id.index) < Some(first_version));
+        assert!(state.pending_entries > 0);
+        assert_eq!(
+            nodes[leader].local_get(b"key").unwrap(),
+            Some((first_version, b"one".to_vec()))
+        );
+        assert_eq!(
+            nodes[leader]
+                .read(b"key", Consistency::Linearizable)
+                .await
+                .unwrap(),
+            ReadOutcome::Value(Some((first_version, b"one".to_vec())))
+        );
+
+        // An identical retry returns the original result. Conditional failure,
+        // successful CAS, conditional delete failure, and successful delete
+        // then execute in the same per-client stream without observing stale
+        // materialized state.
+        assert_eq!(
+            write_to_leader(&nodes, &first).await,
+            ApplyResult::Replayed(MutationResult::Applied {
+                version: first_version,
+            })
+        );
+        let failed_put = put(
+            2,
+            b"key",
+            b"wrong",
+            Some(IfVersion::Number(first_version + 100)),
+        );
+        let failed_result = MutationResult::ConditionFailed {
+            current: KeyPresence::Present {
+                version: first_version,
+            },
+        };
+        assert_eq!(
+            write_to_leader(&nodes, &failed_put).await,
+            ApplyResult::Decided(failed_result)
+        );
+        assert_eq!(
+            write_to_leader(&nodes, &failed_put).await,
+            ApplyResult::Replayed(failed_result)
+        );
+
+        let updated = write_to_leader(
+            &nodes,
+            &put(3, b"key", b"two", Some(IfVersion::Number(first_version))),
+        )
+        .await;
+        let updated_version = match updated {
+            ApplyResult::Decided(MutationResult::Applied { version }) => version,
+            other => panic!("unexpected conditional put result: {other:?}"),
+        };
+        assert_eq!(
+            write_to_leader(
+                &nodes,
+                &delete(4, b"key", Some(IfVersion::Number(first_version))),
+            )
+            .await,
+            ApplyResult::Decided(MutationResult::ConditionFailed {
+                current: KeyPresence::Present {
+                    version: updated_version,
+                },
+            })
+        );
+        let deleted = write_to_leader(
+            &nodes,
+            &delete(5, b"key", Some(IfVersion::Number(updated_version))),
+        )
+        .await;
+        assert!(matches!(
+            deleted,
+            ApplyResult::Decided(MutationResult::Applied { .. })
+        ));
+        let leader = leader_idx(&nodes).unwrap();
+        assert_eq!(
+            nodes[leader]
+                .read(b"key", Consistency::Linearizable)
+                .await
+                .unwrap(),
+            ReadOutcome::Value(None)
+        );
+
+        // Retain an acknowledged value across a follower restart. Async state
+        // starts every process epoch fenced even when the recovered state is
+        // fully durable; a subsequent committed apply reopens stale reads.
+        let retained = write_to_leader(&nodes, &put(6, b"retained", b"value", None)).await;
+        let retained_version = match retained {
+            ApplyResult::Decided(MutationResult::Applied { version }) => version,
+            other => panic!("unexpected retained put result: {other:?}"),
+        };
+        eventually("all replicas apply retained value", || {
+            nodes.iter().all(|node| {
+                node.local_get(b"retained").unwrap() == Some((retained_version, b"value".to_vec()))
+            })
+        })
+        .await;
+        for storage in &storages {
+            let visible = storage
+                .state_durability(TEST_GROUP)
+                .visible
+                .expect("replica has visible state");
+            storage
+                .wait_state_durable(TEST_GROUP, &visible)
+                .await
+                .unwrap();
+        }
+
+        let leader = leader_idx(&nodes).unwrap();
+        let follower = (leader + 1) % nodes.len();
+        let follower_id = nodes[follower].node_id();
+        let stopped = nodes.remove(follower);
+        stopped.shutdown().await.unwrap();
+        cluster.registry.remove(follower_id);
+        drop(stopped);
+        drop(storages.remove(follower));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (restarted, restarted_storage) = cluster.start(follower).await;
+        assert!(!restarted_storage.state_recovery_ready(TEST_GROUP));
+        assert_eq!(
+            restarted.local_get(b"retained").unwrap(),
+            Some((retained_version, b"value".to_vec()))
+        );
+        nodes.insert(follower, restarted);
+        storages.insert(follower, restarted_storage);
+        eventually("restarted follower observes leader", || {
+            nodes[follower].current_leader().is_some()
+        })
+        .await;
+        assert!(matches!(
+            nodes[follower]
+                .read(b"retained", Consistency::Stale { min_version: None })
+                .await
+                .unwrap(),
+            ReadOutcome::TooStale { .. }
+        ));
+
+        let after_restart =
+            write_to_leader(&nodes, &put(7, b"after-restart", b"ready", None)).await;
+        assert!(matches!(
+            after_restart,
+            ApplyResult::Decided(MutationResult::Applied { .. })
+        ));
+        eventually("restarted follower recovery gate opens", || {
+            storages[follower].state_recovery_ready(TEST_GROUP)
+                && matches!(
+                    nodes[follower].local_get(b"after-restart").unwrap(),
+                    Some((_, ref value)) if value == b"ready"
+                )
+        })
+        .await;
+        assert_eq!(
+            nodes[follower]
+                .read(b"retained", Consistency::Stale { min_version: None })
+                .await
+                .unwrap(),
+            ReadOutcome::Value(Some((retained_version, b"value".to_vec())))
+        );
+
+        // Finally remove the current leader and verify that a new quorum still
+        // serves every acknowledged operation.
+        let old_leader = leader_idx(&nodes).unwrap();
+        let old_leader_id = nodes[old_leader].node_id();
+        nodes[old_leader].shutdown().await.unwrap();
+        cluster.registry.remove(old_leader_id);
+        let survivors: Vec<usize> = (0..nodes.len()).filter(|&idx| idx != old_leader).collect();
+        let mut served = false;
+        for _ in 0..200 {
+            if let Some(new_leader) = survivors
+                .iter()
+                .copied()
+                .find(|&idx| nodes[idx].current_leader() == Some(nodes[idx].node_id()))
+                && let Ok(ReadOutcome::Value(Some((version, value)))) = nodes[new_leader]
+                    .read(b"retained", Consistency::Linearizable)
+                    .await
+            {
+                assert_eq!(version, retained_version);
+                assert_eq!(value, b"value");
+                served = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(served, "new leader did not preserve the acknowledged value");
+
+        for idx in survivors {
+            nodes[idx].shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn acknowledged_async_suffix_replays_after_simulated_power_loss_matrix() {
+        for scope in [
+            CrashScope::Follower,
+            CrashScope::Leader,
+            CrashScope::FollowerMajority,
+            CrashScope::FullCluster,
+        ] {
+            let cluster = AsyncCluster::new();
+            let mut nodes = Vec::new();
+            let mut storages = Vec::new();
+            for idx in 0..VOTERS.len() {
+                let (node, storage) = cluster.start(idx).await;
+                nodes.push(Some(node));
+                storages.push(Some(storage));
+            }
+            nodes[0]
+                .as_ref()
+                .unwrap()
+                .initialize(&VOTERS)
+                .await
+                .unwrap();
+            eventually("matrix leader election", || {
+                active_leader_idx(&nodes).is_some()
+            })
+            .await;
+
+            // Establish D and capture the exact state/hint prefix each replica
+            // is allowed to recover after the simulated power loss.
+            let baseline = put(1, b"baseline", b"baseline-value", None);
+            let baseline_result = write_to_active_leader(&nodes, &baseline).await;
+            let baseline_version = match baseline_result {
+                ApplyResult::Decided(MutationResult::Applied { version }) => version,
+                other => panic!("{scope:?}: unexpected baseline result: {other:?}"),
+            };
+            eventually("baseline reaches every replica", || {
+                nodes.iter().flatten().all(|node| {
+                    node.local_get(b"baseline").unwrap()
+                        == Some((baseline_version, b"baseline-value".to_vec()))
+                })
+            })
+            .await;
+            for storage in storages.iter().flatten() {
+                let visible = storage
+                    .state_durability(TEST_GROUP)
+                    .visible
+                    .expect("baseline is visible");
+                storage
+                    .wait_state_durable(TEST_GROUP, &visible)
+                    .await
+                    .unwrap();
+            }
+            let durable_prefixes: Vec<_> = storages
+                .iter()
+                .map(|storage| capture_durable_prefix(storage.as_ref().unwrap()))
+                .collect();
+
+            // This operation is acknowledged from A while its state batch is
+            // still pending durability. Its Raft log entry is already durable
+            // on a quorum and is the sole recovery authority after rewind.
+            let suffix = scope.suffix(baseline_version);
+            let suffix_result = write_to_active_leader(&nodes, &suffix).await;
+            let mutation = match suffix_result {
+                ApplyResult::Decided(mutation) => mutation,
+                other => panic!("{scope:?}: unexpected suffix result: {other:?}"),
+            };
+            let leader = active_leader_idx(&nodes).unwrap();
+            let leader_state = storages[leader]
+                .as_ref()
+                .unwrap()
+                .state_durability(TEST_GROUP);
+            assert!(
+                leader_state.visible > leader_state.durable,
+                "{scope:?}: response did not expose the intended A>D cut"
+            );
+            let suffix_index = leader_state.visible.unwrap().index;
+            eventually("suffix applies on every replica", || {
+                nodes.iter().flatten().all(|node| {
+                    node.applied_index()
+                        .is_some_and(|index| index >= suffix_index)
+                })
+            })
+            .await;
+
+            let targets = scope.targets(leader);
+            for &idx in &targets {
+                let node = nodes[idx].take().unwrap();
+                node.shutdown().await.unwrap();
+                cluster.registry.remove(node.node_id());
+                drop(node);
+                drop(storages[idx].take());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for &idx in &targets {
+                restore_durable_prefix(cluster.dirs[idx].path(), &durable_prefixes[idx]);
+            }
+
+            // Reopen the damaged replicas. For the full-cluster case a new-term
+            // blank entry re-establishes the forgotten committed suffix before
+            // any local/stale state may be trusted.
+            for &idx in &targets {
+                let (node, storage) = cluster.start(idx).await;
+                assert!(!storage.state_recovery_ready(TEST_GROUP));
+                nodes[idx] = Some(node);
+                storages[idx] = Some(storage);
+            }
+            eventually("post-crash leader election", || {
+                active_leader_idx(&nodes).is_some()
+            })
+            .await;
+
+            let (expected_key, expected_value) = scope.expected_state(mutation);
+            eventually("Raft log replays the lost materialized suffix", || {
+                nodes.iter().flatten().all(|node| {
+                    node.local_get(expected_key)
+                        .unwrap()
+                        .map(|(_, value)| value)
+                        == expected_value
+                })
+            })
+            .await;
+            eventually("replayed replicas pass their recovery fence", || {
+                targets.iter().all(|&idx| {
+                    storages[idx]
+                        .as_ref()
+                        .unwrap()
+                        .state_recovery_ready(TEST_GROUP)
+                })
+            })
+            .await;
+
+            // Reissuing the exact client/sequence bytes must return the
+            // original decision, including a failed-CAS result, without
+            // creating a new version.
+            assert_eq!(
+                write_to_active_leader(&nodes, &suffix).await,
+                ApplyResult::Replayed(mutation),
+                "{scope:?}: replay result changed after state loss"
+            );
+
+            for node in nodes.into_iter().flatten() {
+                node.shutdown().await.unwrap();
+            }
+        }
+    }
+}

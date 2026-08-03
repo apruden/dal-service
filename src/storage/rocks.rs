@@ -153,6 +153,16 @@ impl Storage {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_sync_test(path: impl AsRef<Path>) -> Result<Storage> {
+        Self::open_with_options(path, DurabilityConfig::default(), false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_durability_test(&self, error: impl Into<String>) {
+        self.apply_durability.fail_all(error.into());
+    }
+
     /// Open and bind identity: on a fresh dir persist `(cluster_id, node_id)`;
     /// on a reused dir require an exact match (DESIGN §12.1).
     pub fn open_checked(
@@ -844,5 +854,44 @@ mod tests {
         storage.wait_state_durable(group, &log_id).await.unwrap();
         storage.reclaim_group(group).unwrap();
         assert!(!storage.group_exists(group));
+    }
+
+    #[tokio::test]
+    async fn async_reclamation_closes_admission_and_waits_for_state_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            Storage::open_with_options(
+                dir.path(),
+                delayed_config(Duration::from_millis(200)),
+                true,
+            )
+            .unwrap(),
+        );
+        let group = GroupId::Data(10);
+        storage.ensure_group(group).unwrap();
+        let cf = storage.state_cf(group).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"state-key", b"state-value");
+        let wal_bytes = batch.size_in_bytes();
+        storage
+            .write_state_batch(group, raft_log_id(4, 9), 1, batch, wal_bytes)
+            .await
+            .unwrap();
+
+        let reclaimer = storage.clone();
+        let reclaim = tokio::spawn(async move { reclaimer.reclaim_group_durable(group).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!reclaim.is_finished());
+        assert!(
+            storage.apply_durability.begin(group, 1, 1).is_err(),
+            "closing must reject a newly admitted state batch"
+        );
+
+        reclaim.await.unwrap().unwrap();
+        assert!(!storage.group_exists(group));
+        assert_eq!(
+            storage.serving_state(group).unwrap(),
+            Some(ServingState::NonServing)
+        );
     }
 }
