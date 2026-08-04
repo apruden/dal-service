@@ -193,26 +193,41 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
             let ret = s.tick();
 
             // A decided or replayed result advances the client stream.
-            let out = match result.mutation() {
-                Some(MutationResult::Applied { version }) => {
+            let Some(mutation) = result.mutation() else {
+                // A protocol rejection carries no register semantics; skip it.
+                seq += 1;
+                continue;
+            };
+            let out = match mutation {
+                MutationResult::Applied { version } => {
                     s.acked.lock().unwrap().push((key.clone(), version));
                     Outcome::Applied { version }
                 }
-                Some(MutationResult::ConditionFailed { current }) => Outcome::ConditionFailed {
+                MutationResult::ConditionFailed { current } => Outcome::ConditionFailed {
                     present: present(current),
                 },
-                // A protocol rejection carries no register semantics; skip it.
-                None => {
-                    seq += 1;
-                    continue;
-                }
             };
             s.applied.lock().unwrap().push(Applied {
                 client_id,
                 partition: 0,
                 sequence: seq,
                 digest: dg,
+                fresh: matches!(&result, ApplyResult::Decided(_)),
             });
+
+            // Deliberately append the same idempotency key again. The oracle
+            // now observes both the original response and a concrete replay;
+            // a second fresh decision is a real exactly-once violation.
+            if let Some(replay) = do_write(&s, &req).await {
+                assert_eq!(replay.mutation(), Some(mutation));
+                s.applied.lock().unwrap().push(Applied {
+                    client_id,
+                    partition: 0,
+                    sequence: seq,
+                    digest: dg,
+                    fresh: matches!(replay, ApplyResult::Decided(_)),
+                });
+            }
             s.history.lock().unwrap().push(Recorded {
                 key,
                 call,
@@ -385,7 +400,7 @@ async fn check_oracles(s: &Shared) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn oracles_hold_under_leader_crash_multiple_seeds() {
-    let seeds = match std::env::var("DAL_VERIFY_SEEDS")
+    let seeds: Vec<u64> = match std::env::var("DAL_VERIFY_SEEDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
@@ -397,7 +412,7 @@ async fn oracles_hold_under_leader_crash_multiple_seeds() {
             (start..start.saturating_add(count)).collect()
         }
         Some(_) => panic!("DAL_VERIFY_SEEDS must be greater than zero"),
-        None => vec![1u64, 7, 42, 1337],
+        None => (0u64..100).collect(),
     };
     for seed in seeds {
         eprintln!("verification seed: {seed}");

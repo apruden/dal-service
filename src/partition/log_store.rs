@@ -129,6 +129,9 @@ impl RocksLogStore {
         &self,
         key: &[u8],
     ) -> Result<Option<T>, StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(read_err)?;
         let cf = self.storage.log_cf(self.group).map_err(read_err)?;
         let raw = self
             .storage
@@ -146,6 +149,9 @@ impl RocksLogStore {
         C: GroupConfig,
         openraft::Entry<C>: serde::de::DeserializeOwned,
     {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(read_err)?;
         let cf = self.storage.log_cf(self.group).map_err(read_err)?;
         // Seek just past the entry range and step backwards to the highest entry.
         let mut iter = self.storage.db().iterator_cf(
@@ -172,6 +178,9 @@ where
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<C>>, StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(read_err)?;
         let start = match range.start_bound() {
             Bound::Included(i) => *i,
             Bound::Excluded(i) => i + 1,
@@ -225,6 +234,9 @@ where
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(write_err)?;
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         let _profile = crate::perf::timer(WriteStage::SaveVoteSynced);
         self.storage
@@ -239,6 +251,9 @@ where
     }
 
     async fn save_committed(&mut self, _committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(write_err)?;
         // The state machine folds its final applied LogId into the same cross-CF
         // batch as the applied pointer and business mutations. OpenRaft permits
         // this method to be a no-op for a durable state machine; a crash before
@@ -263,6 +278,9 @@ where
         I: IntoIterator<Item = openraft::Entry<C>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(write_err)?;
         let (batch, wal_bytes) = {
             let cf = self.storage.log_cf(self.group).map_err(write_err)?;
             let mut batch = WriteBatch::default();
@@ -303,6 +321,9 @@ where
     }
 
     async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(write_err)?;
         // Delete all entries with index >= log_id.index.
         let cf = self.storage.log_cf(self.group).map_err(write_err)?;
         self.storage
@@ -318,6 +339,9 @@ where
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
+        self.storage
+            .require_group_healthy(self.group)
+            .map_err(write_err)?;
         // A snapshot/purge boundary may only discard the replay source after
         // the materialized state through the same log id is WAL-durable.
         self.storage
@@ -561,6 +585,28 @@ mod tests {
                 format!("log-{index}").as_bytes(),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn database_failure_fences_vote_and_log_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(10);
+        storage.ensure_group(group).unwrap();
+        let mut store = RocksLogStore::new(storage.clone(), group);
+
+        storage.fail_durability_test("injected database failure");
+
+        assert!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::save_vote(&mut store, &Vote::new(2, 1),)
+                .await
+                .is_err()
+        );
+        assert!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut store)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

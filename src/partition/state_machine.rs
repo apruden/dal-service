@@ -23,7 +23,7 @@ use crate::types::{
 /// A read seam over a group's state CF. `evaluate` decides an entry purely from
 /// these reads, so the same logic serves two callers: the committed CF directly
 /// ([`Storage`]), or a [`StateOverlay`] that layers not-yet-durable mutations
-/// from earlier entries in the same apply batch on top of it. The two are
+/// from earlier entries in the same bounded apply chunk on top of it. The two are
 /// observationally identical, which is what lets the Raft applier coalesce a
 /// batch into one fsync without changing any decision.
 pub trait StateRead {
@@ -37,15 +37,15 @@ impl StateRead for Storage {
 }
 
 /// An in-memory overlay of pending state-CF writes for one group, layered over
-/// the committed CF for the duration of a single Raft apply batch.
+/// the committed CF for the duration of a single bounded Raft apply chunk.
 ///
 /// Writing each committed entry with its own fsync is correct but pays one fsync
-/// per entry. Coalescing the whole batch into one durable write requires that a
+/// per entry. Coalescing a bounded chunk into one atomic write requires that a
 /// later entry still observe an earlier entry's effects (a CAS chain on one key,
 /// or two ops on one client's sequence stream). This overlay provides exactly
 /// that: staged mutations are visible to subsequent [`StateRead`] calls, while
-/// the actual durable write happens once at the end of the batch. Reads fall
-/// through to the committed CF for any key the batch has not touched.
+/// the actual write happens once at the end of the chunk. Reads fall through to
+/// the committed CF for any key the chunk has not touched.
 pub struct StateOverlay<'a> {
     storage: &'a Storage,
     pending: HashMap<Vec<u8>, Option<Vec<u8>>>,

@@ -510,6 +510,7 @@ impl Node {
             let src: Arc<dyn StatusSource> = Arc::new(NodeStatus {
                 node_id: cfg.node_id,
                 cluster: cluster.clone(),
+                storage: storage.clone(),
                 meta: meta_handle.clone(),
                 partitions: partitions.clone(),
             });
@@ -904,6 +905,7 @@ async fn recovery_fence_driver(
 struct NodeStatus {
     node_id: NodeId,
     cluster: ClusterConfig,
+    storage: Arc<Storage>,
     meta: MetaHandle,
     partitions: PartitionMap,
 }
@@ -993,6 +995,7 @@ impl StatusSource for NodeStatus {
             node_id: self.node_id,
             cluster_id: cluster_id_hex(self.cluster.cluster_id),
             protocol_version: self.cluster.protocol_version,
+            storage_failed: self.storage.database_failure().is_some(),
             meta,
             partitions,
             directory,

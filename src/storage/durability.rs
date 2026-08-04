@@ -46,7 +46,7 @@ impl Default for DurabilityConfig {
     fn default() -> Self {
         Self {
             max_pending_requests: 1_024,
-            max_pending_bytes: 64 * 1024 * 1024,
+            max_pending_bytes: super::MAX_PENDING_WAL_BYTES,
             max_batch_delay: Duration::from_micros(200),
             // A lone request flushes immediately. Under concurrency, producers
             // reserve before enqueueing, which tells the worker to wait briefly
@@ -91,10 +91,16 @@ impl Shared {
     }
 
     fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
-        // One oversized batch is allowed when the byte budget is otherwise
-        // empty. Charging it at the limit prevents another request from being
-        // admitted until that batch is durable.
-        let charged_bytes = bytes.min(self.config.max_pending_bytes);
+        if bytes > self.config.max_pending_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "WAL batch of {bytes} bytes exceeds durability limit of {} bytes",
+                    self.config.max_pending_bytes
+                ),
+            ));
+        }
+        let charged_bytes = bytes;
         let mut state = self.state.lock().unwrap();
 
         loop {
@@ -560,6 +566,14 @@ mod tests {
             .unwrap();
 
         assert!(rx.recv_timeout(Duration::from_millis(100)).unwrap());
+    }
+
+    #[test]
+    fn oversized_batch_is_rejected_instead_of_undercharged() {
+        let durability =
+            WalDurability::with_config(test_config(true), |_| Ok(()), || Ok(())).unwrap();
+        assert!(durability.reserve(1_025).is_err());
+        assert_eq!(durability.shared.pending_requests(), 0);
     }
 
     #[test]

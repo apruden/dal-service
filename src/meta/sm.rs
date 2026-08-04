@@ -46,6 +46,7 @@ impl MetaRaftStateMachine {
     }
 
     fn read_applied(&self) -> Result<Applied, StorageError<NodeId>> {
+        self.storage.require_healthy().map_err(read_err)?;
         match self.storage.raft_applied(GroupId::Meta).map_err(read_err)? {
             Some(bytes) => codec::decode(&bytes).map_err(read_err),
             None => Ok((None, StoredMembership::default())),
@@ -143,6 +144,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotData>, StorageError<NodeId>> {
+        self.storage.require_healthy().map_err(write_err)?;
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 

@@ -28,8 +28,15 @@ use crate::partition::raft_types::{
 };
 use crate::partition::state_machine::{ApplyResult, DataStateMachine, StateOverlay};
 use crate::perf::WriteStage;
-use crate::storage::Storage;
+use crate::storage::{MAX_PENDING_STATE_BYTES, MAX_PENDING_STATE_ENTRIES, Storage};
 use crate::types::GroupId;
+
+/// Keep normal coalesced chunks comfortably below the final RocksDB batch
+/// limits. The final storage boundary still measures and rejects an oversized
+/// batch, so unusual membership records or encoding growth cannot bypass the
+/// hard limit.
+const APPLY_CHUNK_INPUT_BYTES: usize = MAX_PENDING_STATE_BYTES / 2;
+const APPLY_CHUNK_ENTRIES: usize = MAX_PENDING_STATE_ENTRIES / 2;
 
 /// Whether a Raft apply batch is committed with one fsync (coalesced) or one
 /// fsync per entry (the original path). Coalescing is the default; set
@@ -71,18 +78,18 @@ impl RocksStateMachine {
     }
 
     fn read_applied(&self) -> Result<Applied, StorageError<NodeId>> {
+        self.storage.require_healthy().map_err(read_err)?;
         match self.storage.raft_applied(self.group).map_err(read_err)? {
             Some(bytes) => codec::decode(&bytes).map_err(read_err),
             None => Ok((None, StoredMembership::default())),
         }
     }
 
-    /// Coalesced apply: decide every entry against a [`StateOverlay`] so later
-    /// entries see earlier ones, then commit the whole batch in one atomic write
-    /// with `last_applied` set to the final entry. Atomic and crash-safe: a
-    /// crash before durability recovers to the previous durable
-    /// `last_applied`, and Raft re-delivers the same contiguous, deterministic
-    /// batch (idempotent via the per-client sequence records).
+    /// Coalesced apply: decide bounded chunks against a [`StateOverlay`] so
+    /// later entries see earlier ones, then atomically commit each chunk with
+    /// `last_applied` set to its final entry. A crash between chunks recovers a
+    /// clean prefix, and Raft re-delivers the remaining contiguous,
+    /// deterministic entries (idempotent via the per-client sequence records).
     async fn apply_coalesced<I>(
         &mut self,
         entries: I,
@@ -91,6 +98,39 @@ impl RocksStateMachine {
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let mut all_results = Vec::new();
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0usize;
+
+        for entry in entries {
+            let entry_bytes = codec::encode(&entry).len();
+            let would_exceed = !chunk.is_empty()
+                && (chunk.len() >= APPLY_CHUNK_ENTRIES
+                    || chunk_bytes.saturating_add(entry_bytes) > APPLY_CHUNK_INPUT_BYTES);
+            if would_exceed {
+                all_results.extend(
+                    self.apply_coalesced_chunk(std::mem::take(&mut chunk))
+                        .await?,
+                );
+                chunk_bytes = 0;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(entry_bytes);
+            chunk.push(entry);
+        }
+
+        if !chunk.is_empty() {
+            all_results.extend(self.apply_coalesced_chunk(chunk).await?);
+        }
+        Ok(all_results)
+    }
+
+    /// Apply one bounded coalesced chunk. A multi-chunk call remains crash-safe:
+    /// every chunk advances the atomic applied record only after becoming
+    /// visible, so restart observes a prefix and OpenRaft re-delivers the rest.
+    async fn apply_coalesced_chunk(
+        &mut self,
+        entries: Vec<Entry>,
+    ) -> Result<Vec<ApplyResult>, StorageError<NodeId>> {
         let (_, mut membership) = self.read_applied()?;
         let mut overlay = StateOverlay::new(&self.storage);
         let mut results = Vec::new();
@@ -248,6 +288,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotData>, StorageError<NodeId>> {
+        self.storage.require_healthy().map_err(write_err)?;
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -371,6 +412,26 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(committed, Some(log_id(12)));
+    }
+
+    #[tokio::test]
+    async fn coalesced_apply_chunks_input_larger_than_the_dirty_entry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(4);
+        storage.ensure_group(group).unwrap();
+        let mut sm = RocksStateMachine::new(storage, group);
+        let last_index = MAX_PENDING_STATE_ENTRIES as u64 + 1;
+        let entries = (1..=last_index).map(|index| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        });
+
+        let results = sm.apply_coalesced(entries).await.unwrap();
+
+        assert_eq!(results.len(), last_index as usize);
+        assert!(results.iter().all(|result| *result == ApplyResult::NoOp));
+        assert_eq!(sm.read_applied().unwrap().0, Some(log_id(last_index)));
     }
 
     #[tokio::test]

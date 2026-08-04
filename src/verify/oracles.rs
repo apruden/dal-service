@@ -17,25 +17,37 @@ pub struct Applied {
     /// Digest of the canonical command bytes, so a duplicate response can be
     /// confirmed to be for a byte-identical command (DESIGN §8.4).
     pub digest: u128,
+    /// `true` only when the state machine reported a fresh decision. Retry
+    /// responses must be marked as replays, allowing the oracle to distinguish
+    /// repeated observations from repeated logical application.
+    pub fresh: bool,
 }
 
 /// Exactly-once: every `(client_id, partition, sequence)` is applied at most
 /// once, and any repeat carries the identical command digest (a replayed
 /// response for the same bytes, never a different command reusing the key).
 pub fn exactly_once(applied: &[Applied]) -> Result<(), String> {
-    let mut seen: HashMap<(u128, u16, u64), u128> = HashMap::new();
+    let mut seen: HashMap<(u128, u16, u64), (u128, bool)> = HashMap::new();
     for a in applied {
         let key = (a.client_id, a.partition, a.sequence);
-        match seen.get(&key) {
-            Some(&digest) if digest != a.digest => {
+        match seen.get_mut(&key) {
+            Some((digest, _)) if *digest != a.digest => {
                 return Err(format!(
                     "sequence {key:?} applied for two different commands \
                      ({digest:#x} vs {:#x})",
                     a.digest
                 ));
             }
-            _ => {
-                seen.insert(key, a.digest);
+            Some((_, fresh_seen)) if *fresh_seen && a.fresh => {
+                return Err(format!(
+                    "sequence {key:?} was reported as freshly decided more than once"
+                ));
+            }
+            Some((_, fresh_seen)) => {
+                *fresh_seen |= a.fresh;
+            }
+            None => {
+                seen.insert(key, (a.digest, a.fresh));
             }
         }
     }
@@ -114,12 +126,14 @@ mod tests {
                 partition: 0,
                 sequence: 1,
                 digest: 0xAA,
+                fresh: true,
             },
             Applied {
                 client_id: 1,
                 partition: 0,
                 sequence: 1,
                 digest: 0xAA,
+                fresh: false,
             }, // replay
         ];
         assert!(exactly_once(&a).is_ok());
@@ -133,12 +147,35 @@ mod tests {
                 partition: 0,
                 sequence: 1,
                 digest: 0xAA,
+                fresh: true,
             },
             Applied {
                 client_id: 1,
                 partition: 0,
                 sequence: 1,
                 digest: 0xBB,
+                fresh: false,
+            },
+        ];
+        assert!(exactly_once(&a).is_err());
+    }
+
+    #[test]
+    fn exactly_once_rejects_two_fresh_decisions() {
+        let a = vec![
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xAA,
+                fresh: true,
+            },
+            Applied {
+                client_id: 1,
+                partition: 0,
+                sequence: 1,
+                digest: 0xAA,
+                fresh: true,
             },
         ];
         assert!(exactly_once(&a).is_err());

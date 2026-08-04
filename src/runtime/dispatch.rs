@@ -130,6 +130,9 @@ impl RootDispatch {
                 let Some(meta) = self.meta() else {
                     return self.raft_unavailable(&req);
                 };
+                if !meta.raft_storage_healthy() {
+                    return self.raft_unavailable(&req);
+                }
                 let raft = meta.raft();
                 match req.msg_type {
                     MsgType::RaftAppend => {
@@ -160,6 +163,9 @@ impl RootDispatch {
                 let Some(node) = self.partitions.read().unwrap().get(&p).cloned() else {
                     return self.raft_unavailable(&req);
                 };
+                if !node.raft_storage_healthy() {
+                    return self.raft_unavailable(&req);
+                }
                 let raft = node.raft();
                 match req.msg_type {
                     MsgType::RaftAppend => {

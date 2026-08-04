@@ -42,6 +42,31 @@ pub struct MetaNode {
     node_id: NodeId,
     raft: Raft,
     storage: Arc<Storage>,
+    storage_failure_monitor: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MetaNode {
+    fn drop(&mut self) {
+        self.storage_failure_monitor.abort();
+    }
+}
+
+fn spawn_storage_failure_monitor(storage: Arc<Storage>, raft: Raft) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut metrics = raft.metrics();
+        tokio::select! {
+            _ = storage.wait_for_failure() => {
+                let _ = raft.shutdown().await;
+            }
+            _ = async {
+                loop {
+                    if metrics.borrow().running_state.is_err() || metrics.changed().await.is_err() {
+                        return;
+                    }
+                }
+            } => {}
+        }
+    })
 }
 
 impl MetaNode {
@@ -92,11 +117,13 @@ impl MetaNode {
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
             .map_err(|e| Error::Raft(format!("raft new: {e}")))?;
+        let storage_failure_monitor = spawn_storage_failure_monitor(storage.clone(), raft.clone());
 
         Ok(MetaNode {
             node_id,
             raft,
             storage,
+            storage_failure_monitor,
         })
     }
 
@@ -110,6 +137,10 @@ impl MetaNode {
 
     pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
         self.storage.rocks_counters()
+    }
+
+    pub(crate) fn raft_storage_healthy(&self) -> bool {
+        self.storage.require_group_healthy(GroupId::Meta).is_ok()
     }
 
     /// Bootstrap the meta group with its initial voter set (DESIGN §3.1).

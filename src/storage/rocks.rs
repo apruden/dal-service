@@ -341,10 +341,30 @@ impl Storage {
                 group
             )));
         }
-        if let Some(error) = self.apply_durability.snapshot(group).failed {
-            return Err(Error::Io(std::io::Error::other(error)));
+        self.require_group_healthy(group)
+    }
+
+    /// Database-wide fail-stop fence. Once a WAL write, WAL flush, dirty-age
+    /// watchdog, or materialization invariant fails, every client and Raft I/O
+    /// path must refuse further participation for the rest of this process.
+    pub(crate) fn require_healthy(&self) -> Result<()> {
+        self.apply_durability.ensure_healthy()
+    }
+
+    pub(crate) fn require_group_healthy(&self, group: GroupId) -> Result<()> {
+        self.require_healthy()?;
+        match self.apply_durability.snapshot(group).failed {
+            Some(error) => Err(Error::Io(std::io::Error::other(error))),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    pub(crate) fn database_failure(&self) -> Option<String> {
+        self.apply_durability.failure()
+    }
+
+    pub(crate) async fn wait_for_failure(&self) -> String {
+        self.apply_durability.wait_for_failure().await
     }
 
     /// Reclaim a removed group's local data (DESIGN §7.4): record `NonServing`
@@ -487,6 +507,7 @@ impl Storage {
         wal_bytes: usize,
         callback: OnDurable,
     ) -> Result<()> {
+        self.require_healthy()?;
         // Reserve first so bytes waiting for durability remain bounded even if
         // the disk becomes slower than Raft producers.
         let reservation = {
@@ -521,6 +542,7 @@ impl Storage {
         batch: rocksdb::WriteBatch,
         wal_bytes: usize,
     ) -> Result<()> {
+        self.require_healthy()?;
         let reservation = {
             let _profile = crate::perf::timer(WriteStage::StateApplyCapacityWait);
             self.durability.reserve(wal_bytes)?

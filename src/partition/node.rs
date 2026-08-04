@@ -55,6 +55,31 @@ pub struct PartitionNode {
     raft: Raft,
     storage: Arc<Storage>,
     data: DataStateMachine,
+    storage_failure_monitor: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PartitionNode {
+    fn drop(&mut self) {
+        self.storage_failure_monitor.abort();
+    }
+}
+
+fn spawn_storage_failure_monitor(storage: Arc<Storage>, raft: Raft) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut metrics = raft.metrics();
+        tokio::select! {
+            _ = storage.wait_for_failure() => {
+                let _ = raft.shutdown().await;
+            }
+            _ = async {
+                loop {
+                    if metrics.borrow().running_state.is_err() || metrics.changed().await.is_err() {
+                        return;
+                    }
+                }
+            } => {}
+        }
+    })
 }
 
 impl PartitionNode {
@@ -113,6 +138,7 @@ impl PartitionNode {
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
             .map_err(|e| Error::Raft(format!("raft new: {e}")))?;
+        let storage_failure_monitor = spawn_storage_failure_monitor(storage.clone(), raft.clone());
 
         Ok(PartitionNode {
             node_id,
@@ -120,6 +146,7 @@ impl PartitionNode {
             raft,
             storage,
             data: DataStateMachine::new(group),
+            storage_failure_monitor,
         })
     }
 
@@ -141,6 +168,10 @@ impl PartitionNode {
 
     pub(crate) fn materialized_state_status(&self) -> crate::storage::ApplyDurabilitySnapshot {
         self.storage.state_durability(self.group)
+    }
+
+    pub(crate) fn raft_storage_healthy(&self) -> bool {
+        self.storage.require_group_healthy(self.group).is_ok()
     }
 
     /// Bootstrap this group with the given voter set (DESIGN §3.1). Idempotent
@@ -607,6 +638,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("no active leader accepted request {req:?}");
+    }
+
+    #[tokio::test]
+    async fn database_failure_stops_raft_participation() {
+        let cluster = AsyncCluster::new();
+        let (node, storage) = cluster.start(0).await;
+        let mut metrics = node.raft().metrics();
+
+        storage.fail_durability_test("injected database failure");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if metrics.borrow().running_state.is_err() {
+                    return;
+                }
+                metrics.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Raft runtime kept participating after database failure");
+        cluster.registry.remove(node.node_id());
     }
 
     async fn fence_node(nodes: &[PartitionNode], target: usize) {

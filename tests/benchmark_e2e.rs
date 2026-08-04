@@ -23,7 +23,7 @@
 //!
 //! To A/B the Raft-apply fsync coalescing, run this benchmark twice:
 //!   DAL_APPLY_COALESCE=0 ...  (baseline: one fsync per committed entry)
-//!   DAL_APPLY_COALESCE=1 ...  (coalesced: one fsync per apply batch, default)
+//!   DAL_APPLY_COALESCE=1 ...  (coalesced: one fsync per bounded apply chunk, default)
 //! The write-throughput phases (3 and 4) are where the difference shows, since
 //! that is where openraft applies committed entries in batches.
 //!
@@ -344,7 +344,7 @@ async fn end_to_end_benchmark_three_nodes() {
     println!(
         "  apply mode: {} (DAL_APPLY_COALESCE)",
         if coalesce {
-            "coalesced (1 fsync / batch)"
+            "coalesced (1 fsync / bounded chunk)"
         } else {
             "per-entry (1 fsync / entry)"
         },

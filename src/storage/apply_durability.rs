@@ -31,8 +31,8 @@ pub(crate) struct ApplyDurabilityLimits {
 impl Default for ApplyDurabilityLimits {
     fn default() -> Self {
         Self {
-            max_pending_entries: 4_096,
-            max_pending_bytes: 64 * 1024 * 1024,
+            max_pending_entries: super::MAX_PENDING_STATE_ENTRIES,
+            max_pending_bytes: super::MAX_PENDING_STATE_BYTES,
             max_dirty_age: Duration::from_secs(30),
         }
     }
@@ -169,11 +169,18 @@ impl GroupTracker {
                 "materialized-state durability tracker is closing".into(),
             ));
         }
-        let empty = state.pending.is_empty();
+        if entries > limits.max_pending_entries || bytes > limits.max_pending_bytes {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "materialized-state batch of {entries} entries / {bytes} bytes exceeds limits of {} entries / {} bytes",
+                    limits.max_pending_entries, limits.max_pending_bytes
+                ),
+            )));
+        }
         let entries_fit =
-            empty || state.pending_entries.saturating_add(entries) <= limits.max_pending_entries;
-        let bytes_fit =
-            empty || state.pending_bytes.saturating_add(bytes) <= limits.max_pending_bytes;
+            state.pending_entries.saturating_add(entries) <= limits.max_pending_entries;
+        let bytes_fit = state.pending_bytes.saturating_add(bytes) <= limits.max_pending_bytes;
         if !entries_fit || !bytes_fit {
             return Ok(false);
         }
@@ -432,6 +439,7 @@ impl GroupTracker {
 pub(crate) struct ApplyDurabilityRegistry {
     groups: Mutex<HashMap<GroupId, Arc<GroupTracker>>>,
     failed: Mutex<Option<String>>,
+    failure_changed: Notify,
     limits: ApplyDurabilityLimits,
 }
 
@@ -445,6 +453,7 @@ impl ApplyDurabilityRegistry {
         Self {
             groups: Mutex::new(HashMap::new()),
             failed: Mutex::new(None),
+            failure_changed: Notify::new(),
             limits,
         }
     }
@@ -526,11 +535,19 @@ impl ApplyDurabilityRegistry {
     }
 
     pub(crate) fn visible(&self, group: GroupId, log_id: RaftLogId) {
-        self.tracker(group).visible(log_id);
+        let tracker = self.tracker(group);
+        tracker.visible(log_id);
+        if let Some(error) = tracker.snapshot().failed {
+            self.fail_all(error);
+        }
     }
 
     pub(crate) fn durable(&self, group: GroupId, log_id: RaftLogId) {
-        self.tracker(group).durable(log_id);
+        let tracker = self.tracker(group);
+        tracker.durable(log_id);
+        if let Some(error) = tracker.snapshot().failed {
+            self.fail_all(error);
+        }
     }
 
     pub(crate) fn cancel(&self, group: GroupId, log_id: RaftLogId, error: String) {
@@ -540,13 +557,42 @@ impl ApplyDurabilityRegistry {
 
     pub(crate) fn fail_all(&self, error: String) {
         let mut failed = self.failed.lock().unwrap();
+        let first_failure = failed.is_none();
         if failed.is_none() {
             *failed = Some(error.clone());
         }
         drop(failed);
+        if first_failure {
+            self.failure_changed.notify_waiters();
+        }
         let trackers: Vec<_> = self.groups.lock().unwrap().values().cloned().collect();
         for tracker in trackers {
             tracker.fail(error.clone());
+        }
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<()> {
+        self.expire_dirty();
+        match self.failed.lock().unwrap().as_ref() {
+            Some(error) => Err(Error::Io(std::io::Error::other(error.clone()))),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.expire_dirty();
+        self.failed.lock().unwrap().clone()
+    }
+
+    pub(crate) async fn wait_for_failure(&self) -> String {
+        loop {
+            // Register before checking the predicate so a concurrent failure
+            // cannot be lost between the check and the await.
+            let notified = self.failure_changed.notified();
+            if let Some(error) = self.failure() {
+                return error;
+            }
+            notified.await;
         }
     }
 
@@ -576,8 +622,11 @@ impl ApplyDurabilityRegistry {
     }
 
     pub(crate) fn installed(&self, group: GroupId, log_id: Option<RaftLogId>) {
-        self.tracker(group)
-            .installed(log_id, matches!(group, GroupId::Data(_)));
+        let tracker = self.tracker(group);
+        tracker.installed(log_id, matches!(group, GroupId::Data(_)));
+        if let Some(error) = tracker.snapshot().failed {
+            self.fail_all(error);
+        }
     }
 
     pub(crate) fn validate_install(
@@ -798,6 +847,23 @@ mod tests {
         registry.durable(group, log_id(1, 1));
         blocked.await.unwrap().unwrap();
         registry.durable(group, log_id(1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_single_batch_cannot_bypass_group_limits() {
+        let registry = ApplyDurabilityRegistry::with_limits(ApplyDurabilityLimits {
+            max_pending_entries: 2,
+            max_pending_bytes: 100,
+            max_dirty_age: Duration::from_secs(2),
+        });
+        let group = GroupId::Data(7);
+        registry.register(group, None);
+
+        assert!(registry.begin(group, log_id(1, 1), 3, 10).await.is_err());
+        assert!(registry.begin(group, log_id(1, 1), 1, 101).await.is_err());
+        let state = registry.snapshot(group);
+        assert_eq!(state.pending_entries, 0);
+        assert_eq!(state.pending_bytes, 0);
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct ClusterStatus {
     /// Cluster id as a hex string (JSON cannot carry a u128 reliably).
     pub cluster_id: String,
     pub protocol_version: u32,
+    /// Database-wide fail-stop state. This includes meta-only nodes and remains
+    /// true for the rest of the process after any materialization/WAL failure.
+    pub storage_failed: bool,
     /// Present when this node runs the meta group.
     pub meta: Option<MetaStatus>,
     pub partitions: Vec<PartitionStatus>,
@@ -105,11 +108,12 @@ async fn status(State(src): State<Arc<dyn StatusSource>>) -> Json<ClusterStatus>
 async fn health(
     State(src): State<Arc<dyn StatusSource>>,
 ) -> (axum::http::StatusCode, &'static str) {
-    if src
-        .status()
-        .partitions
-        .iter()
-        .any(|partition| partition.materialized_failed)
+    let status = src.status();
+    if status.storage_failed
+        || status
+            .partitions
+            .iter()
+            .any(|partition| partition.materialized_failed)
     {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, "failed")
     } else {
@@ -131,6 +135,7 @@ mod tests {
                 node_id: 7,
                 cluster_id: "0xda1".into(),
                 protocol_version: 1,
+                storage_failed: false,
                 meta: Some(MetaStatus {
                     is_leader: true,
                     leader: Some(7),
@@ -175,7 +180,10 @@ mod tests {
     impl StatusSource for FailedStatus {
         fn status(&self) -> ClusterStatus {
             let mut status = StubStatus.status();
-            status.partitions[0].materialized_failed = true;
+            // Model a meta-only node: database health must not depend on a
+            // data partition being present in the status response.
+            status.storage_failed = true;
+            status.partitions.clear();
             status
         }
     }
