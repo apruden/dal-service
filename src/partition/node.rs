@@ -1,6 +1,6 @@
 //! A single partition's Raft runtime and its serving gate (DESIGN §7.4, M3).
 //!
-//! [`PartitionHandle`] is the *only* path to the state machine: `write` goes
+//! [`PartitionNode`] is the *only* path to the state machine: `write` goes
 //! through `client_write` (durable majority commit), `read` through
 //! `ensure_linearizable` (ReadIndex) then a local get. A removed or
 //! partitioned-away old leader cannot pass the ReadIndex quorum check, so it
@@ -18,7 +18,7 @@ use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
 use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
 use crate::partition::sm::RocksStateMachine;
-use crate::partition::state_machine::{ApplyResult, DataStateMachine};
+use crate::partition::state_machine::{ApplyObserver, ApplyResult, DataStateMachine};
 use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::transport::raft_wire::{RecoveryFence, RecoveryFenceReply};
@@ -93,9 +93,41 @@ impl PartitionNode {
         faults: Faults,
     ) -> Result<PartitionNode> {
         let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
-        let node =
-            Self::start_with_network(node_id, group, storage, network, RaftTuning::default())
-                .await?;
+        let node = Self::start_with_network_inner(
+            node_id,
+            group,
+            storage,
+            network,
+            RaftTuning::default(),
+            None,
+        )
+        .await?;
+        registry.register(node_id, node.raft.clone());
+        Ok(node)
+    }
+
+    /// In-process constructor with apply-boundary instrumentation for system
+    /// verification. The observer sees a committed client entry after its
+    /// atomic state batch becomes visible, even if the leader stops before the
+    /// client receives the result.
+    pub async fn start_with_apply_observer(
+        node_id: NodeId,
+        group: GroupId,
+        storage: Arc<Storage>,
+        registry: Registry<TypeConfig>,
+        faults: Faults,
+        observer: Arc<dyn ApplyObserver>,
+    ) -> Result<PartitionNode> {
+        let network = ChannelNetworkFactory::new(node_id, registry.clone(), faults);
+        let node = Self::start_with_network_inner(
+            node_id,
+            group,
+            storage,
+            network,
+            RaftTuning::default(),
+            Some(observer),
+        )
+        .await?;
         registry.register(node_id, node.raft.clone());
         Ok(node)
     }
@@ -108,6 +140,20 @@ impl PartitionNode {
         storage: Arc<Storage>,
         network: NF,
         tuning: RaftTuning,
+    ) -> Result<PartitionNode>
+    where
+        NF: RaftNetworkFactory<TypeConfig>,
+    {
+        Self::start_with_network_inner(node_id, group, storage, network, tuning, None).await
+    }
+
+    async fn start_with_network_inner<NF>(
+        node_id: NodeId,
+        group: GroupId,
+        storage: Arc<Storage>,
+        network: NF,
+        tuning: RaftTuning,
+        apply_observer: Option<Arc<dyn ApplyObserver>>,
     ) -> Result<PartitionNode>
     where
         NF: RaftNetworkFactory<TypeConfig>,
@@ -133,7 +179,12 @@ impl PartitionNode {
         );
 
         let log_store = RocksLogStore::new(storage.clone(), group);
-        let sm = RocksStateMachine::new(storage.clone(), group);
+        let sm = match apply_observer {
+            Some(observer) => {
+                RocksStateMachine::new_with_observer(storage.clone(), group, observer)
+            }
+            None => RocksStateMachine::new(storage.clone(), group),
+        };
 
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await

@@ -134,6 +134,35 @@ pub enum ApplyResult {
     NoOp,
 }
 
+/// One committed client entry observed after its state batch became visible.
+/// Verification harnesses deduplicate this record by `log_id` because every
+/// replica applies the same logical Raft entry independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyObservation {
+    pub group: GroupId,
+    pub log_id: openraft::LogId<u64>,
+    pub client_id: ClientId,
+    pub sequence: Sequence,
+    pub digest: u128,
+    pub result: ApplyResult,
+}
+
+/// Optional apply-boundary instrumentation. Production state machines have no
+/// observer; system verification installs one so a leader crash after apply but
+/// before client response cannot hide a fresh decision from the oracle.
+pub trait ApplyObserver: Send + Sync {
+    fn observe(&self, observation: ApplyObservation);
+}
+
+impl<F> ApplyObserver for F
+where
+    F: Fn(ApplyObservation) + Send + Sync,
+{
+    fn observe(&self, observation: ApplyObservation) {
+        self(observation);
+    }
+}
+
 impl ApplyResult {
     /// The client-visible mutation result, if this entry produced one.
     pub fn mutation(&self) -> Option<MutationResult> {
@@ -164,7 +193,7 @@ pub enum RejectReason {
 /// Compute the idempotency digest over a command's canonical bytes. Taken over
 /// the operation only (not the client/sequence framing), so a retry at the same
 /// sequence must carry an identical operation to match.
-fn digest(op: &DataOp) -> u128 {
+pub(crate) fn digest(op: &DataOp) -> u128 {
     xxhash_rust::xxh3::xxh3_128(&codec::encode(op))
 }
 

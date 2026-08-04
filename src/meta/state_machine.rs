@@ -3,10 +3,11 @@
 //! decision is a deterministic function of committed input and never depends on
 //! who proposed it (IMPLEMENTATION §M5, ground rule 1).
 //!
-//! Like the data state machine (M2) this is split into a pure [`Self::evaluate`]
-//! (decision + mutations, no write) and a thin [`Self::apply`] that commits them
-//! atomically with `last_applied`. The Raft wrapper reuses `evaluate` so it can
-//! fold the applied `LogId` into the same batch.
+//! Like the data state machine (M2) this is split into a pure
+//! [`MetaStateMachine::evaluate`] (decision + mutations, no write) and a thin
+//! [`MetaStateMachine::apply`] that commits them atomically with `last_applied`.
+//! The Raft wrapper reuses `evaluate` so it can fold the applied `LogId` into
+//! the same batch.
 
 use serde::{Deserialize, Serialize};
 

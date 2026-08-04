@@ -45,10 +45,25 @@ impl MetaRaftStateMachine {
         }
     }
 
+    fn read_failure(&self, context: &str, error: crate::error::Error) -> StorageError<NodeId> {
+        read_err(self.storage.poison_raft_error(context, error))
+    }
+
+    fn write_failure(&self, context: &str, error: crate::error::Error) -> StorageError<NodeId> {
+        write_err(self.storage.poison_raft_error(context, error))
+    }
+
     fn read_applied(&self) -> Result<Applied, StorageError<NodeId>> {
-        self.storage.require_healthy().map_err(read_err)?;
-        match self.storage.raft_applied(GroupId::Meta).map_err(read_err)? {
-            Some(bytes) => codec::decode(&bytes).map_err(read_err),
+        self.storage
+            .require_healthy()
+            .map_err(|error| self.read_failure("meta state-machine health check failed", error))?;
+        match self
+            .storage
+            .raft_applied(GroupId::Meta)
+            .map_err(|error| self.read_failure("meta applied record read failed", error))?
+        {
+            Some(bytes) => codec::decode(&bytes)
+                .map_err(|error| self.read_failure("meta applied record decode failed", error)),
             None => Ok((None, StoredMembership::default())),
         }
     }
@@ -60,9 +75,14 @@ impl MetaRaftStateMachine {
             self.storage
                 .wait_state_durable_for_snapshot(GroupId::Meta, log_id)
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| {
+                    self.write_failure("meta snapshot durability fence failed", error)
+                })?;
         }
-        let pairs = self.storage.scan_state(GroupId::Meta).map_err(read_err)?;
+        let pairs = self
+            .storage
+            .scan_state(GroupId::Meta)
+            .map_err(|error| self.read_failure("meta snapshot state scan failed", error))?;
         let data = codec::encode(&pairs);
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
@@ -112,7 +132,12 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
                 EntryPayload::Normal(cmd) => self
                     .sm
                     .evaluate(&self.storage, &cmd, to_crate_log_id(log_id))
-                    .map_err(|e| StorageError::from(openraft::StorageIOError::apply(log_id, &e)))?,
+                    .map_err(|error| {
+                        let error = self
+                            .storage
+                            .poison_raft_error("meta state-machine evaluation failed", error);
+                        StorageError::from(openraft::StorageIOError::apply(log_id, &error))
+                    })?,
                 EntryPayload::Membership(m) => {
                     membership = StoredMembership::new(Some(log_id), m);
                     (MetaApplyResult::NoOp, Vec::new())
@@ -131,7 +156,9 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
                     1,
                 )
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| {
+                    self.write_failure("meta state-machine apply write failed", error)
+                })?;
             results.push(result);
         }
         Ok(results)
@@ -162,7 +189,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
         self.storage
             .install_state(GroupId::Meta, &pairs, &codec::encode(&applied))
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("meta snapshot state install failed", error))?;
         self.storage
             .record_state_installed(GroupId::Meta, meta.last_log_id);
         Ok(())

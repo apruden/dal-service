@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::types::GroupId;
 
 type RaftLogId = LogId<u64>;
+type FailureHook = Arc<dyn Fn(String) + Send + Sync>;
 
 static NEXT_RECOVERY_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -435,10 +436,10 @@ impl GroupTracker {
 
 /// Database-scoped registry. The shared WAL worker can fail every group at
 /// once, while purge and snapshots wait on one group's durable prefix.
-#[derive(Debug)]
 pub(crate) struct ApplyDurabilityRegistry {
     groups: Mutex<HashMap<GroupId, Arc<GroupTracker>>>,
     failed: Mutex<Option<String>>,
+    failure_hook: Mutex<Option<FailureHook>>,
     failure_changed: Notify,
     limits: ApplyDurabilityLimits,
 }
@@ -453,8 +454,22 @@ impl ApplyDurabilityRegistry {
         Self {
             groups: Mutex::new(HashMap::new()),
             failed: Mutex::new(None),
+            failure_hook: Mutex::new(None),
             failure_changed: Notify::new(),
             limits,
+        }
+    }
+
+    /// Couple registry failures to the database WAL worker. Installing the
+    /// hook while holding the failure lock prevents a concurrent first failure
+    /// from being missed.
+    pub(crate) fn set_failure_hook(&self, hook: FailureHook) {
+        let failed = self.failed.lock().unwrap();
+        *self.failure_hook.lock().unwrap() = Some(hook.clone());
+        let existing = failed.clone();
+        drop(failed);
+        if let Some(error) = existing {
+            hook(error);
         }
     }
 
@@ -561,14 +576,27 @@ impl ApplyDurabilityRegistry {
         if failed.is_none() {
             *failed = Some(error.clone());
         }
+        let failure_hook = first_failure
+            .then(|| self.failure_hook.lock().unwrap().clone())
+            .flatten();
         drop(failed);
         if first_failure {
             self.failure_changed.notify_waiters();
+        }
+        if let Some(hook) = failure_hook {
+            hook(error.clone());
         }
         let trackers: Vec<_> = self.groups.lock().unwrap().values().cloned().collect();
         for tracker in trackers {
             tracker.fail(error.clone());
         }
+    }
+
+    fn fail_on_corruption<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error @ Error::Corrupt(_, _)) = &result {
+            self.fail_all(error.to_string());
+        }
+        result
     }
 
     pub(crate) fn ensure_healthy(&self) -> Result<()> {
@@ -606,11 +634,12 @@ impl ApplyDurabilityRegistry {
         let started = Instant::now();
         let result = tracker.wait_durable(target).await;
         tracker.record_wait(kind, started.elapsed());
-        result
+        self.fail_on_corruption(result)
     }
 
     pub(crate) async fn wait_visible(&self, group: GroupId, target: &RaftLogId) -> Result<()> {
-        self.tracker(group).wait_visible(target).await
+        let result = self.tracker(group).wait_visible(target).await;
+        self.fail_on_corruption(result)
     }
 
     pub(crate) async fn drain(&self, group: GroupId) -> Result<()> {
@@ -651,7 +680,8 @@ impl ApplyDurabilityRegistry {
         epoch: u64,
         target: Option<&RaftLogId>,
     ) -> Result<()> {
-        self.tracker(group).mark_recovery_ready(epoch, target)
+        let result = self.tracker(group).mark_recovery_ready(epoch, target);
+        self.fail_on_corruption(result)
     }
 
     fn expire_dirty(&self) {
@@ -795,6 +825,19 @@ mod tests {
                 .wait_durable(group, &log_id(2, 3), DurabilityWaitKind::General)
                 .await
                 .is_err()
+        );
+        assert!(registry.ensure_healthy().is_err());
+        assert!(
+            registry
+                .failure()
+                .is_some_and(|error| error.contains("log id mismatch at index 3"))
+        );
+
+        let sibling = GroupId::Data(2);
+        registry.register(sibling, None);
+        assert!(
+            registry.begin(sibling, log_id(1, 4), 1, 10).await.is_err(),
+            "watermark corruption must fence every group sharing the database"
         );
     }
 

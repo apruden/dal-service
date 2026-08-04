@@ -112,6 +112,14 @@ impl RocksLogStore {
         wo
     }
 
+    fn read_failure(&self, context: &str, error: crate::error::Error) -> StorageError<Nid> {
+        read_err(self.storage.poison_raft_error(context, error))
+    }
+
+    fn write_failure(&self, context: &str, error: crate::error::Error) -> StorageError<Nid> {
+        write_err(self.storage.poison_raft_error(context, error))
+    }
+
     /// Default-on rollback/A-B switch for asynchronous database-wide WAL
     /// group commit. Read once per process so environment lookup never touches
     /// the append hot path.
@@ -131,15 +139,19 @@ impl RocksLogStore {
     ) -> Result<Option<T>, StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(read_err)?;
-        let cf = self.storage.log_cf(self.group).map_err(read_err)?;
-        let raw = self
+            .map_err(|error| self.read_failure("Raft log health check failed", error))?;
+        let cf = self
             .storage
-            .db()
-            .get_cf(&cf, key)
-            .map_err(|e| read_err(e.into()))?;
+            .log_cf(self.group)
+            .map_err(|error| self.read_failure("Raft log column-family lookup failed", error))?;
+        let raw =
+            self.storage.db().get_cf(&cf, key).map_err(|error| {
+                self.read_failure("Raft log singleton read failed", error.into())
+            })?;
         match raw {
-            Some(bytes) => Ok(Some(codec::decode(&bytes).map_err(read_err)?)),
+            Some(bytes) => Ok(Some(codec::decode(&bytes).map_err(|error| {
+                self.read_failure("Raft log singleton decode failed", error)
+            })?)),
             None => Ok(None),
         }
     }
@@ -151,17 +163,22 @@ impl RocksLogStore {
     {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(read_err)?;
-        let cf = self.storage.log_cf(self.group).map_err(read_err)?;
+            .map_err(|error| self.read_failure("Raft log health check failed", error))?;
+        let cf = self
+            .storage
+            .log_cf(self.group)
+            .map_err(|error| self.read_failure("Raft log column-family lookup failed", error))?;
         // Seek just past the entry range and step backwards to the highest entry.
         let mut iter = self.storage.db().iterator_cf(
             &cf,
             IteratorMode::From(&[ENTRY_PREFIX_END], Direction::Reverse),
         );
         if let Some(item) = iter.next() {
-            let (k, v) = item.map_err(|e| read_err(e.into()))?;
+            let (k, v) =
+                item.map_err(|error| self.read_failure("Raft last-log read failed", error.into()))?;
             if entry_index(&k).is_some() {
-                let entry: openraft::Entry<C> = codec::decode(&v).map_err(read_err)?;
+                let entry: openraft::Entry<C> = codec::decode(&v)
+                    .map_err(|error| self.read_failure("Raft last-log decode failed", error))?;
                 return Ok(Some(entry.log_id));
             }
         }
@@ -180,7 +197,7 @@ where
     ) -> Result<Vec<openraft::Entry<C>>, StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(read_err)?;
+            .map_err(|error| self.read_failure("Raft log health check failed", error))?;
         let start = match range.start_bound() {
             Bound::Included(i) => *i,
             Bound::Excluded(i) => i + 1,
@@ -192,17 +209,23 @@ where
             Bound::Unbounded => u64::MAX,
         };
 
-        let cf = self.storage.log_cf(self.group).map_err(read_err)?;
+        let cf = self
+            .storage
+            .log_cf(self.group)
+            .map_err(|error| self.read_failure("Raft log column-family lookup failed", error))?;
         let mut out = Vec::new();
         let iter = self.storage.db().iterator_cf(
             &cf,
             IteratorMode::From(&entry_key(start), Direction::Forward),
         );
         for item in iter {
-            let (k, v) = item.map_err(|e| read_err(e.into()))?;
+            let (k, v) = item
+                .map_err(|error| self.read_failure("Raft log range read failed", error.into()))?;
             match entry_index(&k) {
                 Some(idx) if idx < end => {
-                    out.push(codec::decode::<openraft::Entry<C>>(&v).map_err(read_err)?);
+                    out.push(codec::decode::<openraft::Entry<C>>(&v).map_err(|error| {
+                        self.read_failure("Raft log entry decode failed", error)
+                    })?);
                 }
                 // Past the entry range or the requested end: stop.
                 _ => break,
@@ -236,13 +259,16 @@ where
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(write_err)?;
-        let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft vote health check failed", error))?;
+        let cf = self
+            .storage
+            .log_cf(self.group)
+            .map_err(|error| self.write_failure("Raft vote column-family lookup failed", error))?;
         let _profile = crate::perf::timer(WriteStage::SaveVoteSynced);
         self.storage
             .db()
             .put_cf_opt(&cf, KEY_VOTE, codec::encode(vote), &Self::sync_wo())
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| self.write_failure("Raft vote write failed", error.into()))?;
         Ok(())
     }
 
@@ -253,7 +279,7 @@ where
     async fn save_committed(&mut self, _committed: Option<LogId>) -> Result<(), StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft committed health check failed", error))?;
         // The state machine folds its final applied LogId into the same cross-CF
         // batch as the applied pointer and business mutations. OpenRaft permits
         // this method to be a no-op for a durable state machine; a crash before
@@ -280,9 +306,11 @@ where
     {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft append health check failed", error))?;
         let (batch, wal_bytes) = {
-            let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+            let cf = self.storage.log_cf(self.group).map_err(|error| {
+                self.write_failure("Raft append column-family lookup failed", error)
+            })?;
             let mut batch = WriteBatch::default();
             let mut wal_bytes = 0usize;
             let _profile = crate::perf::timer(WriteStage::LogEncode);
@@ -306,7 +334,7 @@ where
                     }),
                 )
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| self.write_failure("Raft append write failed", error))?;
             // The entries are readable now. OpenRaft waits on the callback,
             // which the group-commit worker completes after a durable WAL flush.
         } else {
@@ -314,7 +342,9 @@ where
             self.storage
                 .db()
                 .write_opt(batch, &Self::sync_wo())
-                .map_err(|error| write_err(error.into()))?;
+                .map_err(|error| {
+                    self.write_failure("synchronous Raft append failed", error.into())
+                })?;
             callback.log_io_completed(Ok(()));
         }
         Ok(())
@@ -323,52 +353,59 @@ where
     async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft truncate health check failed", error))?;
         // Delete all entries with index >= log_id.index.
-        let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+        let cf = self.storage.log_cf(self.group).map_err(|error| {
+            self.write_failure("Raft truncate column-family lookup failed", error)
+        })?;
         self.storage
             .db()
             .delete_range_cf(&cf, entry_key(log_id.index), entry_key(u64::MAX))
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| {
+                self.write_failure("Raft truncate range delete failed", error.into())
+            })?;
         // delete_range is end-exclusive; remove the final index explicitly.
         self.storage
             .db()
             .delete_cf_opt(&cf, entry_key(u64::MAX), &Self::sync_wo())
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| self.write_failure("Raft truncate sync failed", error.into()))?;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), StorageError<Nid>> {
         self.storage
             .require_group_healthy(self.group)
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft purge health check failed", error))?;
         // A snapshot/purge boundary may only discard the replay source after
         // the materialized state through the same log id is WAL-durable.
         self.storage
             .wait_state_durable_for_purge(self.group, &log_id)
             .await
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("Raft purge durability fence failed", error))?;
         #[cfg(test)]
         fail_at_purge_test_cut(self.group, PurgeTestCut::DurableWait)?;
-        let cf = self.storage.log_cf(self.group).map_err(write_err)?;
+        let cf = self
+            .storage
+            .log_cf(self.group)
+            .map_err(|error| self.write_failure("Raft purge column-family lookup failed", error))?;
         // Record the purge point first so recovery never re-reads purged logs.
         self.storage
             .db()
             .put_cf_opt(&cf, KEY_PURGED, codec::encode(&log_id), &Self::sync_wo())
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| self.write_failure("Raft purge marker write failed", error.into()))?;
         #[cfg(test)]
         fail_at_purge_test_cut(self.group, PurgeTestCut::Marker)?;
         // Delete entries with index <= log_id.index (end-exclusive + explicit last).
         self.storage
             .db()
             .delete_range_cf(&cf, entry_key(0), entry_key(log_id.index))
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| self.write_failure("Raft purge range delete failed", error.into()))?;
         #[cfg(test)]
         fail_at_purge_test_cut(self.group, PurgeTestCut::RangeDelete)?;
         self.storage
             .db()
             .delete_cf_opt(&cf, entry_key(log_id.index), &Self::sync_wo())
-            .map_err(|e| write_err(e.into()))?;
+            .map_err(|error| self.write_failure("Raft purge sync failed", error.into()))?;
         Ok(())
     }
 }
@@ -606,6 +643,38 @@ mod tests {
             <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut store)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_storage_error_poisons_sibling_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let broken_group = GroupId::Data(12);
+        let sibling_group = GroupId::Data(13);
+        storage.ensure_group(broken_group).unwrap();
+        storage.ensure_group(sibling_group).unwrap();
+        let mut broken = RocksLogStore::new(storage.clone(), broken_group);
+        let mut sibling = RocksLogStore::new(storage.clone(), sibling_group);
+
+        // Model a local Raft-storage invariant failure after the runtime has
+        // acquired its store. The first group reports the missing CF; that
+        // error must enter the database-wide poison state before it returns.
+        storage.drop_group(broken_group).unwrap();
+        assert!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::save_vote(
+                &mut broken,
+                &Vote::new(2, 1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(storage.database_failure().is_some());
+        assert!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut sibling)
+                .await
+                .is_err(),
+            "a sibling Raft group continued after shared storage failed"
         );
     }
 

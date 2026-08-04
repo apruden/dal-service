@@ -11,7 +11,7 @@ use std::time::Duration;
 use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::partition::network::{Faults, Registry};
 use dal::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
-use dal::partition::{ApplyResult, TypeConfig};
+use dal::partition::{ApplyObservation, ApplyObserver, ApplyResult, TypeConfig};
 use dal::storage::Storage;
 use dal::transport::raft_wire::RecoveryFenceReply;
 use dal::types::{
@@ -44,7 +44,7 @@ struct Shared {
     clock: AtomicU64,
     history: Mutex<Vec<Recorded>>,
     acked: Mutex<Vec<(Vec<u8>, u64)>>,
-    applied: Mutex<Vec<Applied>>,
+    applied: Arc<Mutex<Vec<ApplyObservation>>>,
 }
 
 impl Shared {
@@ -65,10 +65,6 @@ impl Shared {
 
 fn key_bytes(i: usize) -> Vec<u8> {
     format!("k{i}").into_bytes()
-}
-
-fn digest(op: &DataOp) -> u128 {
-    xxhash_rust::xxh3::xxh3_128(&dal::codec::encode(op))
 }
 
 fn present(p: KeyPresence) -> Option<u64> {
@@ -179,7 +175,6 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
                     None
                 },
             };
-            let dg = digest(&op);
             let req = DataRequest {
                 client_id,
                 sequence: seq,
@@ -207,26 +202,12 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
                     present: present(current),
                 },
             };
-            s.applied.lock().unwrap().push(Applied {
-                client_id,
-                partition: 0,
-                sequence: seq,
-                digest: dg,
-                fresh: matches!(&result, ApplyResult::Decided(_)),
-            });
-
             // Deliberately append the same idempotency key again. The oracle
-            // now observes both the original response and a concrete replay;
-            // a second fresh decision is a real exactly-once violation.
+            // observes both applications at the state-machine boundary. A
+            // second fresh decision at a different log id is a real
+            // exactly-once violation, even if an earlier response was lost.
             if let Some(replay) = do_write(&s, &req).await {
                 assert_eq!(replay.mutation(), Some(mutation));
-                s.applied.lock().unwrap().push(Applied {
-                    client_id,
-                    partition: 0,
-                    sequence: seq,
-                    digest: dg,
-                    fresh: matches!(replay, ApplyResult::Decided(_)),
-                });
             }
             s.history.lock().unwrap().push(Recorded {
                 key,
@@ -251,6 +232,11 @@ async fn run_once(seed: u64) {
     let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let registry: Registry<TypeConfig> = Registry::default();
     let faults = Faults::default();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let observer_events = applied.clone();
+    let observer: Arc<dyn ApplyObserver> = Arc::new(move |observation: ApplyObservation| {
+        observer_events.lock().unwrap().push(observation);
+    });
 
     let mut nodes = Vec::new();
     for i in 0..3 {
@@ -265,12 +251,13 @@ async fn run_once(seed: u64) {
         )
         .unwrap();
         nodes.push(Arc::new(
-            PartitionNode::start(
+            PartitionNode::start_with_apply_observer(
                 VOTERS[i],
                 GroupId::Data(0),
                 storage,
                 registry.clone(),
                 faults.clone(),
+                observer.clone(),
             )
             .await
             .unwrap(),
@@ -284,7 +271,7 @@ async fn run_once(seed: u64) {
         clock: AtomicU64::new(0),
         history: Mutex::new(Vec::new()),
         acked: Mutex::new(Vec::new()),
-        applied: Mutex::new(Vec::new()),
+        applied,
     });
     await_leader(&shared).await;
 
@@ -383,7 +370,41 @@ async fn check_oracles(s: &Shared) {
     }
 
     // Exactly-once.
-    let applied = s.applied.lock().unwrap().clone();
+    let observations = s.applied.lock().unwrap().clone();
+    let mut logical_applies = HashMap::new();
+    for observation in observations {
+        let GroupId::Data(partition) = observation.group else {
+            continue;
+        };
+        let key = (
+            partition,
+            observation.log_id.leader_id.term,
+            observation.log_id.leader_id.node_id,
+            observation.log_id.index,
+        );
+        if let Some(previous) = logical_applies.get(&key) {
+            assert_eq!(
+                previous, &observation,
+                "replicas disagreed while applying the same Raft entry"
+            );
+        } else {
+            logical_applies.insert(key, observation);
+        }
+    }
+    let applied: Vec<_> = logical_applies
+        .into_values()
+        .filter(|observation| observation.result.mutation().is_some())
+        .map(|observation| Applied {
+            client_id: observation.client_id,
+            partition: match observation.group {
+                GroupId::Data(partition) => partition,
+                GroupId::Meta => unreachable!("filtered above"),
+            },
+            sequence: observation.sequence,
+            digest: observation.digest,
+            fresh: matches!(observation.result, ApplyResult::Decided(_)),
+        })
+        .collect();
     exactly_once(&applied).expect("exactly-once violated");
 
     // No acknowledged write lost: read every key's final version and compare.

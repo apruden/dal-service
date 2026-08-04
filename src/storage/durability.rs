@@ -140,6 +140,13 @@ impl Shared {
         self.capacity_available.notify_all();
     }
 
+    fn failure(&self) -> Option<String> {
+        match &self.state.lock().unwrap().status {
+            WorkerStatus::Failed(error) => Some(error.clone()),
+            WorkerStatus::Running | WorkerStatus::Stopped => None,
+        }
+    }
+
     fn stop(&self) {
         let mut state = self.state.lock().unwrap();
         if matches!(state.status, WorkerStatus::Running) {
@@ -241,6 +248,13 @@ impl WalDurability {
         self.shared.reserve(bytes)
     }
 
+    /// A sink used by the database-wide health registry to fail this worker
+    /// when a synchronous operation detects a storage fault.
+    pub(crate) fn failure_hook(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        let shared = self.shared.clone();
+        Arc::new(move |error| shared.fail(error))
+    }
+
     /// Enqueue a batch for the DB worker. `on_written` is used by Raft log
     /// append to preserve immediate readability; `on_durable` is released only
     /// after the shared WAL sync succeeds.
@@ -302,6 +316,12 @@ fn run_worker<W, F>(
             return;
         };
 
+        if let Some(error) = shared.failure() {
+            fail_unwritten(first, &error);
+            fail_remaining(&receiver, &shared, &error);
+            return;
+        }
+
         let mut batch = Vec::new();
         let mut batch_bytes = 0usize;
         let mut shutdown_after_flush = false;
@@ -353,6 +373,13 @@ fn run_worker<W, F>(
             };
             match command {
                 Command::Write(request) => {
+                    if let Some(error) = shared.failure() {
+                        drop(collect_profile);
+                        fail_unwritten(request, &error);
+                        complete_batch(batch, Some(&error));
+                        fail_remaining(&receiver, &shared, &error);
+                        return;
+                    }
                     if let Err(error) =
                         write_one(request, &mut write_batch, &mut batch, &mut batch_bytes)
                     {
@@ -371,6 +398,12 @@ fn run_worker<W, F>(
         }
         drop(collect_profile);
 
+        if let Some(error) = shared.failure() {
+            complete_batch(batch, Some(&error));
+            fail_remaining(&receiver, &shared, &error);
+            return;
+        }
+
         let log_writes = batch
             .iter()
             .filter(|pending| pending.kind == DurabilityKind::Log)
@@ -383,7 +416,14 @@ fn run_worker<W, F>(
             flush_wal()
         };
         match flush_result {
-            Ok(()) => complete_batch(batch, None),
+            Ok(()) => {
+                if let Some(error) = shared.failure() {
+                    complete_batch(batch, Some(&error));
+                    fail_remaining(&receiver, &shared, &error);
+                    return;
+                }
+                complete_batch(batch, None);
+            }
             Err(error) => {
                 let message = format!("WAL flush failed: {error}");
                 shared.fail(message.clone());
@@ -566,6 +606,42 @@ mod tests {
             .unwrap();
 
         assert!(rx.recv_timeout(Duration::from_millis(100)).unwrap());
+    }
+
+    #[test]
+    fn external_database_failure_fails_an_already_written_request() {
+        let durability =
+            WalDurability::with_config(test_config(false), |_| Ok(()), || Ok(())).unwrap();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (durable_tx, durable_rx) = mpsc::channel();
+        let reservation = durability.reserve(16).unwrap();
+        durability
+            .submit(
+                reservation,
+                batch(),
+                DurabilityKind::Log,
+                Some(Box::new(move |result| {
+                    written_tx.send(result.is_ok()).unwrap()
+                })),
+                Box::new(move |result| durable_tx.send(result).unwrap()),
+            )
+            .unwrap();
+
+        // The write is readable, but still inside the collection window and
+        // has not received its durability callback.
+        assert!(written_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        durability.failure_hook()("external database storage failure".into());
+
+        let error = durable_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external database storage failure")
+        );
+        assert!(durability.reserve(1).is_err());
     }
 
     #[test]

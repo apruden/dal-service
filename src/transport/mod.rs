@@ -3,8 +3,8 @@
 //! trait", here applied to the client/RPC path).
 //!
 //! Correctness tests run over the in-process [`InProcess`] switch, which is
-//! deterministic; the [`zmq`](self::zmq) ZeroMQ transport is exercised
-//! separately for transport concerns only.
+//! deterministic; the [`dealer::ZmqTransport`] transport is exercised
+//! separately for ZeroMQ transport concerns only.
 
 pub mod codec;
 pub mod dealer;

@@ -26,7 +26,9 @@ use crate::partition::raft_types::{
     Entry, LogId, Node, NodeId, Snapshot, SnapshotData, SnapshotMeta, StoredMembership, TypeConfig,
     read_err, write_err,
 };
-use crate::partition::state_machine::{ApplyResult, DataStateMachine, StateOverlay};
+use crate::partition::state_machine::{
+    ApplyObservation, ApplyObserver, ApplyResult, DataStateMachine, StateOverlay, digest,
+};
 use crate::perf::WriteStage;
 use crate::storage::{MAX_PENDING_STATE_BYTES, MAX_PENDING_STATE_ENTRIES, Storage};
 use crate::types::GroupId;
@@ -65,22 +67,65 @@ pub struct RocksStateMachine {
     /// Every clone shares this lock so snapshot metadata and its state-CF scan
     /// describe one applied prefix.
     state_view: Arc<Mutex<()>>,
+    apply_observer: Option<Arc<dyn ApplyObserver>>,
 }
 
 impl RocksStateMachine {
     pub fn new(storage: Arc<Storage>, group: GroupId) -> Self {
+        Self::new_inner(storage, group, None)
+    }
+
+    pub(crate) fn new_with_observer(
+        storage: Arc<Storage>,
+        group: GroupId,
+        observer: Arc<dyn ApplyObserver>,
+    ) -> Self {
+        Self::new_inner(storage, group, Some(observer))
+    }
+
+    fn new_inner(
+        storage: Arc<Storage>,
+        group: GroupId,
+        apply_observer: Option<Arc<dyn ApplyObserver>>,
+    ) -> Self {
         RocksStateMachine {
             storage,
             group,
             data: DataStateMachine::new(group),
             state_view: Arc::new(Mutex::new(())),
+            apply_observer,
         }
     }
 
+    fn observe_applies(&self, observations: impl IntoIterator<Item = ApplyObservation>) {
+        let Some(observer) = &self.apply_observer else {
+            return;
+        };
+        for observation in observations {
+            observer.observe(observation);
+        }
+    }
+
+    fn read_failure(&self, context: &str, error: crate::error::Error) -> StorageError<NodeId> {
+        read_err(self.storage.poison_raft_error(context, error))
+    }
+
+    fn write_failure(&self, context: &str, error: crate::error::Error) -> StorageError<NodeId> {
+        write_err(self.storage.poison_raft_error(context, error))
+    }
+
     fn read_applied(&self) -> Result<Applied, StorageError<NodeId>> {
-        self.storage.require_healthy().map_err(read_err)?;
-        match self.storage.raft_applied(self.group).map_err(read_err)? {
-            Some(bytes) => codec::decode(&bytes).map_err(read_err),
+        self.storage
+            .require_healthy()
+            .map_err(|error| self.read_failure("state-machine health check failed", error))?;
+        match self
+            .storage
+            .raft_applied(self.group)
+            .map_err(|error| self.read_failure("state-machine applied record read failed", error))?
+        {
+            Some(bytes) => codec::decode(&bytes).map_err(|error| {
+                self.read_failure("state-machine applied record decode failed", error)
+            }),
             None => Ok((None, StoredMembership::default())),
         }
     }
@@ -134,22 +179,42 @@ impl RocksStateMachine {
         let (_, mut membership) = self.read_applied()?;
         let mut overlay = StateOverlay::new(&self.storage);
         let mut results = Vec::new();
+        let mut observations = Vec::new();
         let mut last_log_id = None;
 
         for entry in entries {
             let log_id = entry.log_id;
-            let (result, muts) = match entry.payload {
-                EntryPayload::Blank => (ApplyResult::NoOp, Vec::new()),
-                EntryPayload::Normal(req) => self
-                    .data
-                    .evaluate(&overlay, &req, log_id.index)
-                    .map_err(|e| StorageError::from(openraft::StorageIOError::apply(log_id, &e)))?,
+            let (result, muts, request) = match entry.payload {
+                EntryPayload::Blank => (ApplyResult::NoOp, Vec::new(), None),
+                EntryPayload::Normal(req) => {
+                    let request = (req.client_id, req.sequence, digest(&req.op));
+                    let (result, mutations) = self
+                        .data
+                        .evaluate(&overlay, &req, log_id.index)
+                        .map_err(|error| {
+                            let error = self
+                                .storage
+                                .poison_raft_error("state-machine evaluation failed", error);
+                            StorageError::from(openraft::StorageIOError::apply(log_id, &error))
+                        })?;
+                    (result, mutations, Some(request))
+                }
                 EntryPayload::Membership(m) => {
                     membership = StoredMembership::new(Some(log_id), m);
-                    (ApplyResult::NoOp, Vec::new())
+                    (ApplyResult::NoOp, Vec::new(), None)
                 }
             };
             overlay.stage(&muts);
+            if let Some((client_id, sequence, digest)) = request {
+                observations.push(ApplyObservation {
+                    group: self.group,
+                    log_id,
+                    client_id,
+                    sequence,
+                    digest,
+                    result: result.clone(),
+                });
+            }
             results.push(result);
             last_log_id = Some(log_id);
         }
@@ -171,7 +236,8 @@ impl RocksStateMachine {
                     results.len(),
                 )
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| self.write_failure("state-machine apply write failed", error))?;
+            self.observe_applies(observations);
         }
         Ok(results)
     }
@@ -191,15 +257,24 @@ impl RocksStateMachine {
 
         for entry in entries {
             let log_id = entry.log_id;
-            let (result, muts) = match entry.payload {
-                EntryPayload::Blank => (ApplyResult::NoOp, Vec::new()),
-                EntryPayload::Normal(req) => self
-                    .data
-                    .evaluate(self.storage.as_ref(), &req, log_id.index)
-                    .map_err(|e| StorageError::from(openraft::StorageIOError::apply(log_id, &e)))?,
+            let (result, muts, request) = match entry.payload {
+                EntryPayload::Blank => (ApplyResult::NoOp, Vec::new(), None),
+                EntryPayload::Normal(req) => {
+                    let request = (req.client_id, req.sequence, digest(&req.op));
+                    let (result, mutations) = self
+                        .data
+                        .evaluate(self.storage.as_ref(), &req, log_id.index)
+                        .map_err(|error| {
+                            let error = self
+                                .storage
+                                .poison_raft_error("state-machine evaluation failed", error);
+                            StorageError::from(openraft::StorageIOError::apply(log_id, &error))
+                        })?;
+                    (result, mutations, Some(request))
+                }
                 EntryPayload::Membership(m) => {
                     membership = StoredMembership::new(Some(log_id), m);
-                    (ApplyResult::NoOp, Vec::new())
+                    (ApplyResult::NoOp, Vec::new(), None)
                 }
             };
 
@@ -215,7 +290,17 @@ impl RocksStateMachine {
                     1,
                 )
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| self.write_failure("state-machine apply write failed", error))?;
+            if let Some((client_id, sequence, digest)) = request {
+                self.observe_applies([ApplyObservation {
+                    group: self.group,
+                    log_id,
+                    client_id,
+                    sequence,
+                    digest,
+                    result: result.clone(),
+                }]);
+            }
             results.push(result);
         }
         Ok(results)
@@ -228,9 +313,12 @@ impl RocksStateMachine {
             self.storage
                 .wait_state_durable_for_snapshot(self.group, log_id)
                 .await
-                .map_err(write_err)?;
+                .map_err(|error| self.write_failure("snapshot durability fence failed", error))?;
         }
-        let pairs = self.storage.scan_state(self.group).map_err(read_err)?;
+        let pairs = self
+            .storage
+            .scan_state(self.group)
+            .map_err(|error| self.read_failure("snapshot state scan failed", error))?;
         let data = codec::encode(&pairs);
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
@@ -306,7 +394,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
         self.storage
             .install_state(self.group, &pairs, &codec::encode(&applied))
-            .map_err(write_err)?;
+            .map_err(|error| self.write_failure("snapshot state install failed", error))?;
         self.storage
             .record_state_installed(self.group, meta.last_log_id);
         Ok(())
@@ -412,6 +500,39 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(committed, Some(log_id(12)));
+    }
+
+    #[tokio::test]
+    async fn apply_observer_records_fresh_and_replayed_entries_at_the_apply_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(3);
+        storage.ensure_group(group).unwrap();
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let observer: Arc<dyn ApplyObserver> = Arc::new(move |observation: ApplyObservation| {
+            observed.lock().unwrap().push(observation);
+        });
+        let mut sm = RocksStateMachine::new_with_observer(storage, group, observer);
+        let op = DataOp::Put {
+            key: b"observed".to_vec(),
+            value: b"value".to_vec(),
+            if_version: None,
+        };
+
+        let results = sm
+            .apply_coalesced(vec![entry(20, 1, op.clone()), entry(21, 1, op)])
+            .await
+            .unwrap();
+
+        assert!(matches!(results[0], ApplyResult::Decided(_)));
+        assert!(matches!(results[1], ApplyResult::Replayed(_)));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].log_id, log_id(20));
+        assert_eq!(observations[0].result, results[0]);
+        assert_eq!(observations[1].log_id, log_id(21));
+        assert_eq!(observations[1].result, results[1]);
     }
 
     #[tokio::test]

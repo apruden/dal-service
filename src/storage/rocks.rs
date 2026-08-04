@@ -124,6 +124,7 @@ impl Storage {
                 result
             },
         )?;
+        apply_durability.set_failure_hook(durability.failure_hook());
         Ok(Storage {
             durability,
             apply_durability,
@@ -351,6 +352,17 @@ impl Storage {
         self.apply_durability.ensure_healthy()
     }
 
+    /// Convert a local Raft-storage failure into the database-wide fail-stop
+    /// state before returning it to OpenRaft. Every Raft group shares this DB;
+    /// allowing sibling groups to continue after one group observes an I/O or
+    /// on-disk invariant failure would let them acknowledge work against a
+    /// storage device whose durability is no longer trustworthy.
+    pub(crate) fn poison_raft_error(&self, context: &str, error: Error) -> Error {
+        self.apply_durability
+            .fail_all(format!("{context}: {error}"));
+        error
+    }
+
     pub(crate) fn require_group_healthy(&self, group: GroupId) -> Result<()> {
         self.require_healthy()?;
         match self.apply_durability.snapshot(group).failed {
@@ -515,21 +527,29 @@ impl Storage {
             self.durability.reserve(wal_bytes)?
         };
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
-        self.durability
-            .submit(
-                reservation,
-                batch,
-                DurabilityKind::Log,
-                Some(Box::new(move |result| {
-                    let _ = written_tx.send(result);
-                })),
-                callback,
-            )
-            .map_err(Error::Io)?;
-        written_rx
-            .await
-            .map_err(|_| Error::Io(std::io::Error::other("database write worker stopped")))?
-            .map_err(Error::Io)
+        if let Err(error) = self.durability.submit(
+            reservation,
+            batch,
+            DurabilityKind::Log,
+            Some(Box::new(move |result| {
+                let _ = written_tx.send(result);
+            })),
+            callback,
+        ) {
+            return Err(
+                self.poison_raft_error("Raft log durability submission failed", Error::Io(error))
+            );
+        }
+        match written_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                Err(self.poison_raft_error("Raft log WAL write failed", Error::Io(error)))
+            }
+            Err(_) => Err(self.poison_raft_error(
+                "Raft log durability worker stopped",
+                Error::Io(std::io::Error::other("database write worker stopped")),
+            )),
+        }
     }
 
     /// Enqueue an atomic state-machine batch. Data groups return at the
