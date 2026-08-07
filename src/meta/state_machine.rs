@@ -573,7 +573,12 @@ impl MetaStateMachine {
     }
 
     fn search_index(&self, s: &Storage, name: &str) -> Result<Option<SearchIndexRecord>> {
-        s.get_state_record(GroupId::Meta, &keyspace::meta_search_index_key(name))
+        let record: Option<SearchIndexRecord> =
+            s.get_state_record(GroupId::Meta, &keyspace::meta_search_index_key(name))?;
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        Ok(record)
     }
 
     fn create_search_index(
@@ -627,7 +632,16 @@ impl MetaStateMachine {
         if update && record.active.is_none() {
             return Ok((reject(MetaReject::SearchIndexNotFound), vec![]));
         }
+        if update && record.retiring.len() >= crate::search::SEARCH_MAX_RETIRING_GENERATIONS {
+            return Ok((
+                invalid("too many retiring search generations; finalize one before updating"),
+                vec![],
+            ));
+        }
         record.building = Some(generation);
+        if let Err(error) = record.validate() {
+            return Ok((invalid_owned(error.to_string()), vec![]));
+        }
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_search_index_key(name), &record)],
@@ -742,10 +756,22 @@ impl MetaStateMachine {
             }
         }
         let activated = record.building.take().expect("checked building");
-        if let Some(previous) = record.active.replace(activated) {
-            if !record.retiring.contains(&previous.id) {
-                record.retiring.push(previous.id);
-            }
+        if record.active.as_ref().is_some_and(|previous| {
+            !record.retiring.contains(&previous.id)
+                && record.retiring.len() >= crate::search::SEARCH_MAX_RETIRING_GENERATIONS
+        }) {
+            return Ok((
+                invalid("too many retiring search generations; finalize one before activation"),
+                vec![],
+            ));
+        }
+        if let Some(previous) = record.active.replace(activated)
+            && !record.retiring.contains(&previous.id)
+        {
+            record.retiring.push(previous.id);
+        }
+        if let Err(error) = record.validate() {
+            return Ok((invalid_owned(error.to_string()), vec![]));
         }
         let mut mutations = vec![put(keyspace::meta_search_index_key(name), &record)];
         mutations.extend(
@@ -771,10 +797,29 @@ impl MetaStateMachine {
         let ready_prefix = building
             .as_ref()
             .map(|generation| keyspace::meta_search_ready_prefix(name, generation.id));
-        for generation in [record.active.take(), building].into_iter().flatten() {
+        let retiring = [record.active.take(), building]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let additions = retiring
+            .iter()
+            .filter(|generation| !record.retiring.contains(&generation.id))
+            .count();
+        if record.retiring.len().saturating_add(additions)
+            > crate::search::SEARCH_MAX_RETIRING_GENERATIONS
+        {
+            return Ok((
+                invalid("too many retiring search generations; finalize one before dropping"),
+                vec![],
+            ));
+        }
+        for generation in retiring {
             if !record.retiring.contains(&generation.id) {
                 record.retiring.push(generation.id);
             }
+        }
+        if let Err(error) = record.validate() {
+            return Ok((invalid_owned(error.to_string()), vec![]));
         }
         let mut mutations = vec![put(keyspace::meta_search_index_key(name), &record)];
         if let Some(prefix) = ready_prefix {

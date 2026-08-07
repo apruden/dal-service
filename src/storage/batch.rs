@@ -17,6 +17,18 @@ use crate::perf::WriteStage;
 use crate::storage::rocks::Storage;
 use crate::types::{GroupId, LogId};
 
+/// How often the apply path trims the dirty-key outbox. Keyed off the applied
+/// log index so it needs no per-group counter; the scan stops at the first
+/// entry a registered consumer still needs, so a well-behaved group pays
+/// almost nothing.
+const SEARCH_OUTBOX_PRUNE_APPLIES: u64 = 4096;
+
+fn crossed_search_prune_boundary(applied_index: u64, applied_entries: usize) -> bool {
+    let applied_entries = u64::try_from(applied_entries).unwrap_or(u64::MAX);
+    let previous_index = applied_index.saturating_sub(applied_entries);
+    applied_index / SEARCH_OUTBOX_PRUNE_APPLIES > previous_index / SEARCH_OUTBOX_PRUNE_APPLIES
+}
+
 /// A single state-CF mutation. The state machine (M2) decides key encoding; the
 /// batch helper only moves bytes atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,12 +116,9 @@ impl Storage {
                 }
             }
             if matches!(group, GroupId::Data(_)) {
-                let epoch = self.search_projection_epoch(group)?;
-                if epoch == 1
-                    && self
-                        .get_local::<u64>(&keyspace::search_epoch_key(group))?
-                        .is_none()
-                {
+                let stored = self.get_local::<u64>(&keyspace::search_epoch_key(group))?;
+                let epoch = stored.unwrap_or(1);
+                if stored.is_none() {
                     batch.put(keyspace::search_epoch_key(group), codec::encode(&epoch));
                 }
                 for mutation in mutations {
@@ -145,11 +154,35 @@ impl Storage {
 
         crash_point("apply_state::after_write")?;
 
+        // Retention is owned by the write path, not by the search worker: a
+        // group with no registered consumer never runs one, and its outbox
+        // would otherwise grow for the lifetime of the database. Every entry is
+        // discardable there, because a generation registered later rebuilds
+        // from a full state snapshot.
+        if matches!(group, GroupId::Data(_))
+            && crossed_search_prune_boundary(applied_log_id.index, applied_entries)
+        {
+            self.prune_search_outbox(group)?;
+        }
+
         Ok(())
     }
 
     /// Read the raw Raft applied-state blob, if any.
     pub fn raft_applied(&self, group: GroupId) -> Result<Option<Vec<u8>>> {
         self.get_state(group, &keyspace::raft_applied_key())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesced_applies_trigger_when_they_cross_a_prune_boundary() {
+        assert!(!crossed_search_prune_boundary(4095, 128));
+        assert!(crossed_search_prune_boundary(4096, 1));
+        assert!(crossed_search_prune_boundary(4097, 2));
+        assert!(crossed_search_prune_boundary(9000, 5000));
     }
 }

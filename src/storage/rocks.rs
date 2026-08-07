@@ -311,7 +311,7 @@ impl Storage {
             }
             batch.delete(key);
         }
-        if batch.len() != 0 {
+        if !batch.is_empty() {
             self.db.write_opt(batch, &sync_write())?;
         }
         Ok(())
@@ -818,12 +818,15 @@ impl Storage {
         Ok(entries)
     }
 
+    /// Register an outbox consumer, returning whether this call created it. The
+    /// caller needs that to know whether a failed install may unregister it
+    /// again, or whether it belongs to an earlier, healthy install.
     pub fn register_search_consumer(
         &self,
         group: GroupId,
         name: &str,
         generation: &crate::search::SearchIndexGeneration,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _lifecycle = self.search_lifecycle.lock().unwrap();
         crate::search::validate_index_name(name)?;
         generation.validate_identity()?;
@@ -837,7 +840,7 @@ impl Storage {
                     "consumer identity differs from catalog generation".into(),
                 ));
             }
-            return Ok(());
+            return Ok(false);
         }
         self.put_local(
             &key,
@@ -846,7 +849,8 @@ impl Storage {
                 engine_revision: generation.engine_revision,
                 checkpoint: None,
             },
-        )
+        )?;
+        Ok(true)
     }
 
     pub fn record_search_consumer_checkpoint(
@@ -923,12 +927,17 @@ impl Storage {
             {
                 return Ok(0);
             }
-            checkpoints
+            // A consumer that has committed a checkpoint but not yet projected
+            // any Raft entry still needs every retained entry: it must count as
+            // a watermark of zero, never be skipped.
+            let projected: Option<Vec<u64>> = checkpoints
                 .iter()
-                .filter_map(|checkpoint| {
-                    checkpoint.source_log_id.as_ref().map(|log_id| log_id.index)
-                })
-                .min()
+                .map(|checkpoint| checkpoint.source_log_id.as_ref().map(|log_id| log_id.index))
+                .collect();
+            let Some(projected) = projected else {
+                return Ok(0);
+            };
+            projected.into_iter().min()
         };
 
         let prefix = keyspace::search_outbox_prefix(group);
@@ -947,10 +956,14 @@ impl Storage {
                 || entry.epoch < epoch
                 || (entry.epoch == epoch
                     && minimum.is_some_and(|minimum| entry.source_log_id.index <= minimum));
-            if covered {
-                batch.delete(key);
-                deleted += 1;
+            if !covered {
+                // Entries sort by epoch then source index, and coverage is
+                // monotonic in that order, so the first uncovered entry ends
+                // the retained prefix.
+                break;
             }
+            batch.delete(key);
+            deleted += 1;
         }
         if deleted != 0 {
             self.db.write_opt(batch, &sync_write())?;
@@ -961,9 +974,16 @@ impl Storage {
     /// Capture the state rows, projection epoch, and applied prefix from one
     /// database-wide RocksDB snapshot. This prevents a backfill from pairing
     /// state from one prefix with an outbox/applied marker from another.
+    ///
+    /// `incremental_after` picks the shape. `None` loads every user row, which
+    /// is what a rebuild needs. `Some(index)` loads only the rows the outbox
+    /// marks dirty in `(index, applied]` — a caught-up index needs nothing
+    /// else, and scanning the whole partition per catch-up would make the cost
+    /// of a search scale with the partition rather than with the change set.
     pub fn search_source_snapshot(
         &self,
         group: GroupId,
+        incremental_after: Option<u64>,
     ) -> Result<crate::search::SearchSourceSnapshot> {
         if !matches!(group, GroupId::Data(_)) {
             return Err(Error::Search(
@@ -983,18 +1003,6 @@ impl Storage {
             }
             None => None,
         };
-        let mut records = Vec::new();
-        for item in snapshot.iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(&[keyspace::TAG_USER], rocksdb::Direction::Forward),
-        ) {
-            let (key, value) = item?;
-            let Some(user_key) = key.strip_prefix(&[keyspace::TAG_USER]) else {
-                break;
-            };
-            let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
-            records.push((user_key.to_vec(), record.version, record.value));
-        }
         let outbox_prefix = keyspace::search_outbox_epoch_prefix(group, epoch);
         let mut outbox = Vec::new();
         for item in snapshot.iterator(rocksdb::IteratorMode::From(
@@ -1006,6 +1014,45 @@ impl Storage {
                 break;
             }
             outbox.push(crate::search::decode_outbox_key(group, &key)?);
+        }
+
+        let mut records = Vec::new();
+        match incremental_after {
+            None => {
+                for item in snapshot.iterator_cf(
+                    &cf,
+                    rocksdb::IteratorMode::From(&[keyspace::TAG_USER], rocksdb::Direction::Forward),
+                ) {
+                    let (key, value) = item?;
+                    let Some(user_key) = key.strip_prefix(&[keyspace::TAG_USER]) else {
+                        break;
+                    };
+                    let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+                    records.push((user_key.to_vec(), record.version, record.value));
+                }
+            }
+            Some(after) => {
+                let through = applied.as_ref().map(|log_id| log_id.index).unwrap_or(0);
+                outbox.retain(|entry| {
+                    entry.source_log_id.index > after && entry.source_log_id.index <= through
+                });
+                let mut loaded = std::collections::HashSet::new();
+                for entry in &outbox {
+                    if !loaded.insert(entry.user_key.clone()) {
+                        continue;
+                    }
+                    let mut state_key = Vec::with_capacity(entry.user_key.len() + 1);
+                    state_key.push(keyspace::TAG_USER);
+                    state_key.extend_from_slice(&entry.user_key);
+                    // A key absent from the snapshot was deleted; the caller
+                    // projects that as a document removal.
+                    let Some(value) = snapshot.get_cf(&cf, &state_key)? else {
+                        continue;
+                    };
+                    let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+                    records.push((entry.user_key.clone(), record.version, record.value));
+                }
+            }
         }
         Ok(crate::search::SearchSourceSnapshot {
             epoch,

@@ -463,6 +463,7 @@ impl Node {
             tuning,
             partitions: partitions.clone(),
             meta: meta_handle.clone(),
+            search: search.clone(),
             verification_timeout: cfg.timeouts.request.mul_f64(0.8),
             lifecycle: AsyncMutex::new(()),
             identity_gate: identity_gate.clone(),
@@ -1211,6 +1212,7 @@ pub struct PartitionStarter {
     tuning: RaftTuning,
     partitions: PartitionMap,
     meta: MetaHandle,
+    search: Arc<crate::search::SearchService>,
     verification_timeout: Duration,
     lifecycle: AsyncMutex<()>,
     identity_gate: ProcessIdentityGate,
@@ -1293,6 +1295,7 @@ impl PartitionStarter {
             self.tuning,
         )
         .await?;
+        self.search.allow_partition(partition).await;
         self.partitions
             .write()
             .unwrap()
@@ -1338,6 +1341,10 @@ impl PartitionStarter {
             return Ok(());
         };
         node.shutdown().await?;
+        // Release the open Tantivy readers/writers before `reclaim_group_durable`
+        // unlinks the index directory, so nothing keeps serving — or later
+        // re-adopts — a projection of the partition we no longer host.
+        self.search.forget_partition(partition).await;
         self.storage.reclaim_group_durable(group).await?;
         Ok(())
     }

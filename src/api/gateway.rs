@@ -19,6 +19,7 @@ use crate::api::ops::{
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use crate::perf::WriteStage;
+use crate::search::ShardSearchOutcome;
 use crate::transport::Server;
 
 /// The set of data partitions a node currently hosts, shared between the gateway
@@ -205,7 +206,14 @@ impl ClientGateway {
             return SearchShardReply::Error("search service is not configured".into());
         };
         match search.shard_search(&node, &request).await {
-            Ok(reply) => SearchShardReply::Result(reply),
+            Ok(ShardSearchOutcome::Reply(reply)) => SearchShardReply::Result(reply),
+            // A search that reached a follower reuses the redirect channel, so
+            // the client walks to the leader instead of failing the fan-out.
+            Ok(ShardSearchOutcome::NotLeader { leader }) => SearchShardReply::Redirect(Redirect {
+                cluster_id: self.cluster_id,
+                leader,
+                candidates: self.candidates(partition).await,
+            }),
             Err(error) => SearchShardReply::Error(error.to_string()),
         }
     }

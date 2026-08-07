@@ -1,7 +1,7 @@
 use dal::search::{
     FieldKind, GenerationSelection, IndexCheckpoint, LocalSearchIndex, PathSegment, ScoringMode,
     SearchConsistency, SearchField, SearchIndexDefinition, SearchIndexGeneration, SearchQuery,
-    SearchRequest, SearchSourceSnapshot, encode_search_value,
+    SearchRequest, SearchService, SearchSourceSnapshot, encode_search_value,
 };
 use dal::storage::{StateMutation, Storage};
 use dal::types::GroupId;
@@ -32,6 +32,23 @@ fn definition() -> SearchIndexDefinition {
 #[derive(Serialize)]
 struct Article<'a> {
     title: &'a str,
+}
+
+#[derive(Serialize)]
+struct StoredKeyRecord {
+    version: u64,
+    value: Vec<u8>,
+}
+
+fn applied_record(log_id: LogId<u64>) -> Vec<u8> {
+    dal::codec::encode(&(
+        Some(log_id),
+        openraft::StoredMembership::<u64, openraft::BasicNode>::default(),
+    ))
+}
+
+fn stored_record(version: u64, value: Vec<u8>) -> Vec<u8> {
+    dal::codec::encode(&StoredKeyRecord { version, value })
 }
 
 fn value(title: &str) -> Vec<u8> {
@@ -232,4 +249,253 @@ async fn outbox_pruning_waits_for_the_slowest_registered_generation() {
         .unwrap();
     assert_eq!(storage.prune_search_outbox(group).unwrap(), 1);
     assert!(storage.scan_search_outbox(group, 1).unwrap().is_empty());
+}
+
+/// A consumer that has committed a checkpoint but not yet projected any Raft
+/// entry still needs every retained entry. Dropping it from the watermark would
+/// delete outbox entries it has not consumed, and it would then advance past
+/// them with no error — silently losing those documents from its index.
+#[tokio::test]
+async fn outbox_pruning_retains_everything_for_a_consumer_that_has_projected_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(5);
+    storage.ensure_group(group).unwrap();
+    let unprojected = SearchIndexGeneration::new(1, definition()).unwrap();
+    let advanced = SearchIndexGeneration::new(2, definition()).unwrap();
+    storage
+        .register_search_consumer(group, "articles", &unprojected)
+        .unwrap();
+    storage
+        .register_search_consumer(group, "articles", &advanced)
+        .unwrap();
+
+    for index in [11, 12] {
+        storage
+            .apply_raft(
+                group,
+                &[StateMutation::Put {
+                    key: dal::keyspace::user_key(format!("k{index}").as_bytes()),
+                    value: vec![index as u8],
+                }],
+                LogId::new(CommittedLeaderId::new(2, 7), index),
+                b"applied",
+                b"committed",
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    storage
+        .record_search_consumer_checkpoint(
+            group,
+            "articles",
+            1,
+            IndexCheckpoint {
+                projection_epoch: 1,
+                definition_hash: unprojected.definition_hash,
+                engine_revision: unprojected.engine_revision,
+                source_log_id: None,
+            },
+        )
+        .unwrap();
+    storage
+        .record_search_consumer_checkpoint(
+            group,
+            "articles",
+            2,
+            IndexCheckpoint {
+                projection_epoch: 1,
+                definition_hash: advanced.definition_hash,
+                engine_revision: advanced.engine_revision,
+                source_log_id: Some(LogId::new(CommittedLeaderId::new(2, 7), 12)),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 0);
+    assert_eq!(storage.scan_search_outbox(group, 1).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(dir.path()).unwrap());
+    let group = GroupId::Data(6);
+    storage.ensure_group(group).unwrap();
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let first = LogId::new(CommittedLeaderId::new(2, 7), 1);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"doc"),
+                value: stored_record(1, value("old projection")),
+            }],
+            first,
+            &applied_record(first),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+
+    let service = SearchService::new(storage.clone());
+    service
+        .install_generation(6, "articles", generation.clone(), false)
+        .await
+        .unwrap();
+    service
+        .remove_generation(6, "articles", generation.id)
+        .await
+        .unwrap();
+
+    let second = LogId::new(CommittedLeaderId::new(2, 7), 2);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"doc"),
+                value: stored_record(2, value("new projection")),
+            }],
+            second,
+            &applied_record(second),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 1);
+
+    service
+        .install_generation(6, "articles", generation.clone(), false)
+        .await
+        .unwrap();
+    service
+        .remove_generation(6, "articles", generation.id)
+        .await
+        .unwrap();
+    drop(service);
+
+    let path = dir
+        .path()
+        .join("search")
+        .join(group.token())
+        .join("articles")
+        .join(generation.id.to_string());
+    let index = LocalSearchIndex::open_or_create(&path, group, generation).unwrap();
+    let request = SearchRequest {
+        index: "articles".into(),
+        generation: GenerationSelection::Exact(9),
+        query: SearchQuery::Text {
+            query: "new".into(),
+            fields: vec![],
+        },
+        limit: 10,
+        offset: 0,
+        sort: vec![],
+        scoring: ScoringMode::LocalBm25,
+        consistency: SearchConsistency::Eventual,
+        allow_partial: false,
+        deadline_ms: 1_000,
+    };
+    assert_eq!(index.search(6, &request).unwrap().total_hits, 1);
+}
+
+#[tokio::test]
+async fn coalesced_apply_crossing_a_boundary_prunes_without_consumers() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(7);
+    storage.ensure_group(group).unwrap();
+    let log_id = LogId::new(CommittedLeaderId::new(2, 7), 4097);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"doc"),
+                value: b"record".to_vec(),
+            }],
+            log_id,
+            b"applied",
+            b"committed",
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(storage.scan_search_outbox(group, 1).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn forgotten_partitions_reject_installs_until_readmitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(dir.path()).unwrap());
+    storage.ensure_group(GroupId::Data(8)).unwrap();
+    let service = SearchService::new(storage);
+    let generation = SearchIndexGeneration::new(1, definition()).unwrap();
+
+    service.forget_partition(8).await;
+    assert!(
+        service
+            .install_generation(8, "articles", generation.clone(), false)
+            .await
+            .is_err()
+    );
+    service.allow_partition(8).await;
+    service
+        .install_generation(8, "articles", generation, false)
+        .await
+        .unwrap();
+}
+
+/// The index name is a path component of the on-disk Tantivy directory, so a
+/// dot-only name would escape the per-group index root and collide across every
+/// partition on the node.
+#[test]
+fn dot_only_index_names_are_rejected() {
+    for name in [".", "..", "..."] {
+        assert!(
+            dal::search::validate_index_name(name).is_err(),
+            "index name {name:?} must be rejected"
+        );
+    }
+    for name in ["articles", "articles.v2", "a.b-c_d"] {
+        assert!(
+            dal::search::validate_index_name(name).is_ok(),
+            "index name {name:?} must be accepted"
+        );
+    }
+}
+
+/// A catalog record embeds a full definition in both `active` and `building`,
+/// so the frame limit has to clear two maximum-size definitions plus framing or
+/// a legal reply cannot be decoded.
+#[test]
+fn catalog_frames_fit_two_maximum_definitions() {
+    const CATALOG_FRAMING_HEADROOM: usize = 4 * 1024;
+    assert!(
+        dal::transport::codec::MsgType::SearchCatalogQuery.max_payload()
+            > 2 * dal::search::SEARCH_MAX_DEFINITION_BYTES
+                + dal::search::SEARCH_MAX_RETIRING_GENERATIONS
+                    * std::mem::size_of::<dal::search::SearchIndexGenerationId>()
+                + CATALOG_FRAMING_HEADROOM
+    );
+    assert_eq!(
+        dal::transport::codec::MsgType::SearchCatalogQuery.max_payload(),
+        dal::search::SEARCH_MAX_CATALOG_BYTES
+    );
+}
+
+#[test]
+fn catalog_records_bound_the_retiring_generation_list() {
+    let mut record = dal::search::SearchIndexRecord {
+        name: "articles".into(),
+        active: None,
+        building: None,
+        retiring: vec![1; dal::search::SEARCH_MAX_RETIRING_GENERATIONS],
+    };
+    assert!(record.validate().is_ok());
+    record.retiring.push(2);
+    assert!(record.validate().is_err());
 }

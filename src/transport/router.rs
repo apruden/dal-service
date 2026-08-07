@@ -129,10 +129,16 @@ fn max_reply_bytes(msg_type: MsgType) -> usize {
     // Request and reply limits differ materially for Raft replication: append
     // requests can be large batches, but their acknowledgements are tiny.
     // Reserve the reply envelope's actual maximum shape, not the request's.
+    // Any type whose reply is the large side of the exchange needs an arm here:
+    // falling through to the default under-reserves the budget by the whole
+    // ratio between the two limits, so the semaphore stops bounding memory.
     match msg_type {
         MsgType::ClientOp => MsgType::ClientOp.max_payload() + 36,
         MsgType::DirectoryQuery => MsgType::DirectoryQuery.max_payload() + 36,
         MsgType::Redirect => MsgType::Redirect.max_payload() + 36,
+        MsgType::MetaQuery => MsgType::MetaQuery.max_payload() + 36,
+        MsgType::SearchOp | MsgType::SearchExecute => MsgType::SearchOp.max_payload() + 36,
+        MsgType::SearchCatalogQuery => MsgType::SearchCatalogQuery.max_payload() + 36,
         _ => 4 * 1024 + 36,
     }
 }

@@ -21,6 +21,14 @@ pub fn validate_index_name(name: &str) -> Result<()> {
             "index name may contain only ASCII letters, digits, '-', '_', and '.'".into(),
         ));
     }
+    // The name is a path component of the on-disk Tantivy directory, so a
+    // dot-only name would resolve outside the per-group index root and collide
+    // across partitions.
+    if name.bytes().all(|byte| byte == b'.') {
+        return Err(Error::Search(
+            "index name may not consist only of '.' characters".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -224,6 +232,32 @@ pub struct SearchIndexRecord {
     pub active: Option<SearchIndexGeneration>,
     pub building: Option<SearchIndexGeneration>,
     pub retiring: Vec<SearchIndexGenerationId>,
+}
+
+impl SearchIndexRecord {
+    pub fn validate(&self) -> Result<()> {
+        validate_index_name(&self.name)?;
+        if self.retiring.len() > crate::search::SEARCH_MAX_RETIRING_GENERATIONS {
+            return Err(Error::Search(format!(
+                "search index has more than {} retiring generations",
+                crate::search::SEARCH_MAX_RETIRING_GENERATIONS
+            )));
+        }
+        if let Some(active) = &self.active {
+            active.validate_identity()?;
+        }
+        if let Some(building) = &self.building {
+            building.validate_identity()?;
+        }
+        let encoded = bincode::serialized_size(self).map_err(Error::codec)? as usize;
+        if encoded > crate::search::SEARCH_MAX_CATALOG_BYTES {
+            return Err(Error::Search(format!(
+                "encoded search catalog record exceeds {} bytes",
+                crate::search::SEARCH_MAX_CATALOG_BYTES
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

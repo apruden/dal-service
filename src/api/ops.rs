@@ -40,6 +40,9 @@ pub struct SearchCatalogQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The record is deliberately inline: this wire DTO is encoded immediately and
+// boxing it would add allocation without changing the serialized size.
+#[allow(clippy::large_enum_variant)]
 pub enum SearchCatalogReply {
     Record(Option<crate::search::SearchIndexRecord>),
     Unavailable,

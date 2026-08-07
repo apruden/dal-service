@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, Result};
@@ -15,11 +15,23 @@ struct LoadedGeneration {
     worker: SearchIndexWorker,
 }
 
+/// The outcome of a shard search. Not-leader stays structured so the gateway
+/// can route it through the same redirect channel as a point operation instead
+/// of flattening it into a terminal error.
+pub enum ShardSearchOutcome {
+    Reply(SearchReply),
+    NotLeader {
+        leader: Option<crate::types::NodeId>,
+    },
+}
+
 /// Node-local registry of rebuildable per-partition Tantivy generations.
 pub struct SearchService {
     storage: Arc<Storage>,
     loaded: RwLock<HashMap<(u16, String, u64), Arc<LoadedGeneration>>>,
     active: RwLock<HashMap<(u16, String), u64>>,
+    unavailable: RwLock<HashSet<u16>>,
+    lifecycle: tokio::sync::RwLock<()>,
     install: tokio::sync::Mutex<()>,
 }
 
@@ -29,6 +41,8 @@ impl SearchService {
             storage,
             loaded: RwLock::new(HashMap::new()),
             active: RwLock::new(HashMap::new()),
+            unavailable: RwLock::new(HashSet::new()),
+            lifecycle: tokio::sync::RwLock::new(()),
             install: tokio::sync::Mutex::new(()),
         }
     }
@@ -42,7 +56,13 @@ impl SearchService {
         generation: SearchIndexGeneration,
         active: bool,
     ) -> Result<()> {
+        let _lifecycle = self.lifecycle.read().await;
         let _install = self.install.lock().await;
+        if self.unavailable.read().unwrap().contains(&partition) {
+            return Err(Error::Search(format!(
+                "partition {partition} is closed for search"
+            )));
+        }
         validate_index_name(name)?;
         let group = GroupId::Data(partition);
         let path = self
@@ -53,39 +73,120 @@ impl SearchService {
             .join(name)
             .join(generation.id.to_string());
         let key = (partition, name.to_string(), generation.id);
-        self.storage
+        let generation_id = generation.id;
+        let definition_hash = generation.definition_hash;
+        // A registered consumer with no checkpoint holds outbox retention for
+        // the whole partition, so every failure past this point must undo
+        // whatever this call created — and only what this call created, since
+        // an earlier healthy install may own the same records.
+        let registered = self
+            .storage
             .register_search_consumer(group, name, &generation)?;
-        let loaded = if let Some(loaded) = self.loaded.read().unwrap().get(&key).cloned() {
-            if loaded.index.generation().definition_hash != generation.definition_hash {
-                return Err(Error::Search("loaded generation identity mismatch".into()));
+
+        let cached = self.loaded.read().unwrap().get(&key).cloned();
+        let (loaded, opened) = match cached {
+            Some(loaded) => {
+                if loaded.index.generation().definition_hash != definition_hash {
+                    self.roll_back(group, name, generation_id, registered, None);
+                    return Err(Error::Search("loaded generation identity mismatch".into()));
+                }
+                (loaded, false)
             }
-            loaded
-        } else {
-            let index = Arc::new(LocalSearchIndex::open_or_create(&path, group, generation)?);
-            let worker = SearchIndexWorker::new(
-                self.storage.clone(),
-                group,
-                name.to_string(),
-                index.clone(),
-            )?;
-            let loaded = Arc::new(LoadedGeneration { index, worker });
-            let mut guard = self.loaded.write().unwrap();
-            guard
-                .entry(key.clone())
-                .or_insert_with(|| loaded.clone())
-                .clone()
+            None => match self.open(group, &path, name, generation) {
+                Ok(loaded) => {
+                    self.loaded
+                        .write()
+                        .unwrap()
+                        .insert(key.clone(), loaded.clone());
+                    (loaded, true)
+                }
+                Err(error) => {
+                    self.roll_back(group, name, generation_id, registered, None);
+                    return Err(error);
+                }
+            },
         };
-        loaded.worker.catch_up().await?;
+
+        if let Err(error) = loaded.worker.catch_up_rebuilding(registered).await {
+            self.roll_back(
+                group,
+                name,
+                generation_id,
+                registered,
+                opened.then_some(key),
+            );
+            return Err(error);
+        }
         if active {
             self.active
                 .write()
                 .unwrap()
-                .insert((partition, name.to_string()), key.2);
+                .insert((partition, name.to_string()), generation_id);
         }
         Ok(())
     }
 
-    pub fn deactivate(&self, partition: u16, name: &str) {
+    fn open(
+        &self,
+        group: GroupId,
+        path: &std::path::Path,
+        name: &str,
+        generation: SearchIndexGeneration,
+    ) -> Result<Arc<LoadedGeneration>> {
+        let index = Arc::new(LocalSearchIndex::open_or_create(path, group, generation)?);
+        let worker =
+            SearchIndexWorker::new(self.storage.clone(), group, name.to_string(), index.clone())?;
+        Ok(Arc::new(LoadedGeneration { index, worker }))
+    }
+
+    fn roll_back(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+        registered: bool,
+        opened: Option<(u16, String, u64)>,
+    ) {
+        if let Some(key) = opened {
+            self.loaded.write().unwrap().remove(&key);
+        }
+        if registered
+            && let Err(error) = self
+                .storage
+                .unregister_search_consumer(group, name, generation)
+        {
+            tracing::warn!(?group, name, %error, "failed to roll back search consumer");
+        }
+    }
+
+    /// Drop every cached generation for a partition this node no longer hosts.
+    /// The on-disk index and the consumer records are removed by `drop_group`;
+    /// without this the maps would keep serving — and re-adopt — an index built
+    /// from the previous incarnation of the partition.
+    pub async fn forget_partition(&self, partition: u16) {
+        let _lifecycle = self.lifecycle.write().await;
+        self.unavailable.write().unwrap().insert(partition);
+        self.loaded
+            .write()
+            .unwrap()
+            .retain(|(hosted, _, _), _| *hosted != partition);
+        self.active
+            .write()
+            .unwrap()
+            .retain(|(hosted, _), _| *hosted != partition);
+    }
+
+    /// Reopen search installation and serving after a fresh partition runtime
+    /// has been admitted. Reclamation and admission share the runtime's
+    /// partition lifecycle lock, so this cannot overlap the corresponding
+    /// durable group deletion.
+    pub async fn allow_partition(&self, partition: u16) {
+        let _lifecycle = self.lifecycle.write().await;
+        self.unavailable.write().unwrap().remove(&partition);
+    }
+
+    pub async fn deactivate(&self, partition: u16, name: &str) {
+        let _lifecycle = self.lifecycle.read().await;
         self.active
             .write()
             .unwrap()
@@ -94,7 +195,13 @@ impl SearchService {
 
     /// Stop retaining outbox history for a catalog generation after it has
     /// entered `retiring` and all readers have been routed away from it.
-    pub fn remove_generation(&self, partition: u16, name: &str, generation: u64) -> Result<()> {
+    pub async fn remove_generation(
+        &self,
+        partition: u16,
+        name: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let _lifecycle = self.lifecycle.read().await;
         self.loaded
             .write()
             .unwrap()
@@ -108,7 +215,7 @@ impl SearchService {
             .unregister_search_consumer(GroupId::Data(partition), name, generation)
     }
 
-    pub fn readiness_observation(
+    pub async fn readiness_observation(
         &self,
         partition: u16,
         name: &str,
@@ -116,6 +223,7 @@ impl SearchService {
         node_id: crate::types::NodeId,
         voters_log_id: crate::types::LogId,
     ) -> Result<crate::search::SearchIndexReady> {
+        let _lifecycle = self.lifecycle.read().await;
         let loaded = self
             .loaded
             .read()
@@ -149,7 +257,8 @@ impl SearchService {
         &self,
         node: &PartitionNode,
         request: &SearchRequest,
-    ) -> Result<SearchReply> {
+    ) -> Result<ShardSearchOutcome> {
+        let _lifecycle = self.lifecycle.read().await;
         let GroupId::Data(partition) = node.group() else {
             return Err(Error::Search(
                 "shard search requires a data partition".into(),
@@ -173,20 +282,15 @@ impl SearchService {
             .cloned()
             .ok_or_else(|| Error::Search("index generation is not ready on this replica".into()))?;
 
-        let barrier = if matches!(
+        let linearizable = matches!(
             request.consistency,
             crate::search::SearchConsistency::Strict
-        ) {
-            match node.search_barrier().await? {
-                SearchBarrier::Ready(barrier) => barrier,
-                SearchBarrier::NotLeader { leader } => {
-                    return Err(Error::Search(format!(
-                        "not partition leader; leader={leader:?}"
-                    )));
-                }
+        );
+        let barrier = match node.search_barrier(linearizable).await? {
+            SearchBarrier::Ready(barrier) => barrier,
+            SearchBarrier::NotLeader { leader } => {
+                return Ok(ShardSearchOutcome::NotLeader { leader });
             }
-        } else {
-            None
         };
 
         loaded.worker.catch_up().await?;
@@ -208,6 +312,8 @@ impl SearchService {
                 )));
             }
         }
-        loaded.index.search(partition, request)
+        Ok(ShardSearchOutcome::Reply(
+            loaded.index.search(partition, request)?,
+        ))
     }
 }

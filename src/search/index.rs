@@ -149,11 +149,11 @@ impl LocalSearchIndex {
         let mut writer = self.writer.lock().unwrap();
         writer.delete_term(Term::from_field_bytes(self.fields.key, key));
         let mut rejected = false;
-        if let Some((version, value)) = source {
-            if let Err(error) = self.add_if_indexable(&mut writer, key, version, value) {
-                tracing::warn!(group = ?self.group, key_bytes = key.len(), %error, "search document rejected");
-                rejected = true;
-            }
+        if let Some((version, value)) = source
+            && let Err(error) = self.add_if_indexable(&mut writer, key, version, value)
+        {
+            tracing::warn!(group = ?self.group, key_bytes = key.len(), %error, "search document rejected");
+            rejected = true;
         }
         Ok(rejected)
     }

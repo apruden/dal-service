@@ -224,12 +224,30 @@ impl PartitionNode {
         self.storage.rocks_counters()
     }
 
-    /// Confirm this replica is the current leader and return the exact applied
-    /// prefix a strict search projection must cover before it can serve.
-    pub async fn search_barrier(&self) -> Result<SearchBarrier> {
+    /// Gate a shard search. Strict searches establish a fresh quorum barrier;
+    /// eventual searches may skip that barrier, but remain leader-only and may
+    /// not serve from a learner, removed replica, or unopened recovery epoch.
+    pub async fn search_barrier(&self, linearizable: bool) -> Result<SearchBarrier> {
         self.storage.require_serving(self.group)?;
+        if !linearizable {
+            let leader = self.current_leader();
+            let authorized = self.committed_voter_set().contains(&self.node_id)
+                && leader == Some(self.node_id)
+                && self.storage.state_recovery_ready(self.group);
+            return if authorized {
+                Ok(SearchBarrier::Ready(None))
+            } else {
+                Ok(SearchBarrier::NotLeader {
+                    // Never redirect a recovery-fenced leader back to itself.
+                    leader: leader.filter(|leader| *leader != self.node_id),
+                })
+            };
+        }
         match self.raft.ensure_linearizable().await {
-            Ok(log_id) => Ok(SearchBarrier::Ready(log_id)),
+            Ok(log_id) => {
+                self.open_state_recovery(log_id)?;
+                Ok(SearchBarrier::Ready(log_id))
+            }
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
                 Ok(SearchBarrier::NotLeader {
                     leader: forward.leader_id,
@@ -732,6 +750,35 @@ mod tests {
         .await
         .expect("Raft runtime kept participating after database failure");
         cluster.registry.remove(node.node_id());
+    }
+
+    #[tokio::test]
+    async fn eventual_search_remains_leader_authorized() {
+        let cluster = AsyncCluster::new();
+        let mut nodes = Vec::new();
+        for idx in 0..3 {
+            nodes.push(cluster.start(idx).await.0);
+        }
+        nodes[0].initialize(&VOTERS).await.unwrap();
+        eventually("leader election", || leader_idx(&nodes).is_some()).await;
+        let leader = leader_idx(&nodes).unwrap();
+
+        assert!(matches!(
+            nodes[leader].search_barrier(true).await.unwrap(),
+            SearchBarrier::Ready(_)
+        ));
+        assert_eq!(
+            nodes[leader].search_barrier(false).await.unwrap(),
+            SearchBarrier::Ready(None)
+        );
+        for (index, node) in nodes.iter().enumerate() {
+            if index != leader {
+                assert!(matches!(
+                    node.search_barrier(false).await.unwrap(),
+                    SearchBarrier::NotLeader { .. }
+                ));
+            }
+        }
     }
 
     async fn fence_node(nodes: &[PartitionNode], target: usize) {
