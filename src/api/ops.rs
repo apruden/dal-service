@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::partition::state_machine::{ApplyResult, RejectReason};
 use crate::types::{
-    ClusterId, Consistency, DataRequest, GroupId, HashSpec, KeyPresence, NodeDirectoryEntry,
+    ClusterId, Consistency, DataRequest, GroupId, HashSpec, KeyPresence, LogId, NodeDirectoryEntry,
     NodeId, Placement, Version,
 };
 
@@ -31,6 +31,19 @@ pub enum ClientRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingQuery {
     pub local_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchCatalogQuery {
+    pub name: String,
+    pub local_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchCatalogReply {
+    Record(Option<crate::search::SearchIndexRecord>),
+    Unavailable,
+    Error(String),
 }
 
 impl ClientRequest {
@@ -110,6 +123,16 @@ pub enum ClientReply {
     Error(String),
 }
 
+/// Public per-shard search reply used by the client-side scatter/gather
+/// coordinator. Redirect semantics are identical to point operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SearchShardReply {
+    Result(crate::search::SearchReply),
+    Redirect(Redirect),
+    Refused(String),
+    Error(String),
+}
+
 impl ClientReply {
     /// The cluster id stamped on a redirect, if any — used by the client to
     /// reject a mismatched-cluster response (DESIGN §8.2).
@@ -142,6 +165,15 @@ impl RoutingInfo {
             .iter()
             .find(|e| e.node_id == node)
             .map(|e| e.control_addr.as_str())
+    }
+
+    /// The Raft log id that committed a partition's voter set, identifying the
+    /// generation of this snapshot's placement for that partition.
+    pub fn placement_log_id(&self, partition: u16) -> Option<LogId> {
+        self.placements
+            .iter()
+            .find(|(p, _)| *p == partition)
+            .map(|(_, placement)| placement.voters_log_id)
     }
 
     /// The candidate voter set for a partition: `voters`, plus `target_voters`

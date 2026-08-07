@@ -101,9 +101,9 @@ impl StateRead for StateOverlay<'_> {
 
 /// One key's durable record: its value and the log index of its last mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KeyRecord {
-    version: Version,
-    value: Vec<u8>,
+pub(crate) struct KeyRecord {
+    pub(crate) version: Version,
+    pub(crate) value: Vec<u8>,
 }
 
 /// Per-client idempotency record (DESIGN §8.4): the highest *decided* sequence,

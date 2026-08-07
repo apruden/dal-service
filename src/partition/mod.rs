@@ -7,7 +7,7 @@ pub mod raft_types;
 pub mod sm;
 pub mod state_machine;
 
-pub use node::{PartitionNode, ReadOutcome, WriteOutcome};
+pub use node::{PartitionNode, ReadOutcome, SearchBarrier, WriteOutcome};
 pub use raft_types::{Raft, TypeConfig};
 pub use state_machine::{
     ApplyObservation, ApplyObserver, ApplyResult, DataStateMachine, RejectReason,

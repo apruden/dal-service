@@ -15,6 +15,10 @@ use crate::codec;
 use crate::config::{MIN_META_VOTERS, MIN_REPLICATION};
 use crate::error::Result;
 use crate::keyspace;
+use crate::search::{
+    SearchIndexDefinition, SearchIndexGeneration, SearchIndexGenerationId, SearchIndexReady,
+    SearchIndexRecord, validate_index_name,
+};
 use crate::storage::{StateMutation, Storage};
 use crate::types::{
     ClusterConfig, GroupId, LogId, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId, NodeState,
@@ -73,6 +77,11 @@ pub enum MetaReject {
     /// `SeedPlacement` may seed only data groups; the meta placement is written
     /// by `ClusterInit`.
     SeedMetaForbidden,
+    SearchIndexExists,
+    SearchIndexNotFound,
+    SearchGenerationExists,
+    SearchGenerationMismatch,
+    SearchGenerationNotReady,
 }
 
 pub struct MetaStateMachine;
@@ -175,6 +184,22 @@ impl MetaStateMachine {
                 plan_id,
                 observation,
             } => self.finalize_plan(s, *group, *plan_id, observation, true),
+            MetaCommand::CreateSearchIndex { name, definition } => {
+                self.create_search_index(s, name, definition, log_id, false)
+            }
+            MetaCommand::CreateSearchIndexGeneration { name, definition } => {
+                self.create_search_index(s, name, definition, log_id, true)
+            }
+            MetaCommand::ReportSearchIndexReady { name, observation } => {
+                self.report_search_ready(s, name, observation)
+            }
+            MetaCommand::ActivateSearchIndexGeneration { name, generation } => {
+                self.activate_search_generation(s, name, *generation)
+            }
+            MetaCommand::DropSearchIndex { name } => self.drop_search_index(s, name),
+            MetaCommand::FinalizeSearchIndexDrop { name, generation } => {
+                self.finalize_search_drop(s, name, *generation)
+            }
         }
     }
 
@@ -546,6 +571,247 @@ impl MetaStateMachine {
             vec![put(keyspace::meta_placement_key(group), &resolved)],
         ))
     }
+
+    fn search_index(&self, s: &Storage, name: &str) -> Result<Option<SearchIndexRecord>> {
+        s.get_state_record(GroupId::Meta, &keyspace::meta_search_index_key(name))
+    }
+
+    fn create_search_index(
+        &self,
+        s: &Storage,
+        name: &str,
+        definition: &SearchIndexDefinition,
+        log_id: LogId,
+        update: bool,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        if self.cluster(s)?.is_none() {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        }
+        if let Err(error) = validate_index_name(name) {
+            return Ok((invalid_owned(error.to_string()), vec![]));
+        }
+        let generation = match SearchIndexGeneration::new(log_id.index, definition.clone()) {
+            Ok(generation) => generation,
+            Err(error) => return Ok((invalid_owned(error.to_string()), vec![])),
+        };
+        let existing = self.search_index(s, name)?;
+        let mut record = match (existing, update) {
+            (None, false) => SearchIndexRecord {
+                name: name.to_string(),
+                active: None,
+                building: None,
+                retiring: Vec::new(),
+            },
+            (None, true) => return Ok((reject(MetaReject::SearchIndexNotFound), vec![])),
+            (Some(record), false) => {
+                if record.active.is_none()
+                    && record.building.as_ref().map(|item| item.definition_hash)
+                        == Some(generation.definition_hash)
+                {
+                    return Ok((MetaApplyResult::NoOp, vec![]));
+                }
+                return Ok((reject(MetaReject::SearchIndexExists), vec![]));
+            }
+            (Some(record), true) => record,
+        };
+        if record.building.is_some() {
+            if record
+                .building
+                .as_ref()
+                .is_some_and(|building| building.definition_hash == generation.definition_hash)
+            {
+                return Ok((MetaApplyResult::NoOp, vec![]));
+            }
+            return Ok((reject(MetaReject::SearchGenerationExists), vec![]));
+        }
+        if update && record.active.is_none() {
+            return Ok((reject(MetaReject::SearchIndexNotFound), vec![]));
+        }
+        record.building = Some(generation);
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_search_index_key(name), &record)],
+        ))
+    }
+
+    fn report_search_ready(
+        &self,
+        s: &Storage,
+        name: &str,
+        observation: &SearchIndexReady,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(record) = self.search_index(s, name)? else {
+            return Ok((reject(MetaReject::SearchIndexNotFound), vec![]));
+        };
+        let Some(building) = record.building.as_ref() else {
+            return Ok((reject(MetaReject::SearchGenerationMismatch), vec![]));
+        };
+        if observation.generation != building.id
+            || observation.definition_hash != building.definition_hash
+            || observation.engine_revision != building.engine_revision
+        {
+            return Ok((reject(MetaReject::SearchGenerationMismatch), vec![]));
+        }
+        let GroupId::Data(partition) = observation.group else {
+            return Ok((reject(MetaReject::ObservationMismatch), vec![]));
+        };
+        let Some(config) = self.cluster(s)? else {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        };
+        if partition >= config.p || observation.projection_epoch == 0 {
+            return Ok((reject(MetaReject::ObservationMismatch), vec![]));
+        }
+        let Some(placement) = self.placement(s, observation.group)? else {
+            return Ok((reject(MetaReject::NoPlacement), vec![]));
+        };
+        if placement.r#move.is_some()
+            || placement.voters_log_id != observation.voters_log_id
+            || !placement.voters.contains(&observation.node_id)
+        {
+            return Ok((reject(MetaReject::ObservationMismatch), vec![]));
+        }
+        let ready_key = keyspace::meta_search_ready_key(
+            name,
+            observation.generation,
+            observation.group,
+            observation.node_id,
+        );
+        if let Some(previous) = s.get_state_record::<SearchIndexReady>(GroupId::Meta, &ready_key)? {
+            if &previous == observation {
+                return Ok((MetaApplyResult::NoOp, vec![]));
+            }
+            if observation.projection_epoch < previous.projection_epoch
+                || (observation.projection_epoch == previous.projection_epoch
+                    && observation.source_log_id.index < previous.source_log_id.index)
+            {
+                return Ok((reject(MetaReject::ObservationMismatch), vec![]));
+            }
+        }
+        Ok((MetaApplyResult::Applied, vec![put(ready_key, observation)]))
+    }
+
+    fn activate_search_generation(
+        &self,
+        s: &Storage,
+        name: &str,
+        generation: SearchIndexGenerationId,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.search_index(s, name)? else {
+            return Ok((reject(MetaReject::SearchIndexNotFound), vec![]));
+        };
+        if record.active.as_ref().map(|active| active.id) == Some(generation)
+            && record.building.is_none()
+        {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        let Some(building) = record.building.as_ref() else {
+            return Ok((reject(MetaReject::SearchGenerationMismatch), vec![]));
+        };
+        if building.id != generation {
+            return Ok((reject(MetaReject::SearchGenerationMismatch), vec![]));
+        }
+        let Some(config) = self.cluster(s)? else {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        };
+        let ready_prefix = keyspace::meta_search_ready_prefix(name, generation);
+        let readiness: Vec<(Vec<u8>, SearchIndexReady)> = s
+            .scan_state(GroupId::Meta)?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(&ready_prefix))
+            .map(|(key, value)| codec::decode(&value).map(|ready| (key, ready)))
+            .collect::<Result<_>>()?;
+        for partition in 0..config.p {
+            let group = GroupId::Data(partition);
+            let Some(placement) = self.placement(s, group)? else {
+                return Ok((reject(MetaReject::SearchGenerationNotReady), vec![]));
+            };
+            if placement.r#move.is_some() {
+                return Ok((reject(MetaReject::SearchGenerationNotReady), vec![]));
+            }
+            for node_id in &placement.voters {
+                if !readiness.iter().any(|(_, ready)| {
+                    ready.generation == generation
+                        && ready.group == group
+                        && ready.node_id == *node_id
+                        && ready.voters_log_id == placement.voters_log_id
+                        && ready.definition_hash == building.definition_hash
+                        && ready.engine_revision == building.engine_revision
+                }) {
+                    return Ok((reject(MetaReject::SearchGenerationNotReady), vec![]));
+                }
+            }
+        }
+        let activated = record.building.take().expect("checked building");
+        if let Some(previous) = record.active.replace(activated) {
+            if !record.retiring.contains(&previous.id) {
+                record.retiring.push(previous.id);
+            }
+        }
+        let mut mutations = vec![put(keyspace::meta_search_index_key(name), &record)];
+        mutations.extend(
+            readiness
+                .into_iter()
+                .map(|(key, _)| StateMutation::Delete { key }),
+        );
+        Ok((MetaApplyResult::Applied, mutations))
+    }
+
+    fn drop_search_index(
+        &self,
+        s: &Storage,
+        name: &str,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.search_index(s, name)? else {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        };
+        if record.active.is_none() && record.building.is_none() {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        let building = record.building.take();
+        let ready_prefix = building
+            .as_ref()
+            .map(|generation| keyspace::meta_search_ready_prefix(name, generation.id));
+        for generation in [record.active.take(), building].into_iter().flatten() {
+            if !record.retiring.contains(&generation.id) {
+                record.retiring.push(generation.id);
+            }
+        }
+        let mut mutations = vec![put(keyspace::meta_search_index_key(name), &record)];
+        if let Some(prefix) = ready_prefix {
+            mutations.extend(
+                s.scan_state(GroupId::Meta)?
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, _)| StateMutation::Delete { key }),
+            );
+        }
+        Ok((MetaApplyResult::Applied, mutations))
+    }
+
+    fn finalize_search_drop(
+        &self,
+        s: &Storage,
+        name: &str,
+        generation: SearchIndexGenerationId,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.search_index(s, name)? else {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        };
+        let before = record.retiring.len();
+        record.retiring.retain(|id| *id != generation);
+        if record.retiring.len() == before {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        let mutation =
+            if record.active.is_none() && record.building.is_none() && record.retiring.is_empty() {
+                StateMutation::Delete {
+                    key: keyspace::meta_search_index_key(name),
+                }
+            } else {
+                put(keyspace::meta_search_index_key(name), &record)
+            };
+        Ok((MetaApplyResult::Applied, vec![mutation]))
+    }
 }
 
 impl Default for MetaStateMachine {
@@ -567,6 +833,10 @@ fn reject(r: MetaReject) -> MetaApplyResult {
 
 fn invalid(msg: &str) -> MetaApplyResult {
     MetaApplyResult::Rejected(MetaReject::InvalidConfig(msg.to_string()))
+}
+
+fn invalid_owned(msg: String) -> MetaApplyResult {
+    MetaApplyResult::Rejected(MetaReject::InvalidConfig(msg))
 }
 
 fn illegal(msg: &str) -> MetaApplyResult {

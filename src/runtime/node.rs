@@ -19,8 +19,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource};
-use crate::api::ops::{RoutingInfo, RoutingQuery};
+use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource, SearchCatalogSource};
+use crate::api::ops::{RoutingInfo, RoutingQuery, SearchCatalogQuery, SearchCatalogReply};
 use crate::config::{NodeConfig, RaftTuning, Timeouts};
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
@@ -197,6 +197,73 @@ impl RoutingSource for LiveRouting {
     }
 }
 
+struct LiveSearchCatalog {
+    cluster_id: ClusterId,
+    meta: MetaHandle,
+    control: ZmqTransport,
+    addrs: AddrBook,
+    local_control: String,
+}
+
+impl SearchCatalogSource for LiveSearchCatalog {
+    fn index(
+        &self,
+        name: String,
+        local_only: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<Option<crate::search::SearchIndexRecord>, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let local_meta = self.meta.read().unwrap().clone();
+            if let Some(meta) = local_meta {
+                match meta.read_search_index(name.clone()).await {
+                    Ok(MetaRead::Value(record)) => return Ok(record),
+                    Ok(MetaRead::NotLeader { .. }) => {}
+                    Err(error) if local_only => return Err(error.to_string()),
+                    Err(_) => {}
+                }
+            }
+            if local_only {
+                return Err("local node is not the current meta leader".into());
+            }
+            let payload = crate::codec::encode(&SearchCatalogQuery {
+                name,
+                local_only: true,
+            });
+            for addr in self.addrs.control_addrs() {
+                if addr == self.local_control {
+                    continue;
+                }
+                let request = Envelope::new(
+                    self.cluster_id,
+                    MsgType::SearchCatalogQuery,
+                    GroupId::Meta,
+                    0,
+                    payload.clone(),
+                );
+                let Ok(reply) = self.control.call(&addr, request).await else {
+                    continue;
+                };
+                if reply.cluster_id != self.cluster_id
+                    || reply.msg_type != MsgType::SearchCatalogQuery
+                {
+                    continue;
+                }
+                if let Ok(SearchCatalogReply::Record(record)) = crate::codec::decode(&reply.payload)
+                {
+                    return Ok(record);
+                }
+            }
+            Err("no meta leader answered the search catalog query".into())
+        })
+    }
+}
+
 pub struct Node {
     node_id: NodeId,
     cluster: ClusterConfig,
@@ -212,6 +279,7 @@ pub struct Node {
     addrs: AddrBook,
     readiness: RuntimeReadiness,
     identity_gate: ProcessIdentityGate,
+    search: Arc<crate::search::SearchService>,
     // Background control loops (heartbeat emitter, failure detector); aborted on
     // shutdown.
     tasks: Vec<JoinHandle<()>>,
@@ -375,6 +443,15 @@ impl Node {
             partitions.clone(),
             routing,
         ));
+        let search = Arc::new(crate::search::SearchService::new(storage.clone()));
+        gateway.set_search_service(search.clone());
+        gateway.set_search_catalog(Arc::new(LiveSearchCatalog {
+            cluster_id: cfg.cluster_id,
+            meta: meta_handle.clone(),
+            control: control.clone(),
+            addrs: addrs.clone(),
+            local_control: cfg.control_addr.clone(),
+        }));
         let heartbeats = Arc::new(Mutex::new(HeartbeatTracker::new()));
         let starter = Arc::new(PartitionStarter {
             node_id: cfg.node_id,
@@ -448,8 +525,10 @@ impl Node {
         let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
         let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone())?;
 
-        // Control loops: every node beats to the meta voters; the meta leader
-        // turns the collected evidence into directory transitions.
+        // Control loops: every node beats to every node it knows, so a node
+        // promoted to meta voter later already holds liveness evidence; the
+        // meta leader turns that evidence into directory transitions. The cost
+        // is O(N) frames per node per interval — revisit if clusters outgrow it.
         let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
         let directory_timeout = cfg.timeouts.request;
         let hb_control = ZmqTransport::new(ctx.clone(), hb_interval);
@@ -531,10 +610,15 @@ impl Node {
             addrs,
             readiness,
             identity_gate,
+            search,
             tasks,
             _control_srv: Some(control_srv),
             _bulk_srv: Some(bulk_srv),
         })
+    }
+
+    pub fn search_service(&self) -> Arc<crate::search::SearchService> {
+        self.search.clone()
     }
 
     /// Drive the resumable genesis: the designated meta voter initializes and

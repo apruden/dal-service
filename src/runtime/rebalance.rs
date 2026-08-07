@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::codec;
 use crate::meta::bootstrap;
@@ -43,6 +43,12 @@ use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::runtime::readiness::RuntimeReadiness;
 
 const REBALANCE_INTERVAL: Duration = Duration::from_millis(150);
+/// How often a node re-reads the authoritative directory. Off the meta leader
+/// this is a fan-out to every control address, each answered by a ReadIndex and
+/// a directory scan — O(N^2) cluster-wide if it rides the rebalance tick.
+/// Membership changes rarely, so refresh far less often than roles are driven;
+/// this also bounds how long a superseded process can run before it is fenced.
+const DIRECTORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 
 /// Per-node rebalance driver, spawned on every node. The meta-leader role is a
 /// no-op unless this node runs and leads the meta group; the data-leader role
@@ -110,11 +116,15 @@ impl RebalanceDriver {
     }
 
     pub async fn run(self) {
+        let mut next_directory_refresh = Instant::now();
         loop {
             if !self.identity_gate.is_open() {
                 return;
             }
-            self.refresh_addr_book().await;
+            if Instant::now() >= next_directory_refresh {
+                self.refresh_addr_book().await;
+                next_directory_refresh = Instant::now() + DIRECTORY_REFRESH_INTERVAL;
+            }
             if !self.identity_gate.is_open() {
                 return;
             }

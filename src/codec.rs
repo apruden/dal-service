@@ -21,3 +21,10 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     bincode::deserialize(bytes).map_err(Error::codec)
 }
+
+/// The exact length [`encode`] would produce, without allocating or writing the
+/// bytes. Use this wherever only the size is wanted (batch sizing, budgeting).
+pub fn encoded_len<T: Serialize>(value: &T) -> usize {
+    bincode::serialized_size(value).expect("record serialization is infallible for our types")
+        as usize
+}

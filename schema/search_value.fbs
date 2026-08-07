@@ -1,0 +1,11 @@
+namespace dal.search.fb;
+
+/// Envelope stored as a DAL value when the record participates in search.
+/// The payload is a complete FlexBuffer document whose root is a map.
+table SearchValue {
+  type_id:string (required);
+  payload:[ubyte] (required, flexbuffer);
+}
+
+root_type SearchValue;
+file_identifier "DALV";

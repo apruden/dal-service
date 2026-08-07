@@ -148,7 +148,7 @@ impl RocksStateMachine {
         let mut chunk_bytes = 0usize;
 
         for entry in entries {
-            let entry_bytes = codec::encode(&entry).len();
+            let entry_bytes = codec::encoded_len(&entry);
             let would_exceed = !chunk.is_empty()
                 && (chunk.len() >= APPLY_CHUNK_ENTRIES
                     || chunk_bytes.saturating_add(entry_bytes) > APPLY_CHUNK_INPUT_BYTES);
@@ -187,7 +187,13 @@ impl RocksStateMachine {
             let (result, muts, request) = match entry.payload {
                 EntryPayload::Blank => (ApplyResult::NoOp, Vec::new(), None),
                 EntryPayload::Normal(req) => {
-                    let request = (req.client_id, req.sequence, digest(&req.op));
+                    // The digest exists only to describe an apply to an
+                    // observer. Production installs none, so do not hash every
+                    // op's bytes for an observation nobody consumes.
+                    let request = self
+                        .apply_observer
+                        .is_some()
+                        .then(|| (req.client_id, req.sequence, digest(&req.op)));
                     let (result, mutations) = self
                         .data
                         .evaluate(&overlay, &req, log_id.index)
@@ -197,7 +203,7 @@ impl RocksStateMachine {
                                 .poison_raft_error("state-machine evaluation failed", error);
                             StorageError::from(openraft::StorageIOError::apply(log_id, &error))
                         })?;
-                    (result, mutations, Some(request))
+                    (result, mutations, request)
                 }
                 EntryPayload::Membership(m) => {
                     membership = StoredMembership::new(Some(log_id), m);
@@ -260,7 +266,10 @@ impl RocksStateMachine {
             let (result, muts, request) = match entry.payload {
                 EntryPayload::Blank => (ApplyResult::NoOp, Vec::new(), None),
                 EntryPayload::Normal(req) => {
-                    let request = (req.client_id, req.sequence, digest(&req.op));
+                    let request = self
+                        .apply_observer
+                        .is_some()
+                        .then(|| (req.client_id, req.sequence, digest(&req.op)));
                     let (result, mutations) = self
                         .data
                         .evaluate(self.storage.as_ref(), &req, log_id.index)
@@ -270,7 +279,7 @@ impl RocksStateMachine {
                                 .poison_raft_error("state-machine evaluation failed", error);
                             StorageError::from(openraft::StorageIOError::apply(log_id, &error))
                         })?;
-                    (result, mutations, Some(request))
+                    (result, mutations, request)
                 }
                 EntryPayload::Membership(m) => {
                     membership = StoredMembership::new(Some(log_id), m);

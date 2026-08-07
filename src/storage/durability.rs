@@ -8,11 +8,12 @@
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rocksdb::WriteBatch;
+use tokio::sync::Notify;
 
 use crate::perf::WriteStage;
 
@@ -73,7 +74,7 @@ struct BudgetState {
 
 struct Shared {
     state: Mutex<BudgetState>,
-    capacity_available: Condvar,
+    capacity_available: Notify,
     config: DurabilityConfig,
 }
 
@@ -85,12 +86,14 @@ impl Shared {
                 pending_requests: 0,
                 pending_bytes: 0,
             }),
-            capacity_available: Condvar::new(),
+            capacity_available: Notify::new(),
             config,
         }
     }
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
+    /// Take capacity if the budget currently allows, without waiting. `Ok(None)`
+    /// means the budget is full; the worker must drain before this can succeed.
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Option<Reservation>> {
         if bytes > self.config.max_pending_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -103,32 +106,46 @@ impl Shared {
         let charged_bytes = bytes;
         let mut state = self.state.lock().unwrap();
 
+        match &state.status {
+            WorkerStatus::Running => {}
+            WorkerStatus::Failed(error) => return Err(io::Error::other(error.clone())),
+            WorkerStatus::Stopped => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "WAL durability coordinator stopped",
+                ));
+            }
+        }
+
+        let request_fits = state.pending_requests < self.config.max_pending_requests;
+        let bytes_fit =
+            state.pending_bytes.saturating_add(charged_bytes) <= self.config.max_pending_bytes;
+        if !request_fits || !bytes_fit {
+            return Ok(None);
+        }
+
+        state.pending_requests += 1;
+        state.pending_bytes += charged_bytes;
+        Ok(Some(Reservation {
+            shared: self.clone(),
+            charged_bytes,
+            active: true,
+        }))
+    }
+
+    /// Wait for budget. Every caller is a Tokio task on a shared runtime, so a
+    /// full budget must suspend the task: blocking here would park a worker
+    /// thread, and enough concurrent writers would then starve the timers and
+    /// Raft RPC handlers whose progress is what frees the budget.
+    async fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
         loop {
-            match &state.status {
-                WorkerStatus::Running => {}
-                WorkerStatus::Failed(error) => return Err(io::Error::other(error.clone())),
-                WorkerStatus::Stopped => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "WAL durability coordinator stopped",
-                    ));
-                }
+            // Subscribe before checking, so a release between the two leaves a
+            // notification for this waiter instead of being lost.
+            let capacity = self.capacity_available.notified();
+            if let Some(reservation) = self.try_reserve(bytes)? {
+                return Ok(reservation);
             }
-
-            let request_fits = state.pending_requests < self.config.max_pending_requests;
-            let bytes_fit =
-                state.pending_bytes.saturating_add(charged_bytes) <= self.config.max_pending_bytes;
-            if request_fits && bytes_fit {
-                state.pending_requests += 1;
-                state.pending_bytes += charged_bytes;
-                return Ok(Reservation {
-                    shared: self.clone(),
-                    charged_bytes,
-                    active: true,
-                });
-            }
-
-            state = self.capacity_available.wait(state).unwrap();
+            capacity.await;
         }
     }
 
@@ -137,7 +154,7 @@ impl Shared {
         if matches!(state.status, WorkerStatus::Running) {
             state.status = WorkerStatus::Failed(error);
         }
-        self.capacity_available.notify_all();
+        self.capacity_available.notify_waiters();
     }
 
     fn failure(&self) -> Option<String> {
@@ -152,7 +169,7 @@ impl Shared {
         if matches!(state.status, WorkerStatus::Running) {
             state.status = WorkerStatus::Stopped;
         }
-        self.capacity_available.notify_all();
+        self.capacity_available.notify_waiters();
     }
 
     fn pending_requests(&self) -> usize {
@@ -186,7 +203,8 @@ impl Drop for Reservation {
         state.pending_requests -= 1;
         state.pending_bytes -= self.charged_bytes;
         self.active = false;
-        self.shared.capacity_available.notify_all();
+        drop(state);
+        self.shared.capacity_available.notify_waiters();
     }
 }
 
@@ -243,9 +261,15 @@ impl WalDurability {
         })
     }
 
-    /// Reserve bounded not-yet-durable capacity before enqueueing a write.
-    pub(crate) fn reserve(&self, bytes: usize) -> io::Result<Reservation> {
-        self.shared.reserve(bytes)
+    /// Reserve bounded not-yet-durable capacity before enqueueing a write,
+    /// waiting for the worker to drain if the budget is currently full.
+    pub(crate) async fn reserve(&self, bytes: usize) -> io::Result<Reservation> {
+        self.shared.reserve(bytes).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve(&self, bytes: usize) -> io::Result<Option<Reservation>> {
+        self.shared.try_reserve(bytes)
     }
 
     /// A sink used by the database-wide health registry to fail this worker
@@ -568,8 +592,8 @@ mod tests {
 
         // Reserve both first so adaptive collection knows another active writer
         // exists even if the worker receives the first command immediately.
-        let first = durability.reserve(16).unwrap();
-        let second = durability.reserve(16).unwrap();
+        let first = durability.try_reserve(16).unwrap().expect("capacity");
+        let second = durability.try_reserve(16).unwrap().expect("capacity");
         for (id, reservation) in [(1, first), (2, second)] {
             let tx = tx.clone();
             durability
@@ -594,7 +618,7 @@ mod tests {
         let durability =
             WalDurability::with_config(test_config(true), |_| Ok(()), || Ok(())).unwrap();
         let (tx, rx) = mpsc::channel();
-        let reservation = durability.reserve(16).unwrap();
+        let reservation = durability.try_reserve(16).unwrap().expect("capacity");
         durability
             .submit(
                 reservation,
@@ -614,7 +638,7 @@ mod tests {
             WalDurability::with_config(test_config(false), |_| Ok(()), || Ok(())).unwrap();
         let (written_tx, written_rx) = mpsc::channel();
         let (durable_tx, durable_rx) = mpsc::channel();
-        let reservation = durability.reserve(16).unwrap();
+        let reservation = durability.try_reserve(16).unwrap().expect("capacity");
         durability
             .submit(
                 reservation,
@@ -641,14 +665,14 @@ mod tests {
                 .to_string()
                 .contains("external database storage failure")
         );
-        assert!(durability.reserve(1).is_err());
+        assert!(durability.try_reserve(1).is_err());
     }
 
     #[test]
     fn oversized_batch_is_rejected_instead_of_undercharged() {
         let durability =
             WalDurability::with_config(test_config(true), |_| Ok(()), || Ok(())).unwrap();
-        assert!(durability.reserve(1_025).is_err());
+        assert!(durability.try_reserve(1_025).is_err());
         assert_eq!(durability.shared.pending_requests(), 0);
     }
 
@@ -667,8 +691,8 @@ mod tests {
         .unwrap();
         let (written_tx, written_rx) = mpsc::channel();
         let (durable_tx, durable_rx) = mpsc::channel();
-        let log_reservation = durability.reserve(16).unwrap();
-        let state_reservation = durability.reserve(16).unwrap();
+        let log_reservation = durability.try_reserve(16).unwrap().expect("capacity");
+        let state_reservation = durability.try_reserve(16).unwrap().expect("capacity");
         let log_durable_tx = durable_tx.clone();
         durability
             .submit(
@@ -698,7 +722,7 @@ mod tests {
         ];
         results.sort_unstable();
         assert_eq!(results, [("log", true), ("state", true)]);
-        assert!(durability.reserve(1).is_err());
+        assert!(durability.try_reserve(1).is_err());
         assert_eq!(flushes.load(Ordering::SeqCst), 1);
     }
 }

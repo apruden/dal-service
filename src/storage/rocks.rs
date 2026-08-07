@@ -53,6 +53,9 @@ pub struct Storage {
     db: Arc<Db>,
     profile_options: Option<Options>,
     path: PathBuf,
+    /// Serializes consumer registration with outbox pruning so a new backfill
+    /// cannot lose a mutation between registration and its source snapshot.
+    search_lifecycle: std::sync::Mutex<()>,
 }
 
 fn sync_write() -> WriteOptions {
@@ -131,6 +134,7 @@ impl Storage {
             db,
             profile_options: crate::perf::write_path_enabled().then_some(opts),
             path,
+            search_lifecycle: std::sync::Mutex::new(()),
         })
     }
 
@@ -295,6 +299,24 @@ impl Storage {
         Ok(())
     }
 
+    fn delete_local_prefix(&self, prefix: &[u8]) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            batch.delete(key);
+        }
+        if batch.len() != 0 {
+            self.db.write_opt(batch, &sync_write())?;
+        }
+        Ok(())
+    }
+
     // ---- column-family lifecycle -------------------------------------------
 
     /// Idempotently create both CFs for a group.
@@ -319,6 +341,13 @@ impl Storage {
             }
         }
         self.apply_durability.remove(group);
+        if matches!(group, GroupId::Data(_)) {
+            self.delete_local_prefix(&keyspace::search_prefix(group))?;
+            let index_path = self.path.join("search").join(group.token());
+            if index_path.exists() {
+                std::fs::remove_dir_all(index_path)?;
+            }
+        }
         Ok(())
     }
 
@@ -365,7 +394,7 @@ impl Storage {
 
     pub(crate) fn require_group_healthy(&self, group: GroupId) -> Result<()> {
         self.require_healthy()?;
-        match self.apply_durability.snapshot(group).failed {
+        match self.apply_durability.group_failure(group) {
             Some(error) => Err(Error::Io(std::io::Error::other(error))),
             None => Ok(()),
         }
@@ -524,7 +553,7 @@ impl Storage {
         // the disk becomes slower than Raft producers.
         let reservation = {
             let _profile = crate::perf::timer(WriteStage::WalCapacityWait);
-            self.durability.reserve(wal_bytes)?
+            self.durability.reserve(wal_bytes).await?
         };
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
         if let Err(error) = self.durability.submit(
@@ -563,13 +592,24 @@ impl Storage {
         wal_bytes: usize,
     ) -> Result<()> {
         self.require_healthy()?;
-        let reservation = {
-            let _profile = crate::perf::timer(WriteStage::StateApplyCapacityWait);
-            self.durability.reserve(wal_bytes)?
-        };
+        // Admit against this group's dirty budget before taking database-wide
+        // WAL capacity: holding shared capacity while parked on one group's
+        // backlog would let that group's durability lag stall every sibling
+        // group's log appends.
         self.apply_durability
             .begin(group, log_id, applied_entries, wal_bytes)
             .await?;
+        let reservation = {
+            let _profile = crate::perf::timer(WriteStage::StateApplyCapacityWait);
+            match self.durability.reserve(wal_bytes).await {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    self.apply_durability
+                        .cancel(group, log_id, error.to_string());
+                    return Err(Error::Io(error));
+                }
+            }
+        };
 
         let written_tracker = self.apply_durability.clone();
         let written_log_id = log_id;
@@ -631,7 +671,6 @@ impl Storage {
         self.apply_durability.durable(group, log_id);
     }
 
-    #[cfg(test)]
     pub(crate) async fn wait_state_durable(
         &self,
         group: GroupId,
@@ -741,6 +780,241 @@ impl Storage {
         Ok(out)
     }
 
+    /// Current local search projection epoch. Epoch one is implicit on stores
+    /// created before search was enabled and is persisted with the first dirty
+    /// record or snapshot install.
+    pub fn search_projection_epoch(&self, group: GroupId) -> Result<u64> {
+        if !matches!(group, GroupId::Data(_)) {
+            return Err(Error::Search(
+                "search projection requires a data group".into(),
+            ));
+        }
+        Ok(self
+            .get_local::<u64>(&keyspace::search_epoch_key(group))?
+            .unwrap_or(1))
+    }
+
+    /// Scan one epoch of the persistent local dirty-key outbox in source-log
+    /// order. Values are intentionally empty; source values are read from the
+    /// authoritative state CF.
+    pub fn scan_search_outbox(
+        &self,
+        group: GroupId,
+        epoch: u64,
+    ) -> Result<Vec<crate::search::SearchOutboxEntry>> {
+        let prefix = keyspace::search_outbox_epoch_prefix(group, epoch);
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        ));
+        let mut entries = Vec::new();
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            entries.push(crate::search::decode_outbox_key(group, &key)?);
+        }
+        Ok(entries)
+    }
+
+    pub fn register_search_consumer(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: &crate::search::SearchIndexGeneration,
+    ) -> Result<()> {
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
+        crate::search::validate_index_name(name)?;
+        generation.validate_identity()?;
+        let key = keyspace::search_consumer_key(group, name, generation.id);
+        if let Some(existing) = self.get_local::<crate::search::SearchConsumerState>(&key)? {
+            if existing.definition_hash != generation.definition_hash
+                || existing.engine_revision != generation.engine_revision
+            {
+                return Err(Error::Corrupt(
+                    "search consumer".into(),
+                    "consumer identity differs from catalog generation".into(),
+                ));
+            }
+            return Ok(());
+        }
+        self.put_local(
+            &key,
+            &crate::search::SearchConsumerState {
+                definition_hash: generation.definition_hash,
+                engine_revision: generation.engine_revision,
+                checkpoint: None,
+            },
+        )
+    }
+
+    pub fn record_search_consumer_checkpoint(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+        checkpoint: crate::search::IndexCheckpoint,
+    ) -> Result<()> {
+        let key = keyspace::search_consumer_key(group, name, generation);
+        let Some(mut state) = self.get_local::<crate::search::SearchConsumerState>(&key)? else {
+            return Err(Error::Corrupt(
+                "search consumer".into(),
+                "checkpoint written for an unregistered consumer".into(),
+            ));
+        };
+        if state.definition_hash != checkpoint.definition_hash
+            || state.engine_revision != checkpoint.engine_revision
+        {
+            return Err(Error::Corrupt(
+                "search consumer".into(),
+                "checkpoint identity differs from consumer".into(),
+            ));
+        }
+        state.checkpoint = Some(checkpoint);
+        self.put_local(&key, &state)
+    }
+
+    pub fn unregister_search_consumer(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+    ) -> Result<()> {
+        {
+            let _lifecycle = self.search_lifecycle.lock().unwrap();
+            self.delete_local(&keyspace::search_consumer_key(group, name, generation))?;
+        }
+        self.prune_search_outbox(group)?;
+        Ok(())
+    }
+
+    /// Delete only the outbox prefix covered by every registered local
+    /// generation. No-consumer groups may discard all entries because a newly
+    /// registered generation starts with a full state snapshot.
+    pub fn prune_search_outbox(&self, group: GroupId) -> Result<usize> {
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
+        let consumer_prefix = keyspace::search_consumer_prefix(group);
+        let mut consumers = Vec::new();
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            &consumer_prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = item?;
+            if !key.starts_with(&consumer_prefix) {
+                break;
+            }
+            consumers.push(codec::decode::<crate::search::SearchConsumerState>(&value)?);
+        }
+        let epoch = self.search_projection_epoch(group)?;
+        let minimum = if consumers.is_empty() {
+            None
+        } else {
+            let checkpoints: Option<Vec<_>> = consumers
+                .iter()
+                .map(|consumer| consumer.checkpoint.as_ref())
+                .collect();
+            let Some(checkpoints) = checkpoints else {
+                return Ok(0);
+            };
+            if checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.projection_epoch != epoch)
+            {
+                return Ok(0);
+            }
+            checkpoints
+                .iter()
+                .filter_map(|checkpoint| {
+                    checkpoint.source_log_id.as_ref().map(|log_id| log_id.index)
+                })
+                .min()
+        };
+
+        let prefix = keyspace::search_outbox_prefix(group);
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut deleted = 0usize;
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let entry = crate::search::decode_outbox_key(group, &key)?;
+            let covered = consumers.is_empty()
+                || entry.epoch < epoch
+                || (entry.epoch == epoch
+                    && minimum.is_some_and(|minimum| entry.source_log_id.index <= minimum));
+            if covered {
+                batch.delete(key);
+                deleted += 1;
+            }
+        }
+        if deleted != 0 {
+            self.db.write_opt(batch, &sync_write())?;
+        }
+        Ok(deleted)
+    }
+
+    /// Capture the state rows, projection epoch, and applied prefix from one
+    /// database-wide RocksDB snapshot. This prevents a backfill from pairing
+    /// state from one prefix with an outbox/applied marker from another.
+    pub fn search_source_snapshot(
+        &self,
+        group: GroupId,
+    ) -> Result<crate::search::SearchSourceSnapshot> {
+        if !matches!(group, GroupId::Data(_)) {
+            return Err(Error::Search(
+                "search projection requires a data group".into(),
+            ));
+        }
+        let cf = self.state_cf(group)?;
+        let snapshot = self.db.snapshot();
+        let epoch = match snapshot.get(keyspace::search_epoch_key(group))? {
+            Some(bytes) => codec::decode(&bytes)?,
+            None => 1,
+        };
+        let applied = match snapshot.get_cf(&cf, keyspace::raft_applied_key())? {
+            Some(bytes) => {
+                let (applied, _membership): RaftApplied = codec::decode(&bytes)?;
+                applied
+            }
+            None => None,
+        };
+        let mut records = Vec::new();
+        for item in snapshot.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&[keyspace::TAG_USER], rocksdb::Direction::Forward),
+        ) {
+            let (key, value) = item?;
+            let Some(user_key) = key.strip_prefix(&[keyspace::TAG_USER]) else {
+                break;
+            };
+            let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+            records.push((user_key.to_vec(), record.version, record.value));
+        }
+        let outbox_prefix = keyspace::search_outbox_epoch_prefix(group, epoch);
+        let mut outbox = Vec::new();
+        for item in snapshot.iterator(rocksdb::IteratorMode::From(
+            &outbox_prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, _) = item?;
+            if !key.starts_with(&outbox_prefix) {
+                break;
+            }
+            outbox.push(crate::search::decode_outbox_key(group, &key)?);
+        }
+        Ok(crate::search::SearchSourceSnapshot {
+            epoch,
+            applied,
+            records,
+            outbox,
+        })
+    }
+
     /// Atomically replace a group's replicated state from a snapshot. Clearing
     /// the existing keys and writing the replacement happen in one durable
     /// WriteBatch, so a crash exposes either the old complete state or the new
@@ -763,6 +1037,16 @@ impl Storage {
             batch.put_cf(&cf, k, v);
         }
         batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
+        if matches!(group, GroupId::Data(_)) {
+            let next_epoch = self
+                .search_projection_epoch(group)?
+                .checked_add(1)
+                .ok_or_else(|| Error::Search("search projection epoch exhausted".into()))?;
+            batch.put(
+                keyspace::search_epoch_key(group),
+                codec::encode(&next_epoch),
+            );
+        }
         fail::fail_point!("snapshot_install::before_write", |_| Err(Error::Io(
             std::io::Error::other("injected crash at snapshot_install::before_write")
         )));

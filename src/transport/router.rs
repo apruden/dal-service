@@ -23,6 +23,10 @@ use crate::transport::codec::MsgType;
 
 const MAX_HANDLERS: usize = 1024;
 const MAX_CLIENT_HANDLERS: usize = 768;
+/// Ceiling on concurrently reserved reply bytes. A client op reserves its worst
+/// case (a 16 MiB value read), so this budget — not `MAX_CLIENT_HANDLERS` — is
+/// what bounds concurrent client ops, at `REPLY_BUDGET_MIB / 17`. Raise it to
+/// trade resident reply memory for client concurrency.
 const REPLY_BUDGET_MIB: usize = 512;
 const MIB: usize = 1024 * 1024;
 
@@ -82,7 +86,8 @@ struct PendingReply {
     queued_at: Option<Instant>,
     queue_stage: Option<crate::perf::WriteStage>,
     send_stage: Option<crate::perf::WriteStage>,
-    _permit: HeldAdmission,
+    /// Absent for a shed request, which never held admission.
+    _permit: Option<HeldAdmission>,
 }
 
 #[derive(Clone)]
@@ -268,6 +273,25 @@ impl ZmqServer {
         let Some(permit) = admission.try_acquire(env.msg_type.is_peer_control(), max_reply_bytes)
         else {
             ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            // Shed loudly: an empty-bodied reply carries no outcome, so the
+            // caller treats it as "this node is not participating" and moves to
+            // another candidate immediately. Dropping the frame instead would
+            // cost the caller a full request timeout per shed request.
+            let shed = Envelope::new(
+                env.cluster_id,
+                env.msg_type,
+                env.group_id,
+                env.request_id,
+                Vec::new(),
+            );
+            let _ = reply_tx.try_send(PendingReply {
+                identity,
+                bytes: shed.encode(),
+                queued_at: None,
+                queue_stage: None,
+                send_stage: None,
+                _permit: None,
+            });
             return;
         };
         let profile_class = crate::perf::write_path_enabled()
@@ -328,7 +352,7 @@ impl ZmqServer {
                     queued_at,
                     queue_stage,
                     send_stage,
-                    _permit: permit,
+                    _permit: Some(permit),
                 })
                 .is_ok()
                 && let (Some(stage), Some(started)) = (enqueue_stage, reply_completed_at)

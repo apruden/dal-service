@@ -331,6 +331,29 @@ pub enum MetaCommand {
         plan_id: u64,
         observation: DataConfigObservation,
     },
+    CreateSearchIndex {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    CreateSearchIndexGeneration {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    ReportSearchIndexReady {
+        name: String,
+        observation: crate::search::SearchIndexReady,
+    },
+    ActivateSearchIndexGeneration {
+        name: String,
+        generation: crate::search::SearchIndexGenerationId,
+    },
+    DropSearchIndex {
+        name: String,
+    },
+    FinalizeSearchIndexDrop {
+        name: String,
+        generation: crate::search::SearchIndexGenerationId,
+    },
 }
 
 // ---------------------------------------------------------------------------

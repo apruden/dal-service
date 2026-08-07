@@ -103,6 +103,30 @@ impl Storage {
                     StateMutation::Delete { key } => batch.delete_cf(&cf, key),
                 }
             }
+            if matches!(group, GroupId::Data(_)) {
+                let epoch = self.search_projection_epoch(group)?;
+                if epoch == 1
+                    && self
+                        .get_local::<u64>(&keyspace::search_epoch_key(group))?
+                        .is_none()
+                {
+                    batch.put(keyspace::search_epoch_key(group), codec::encode(&epoch));
+                }
+                for mutation in mutations {
+                    let state_key = match mutation {
+                        StateMutation::Put { key, .. } | StateMutation::Delete { key } => key,
+                    };
+                    if let Some(user_key) = state_key.strip_prefix(&[keyspace::TAG_USER]) {
+                        let outbox_key = crate::search::encode_outbox_key(
+                            group,
+                            epoch,
+                            &applied_log_id,
+                            user_key,
+                        )?;
+                        batch.put(outbox_key, []);
+                    }
+                }
+            }
             batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
             // Persist the optional recovery hint with exactly the state prefix
             // it describes. Cross-CF WriteBatch atomicity prevents the two

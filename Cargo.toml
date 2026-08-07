@@ -22,6 +22,10 @@ tracing = "0.1"
 fail = "0.5"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 serde_json = "1"
+flatbuffers = "25.12.19"
+flexbuffers = "25.12.19"
+tantivy = "0.26.1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "signal", "net"] }
 futures = "0.3"
 zmq = "0.10"

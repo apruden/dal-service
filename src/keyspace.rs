@@ -78,6 +78,45 @@ pub fn meta_placement_key(group: GroupId) -> Vec<u8> {
     k
 }
 
+pub fn meta_search_index_prefix() -> [u8; 2] {
+    [TAG_META, b'S']
+}
+
+pub fn meta_search_index_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + 4 + name.len());
+    key.extend_from_slice(&meta_search_index_prefix());
+    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub fn meta_search_ready_prefix(name: &str, generation: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + 4 + name.len() + 8);
+    key.extend_from_slice(&[TAG_META, b's']);
+    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(&generation.to_be_bytes());
+    key
+}
+
+pub fn meta_search_ready_key(
+    name: &str,
+    generation: u64,
+    group: GroupId,
+    node_id: crate::types::NodeId,
+) -> Vec<u8> {
+    let mut key = meta_search_ready_prefix(name, generation);
+    match group {
+        GroupId::Data(partition) => {
+            key.push(1);
+            key.extend_from_slice(&partition.to_be_bytes());
+        }
+        GroupId::Meta => key.extend_from_slice(&[0, 0, 0]),
+    }
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key
+}
+
 // ---------------------------------------------------------------------------
 // Node-local default-CF record keys (DESIGN §6). These survive snapshot install
 // and CF reclamation because they never live in a group's CFs.
@@ -112,6 +151,42 @@ pub fn pending_report_key(group: GroupId) -> Vec<u8> {
 
 pub fn bootstrap_key(group: GroupId) -> Vec<u8> {
     format!("local/bootstrap/{}", group.token()).into_bytes()
+}
+
+pub fn search_prefix(group: GroupId) -> Vec<u8> {
+    format!("local/search/{}/", group.token()).into_bytes()
+}
+
+pub fn search_epoch_key(group: GroupId) -> Vec<u8> {
+    let mut key = search_prefix(group);
+    key.extend_from_slice(b"epoch");
+    key
+}
+
+pub fn search_outbox_prefix(group: GroupId) -> Vec<u8> {
+    let mut key = search_prefix(group);
+    key.extend_from_slice(b"outbox/");
+    key
+}
+
+pub fn search_outbox_epoch_prefix(group: GroupId, epoch: u64) -> Vec<u8> {
+    let mut key = search_outbox_prefix(group);
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+pub fn search_consumer_prefix(group: GroupId) -> Vec<u8> {
+    let mut key = search_prefix(group);
+    key.extend_from_slice(b"consumer/");
+    key
+}
+
+pub fn search_consumer_key(group: GroupId, name: &str, generation: u64) -> Vec<u8> {
+    let mut key = search_consumer_prefix(group);
+    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(&generation.to_be_bytes());
+    key
 }
 
 #[cfg(test)]

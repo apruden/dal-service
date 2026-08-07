@@ -41,7 +41,6 @@ impl Default for ApplyDurabilityLimits {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DurabilityWaitKind {
-    #[cfg(test)]
     General,
     Purge,
     Snapshot,
@@ -152,6 +151,16 @@ impl GroupTracker {
             snapshot_wait_ms: state.snapshot_wait_ms,
             failed: state.failed.clone(),
         }
+    }
+
+    /// The group's fail-stop reason, if any. Hot paths check this instead of
+    /// cloning a full [`ApplyDurabilitySnapshot`] to read one field.
+    fn failure(&self) -> Option<String> {
+        self.state.lock().unwrap().failed.clone()
+    }
+
+    fn is_recovery_ready(&self) -> bool {
+        self.state.lock().unwrap().recovery_ready
     }
 
     fn begin(
@@ -404,7 +413,6 @@ impl GroupTracker {
         let mut state = self.state.lock().unwrap();
         let elapsed = millis(elapsed);
         match kind {
-            #[cfg(test)]
             DurabilityWaitKind::General => {}
             DurabilityWaitKind::Purge => {
                 state.purge_waits = state.purge_waits.saturating_add(1);
@@ -552,7 +560,7 @@ impl ApplyDurabilityRegistry {
     pub(crate) fn visible(&self, group: GroupId, log_id: RaftLogId) {
         let tracker = self.tracker(group);
         tracker.visible(log_id);
-        if let Some(error) = tracker.snapshot().failed {
+        if let Some(error) = tracker.failure() {
             self.fail_all(error);
         }
     }
@@ -560,7 +568,7 @@ impl ApplyDurabilityRegistry {
     pub(crate) fn durable(&self, group: GroupId, log_id: RaftLogId) {
         let tracker = self.tracker(group);
         tracker.durable(log_id);
-        if let Some(error) = tracker.snapshot().failed {
+        if let Some(error) = tracker.failure() {
             self.fail_all(error);
         }
     }
@@ -653,9 +661,15 @@ impl ApplyDurabilityRegistry {
     pub(crate) fn installed(&self, group: GroupId, log_id: Option<RaftLogId>) {
         let tracker = self.tracker(group);
         tracker.installed(log_id, matches!(group, GroupId::Data(_)));
-        if let Some(error) = tracker.snapshot().failed {
+        if let Some(error) = tracker.failure() {
             self.fail_all(error);
         }
+    }
+
+    /// A group's fail-stop reason without the database-wide dirty-age sweep or a
+    /// full snapshot clone — the per-op health check on every serving path.
+    pub(crate) fn group_failure(&self, group: GroupId) -> Option<String> {
+        self.tracker(group).failure()
     }
 
     pub(crate) fn validate_install(
@@ -663,11 +677,17 @@ impl ApplyDurabilityRegistry {
         group: GroupId,
         log_id: Option<&RaftLogId>,
     ) -> Result<()> {
-        self.tracker(group).validate_install(log_id)
+        // A snapshot that would move this group's watermarks backwards means the
+        // local durability bookkeeping is corrupt, not that the sender is wrong:
+        // OpenRaft already filters snapshots at or below `committed`. Poison the
+        // database like every other corruption signal, so sibling groups sharing
+        // it stop acknowledging writes too.
+        let result = self.tracker(group).validate_install(log_id);
+        self.fail_on_corruption(result)
     }
 
     pub(crate) fn recovery_ready(&self, group: GroupId) -> bool {
-        self.tracker(group).snapshot().recovery_ready
+        self.tracker(group).is_recovery_ready()
     }
 
     pub(crate) fn begin_recovery_attempt(&self, group: GroupId, target: Option<RaftLogId>) -> u64 {
@@ -781,6 +801,26 @@ mod tests {
 
     fn log_id(term: u64, index: u64) -> RaftLogId {
         RaftLogId::new(CommittedLeaderId::new(term, 1), index)
+    }
+
+    #[tokio::test]
+    async fn a_backwards_snapshot_install_fails_the_whole_database() {
+        let registry = ApplyDurabilityRegistry::new();
+        let group = GroupId::Data(1);
+        let sibling = GroupId::Data(2);
+        registry.register(group, Some(log_id(1, 9)));
+        registry.register(sibling, None);
+
+        // A snapshot below this group's watermark means the local durability
+        // bookkeeping is corrupt: OpenRaft never installs one at or below
+        // `committed`. Every group sharing the database must stop.
+        assert!(matches!(
+            registry.validate_install(group, Some(&log_id(1, 4))),
+            Err(Error::Corrupt(_, _))
+        ));
+        assert!(registry.failure().is_some());
+        assert!(registry.ensure_healthy().is_err());
+        assert!(registry.group_failure(sibling).is_some());
     }
 
     #[tokio::test]

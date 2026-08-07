@@ -856,9 +856,19 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
         joined,
         MetaApplyResult::Applied | MetaApplyResult::NoOp
     ));
-    assert_eq!(
-        nodes[0].local_node_state(4).unwrap(),
-        Some(NodeState::Active),
+    // `join` returns once the meta *leader* applied the registration; node 1 is
+    // only guaranteed to observe it after replication, so poll rather than
+    // assume this node leads.
+    let mut registered = false;
+    for _ in 0..40 {
+        if nodes[0].local_node_state(4).unwrap() == Some(NodeState::Active) {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        registered,
         "a newly registered node must receive a full heartbeat grace period"
     );
 

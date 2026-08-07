@@ -32,6 +32,9 @@ pub enum Error {
     #[error("raft: {0}")]
     Raft(String),
 
+    #[error("search: {0}")]
+    Search(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

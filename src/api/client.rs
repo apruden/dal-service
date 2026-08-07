@@ -15,15 +15,18 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::api::ops::{ClientReply, ClientRequest, RoutingInfo, WriteReply};
+use crate::api::ops::{
+    ClientReply, ClientRequest, RoutingInfo, SearchCatalogQuery, SearchCatalogReply,
+    SearchShardReply, WriteReply,
+};
 use crate::codec;
 use crate::error::{Error, Result};
 use crate::perf::WriteStage;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::types::{
-    ClientId, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion, NodeId,
-    Sequence, Version,
+    ClientId, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion, LogId,
+    NodeId, Sequence, Version,
 };
 
 /// How many refresh-and-retry rounds a single operation will attempt before
@@ -37,10 +40,31 @@ struct Cache {
     /// Best-known leader per partition, tried first (DESIGN §8.1).
     leader_hint: HashMap<u16, NodeId>,
     /// Candidates learned from redirects newer than the cached routing snapshot.
-    redirect_candidates: HashMap<u16, Vec<NodeId>>,
+    redirect_candidates: HashMap<u16, RedirectHints>,
     /// Next unused sequence per partition for this client (DESIGN §8.4).
     /// Sequence 0 is never decided, so streams start at 1.
     next_seq: HashMap<u16, Sequence>,
+}
+
+/// Candidates a redirect advertised, tagged with the placement generation they
+/// were learned against so a later snapshot can retire them.
+#[derive(Default)]
+struct RedirectHints {
+    /// `voters_log_id` of the cached placement when the redirect arrived, or
+    /// `None` if the client had no placement for the partition yet.
+    learned_at: Option<LogId>,
+    candidates: Vec<NodeId>,
+}
+
+impl RedirectHints {
+    /// Whether a snapshot whose placement committed at `log_id` already
+    /// accounts for everything this redirect taught us.
+    fn subsumed_by(&self, log_id: LogId) -> bool {
+        match self.learned_at {
+            Some(learned) => (log_id.term, log_id.index) > (learned.term, learned.index),
+            None => true,
+        }
+    }
 }
 
 /// A mutation that may have committed even though the client has not yet
@@ -151,6 +175,73 @@ impl<T: Transport> Client<T> {
         min_version: Option<Version>,
     ) -> Result<Option<(Version, Vec<u8>)>> {
         self.get_with(key, Consistency::Stale { min_version }).await
+    }
+
+    /// Scatter a search to every partition leader and merge deterministically.
+    /// The generation must come from a ReadIndex-fenced control-plane lookup.
+    pub async fn search(
+        &self,
+        generation: &crate::search::SearchIndexGeneration,
+        request: &crate::search::SearchRequest,
+    ) -> Result<crate::search::SearchReply> {
+        let (partitions, _) = self.routing_params().await?;
+        crate::search::SearchCoordinator::new(partitions, ClientShardSource { client: self })?
+            .search(generation, request)
+            .await
+    }
+
+    /// Resolve the active generation through a meta ReadIndex and execute the
+    /// complete-by-default scatter/gather search.
+    pub async fn search_active(
+        &self,
+        request: &crate::search::SearchRequest,
+    ) -> Result<crate::search::SearchReply> {
+        let record = self
+            .search_index(&request.index)
+            .await?
+            .ok_or_else(|| Error::Search(format!("index {:?} does not exist", request.index)))?;
+        let generation = record.active.ok_or_else(|| {
+            Error::Search(format!(
+                "index {:?} has no active generation",
+                request.index
+            ))
+        })?;
+        self.search(&generation, request).await
+    }
+
+    pub async fn search_index(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::search::SearchIndexRecord>> {
+        crate::search::validate_index_name(name)?;
+        let payload = codec::encode(&SearchCatalogQuery {
+            name: name.to_string(),
+            local_only: false,
+        });
+        for addr in &self.seeds {
+            let request = Envelope::new(
+                self.cluster_id,
+                MsgType::SearchCatalogQuery,
+                GroupId::Meta,
+                self.next_request_id(),
+                payload.clone(),
+            );
+            let Ok(reply) = self.transport.call(addr, request).await else {
+                continue;
+            };
+            if reply.cluster_id != self.cluster_id || reply.msg_type != MsgType::SearchCatalogQuery
+            {
+                continue;
+            }
+            match codec::decode::<SearchCatalogReply>(&reply.payload) {
+                Ok(SearchCatalogReply::Record(record)) => return Ok(record),
+                Ok(SearchCatalogReply::Error(error)) => return Err(Error::Search(error)),
+                _ => continue,
+            }
+        }
+        Err(Error::Search(
+            "no seed answered the search catalog query".into(),
+        ))
     }
 
     async fn get_with(
@@ -322,7 +413,16 @@ impl<T: Transport> Client<T> {
                 continue;
             }
             if let Ok(info) = codec::decode::<RoutingInfo>(&reply.payload) {
-                self.cache.lock().unwrap().routing = Some(info);
+                let mut cache = self.cache.lock().unwrap();
+                // A snapshot newer than the redirect that taught us a candidate
+                // already lists whoever still serves the partition. Retiring the
+                // hint keeps a decommissioned node from being retried forever.
+                cache.redirect_candidates.retain(|partition, hints| {
+                    !info
+                        .placement_log_id(*partition)
+                        .is_some_and(|log_id| hints.subsumed_by(log_id))
+                });
+                cache.routing = Some(info);
                 return Ok(());
             }
         }
@@ -347,7 +447,7 @@ impl<T: Transport> Client<T> {
             let mut out = cache
                 .redirect_candidates
                 .get(&partition)
-                .cloned()
+                .map(|hints| hints.candidates.clone())
                 .unwrap_or_default();
             if lead_with_hint
                 && let Some(&hint) = cache.leader_hint.get(&partition)
@@ -359,8 +459,8 @@ impl<T: Transport> Client<T> {
         };
 
         let mut voters = info.candidates(partition);
-        if let Some(redirected) = cache.redirect_candidates.get(&partition) {
-            for &candidate in redirected {
+        if let Some(hints) = cache.redirect_candidates.get(&partition) {
+            for &candidate in &hints.candidates {
                 if !voters.contains(&candidate) {
                     voters.push(candidate);
                 }
@@ -438,7 +538,14 @@ impl<T: Transport> Client<T> {
                     )));
                 }
 
-                let reply: ClientReply = codec::decode(&reply_env.payload)?;
+                // An empty or undecodable body is how a node reports that it
+                // cannot serve right now (identity-fenced, shedding load): it
+                // carries no client-visible outcome, so treat it like a timeout
+                // and walk to the next candidate rather than failing the whole
+                // operation on a node that is not participating.
+                let Ok(reply) = codec::decode::<ClientReply>(&reply_env.payload) else {
+                    continue;
+                };
                 match reply {
                     ClientReply::Redirect(r) => {
                         if r.cluster_id != self.cluster_id {
@@ -477,14 +584,81 @@ impl<T: Transport> Client<T> {
         )))
     }
 
+    async fn route_search(
+        &self,
+        partition: u16,
+        request: &crate::search::SearchRequest,
+    ) -> Result<crate::search::SearchReply> {
+        let payload = codec::encode(request);
+        for _round in 0..MAX_ROUNDS {
+            let candidates = self.candidate_nodes(partition, RouteOrder::LeaderFirst);
+            let mut redirected = false;
+            for node in candidates {
+                let Some(addr) = self.resolve_addr(node) else {
+                    continue;
+                };
+                let env = Envelope::new(
+                    self.cluster_id,
+                    MsgType::SearchOp,
+                    GroupId::Data(partition),
+                    self.next_request_id(),
+                    payload.clone(),
+                );
+                let Ok(reply_env) = self.transport.call(&addr, env).await else {
+                    continue;
+                };
+                if reply_env.cluster_id != self.cluster_id {
+                    return Err(Error::Search(
+                        "search reply came from another cluster".into(),
+                    ));
+                }
+                let Ok(reply) = codec::decode::<SearchShardReply>(&reply_env.payload) else {
+                    continue;
+                };
+                match reply {
+                    SearchShardReply::Result(reply) => return Ok(reply),
+                    SearchShardReply::Redirect(redirect) => {
+                        if redirect.cluster_id != self.cluster_id {
+                            return Err(Error::Search(
+                                "search redirect came from another cluster".into(),
+                            ));
+                        }
+                        let restart = redirect.leader.is_some_and(|leader| leader != node);
+                        self.apply_redirect(partition, node, &redirect);
+                        redirected = true;
+                        if restart {
+                            break;
+                        }
+                    }
+                    SearchShardReply::Refused(error) | SearchShardReply::Error(error) => {
+                        return Err(Error::Search(error));
+                    }
+                }
+            }
+            if redirected {
+                let _ = self.refresh_routing().await;
+            } else {
+                self.refresh_routing().await?;
+            }
+        }
+        Err(Error::Search(format!(
+            "no candidate served search partition {partition}"
+        )))
+    }
+
     /// Fold a redirect into the cache: adopt the hinted leader and merge any
     /// newly advertised candidates. Advisory only (DESIGN §8.2).
     fn apply_redirect(&self, partition: u16, from: NodeId, r: &crate::api::ops::Redirect) {
         let mut cache = self.cache.lock().unwrap();
-        let candidates = cache.redirect_candidates.entry(partition).or_default();
+        let learned_at = cache
+            .routing
+            .as_ref()
+            .and_then(|info| info.placement_log_id(partition));
+        let hints = cache.redirect_candidates.entry(partition).or_default();
+        hints.learned_at = learned_at;
         for &candidate in &r.candidates {
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
+            if !hints.candidates.contains(&candidate) {
+                hints.candidates.push(candidate);
             }
         }
         match r.leader {
@@ -499,6 +673,22 @@ impl<T: Transport> Client<T> {
                 }
             }
         }
+    }
+}
+
+struct ClientShardSource<'a, T: Transport> {
+    client: &'a Client<T>,
+}
+
+impl<T: Transport> crate::search::ShardSearchSource for ClientShardSource<'_, T> {
+    fn search(
+        &self,
+        partition: u16,
+        request: crate::search::SearchRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::search::SearchReply>> + Send + '_>,
+    > {
+        Box::pin(async move { self.client.route_search(partition, &request).await })
     }
 }
 
@@ -615,6 +805,9 @@ mod tests {
         Redirect,
         Leader,
         Routing(RoutingInfo),
+        /// A node that cannot serve — identity-fenced, or shedding load at the
+        /// router — answers with an empty body carrying no client outcome.
+        Unavailable,
     }
 
     struct ScriptedServer(ScriptedReply);
@@ -622,6 +815,7 @@ mod tests {
     impl Server for ScriptedServer {
         async fn serve(&self, request: Envelope) -> Envelope {
             let payload = match &self.0 {
+                ScriptedReply::Unavailable => Vec::new(),
                 ScriptedReply::Redirect => codec::encode(&ClientReply::Redirect(Redirect {
                     cluster_id: 1,
                     leader: Some(4),
@@ -640,6 +834,124 @@ mod tests {
                 payload,
             )
         }
+    }
+
+    fn directory_entry(node_id: NodeId, addr: &str) -> NodeDirectoryEntry {
+        NodeDirectoryEntry {
+            node_id,
+            control_addr: addr.into(),
+            bulk_addr: format!("{addr}-bulk"),
+            state: NodeState::Active,
+            incarnation: 1,
+        }
+    }
+
+    fn routing(voters: Vec<NodeId>, voters_log_id: LogId) -> RoutingInfo {
+        RoutingInfo {
+            cluster_id: 1,
+            p: 1,
+            hash_spec: HashSpec::CANONICAL,
+            directory: voters
+                .iter()
+                .map(|&id| directory_entry(id, &format!("node-{id}")))
+                .collect(),
+            placements: vec![(
+                0,
+                Placement {
+                    voters,
+                    voters_log_id,
+                    r#move: None,
+                },
+            )],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_candidate_is_skipped_rather_than_failing_the_operation() {
+        let transport = InProcess::new();
+        transport.register(
+            "node-1",
+            Arc::new(ScriptedServer(ScriptedReply::Unavailable)),
+        );
+        transport.register("node-4", Arc::new(ScriptedServer(ScriptedReply::Leader)));
+
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(routing(vec![1, 4], LogId::new(1, 1)));
+
+        // Node 1 answers first and cannot serve; the operation must walk to the
+        // healthy replica instead of failing on an undecodable body.
+        assert_eq!(
+            client.get(b"key").await.unwrap(),
+            Some((7, b"new".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_placement_snapshot_retires_redirect_candidates() {
+        let transport = InProcess::new();
+        transport.register(
+            "seed",
+            Arc::new(ScriptedServer(ScriptedReply::Routing(routing(
+                vec![1, 2, 3],
+                LogId::new(2, 10),
+            )))),
+        );
+        let client = Client::new(1, 9, vec!["seed".into()], transport);
+        client.cache.lock().unwrap().routing = Some(routing(vec![1, 2, 3], LogId::new(1, 1)));
+
+        client.apply_redirect(
+            0,
+            1,
+            &Redirect {
+                cluster_id: 1,
+                leader: None,
+                candidates: vec![9],
+            },
+        );
+        assert_eq!(
+            client.candidate_nodes(0, RouteOrder::LeaderFirst),
+            vec![1, 2, 3, 9]
+        );
+
+        // The refreshed placement is newer than the redirect that taught us
+        // node 9, so it already names everyone who can serve: stop carrying an
+        // id that may since have been decommissioned.
+        client.refresh_routing().await.unwrap();
+        assert_eq!(
+            client.candidate_nodes(0, RouteOrder::LeaderFirst),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_newer_than_the_refreshed_snapshot_is_kept() {
+        let transport = InProcess::new();
+        transport.register(
+            "seed",
+            Arc::new(ScriptedServer(ScriptedReply::Routing(routing(
+                vec![1, 2, 3],
+                LogId::new(1, 1),
+            )))),
+        );
+        let client = Client::new(1, 9, vec!["seed".into()], transport);
+        client.cache.lock().unwrap().routing = Some(routing(vec![1, 2, 3], LogId::new(1, 1)));
+
+        client.apply_redirect(
+            0,
+            1,
+            &Redirect {
+                cluster_id: 1,
+                leader: None,
+                candidates: vec![9],
+            },
+        );
+        // Same placement generation: the seed's snapshot is no fresher than the
+        // redirect, so the hint is still the client's only lead on node 9.
+        client.refresh_routing().await.unwrap();
+        assert_eq!(
+            client.candidate_nodes(0, RouteOrder::LeaderFirst),
+            vec![1, 2, 3, 9]
+        );
     }
 
     #[tokio::test]

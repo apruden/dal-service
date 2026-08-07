@@ -21,6 +21,7 @@ use crate::meta::sm::MetaRaftStateMachine;
 use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
+use crate::search::SearchIndexRecord;
 use crate::storage::Storage;
 use crate::types::{ClusterConfig, GroupId, MetaCommand, NodeDirectoryEntry, Placement};
 
@@ -282,6 +283,24 @@ impl MetaNode {
         .await
     }
 
+    pub async fn read_search_index(
+        &self,
+        name: String,
+    ) -> Result<MetaRead<Option<SearchIndexRecord>>> {
+        crate::search::validate_index_name(&name)?;
+        self.linearizable(move || {
+            self.storage
+                .get_state_record(GroupId::Meta, &keyspace::meta_search_index_key(&name))
+        })
+        .await
+    }
+
+    pub async fn read_search_catalog(&self) -> Result<MetaRead<Vec<SearchIndexRecord>>> {
+        let storage = self.storage.clone();
+        self.linearizable(move || scan_search_catalog(&storage))
+            .await
+    }
+
     /// Read the complete directory after a ReadIndex barrier. This is the
     /// authoritative source for runtime endpoint/incarnation state; callers
     /// must not substitute the advisory `MetaQuery` follower view.
@@ -307,6 +326,10 @@ impl MetaNode {
         scan_directory(&self.storage)
     }
 
+    pub fn local_search_catalog(&self) -> Result<Vec<SearchIndexRecord>> {
+        scan_search_catalog(&self.storage)
+    }
+
     pub fn applied_index(&self) -> Option<u64> {
         self.raft.metrics().borrow().last_applied.map(|l| l.index)
     }
@@ -330,5 +353,15 @@ fn scan_directory(storage: &Storage) -> Result<Vec<NodeDirectoryEntry>> {
         .into_iter()
         .filter(|(k, _)| k.starts_with(&prefix))
         .map(|(_, v)| crate::codec::decode(&v).map_err(crate::error::Error::codec))
+        .collect()
+}
+
+fn scan_search_catalog(storage: &Storage) -> Result<Vec<SearchIndexRecord>> {
+    let prefix = keyspace::meta_search_index_prefix();
+    storage
+        .scan_state(GroupId::Meta)?
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, value)| crate::codec::decode(&value).map_err(crate::error::Error::codec))
         .collect()
 }

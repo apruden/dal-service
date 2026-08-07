@@ -66,6 +66,16 @@ pub enum MsgType {
     /// Peer-control: obtain a quorum-fenced recovery target from the current
     /// data-group leader before reopening follower-local reads.
     DataRecoveryFence = 16,
+    /// Public scatter/gather search request/reply, addressed to the meta group.
+    SearchOp = 17,
+    /// Peer-only leader-fenced shard preparation.
+    SearchPrepare = 18,
+    /// Peer-only execution against a prepared shard session.
+    SearchExecute = 19,
+    /// Peer-only index readiness/rebuild observation.
+    SearchIndexStatus = 20,
+    /// ReadIndex-fenced public control-plane index lookup.
+    SearchCatalogQuery = 21,
 }
 
 impl MsgType {
@@ -88,6 +98,11 @@ impl MsgType {
             14 => MsgType::PlacementQuery,
             15 => MsgType::DirectoryQuery,
             16 => MsgType::DataRecoveryFence,
+            17 => MsgType::SearchOp,
+            18 => MsgType::SearchPrepare,
+            19 => MsgType::SearchExecute,
+            20 => MsgType::SearchIndexStatus,
+            21 => MsgType::SearchCatalogQuery,
             _ => return None,
         })
     }
@@ -104,7 +119,10 @@ impl MsgType {
             MsgType::RaftVote => 4 * KIB,
             // Bulk lane.
             MsgType::RaftSnapshot | MsgType::MigrationChunk => 256 * MIB,
-            MsgType::MetaQuery => 4 * KIB,
+            // A routing snapshot carries the whole directory plus a placement
+            // per partition, so it scales with both cluster and `P` — the same
+            // reason `DirectoryQuery` is not held to the command-body limit.
+            MsgType::MetaQuery => 4 * MIB,
             MsgType::Redirect => 64 * KIB,
             MsgType::Heartbeat => 4 * KIB,
             MsgType::BecomeLearner => 4 * KIB,
@@ -119,6 +137,9 @@ impl MsgType {
             // without constraining it to the tiny command-body limit.
             MsgType::DirectoryQuery => 4 * MIB,
             MsgType::DataRecoveryFence => 4 * KIB,
+            MsgType::SearchOp | MsgType::SearchExecute => 32 * MIB,
+            MsgType::SearchPrepare | MsgType::SearchIndexStatus => 64 * KIB,
+            MsgType::SearchCatalogQuery => 128 * KIB,
         }
     }
 
@@ -142,6 +163,9 @@ impl MsgType {
                 | MsgType::PlacementQuery
                 | MsgType::DirectoryQuery
                 | MsgType::DataRecoveryFence
+                | MsgType::SearchPrepare
+                | MsgType::SearchExecute
+                | MsgType::SearchIndexStatus
         )
     }
 }

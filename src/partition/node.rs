@@ -49,6 +49,13 @@ pub enum ReadOutcome {
     },
 }
 
+/// ReadIndex outcome used to fence a strict derived-index read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchBarrier {
+    Ready(Option<crate::partition::raft_types::LogId>),
+    NotLeader { leader: Option<NodeId> },
+}
+
 pub struct PartitionNode {
     node_id: NodeId,
     group: GroupId,
@@ -215,6 +222,21 @@ impl PartitionNode {
 
     pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
         self.storage.rocks_counters()
+    }
+
+    /// Confirm this replica is the current leader and return the exact applied
+    /// prefix a strict search projection must cover before it can serve.
+    pub async fn search_barrier(&self) -> Result<SearchBarrier> {
+        self.storage.require_serving(self.group)?;
+        match self.raft.ensure_linearizable().await {
+            Ok(log_id) => Ok(SearchBarrier::Ready(log_id)),
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                Ok(SearchBarrier::NotLeader {
+                    leader: forward.leader_id,
+                })
+            }
+            Err(error) => Err(Error::Raft(format!("search ReadIndex: {error}"))),
+        }
     }
 
     pub(crate) fn materialized_state_status(&self) -> crate::storage::ApplyDurabilitySnapshot {

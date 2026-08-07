@@ -374,6 +374,16 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
     }
     assert!(safe, "isolated old leader served a read without quorum");
 
+    // The linearizable path must refuse for the same reason: ReadIndex cannot
+    // reach a quorum, so a deposed leader can never answer with a value.
+    assert!(
+        !matches!(
+            nodes[old].read(b"k", Consistency::Linearizable).await,
+            Ok(ReadOutcome::Value(_))
+        ),
+        "isolated old leader answered a linearizable read"
+    );
+
     // Membership reports use the same quorum fence. In particular, the old
     // leader cannot later resolve an abort from its frozen local metrics after
     // the surviving quorum has elected a replacement leader.

@@ -13,8 +13,8 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use crate::api::ops::{
-    ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, RoutingQuery, WriteReply,
-    check_partition,
+    ClientReply, ClientRequest, Redirect, RejectFrame, RoutingInfo, RoutingQuery,
+    SearchCatalogQuery, SearchCatalogReply, SearchShardReply, WriteReply, check_partition,
 };
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
@@ -36,6 +36,20 @@ pub trait RoutingSource: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<RoutingInfo>> + Send + '_>>;
 }
 
+pub trait SearchCatalogSource: Send + Sync {
+    fn index(
+        &self,
+        name: String,
+        local_only: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<crate::search::SearchIndexRecord>, String>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
 /// A gateway fronting the partitions this node hosts.
 pub struct ClientGateway {
     cluster_id: ClusterId,
@@ -43,6 +57,8 @@ pub struct ClientGateway {
     hash_spec: HashSpec,
     partitions: PartitionMap,
     routing: Arc<dyn RoutingSource>,
+    search: RwLock<Option<Arc<crate::search::SearchService>>>,
+    search_catalog: RwLock<Option<Arc<dyn SearchCatalogSource>>>,
 }
 
 impl ClientGateway {
@@ -59,7 +75,17 @@ impl ClientGateway {
             hash_spec,
             partitions,
             routing,
+            search: RwLock::new(None),
+            search_catalog: RwLock::new(None),
         }
+    }
+
+    pub fn set_search_service(&self, search: Arc<crate::search::SearchService>) {
+        *self.search.write().unwrap() = Some(search);
+    }
+
+    pub fn set_search_catalog(&self, catalog: Arc<dyn SearchCatalogSource>) {
+        *self.search_catalog.write().unwrap() = Some(catalog);
     }
 
     /// Wrap a reply body in an envelope stamped with *this* node's cluster id,
@@ -73,10 +99,14 @@ impl ClientGateway {
         self.reply(MsgType::ClientOp, group, request_id, codec::encode(&reply))
     }
 
-    /// The candidate voter set for a partition, from the routing snapshot.
+    /// The candidate voter set for a partition, from the local routing
+    /// snapshot. Redirect candidates are advisory — the client already has its
+    /// own snapshot and its seeds — so this never proxies to peers: a client
+    /// operation must not block on control-plane round trips (each of which can
+    /// cost a full request timeout) while holding its router admission.
     async fn candidates(&self, partition: u16) -> Vec<u64> {
         self.routing
-            .routing(false)
+            .routing(true)
             .await
             .map(|r| r.candidates(partition))
             .unwrap_or_default()
@@ -153,6 +183,32 @@ impl ClientGateway {
             },
         }
     }
+
+    async fn handle_search_op(&self, env: &Envelope) -> SearchShardReply {
+        let request: crate::search::SearchRequest = match codec::decode(&env.payload) {
+            Ok(request) => request,
+            Err(error) => return SearchShardReply::Refused(format!("malformed SearchOp: {error}")),
+        };
+        let GroupId::Data(partition) = env.group_id else {
+            return SearchShardReply::Refused("SearchOp must address a data partition".into());
+        };
+        let node = self.partitions.read().unwrap().get(&partition).cloned();
+        let Some(node) = node else {
+            return SearchShardReply::Redirect(Redirect {
+                cluster_id: self.cluster_id,
+                leader: None,
+                candidates: self.candidates(partition).await,
+            });
+        };
+        let search = self.search.read().unwrap().clone();
+        let Some(search) = search else {
+            return SearchShardReply::Error("search service is not configured".into());
+        };
+        match search.shard_search(&node, &request).await {
+            Ok(reply) => SearchShardReply::Result(reply),
+            Err(error) => SearchShardReply::Error(error.to_string()),
+        }
+    }
 }
 
 impl Server for ClientGateway {
@@ -160,6 +216,22 @@ impl Server for ClientGateway {
         // Wrong cluster: reply stamped with our real cluster id so the client's
         // per-reply cluster check rejects it (DESIGN §8.2).
         if request.cluster_id != self.cluster_id {
+            if request.msg_type == MsgType::SearchOp {
+                return self.reply(
+                    MsgType::SearchOp,
+                    request.group_id,
+                    request.request_id,
+                    codec::encode(&SearchShardReply::Error("wrong cluster".into())),
+                );
+            }
+            if request.msg_type == MsgType::SearchCatalogQuery {
+                return self.reply(
+                    MsgType::SearchCatalogQuery,
+                    GroupId::Meta,
+                    request.request_id,
+                    codec::encode(&SearchCatalogReply::Error("wrong cluster".into())),
+                );
+            }
             return self.client_reply(
                 request.group_id,
                 request.request_id,
@@ -199,6 +271,40 @@ impl Server for ClientGateway {
             MsgType::ClientOp => {
                 let reply = self.handle_client_op(&request).await;
                 self.client_reply(request.group_id, request.request_id, reply)
+            }
+            MsgType::SearchOp => {
+                let reply = self.handle_search_op(&request).await;
+                self.reply(
+                    MsgType::SearchOp,
+                    request.group_id,
+                    request.request_id,
+                    codec::encode(&reply),
+                )
+            }
+            MsgType::SearchCatalogQuery => {
+                let reply = match codec::decode::<SearchCatalogQuery>(&request.payload) {
+                    Ok(query) => {
+                        let catalog = self.search_catalog.read().unwrap().clone();
+                        match catalog {
+                            Some(catalog) => {
+                                match catalog.index(query.name, query.local_only).await {
+                                    Ok(record) => SearchCatalogReply::Record(record),
+                                    Err(error) => SearchCatalogReply::Error(error),
+                                }
+                            }
+                            None => SearchCatalogReply::Unavailable,
+                        }
+                    }
+                    Err(error) => {
+                        SearchCatalogReply::Error(format!("malformed catalog query: {error}"))
+                    }
+                };
+                self.reply(
+                    MsgType::SearchCatalogQuery,
+                    GroupId::Meta,
+                    request.request_id,
+                    codec::encode(&reply),
+                )
             }
             other => self.client_reply(
                 request.group_id,
