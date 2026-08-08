@@ -199,28 +199,64 @@ pub struct SearchIndexGeneration {
 }
 
 impl SearchIndexGeneration {
+    /// Proposer-side constructor: stamps this binary's engine revision.
     pub fn new(id: SearchIndexGenerationId, definition: SearchIndexDefinition) -> Result<Self> {
+        Self::with_revision(id, SEARCH_ENGINE_REVISION, definition)
+    }
+
+    /// Replicated-apply constructor: the engine revision comes from the
+    /// committed command, never from the local binary, so every meta replica
+    /// applies the same command to the same record regardless of its version.
+    pub fn with_revision(
+        id: SearchIndexGenerationId,
+        engine_revision: u32,
+        definition: SearchIndexDefinition,
+    ) -> Result<Self> {
         if id == 0 {
             return Err(Error::Search("index generation must be non-zero".into()));
+        }
+        if engine_revision == 0 {
+            return Err(Error::Search(
+                "index engine revision must be non-zero".into(),
+            ));
         }
         let definition_hash = definition.definition_hash()?;
         Ok(Self {
             id,
             definition_hash,
-            engine_revision: SEARCH_ENGINE_REVISION,
+            engine_revision,
             definition,
         })
     }
 
+    /// Deterministic structural checks, safe inside replicated state-machine
+    /// apply: no comparison against this binary's engine revision, which would
+    /// diverge across mixed-version replicas or poison the meta group after a
+    /// revision bump.
+    pub fn validate_integrity(&self) -> Result<()> {
+        if self.id == 0 {
+            return Err(Error::Search("index generation must be non-zero".into()));
+        }
+        if self.engine_revision == 0 {
+            return Err(Error::Search(
+                "index engine revision must be non-zero".into(),
+            ));
+        }
+        if self.definition_hash != self.definition.definition_hash()? {
+            return Err(Error::Search("index definition hash mismatch".into()));
+        }
+        Ok(())
+    }
+
+    /// Node-local check for actually building/serving this generation: this
+    /// binary must implement the recorded engine revision.
     pub fn validate_identity(&self) -> Result<()> {
+        self.validate_integrity()?;
         if self.engine_revision != SEARCH_ENGINE_REVISION {
             return Err(Error::Search(format!(
                 "index engine revision {} is not supported (expected {SEARCH_ENGINE_REVISION})",
                 self.engine_revision
             )));
-        }
-        if self.definition_hash != self.definition.definition_hash()? {
-            return Err(Error::Search("index definition hash mismatch".into()));
         }
         Ok(())
     }
@@ -243,11 +279,14 @@ impl SearchIndexRecord {
                 crate::search::SEARCH_MAX_RETIRING_GENERATIONS
             )));
         }
+        // Integrity only: catalog records are read inside deterministic meta
+        // apply, where a record written by a different binary revision must
+        // stay readable rather than fail-stop the group.
         if let Some(active) = &self.active {
-            active.validate_identity()?;
+            active.validate_integrity()?;
         }
         if let Some(building) = &self.building {
-            building.validate_identity()?;
+            building.validate_integrity()?;
         }
         let encoded = bincode::serialized_size(self).map_err(Error::codec)? as usize;
         if encoded > crate::search::SEARCH_MAX_CATALOG_BYTES {

@@ -78,15 +78,25 @@ impl LocalSearchIndex {
         let (schema, fields) = build_schema(&generation)?;
         fs::create_dir_all(path)?;
         let index = if path.join("meta.json").exists() {
-            let index = Index::open_in_dir(path).map_err(search_error)?;
-            if index.schema() != schema {
-                return Err(Error::Search(
-                    "on-disk Tantivy schema does not match index definition".into(),
-                ));
+            match Index::open_in_dir(path) {
+                Ok(index) if index.schema() == schema => index,
+                outcome => {
+                    // Design §7.2: an unreadable or mismatched directory is
+                    // quarantined and rebuilt from authoritative state, never
+                    // a permanent failure — index files are derived data.
+                    let reason = match outcome {
+                        Ok(_) => {
+                            "on-disk Tantivy schema does not match index definition".to_string()
+                        }
+                        Err(error) => error.to_string(),
+                    };
+                    quarantine_index_dir(path, &reason)?;
+                    fs::create_dir_all(path)?;
+                    Index::create_in_dir(path, schema.clone()).map_err(search_error)?
+                }
             }
-            index
         } else {
-            Index::create_in_dir(path, schema).map_err(search_error)?
+            Index::create_in_dir(path, schema.clone()).map_err(search_error)?
         };
         let writer = index.writer(WRITER_MEMORY_BYTES).map_err(search_error)?;
         let reader = index
@@ -116,7 +126,21 @@ impl LocalSearchIndex {
     }
 
     pub fn validate_checkpoint(&self, epoch: u64) -> Result<Option<IndexCheckpoint>> {
-        let Some(checkpoint) = self.checkpoint()? else {
+        // An unreadable or unparseable checkpoint payload invalidates the
+        // projection rather than failing every caller forever: `None` routes
+        // the worker into a full rebuild (design §7.2).
+        let checkpoint = match self.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::warn!(
+                    group = ?self.group,
+                    %error,
+                    "unreadable search checkpoint; treating index as unprojected"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(checkpoint) = checkpoint else {
             return Ok(None);
         };
         if checkpoint.projection_epoch != epoch
@@ -135,7 +159,7 @@ impl LocalSearchIndex {
         writer.delete_all_documents().map_err(search_error)?;
         let mut rejected = 0u64;
         for (key, version, value) in &snapshot.records {
-            if let Err(error) = self.add_if_indexable(&mut writer, key, *version, value) {
+            if let Some(error) = self.add_if_indexable(&mut writer, key, *version, value)? {
                 tracing::warn!(group = ?self.group, key_bytes = key.len(), %error, "search document rejected");
                 rejected += 1;
             }
@@ -150,7 +174,7 @@ impl LocalSearchIndex {
         writer.delete_term(Term::from_field_bytes(self.fields.key, key));
         let mut rejected = false;
         if let Some((version, value)) = source
-            && let Err(error) = self.add_if_indexable(&mut writer, key, version, value)
+            && let Some(error) = self.add_if_indexable(&mut writer, key, version, value)?
         {
             tracing::warn!(group = ?self.group, key_bytes = key.len(), %error, "search document rejected");
             rejected = true;
@@ -183,24 +207,36 @@ impl LocalSearchIndex {
         self.reader.reload().map_err(search_error)
     }
 
+    /// Attempt to index one authoritative record. `Ok(Some(reason))` is a
+    /// rejected document — outside the searchable domain by data shape.
+    /// `Ok(None)` was indexed or is not a document of this type. `Err` is an
+    /// engine failure and must fail the projection: counting it as a rejection
+    /// would let a later commit claim coverage through a prefix while silently
+    /// omitting a valid document (I5).
     fn add_if_indexable(
         &self,
         writer: &mut IndexWriter,
         key: &[u8],
         version: Version,
         encoded: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<Error>> {
         if key.len() > crate::search::SEARCH_MAX_KEY_BYTES {
-            return Err(Error::Search("key exceeds searchable key limit".into()));
+            return Ok(Some(Error::Search(
+                "key exceeds searchable key limit".into(),
+            )));
         }
-        let Some(extracted) =
-            crate::search::extract_document(encoded, &self.generation.definition)?
-        else {
-            return Ok(());
+        let extracted = match crate::search::extract_document(encoded, &self.generation.definition)
+        {
+            Ok(Some(extracted)) => extracted,
+            Ok(None) => return Ok(None),
+            Err(error) => return Ok(Some(error)),
         };
-        let document = self.to_tantivy_document(key, version, &extracted)?;
+        let document = match self.to_tantivy_document(key, version, &extracted) {
+            Ok(document) => document,
+            Err(error) => return Ok(Some(error)),
+        };
         writer.add_document(document).map_err(search_error)?;
-        Ok(())
+        Ok(None)
     }
 
     fn to_tantivy_document(
@@ -527,6 +563,28 @@ fn numeric_options(field: &crate::search::SearchField) -> NumericOptions {
         options = options.set_fast();
     }
     options
+}
+
+/// Move a corrupt index directory aside, keeping the latest copy for
+/// diagnosis, so the caller can create a fresh directory in its place.
+fn quarantine_index_dir(path: &Path, reason: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Search("index path has no directory name".into()))?;
+    let mut quarantined = name.to_os_string();
+    quarantined.push(".quarantined");
+    let quarantined = path.with_file_name(quarantined);
+    if quarantined.exists() {
+        fs::remove_dir_all(&quarantined)?;
+    }
+    fs::rename(path, &quarantined)?;
+    tracing::warn!(
+        ?path,
+        ?quarantined,
+        reason,
+        "quarantined corrupt search index directory"
+    );
+    Ok(())
 }
 
 fn search_error(error: impl std::fmt::Display) -> Error {

@@ -10,6 +10,17 @@ use crate::search::{
     SearchRequest,
 };
 
+/// Total descending score order: scored hits before unscored, and NaN handled
+/// via `total_cmp` so the distributed merge stays deterministic (I12).
+fn score_descending(left: &Option<f32>, right: &Option<f32>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.total_cmp(left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 pub trait ShardSearchSource: Send + Sync {
     fn search(
         &self,
@@ -113,10 +124,7 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
             .flat_map(|reply| reply.hits)
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
+            score_descending(&left.score, &right.score)
                 .then_with(|| left.partition.cmp(&right.partition))
                 .then_with(|| left.key.cmp(&right.key))
         });
@@ -133,5 +141,50 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
             partial: !failures.is_empty(),
             failed_partitions: failures,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_order_is_total_even_with_nan_and_none() {
+        let values = [
+            Some(2.0_f32),
+            Some(f32::NAN),
+            None,
+            Some(1.0),
+            Some(f32::NAN),
+            None,
+            Some(2.0),
+        ];
+        let mut sorted = values.to_vec();
+        // A non-total comparator panics here on Rust >= 1.81; determinism is
+        // asserted by comparing against an independently sorted copy.
+        sorted.sort_by(score_descending);
+        let mut again = values.to_vec();
+        again.reverse();
+        again.sort_by(score_descending);
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|s| s.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|s| s.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+        // Unscored hits sort after every scored hit.
+        assert!(sorted.iter().rev().take(2).all(Option::is_none));
+        // Plain scores stay descending.
+        let plain: Vec<f32> = sorted
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|s| !s.is_nan())
+            .collect();
+        assert_eq!(plain, vec![2.0, 2.0, 1.0]);
     }
 }

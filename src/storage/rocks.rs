@@ -818,15 +818,17 @@ impl Storage {
         Ok(entries)
     }
 
-    /// Register an outbox consumer, returning whether this call created it. The
-    /// caller needs that to know whether a failed install may unregister it
-    /// again, or whether it belongs to an earlier, healthy install.
+    /// Register an outbox consumer. `created` tells a failed install whether it
+    /// may unregister the record again or whether it belongs to an earlier,
+    /// healthy install; `needs_rebuild` is derived from the durable record so
+    /// a crash between registration and the first committed rebuild cannot
+    /// resurrect a stale on-disk index over a pruned outbox gap.
     pub fn register_search_consumer(
         &self,
         group: GroupId,
         name: &str,
         generation: &crate::search::SearchIndexGeneration,
-    ) -> Result<bool> {
+    ) -> Result<crate::search::SearchConsumerRegistration> {
         let _lifecycle = self.search_lifecycle.lock().unwrap();
         crate::search::validate_index_name(name)?;
         generation.validate_identity()?;
@@ -840,7 +842,10 @@ impl Storage {
                     "consumer identity differs from catalog generation".into(),
                 ));
             }
-            return Ok(false);
+            return Ok(crate::search::SearchConsumerRegistration {
+                created: false,
+                needs_rebuild: existing.checkpoint.is_none(),
+            });
         }
         self.put_local(
             &key,
@@ -850,7 +855,10 @@ impl Storage {
                 checkpoint: None,
             },
         )?;
-        Ok(true)
+        Ok(crate::search::SearchConsumerRegistration {
+            created: true,
+            needs_rebuild: true,
+        })
     }
 
     pub fn record_search_consumer_checkpoint(
@@ -860,6 +868,10 @@ impl Storage {
         generation: u64,
         checkpoint: crate::search::IndexCheckpoint,
     ) -> Result<()> {
+        // Same lock as unregister/prune: an unlocked get-then-put here could
+        // interleave with unregistration and recreate a deleted record, leaving
+        // a ghost consumer that pins outbox retention forever.
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
         let key = keyspace::search_consumer_key(group, name, generation);
         let Some(mut state) = self.get_local::<crate::search::SearchConsumerState>(&key)? else {
             return Err(Error::Corrupt(
@@ -877,6 +889,39 @@ impl Storage {
         }
         state.checkpoint = Some(checkpoint);
         self.put_local(&key, &state)
+    }
+
+    /// Pin this consumer's outbox retention before taking a full rebuild
+    /// snapshot. Clearing the durable watermark first is essential when the
+    /// local index checkpoint is ahead of recovered source state: otherwise a
+    /// concurrent prune could trust the stale watermark and delete mutations
+    /// that occur after the rebuild snapshot.
+    pub fn begin_search_consumer_rebuild(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: &crate::search::SearchIndexGeneration,
+    ) -> Result<()> {
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
+        let key = keyspace::search_consumer_key(group, name, generation.id);
+        let Some(mut state) = self.get_local::<crate::search::SearchConsumerState>(&key)? else {
+            return Err(Error::Corrupt(
+                "search consumer".into(),
+                "rebuild started for an unregistered consumer".into(),
+            ));
+        };
+        if state.definition_hash != generation.definition_hash
+            || state.engine_revision != generation.engine_revision
+        {
+            return Err(Error::Corrupt(
+                "search consumer".into(),
+                "rebuild identity differs from consumer".into(),
+            ));
+        }
+        if state.checkpoint.take().is_some() {
+            self.put_local(&key, &state)?;
+        }
+        Ok(())
     }
 
     pub fn unregister_search_consumer(

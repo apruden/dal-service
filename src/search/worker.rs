@@ -51,9 +51,11 @@ impl SearchIndexWorker {
     }
 
     /// Catch up this generation, forcing a full authoritative-state rebuild
-    /// when its consumer registration is new. A valid-looking on-disk
-    /// checkpoint is not proof of continuity in that case: while the consumer
-    /// was absent, no-consumer pruning was allowed to discard its outbox gap.
+    /// when its durable consumer record carries no checkpoint — a fresh
+    /// registration, or a registration whose first rebuild never committed
+    /// before a crash. A valid-looking on-disk checkpoint is not proof of
+    /// continuity in either case: while no checkpoint was held, pruning was
+    /// allowed to discard this consumer's outbox gap.
     pub(crate) async fn catch_up_rebuilding(&self, force_rebuild: bool) -> Result<SearchCatchUp> {
         let _run = self.run.lock().await;
 
@@ -67,15 +69,19 @@ impl SearchIndexWorker {
         } else {
             self.incremental_position()?
         };
+        if hint.is_none() {
+            self.begin_rebuild()?;
+        }
         let mut snapshot = self.load_source(hint).await?;
         let mut checkpoint = if force_rebuild {
             None
         } else {
-            self.index.validate_checkpoint(snapshot.epoch)?
+            self.usable_checkpoint(&snapshot)?
         };
         if checkpoint.is_none() && hint.is_some() {
+            self.begin_rebuild()?;
             snapshot = self.load_source(None).await?;
-            checkpoint = self.index.validate_checkpoint(snapshot.epoch)?;
+            checkpoint = self.usable_checkpoint(&snapshot)?;
         }
 
         let Some(checkpoint) = checkpoint else {
@@ -91,15 +97,6 @@ impl SearchIndexWorker {
                 checkpoint_index,
             });
         };
-
-        if checkpoint_ahead_of_source(&checkpoint, snapshot.applied.as_ref()) {
-            // A snapshot install can lower the log index while changing epoch;
-            // equal epochs must never allow a checkpoint to move backward.
-            return Err(Error::Corrupt(
-                "search checkpoint".into(),
-                "Tantivy checkpoint is ahead of authoritative state".into(),
-            ));
-        }
 
         let after = checkpoint
             .source_log_id
@@ -160,6 +157,37 @@ impl SearchIndexWorker {
             rejected_documents,
             checkpoint_index: (through != 0).then_some(through),
         })
+    }
+
+    /// A checkpoint the worker may resume from: identity/epoch-valid and not
+    /// ahead of the authoritative snapshot. An ahead checkpoint cannot be
+    /// trusted — with equal epochs a projection must never move backward — so
+    /// it is discarded and the generation rebuilds from authoritative state
+    /// (design §7.2) instead of failing every catch-up forever.
+    fn usable_checkpoint(
+        &self,
+        snapshot: &SearchSourceSnapshot,
+    ) -> Result<Option<IndexCheckpoint>> {
+        let Some(checkpoint) = self.index.validate_checkpoint(snapshot.epoch)? else {
+            return Ok(None);
+        };
+        if checkpoint_ahead_of_source(&checkpoint, snapshot.applied.as_ref()) {
+            tracing::warn!(
+                group = ?self.group,
+                name = self.name,
+                "search checkpoint is ahead of authoritative state; discarding for rebuild"
+            );
+            return Ok(None);
+        }
+        Ok(Some(checkpoint))
+    }
+
+    /// Clear the durable pruning watermark before the authoritative snapshot
+    /// that will seed a rebuild. A crash after this point leaves `None`, so the
+    /// next install also rebuilds and retention remains pinned.
+    fn begin_rebuild(&self) -> Result<()> {
+        self.storage
+            .begin_search_consumer_rebuild(self.group, &self.name, self.index.generation())
     }
 
     /// The source index a valid checkpoint has already projected through, or

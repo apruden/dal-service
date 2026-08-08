@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Wire/protocol version. Bumped only on an incompatible envelope or command
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Stable node identity, assigned at `join` and never reused.
 pub type NodeId = u64;
@@ -353,6 +353,22 @@ pub enum MetaCommand {
     FinalizeSearchIndexDrop {
         name: String,
         generation: crate::search::SearchIndexGenerationId,
+    },
+    /// Revision-aware replacement for `CreateSearchIndex`. Kept as a new,
+    /// appended variant so binaries can replay commands written before engine
+    /// revisions were carried in the replicated command.
+    CreateSearchIndexWithRevision {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+        /// Stamped by the proposer. Apply records it verbatim so future
+        /// mixed-engine-revision replicas produce identical catalog state.
+        engine_revision: u32,
+    },
+    /// Revision-aware replacement for `CreateSearchIndexGeneration`.
+    CreateSearchIndexGenerationWithRevision {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+        engine_revision: u32,
     },
 }
 

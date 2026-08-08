@@ -6,6 +6,7 @@ use dal::search::{
 };
 use dal::storage::Storage;
 use dal::types::{ClusterConfig, GroupId, HashSpec, LogId, MetaCommand, PROTOCOL_VERSION};
+use serde::Serialize;
 
 fn apply(
     state: &MetaStateMachine,
@@ -103,9 +104,10 @@ fn activation_requires_every_current_partition_voter() {
             &state,
             &storage,
             &mut index,
-            MetaCommand::CreateSearchIndex {
+            MetaCommand::CreateSearchIndexWithRevision {
                 name: "articles".into(),
-                definition: definition()
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION,
             }
         ),
         MetaApplyResult::Applied
@@ -187,4 +189,118 @@ fn activation_requires_every_current_partition_voter() {
         .unwrap();
     assert_eq!(record.active.unwrap().id, generation);
     assert!(record.building.is_none());
+}
+
+#[test]
+fn engine_revision_is_part_of_search_command_idempotency() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open_checked(dir.path(), 1, 1).unwrap();
+    storage.ensure_group(GroupId::Meta).unwrap();
+    let state = MetaStateMachine::new();
+    let mut index = 0u64;
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::ClusterInit {
+                config: ClusterConfig {
+                    cluster_id: 1,
+                    protocol_version: PROTOCOL_VERSION,
+                    p: 1,
+                    r: 3,
+                    hash_spec: HashSpec::CANONICAL,
+                },
+                meta_voters: vec![1, 2, 3],
+            },
+        ),
+        MetaApplyResult::Applied
+    );
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION,
+            },
+        ),
+        MetaApplyResult::Applied
+    );
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION,
+            },
+        ),
+        MetaApplyResult::NoOp
+    );
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION + 1,
+            },
+        ),
+        MetaApplyResult::Rejected(MetaReject::SearchIndexExists)
+    );
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::CreateSearchIndexGenerationWithRevision {
+                name: "articles".into(),
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION + 1,
+            },
+        ),
+        MetaApplyResult::Rejected(MetaReject::SearchGenerationExists)
+    );
+}
+
+#[test]
+fn legacy_search_command_encoding_remains_decodable() {
+    // The first eight placeholder variants preserve the legacy command's enum
+    // discriminant. Their payloads do not affect this instantiated variant.
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum LegacyMetaCommand {
+        ClusterInit,
+        RegisterNode,
+        SeedPlacement,
+        SetNodeState,
+        CreatePlan,
+        MarkAborting,
+        FinalizePlan,
+        AbortReport,
+        CreateSearchIndex {
+            name: String,
+            definition: SearchIndexDefinition,
+        },
+    }
+
+    let encoded = dal::codec::encode(&LegacyMetaCommand::CreateSearchIndex {
+        name: "articles".into(),
+        definition: definition(),
+    });
+    let decoded: MetaCommand = dal::codec::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded,
+        MetaCommand::CreateSearchIndex {
+            name: "articles".into(),
+            definition: definition(),
+        }
+    );
 }

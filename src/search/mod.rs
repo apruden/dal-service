@@ -14,7 +14,10 @@ mod worker;
 pub use coordinator::{SearchCoordinator, ShardSearchSource};
 pub use definition::*;
 pub use index::{IndexCheckpoint, LocalSearchIndex, SearchSourceSnapshot};
-pub use outbox::{SearchConsumerState, SearchOutboxEntry, decode_outbox_key, encode_outbox_key};
+pub use outbox::{
+    SearchConsumerRegistration, SearchConsumerState, SearchOutboxEntry, decode_outbox_key,
+    encode_outbox_key,
+};
 pub use service::{SearchService, ShardSearchOutcome};
 pub use value::{ExtractedDocument, ExtractedValue, encode_search_value, extract_document};
 pub use worker::{SearchCatchUp, SearchIndexWorker};

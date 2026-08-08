@@ -19,6 +19,17 @@ pub struct SearchConsumerState {
     pub checkpoint: Option<crate::search::IndexCheckpoint>,
 }
 
+/// Outcome of registering an outbox consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchConsumerRegistration {
+    /// This call created the record; a failed install may unregister it again.
+    pub created: bool,
+    /// The durable record carries no checkpoint, so on-disk Tantivy state is
+    /// not proof of outbox continuity: while no checkpoint was held, pruning
+    /// was free to discard this consumer's gap. The next catch-up must rebuild.
+    pub needs_rebuild: bool,
+}
+
 pub fn encode_outbox_key(
     group: GroupId,
     epoch: u64,

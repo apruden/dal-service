@@ -79,9 +79,10 @@ impl SearchService {
         // the whole partition, so every failure past this point must undo
         // whatever this call created — and only what this call created, since
         // an earlier healthy install may own the same records.
-        let registered = self
+        let registration = self
             .storage
             .register_search_consumer(group, name, &generation)?;
+        let registered = registration.created;
 
         let cached = self.loaded.read().unwrap().get(&key).cloned();
         let (loaded, opened) = match cached {
@@ -107,7 +108,11 @@ impl SearchService {
             },
         };
 
-        if let Err(error) = loaded.worker.catch_up_rebuilding(registered).await {
+        if let Err(error) = loaded
+            .worker
+            .catch_up_rebuilding(registration.needs_rebuild)
+            .await
+        {
             self.roll_back(
                 group,
                 name,
@@ -264,6 +269,19 @@ impl SearchService {
                 "shard search requires a data partition".into(),
             ));
         };
+        // Leader gate first: a follower that never loaded this generation must
+        // still surface as a redirect, not a terminal per-partition error.
+        let linearizable = matches!(
+            request.consistency,
+            crate::search::SearchConsistency::Strict
+        );
+        let barrier = match node.search_barrier(linearizable).await? {
+            SearchBarrier::Ready(barrier) => barrier,
+            SearchBarrier::NotLeader { leader } => {
+                return Ok(ShardSearchOutcome::NotLeader { leader });
+            }
+        };
+
         let generation = match request.generation {
             GenerationSelection::Active => self
                 .active
@@ -281,17 +299,6 @@ impl SearchService {
             .get(&(partition, request.index.clone(), generation))
             .cloned()
             .ok_or_else(|| Error::Search("index generation is not ready on this replica".into()))?;
-
-        let linearizable = matches!(
-            request.consistency,
-            crate::search::SearchConsistency::Strict
-        );
-        let barrier = match node.search_barrier(linearizable).await? {
-            SearchBarrier::Ready(barrier) => barrier,
-            SearchBarrier::NotLeader { leader } => {
-                return Ok(ShardSearchOutcome::NotLeader { leader });
-            }
-        };
 
         loaded.worker.catch_up().await?;
         let epoch = self.storage.search_projection_epoch(node.group())?;

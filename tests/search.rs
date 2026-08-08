@@ -251,6 +251,90 @@ async fn outbox_pruning_waits_for_the_slowest_registered_generation() {
     assert!(storage.scan_search_outbox(group, 1).unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn rebuild_clears_an_ahead_watermark_before_snapshotting() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(10);
+    storage.ensure_group(group).unwrap();
+    let generation = SearchIndexGeneration::new(1, definition()).unwrap();
+    storage
+        .register_search_consumer(group, "articles", &generation)
+        .unwrap();
+
+    for index in [11, 12] {
+        let log_id = LogId::new(CommittedLeaderId::new(2, 7), index);
+        storage
+            .apply_raft(
+                group,
+                &[StateMutation::Put {
+                    key: dal::keyspace::user_key(format!("k{index}").as_bytes()),
+                    value: stored_record(index, value("article")),
+                }],
+                log_id,
+                &applied_record(log_id),
+                b"committed",
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    storage
+        .record_search_consumer_checkpoint(
+            group,
+            "articles",
+            generation.id,
+            IndexCheckpoint {
+                projection_epoch: 1,
+                definition_hash: generation.definition_hash,
+                engine_revision: generation.engine_revision,
+                source_log_id: Some(LogId::new(CommittedLeaderId::new(2, 7), 100)),
+            },
+        )
+        .unwrap();
+
+    storage
+        .begin_search_consumer_rebuild(group, "articles", &generation)
+        .unwrap();
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 0);
+    assert_eq!(storage.scan_search_outbox(group, 1).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn prune_failure_fences_storage_without_failing_the_applied_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(11);
+    storage.ensure_group(group).unwrap();
+    storage
+        .put_local(
+            &dal::keyspace::search_consumer_key(group, "articles", 1),
+            &1u8,
+        )
+        .unwrap();
+
+    let boundary = LogId::new(CommittedLeaderId::new(2, 7), 4096);
+    storage
+        .apply_raft(
+            group,
+            &[],
+            boundary,
+            &applied_record(boundary),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+
+    let next = LogId::new(CommittedLeaderId::new(2, 7), 4097);
+    assert!(
+        storage
+            .apply_raft(group, &[], next, &applied_record(next), b"committed", 1,)
+            .await
+            .is_err()
+    );
+}
+
 /// A consumer that has committed a checkpoint but not yet projected any Raft
 /// entry still needs every retained entry. Dropping it from the watermark would
 /// delete outbox entries it has not consumed, and it would then advance past
@@ -401,6 +485,129 @@ async fn a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap() {
         deadline_ms: 1_000,
     };
     assert_eq!(index.search(6, &request).unwrap().total_hits, 1);
+}
+
+/// A crash after a consumer registration became durable but before its first
+/// rebuild committed must still force a rebuild on the next install. The
+/// durable record carries no checkpoint, so the stale on-disk Tantivy commit
+/// is not proof of continuity across the pruned outbox gap.
+#[tokio::test]
+async fn reinstall_after_registration_crash_rebuilds_over_the_pruned_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(dir.path()).unwrap());
+    let group = GroupId::Data(9);
+    storage.ensure_group(group).unwrap();
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let first = LogId::new(CommittedLeaderId::new(2, 7), 1);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"doc"),
+                value: stored_record(1, value("old projection")),
+            }],
+            first,
+            &applied_record(first),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+
+    let service = SearchService::new(storage.clone());
+    service
+        .install_generation(9, "articles", generation.clone(), false)
+        .await
+        .unwrap();
+    service
+        .remove_generation(9, "articles", generation.id)
+        .await
+        .unwrap();
+    drop(service);
+
+    // While no consumer is registered, the gap is pruned.
+    let second = LogId::new(CommittedLeaderId::new(2, 7), 2);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"doc"),
+                value: stored_record(2, value("new projection")),
+            }],
+            second,
+            &applied_record(second),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+    storage.prune_search_outbox(group).unwrap();
+
+    // Simulate the crash window: registration is durable (no checkpoint), but
+    // the process died before the forced rebuild committed.
+    let registration = storage
+        .register_search_consumer(group, "articles", &generation)
+        .unwrap();
+    assert!(registration.created);
+
+    // Restart: registration already exists, yet the install must rebuild
+    // rather than resume from the stale on-disk commit.
+    let service = SearchService::new(storage.clone());
+    service
+        .install_generation(9, "articles", generation.clone(), false)
+        .await
+        .unwrap();
+    drop(service);
+
+    let path = dir
+        .path()
+        .join("search")
+        .join(group.token())
+        .join("articles")
+        .join(generation.id.to_string());
+    let index = LocalSearchIndex::open_or_create(&path, group, generation).unwrap();
+    let request = SearchRequest {
+        index: "articles".into(),
+        generation: GenerationSelection::Exact(9),
+        query: SearchQuery::Text {
+            query: "new".into(),
+            fields: vec![],
+        },
+        limit: 10,
+        offset: 0,
+        sort: vec![],
+        scoring: ScoringMode::LocalBm25,
+        consistency: SearchConsistency::Eventual,
+        allow_partial: false,
+        deadline_ms: 1_000,
+    };
+    assert_eq!(index.search(9, &request).unwrap().total_hits, 1);
+}
+
+/// Design §7.2: an unreadable index directory is quarantined and replaced,
+/// never a permanent failure — Tantivy files are derived, rebuildable state.
+#[test]
+fn corrupt_index_directory_is_quarantined_and_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("9");
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let index =
+        LocalSearchIndex::open_or_create(&path, GroupId::Data(2), generation.clone()).unwrap();
+    index
+        .rebuild(&SearchSourceSnapshot {
+            epoch: 3,
+            applied: Some(LogId::new(CommittedLeaderId::new(4, 1), 22)),
+            records: vec![(b"doc-1".to_vec(), 17, value("some article"))],
+            outbox: Vec::new(),
+        })
+        .unwrap();
+    drop(index);
+
+    std::fs::write(path.join("meta.json"), b"not tantivy metadata").unwrap();
+    let reopened = LocalSearchIndex::open_or_create(&path, GroupId::Data(2), generation).unwrap();
+    // The recreated index is empty and unprojected: it must rebuild.
+    assert!(reopened.validate_checkpoint(3).unwrap().is_none());
+    assert!(dir.path().join("9.quarantined").is_dir());
 }
 
 #[tokio::test]

@@ -161,8 +161,15 @@ impl Storage {
         // from a full state snapshot.
         if matches!(group, GroupId::Data(_))
             && crossed_search_prune_boundary(applied_log_id.index, applied_entries)
+            && let Err(error) = self.prune_search_outbox(group)
         {
-            self.prune_search_outbox(group)?;
+            // The state batch above is already visible and the Raft entry is
+            // committed; failing apply now would report failure after the
+            // entry was materialized. Retained outbox entries replay safely,
+            // but a RocksDB/on-disk invariant failure must still trip the
+            // database-wide fail-stop fence before we acknowledge.
+            let error = self.poison_raft_error("search outbox prune failed", error);
+            tracing::error!(?group, %error, "search outbox prune failed; storage fenced");
         }
 
         Ok(())

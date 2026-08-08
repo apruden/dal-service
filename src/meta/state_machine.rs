@@ -25,6 +25,11 @@ use crate::types::{
     Placement, voter_set,
 };
 
+/// Engine identity implied by the legacy search commands that predate an
+/// explicit revision field. Never replace this with the local binary's current
+/// revision: old log replay must remain deterministic after engine upgrades.
+const LEGACY_SEARCH_ENGINE_REVISION: u32 = 1;
+
 /// The outcome of applying one committed meta command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetaApplyResult {
@@ -184,12 +189,23 @@ impl MetaStateMachine {
                 plan_id,
                 observation,
             } => self.finalize_plan(s, *group, *plan_id, observation, true),
-            MetaCommand::CreateSearchIndex { name, definition } => {
-                self.create_search_index(s, name, definition, log_id, false)
-            }
-            MetaCommand::CreateSearchIndexGeneration { name, definition } => {
-                self.create_search_index(s, name, definition, log_id, true)
-            }
+            MetaCommand::CreateSearchIndex { name, definition } => self.create_search_index(
+                s,
+                name,
+                definition,
+                LEGACY_SEARCH_ENGINE_REVISION,
+                log_id,
+                false,
+            ),
+            MetaCommand::CreateSearchIndexGeneration { name, definition } => self
+                .create_search_index(
+                    s,
+                    name,
+                    definition,
+                    LEGACY_SEARCH_ENGINE_REVISION,
+                    log_id,
+                    true,
+                ),
             MetaCommand::ReportSearchIndexReady { name, observation } => {
                 self.report_search_ready(s, name, observation)
             }
@@ -200,6 +216,16 @@ impl MetaStateMachine {
             MetaCommand::FinalizeSearchIndexDrop { name, generation } => {
                 self.finalize_search_drop(s, name, *generation)
             }
+            MetaCommand::CreateSearchIndexWithRevision {
+                name,
+                definition,
+                engine_revision,
+            } => self.create_search_index(s, name, definition, *engine_revision, log_id, false),
+            MetaCommand::CreateSearchIndexGenerationWithRevision {
+                name,
+                definition,
+                engine_revision,
+            } => self.create_search_index(s, name, definition, *engine_revision, log_id, true),
         }
     }
 
@@ -586,6 +612,7 @@ impl MetaStateMachine {
         s: &Storage,
         name: &str,
         definition: &SearchIndexDefinition,
+        engine_revision: u32,
         log_id: LogId,
         update: bool,
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
@@ -595,7 +622,11 @@ impl MetaStateMachine {
         if let Err(error) = validate_index_name(name) {
             return Ok((invalid_owned(error.to_string()), vec![]));
         }
-        let generation = match SearchIndexGeneration::new(log_id.index, definition.clone()) {
+        let generation = match SearchIndexGeneration::with_revision(
+            log_id.index,
+            engine_revision,
+            definition.clone(),
+        ) {
             Ok(generation) => generation,
             Err(error) => return Ok((invalid_owned(error.to_string()), vec![])),
         };
@@ -610,8 +641,10 @@ impl MetaStateMachine {
             (None, true) => return Ok((reject(MetaReject::SearchIndexNotFound), vec![])),
             (Some(record), false) => {
                 if record.active.is_none()
-                    && record.building.as_ref().map(|item| item.definition_hash)
-                        == Some(generation.definition_hash)
+                    && record.building.as_ref().is_some_and(|building| {
+                        building.definition_hash == generation.definition_hash
+                            && building.engine_revision == generation.engine_revision
+                    })
                 {
                     return Ok((MetaApplyResult::NoOp, vec![]));
                 }
@@ -620,11 +653,10 @@ impl MetaStateMachine {
             (Some(record), true) => record,
         };
         if record.building.is_some() {
-            if record
-                .building
-                .as_ref()
-                .is_some_and(|building| building.definition_hash == generation.definition_hash)
-            {
+            if record.building.as_ref().is_some_and(|building| {
+                building.definition_hash == generation.definition_hash
+                    && building.engine_revision == generation.engine_revision
+            }) {
                 return Ok((MetaApplyResult::NoOp, vec![]));
             }
             return Ok((reject(MetaReject::SearchGenerationExists), vec![]));
