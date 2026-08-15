@@ -17,6 +17,20 @@ pub struct SearchConsumerState {
     pub definition_hash: [u8; 32],
     pub engine_revision: u32,
     pub checkpoint: Option<crate::search::IndexCheckpoint>,
+    /// Set when this consumer fell past its outbox lag budget (design §6.5).
+    /// It stops holding retention — so the primary database can reclaim the
+    /// space — and its next catch-up must be a full rebuild rather than an
+    /// incremental pass over a journal that has since been truncated.
+    pub needs_rebuild: bool,
+}
+
+impl SearchConsumerState {
+    /// Whether this consumer's watermark still constrains outbox retention.
+    /// A consumer awaiting rebuild does not: it will re-derive everything from
+    /// authoritative state, so retaining its gap only wastes disk.
+    pub fn holds_retention(&self) -> bool {
+        !self.needs_rebuild
+    }
 }
 
 /// Outcome of registering an outbox consumer.

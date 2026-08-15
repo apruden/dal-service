@@ -234,33 +234,81 @@ impl SearchCatalogSource for LiveSearchCatalog {
             let payload = crate::codec::encode(&SearchCatalogQuery {
                 name,
                 local_only: true,
+                all: false,
             });
-            for addr in self.addrs.control_addrs() {
-                if addr == self.local_control {
-                    continue;
-                }
-                let request = Envelope::new(
-                    self.cluster_id,
-                    MsgType::SearchCatalogQuery,
-                    GroupId::Meta,
-                    0,
-                    payload.clone(),
-                );
-                let Ok(reply) = self.control.call(&addr, request).await else {
-                    continue;
-                };
-                if reply.cluster_id != self.cluster_id
-                    || reply.msg_type != MsgType::SearchCatalogQuery
-                {
-                    continue;
-                }
-                if let Ok(SearchCatalogReply::Record(record)) = crate::codec::decode(&reply.payload)
-                {
+            for reply in self.ask_meta_voters(payload).await {
+                if let SearchCatalogReply::Record(record) = reply {
                     return Ok(record);
                 }
             }
             Err("no meta leader answered the search catalog query".into())
         })
+    }
+
+    fn catalog(
+        &self,
+        local_only: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<Vec<crate::search::SearchIndexRecord>, String>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let local_meta = self.meta.read().unwrap().clone();
+            if let Some(meta) = local_meta
+                && let Ok(MetaRead::Value(records)) = meta.read_search_catalog().await
+            {
+                return Ok(records);
+            }
+            if local_only {
+                return Err("local node is not the current meta leader".into());
+            }
+            let payload = crate::codec::encode(&SearchCatalogQuery {
+                name: String::new(),
+                local_only: true,
+                all: true,
+            });
+            for reply in self.ask_meta_voters(payload).await {
+                if let SearchCatalogReply::Catalog(records) = reply {
+                    return Ok(records);
+                }
+            }
+            Err("no meta leader answered the search catalog query".into())
+        })
+    }
+}
+
+impl LiveSearchCatalog {
+    /// Ask each peer in turn, yielding the replies that decoded. Only the meta
+    /// leader answers with a record; followers report `Unavailable`.
+    async fn ask_meta_voters(&self, payload: Vec<u8>) -> Vec<SearchCatalogReply> {
+        let mut replies = Vec::new();
+        for addr in self.addrs.control_addrs() {
+            if addr == self.local_control {
+                continue;
+            }
+            let request = Envelope::new(
+                self.cluster_id,
+                MsgType::SearchCatalogQuery,
+                GroupId::Meta,
+                0,
+                payload.clone(),
+            );
+            let Ok(reply) = self.control.call(&addr, request).await else {
+                continue;
+            };
+            if reply.cluster_id != self.cluster_id || reply.msg_type != MsgType::SearchCatalogQuery
+            {
+                continue;
+            }
+            if let Ok(decoded) = crate::codec::decode::<SearchCatalogReply>(&reply.payload) {
+                replies.push(decoded);
+            }
+        }
+        replies
     }
 }
 
@@ -429,7 +477,7 @@ impl Node {
         }
         let partitions: PartitionMap = Arc::new(RwLock::new(map));
 
-        let routing = Arc::new(LiveRouting::from_descriptor(
+        let routing: Arc<dyn RoutingSource> = Arc::new(LiveRouting::from_descriptor(
             &desc,
             meta_handle.clone(),
             control.clone(),
@@ -441,16 +489,26 @@ impl Node {
             cluster.p,
             cluster.hash_spec,
             partitions.clone(),
-            routing,
+            routing.clone(),
         ));
-        let search = Arc::new(crate::search::SearchService::new(storage.clone()));
+        let search = Arc::new(crate::search::SearchService::new(storage.clone())?);
         gateway.set_search_service(search.clone());
-        gateway.set_search_catalog(Arc::new(LiveSearchCatalog {
+        let catalog: Arc<dyn SearchCatalogSource> = Arc::new(LiveSearchCatalog {
             cluster_id: cfg.cluster_id,
             meta: meta_handle.clone(),
             control: control.clone(),
             addrs: addrs.clone(),
             local_control: cfg.control_addr.clone(),
+        });
+        gateway.set_search_catalog(catalog.clone());
+        gateway.set_shard_source(Arc::new(crate::runtime::search::LiveShardSource {
+            cluster_id: cfg.cluster_id,
+            node_id: cfg.node_id,
+            partitions: partitions.clone(),
+            search: search.clone(),
+            routing,
+            control: control.clone(),
+            addrs: addrs.clone(),
         }));
         let heartbeats = Arc::new(Mutex::new(HeartbeatTracker::new()));
         let starter = Arc::new(PartitionStarter {
@@ -571,8 +629,26 @@ impl Node {
             registration,
             identity_gate.clone(),
             readiness.clone(),
-        );
+        )
+        .with_search_catalog(catalog.clone());
         tasks.push(tokio::spawn(driver.run()));
+        // Search-index lifecycle: build the generations this node's partitions
+        // owe the catalog, report readiness, and (as meta leader) activate.
+        tasks.push(tokio::spawn(
+            crate::runtime::search::SearchDriver::new(
+                cfg.node_id,
+                cfg.cluster_id,
+                meta_handle.clone(),
+                partitions.clone(),
+                search.clone(),
+                catalog,
+                control.clone(),
+                addrs.clone(),
+                identity_gate.clone(),
+                readiness.clone(),
+            )
+            .run(),
+        ));
         tasks.push(tokio::spawn(recovery_fence_driver(
             cfg.node_id,
             cfg.cluster_id,
@@ -593,6 +669,7 @@ impl Node {
                 storage: storage.clone(),
                 meta: meta_handle.clone(),
                 partitions: partitions.clone(),
+                search: search.clone(),
             });
             tasks.push(tokio::spawn(async move {
                 let _ = axum::serve(listener, crate::runtime::http::router(src)).await;
@@ -993,6 +1070,7 @@ struct NodeStatus {
     storage: Arc<Storage>,
     meta: MetaHandle,
     partitions: PartitionMap,
+    search: Arc<crate::search::SearchService>,
 }
 
 impl StatusSource for NodeStatus {
@@ -1040,6 +1118,9 @@ impl StatusSource for NodeStatus {
                             plan_id: mv.plan_id,
                             aborting: mv.aborting,
                         });
+                    let (search, search_outbox_entries, search_outbox_bytes) = self
+                        .search
+                        .partition_status(partition, node.applied_index().unwrap_or(0));
                     PartitionStatus {
                         partition,
                         role,
@@ -1070,6 +1151,9 @@ impl StatusSource for NodeStatus {
                         committed_voters: committed.into_iter().collect(),
                         serving: node.is_serving(),
                         plan,
+                        search,
+                        search_outbox_entries,
+                        search_outbox_bytes,
                     }
                 })
                 .collect()

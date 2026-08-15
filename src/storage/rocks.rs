@@ -234,6 +234,21 @@ impl Storage {
         Ok(next)
     }
 
+    /// Allocate the next durable incarnation for held-search session handles.
+    /// The lifecycle lock makes two service instances opened over the same
+    /// storage allocate distinct epochs even inside one process.
+    pub fn next_search_session_incarnation(&self) -> Result<u64> {
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
+        let previous: u64 = self
+            .get_local(&keyspace::search_session_incarnation_key())?
+            .unwrap_or(0);
+        let next = previous
+            .checked_add(1)
+            .ok_or_else(|| Error::Search("search session incarnation exhausted".into()))?;
+        self.put_local(&keyspace::search_session_incarnation_key(), &next)?;
+        Ok(next)
+    }
+
     pub fn registration_binding(&self) -> Result<Option<RegistrationBinding>> {
         self.get_local(&keyspace::registration_binding_key())
     }
@@ -853,12 +868,27 @@ impl Storage {
                 definition_hash: generation.definition_hash,
                 engine_revision: generation.engine_revision,
                 checkpoint: None,
+                needs_rebuild: false,
             },
         )?;
         Ok(crate::search::SearchConsumerRegistration {
             created: true,
             needs_rebuild: true,
         })
+    }
+
+    /// Whether this consumer was marked past its lag budget and owes a full
+    /// rebuild before it may advance again.
+    pub fn search_consumer_needs_rebuild(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        let key = keyspace::search_consumer_key(group, name, generation);
+        Ok(self
+            .get_local::<crate::search::SearchConsumerState>(&key)?
+            .is_some_and(|state| state.needs_rebuild))
     }
 
     pub fn record_search_consumer_checkpoint(
@@ -887,8 +917,128 @@ impl Storage {
                 "checkpoint identity differs from consumer".into(),
             ));
         }
+        // The consumer was marked for rebuild after this pass took its source
+        // snapshot, which means retention was released and the journal it was
+        // reading may have been truncated underneath it. This applies to full
+        // rebuilds too: `begin_search_consumer_rebuild` clears the flag before
+        // snapshotting, so seeing it set here proves the rebuild was released
+        // again while it was running. Refuse the checkpoint and retry from a
+        // fresh authoritative snapshot.
+        if state.needs_rebuild {
+            return Err(Error::Search(
+                "search consumer was released from retention while projection was running".into(),
+            ));
+        }
         state.checkpoint = Some(checkpoint);
+        state.needs_rebuild = false;
         self.put_local(&key, &state)
+    }
+
+    /// Enforce the outbox lag budget for a group (design §6.5). When the
+    /// retained journal exceeds its entry or byte limit, the consumer holding
+    /// the oldest watermark is marked for rebuild and stops pinning retention,
+    /// then the newly unblocked prefix is pruned. One consumer is released per
+    /// call; the caller re-evaluates on its next pass.
+    ///
+    /// An unhealthy derived index must never grow the outbox without bound and
+    /// exhaust the disk the authoritative database depends on.
+    pub fn enforce_search_outbox_bounds(
+        &self,
+        group: GroupId,
+        max_entries: u64,
+        max_bytes: u64,
+    ) -> Result<Option<(String, u64)>> {
+        let (entries, bytes) = self.search_outbox_usage(group)?;
+        if entries <= max_entries && bytes <= max_bytes {
+            return Ok(None);
+        }
+        let laggard = {
+            let _lifecycle = self.search_lifecycle.lock().unwrap();
+            let mut laggard: Option<(Vec<u8>, crate::search::SearchConsumerState, u64)> = None;
+            for (key, state) in self.search_consumers(group)? {
+                if !state.holds_retention() {
+                    continue;
+                }
+                // No checkpoint means "retain everything", so it is the most
+                // constraining watermark there is.
+                let watermark = state
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.source_log_id.as_ref())
+                    .map(|log_id| log_id.index)
+                    .unwrap_or(0);
+                if laggard
+                    .as_ref()
+                    .is_none_or(|(_, _, lowest)| watermark < *lowest)
+                {
+                    laggard = Some((key, state, watermark));
+                }
+            }
+            match laggard {
+                Some((key, mut state, _)) => {
+                    state.needs_rebuild = true;
+                    state.checkpoint = None;
+                    self.put_local(&key, &state)?;
+                    Some(key)
+                }
+                None => None,
+            }
+        };
+        let Some(key) = laggard else {
+            return Ok(None);
+        };
+        let identity = keyspace::decode_search_consumer_key(group, &key)?;
+        tracing::warn!(
+            ?group,
+            index = identity.0,
+            generation = identity.1,
+            entries,
+            bytes,
+            "search outbox exceeded its budget; marking the slowest index for rebuild"
+        );
+        self.prune_search_outbox(group)?;
+        Ok(Some(identity))
+    }
+
+    /// Retained outbox size for a group, counting encoded key bytes.
+    pub fn search_outbox_usage(&self, group: GroupId) -> Result<(u64, u64)> {
+        let prefix = keyspace::search_outbox_prefix(group);
+        let mut entries = 0u64;
+        let mut bytes = 0u64;
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            entries += 1;
+            bytes += key.len() as u64;
+        }
+        Ok((entries, bytes))
+    }
+
+    fn search_consumers(
+        &self,
+        group: GroupId,
+    ) -> Result<Vec<(Vec<u8>, crate::search::SearchConsumerState)>> {
+        let prefix = keyspace::search_consumer_prefix(group);
+        let mut consumers = Vec::new();
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            consumers.push((
+                key.to_vec(),
+                codec::decode::<crate::search::SearchConsumerState>(&value)?,
+            ));
+        }
+        Ok(consumers)
     }
 
     /// Pin this consumer's outbox retention before taking a full rebuild
@@ -918,9 +1068,13 @@ impl Storage {
                 "rebuild identity differs from consumer".into(),
             ));
         }
-        if state.checkpoint.take().is_some() {
-            self.put_local(&key, &state)?;
-        }
+        state.checkpoint = None;
+        // A lag-budget release sets this flag and removes the consumer from
+        // retention. Re-acquire retention *before* taking the rebuild snapshot,
+        // otherwise writes concurrent with Tantivy indexing can be pruned and
+        // then skipped permanently by the rebuilt checkpoint.
+        state.needs_rebuild = false;
+        self.put_local(&key, &state)?;
         Ok(())
     }
 
@@ -943,18 +1097,15 @@ impl Storage {
     /// registered generation starts with a full state snapshot.
     pub fn prune_search_outbox(&self, group: GroupId) -> Result<usize> {
         let _lifecycle = self.search_lifecycle.lock().unwrap();
-        let consumer_prefix = keyspace::search_consumer_prefix(group);
-        let mut consumers = Vec::new();
-        for item in self.db.iterator(rocksdb::IteratorMode::From(
-            &consumer_prefix,
-            rocksdb::Direction::Forward,
-        )) {
-            let (key, value) = item?;
-            if !key.starts_with(&consumer_prefix) {
-                break;
-            }
-            consumers.push(codec::decode::<crate::search::SearchConsumerState>(&value)?);
-        }
+        // A consumer awaiting rebuild has forfeited its claim: it will
+        // re-derive its documents from a full authoritative scan, so retaining
+        // its gap would pin disk for nothing (design §6.5).
+        let consumers: Vec<crate::search::SearchConsumerState> = self
+            .search_consumers(group)?
+            .into_iter()
+            .map(|(_, state)| state)
+            .filter(|state| state.holds_retention())
+            .collect();
         let epoch = self.search_projection_epoch(group)?;
         let minimum = if consumers.is_empty() {
             None

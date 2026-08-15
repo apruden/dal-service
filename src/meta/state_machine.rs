@@ -631,6 +631,20 @@ impl MetaStateMachine {
             Err(error) => return Ok((invalid_owned(error.to_string()), vec![])),
         };
         let existing = self.search_index(s, name)?;
+        if existing.is_none() && !update {
+            let prefix = keyspace::meta_search_index_prefix();
+            let count = s
+                .scan_state(GroupId::Meta)?
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .count();
+            if count >= crate::search::SEARCH_MAX_INDEXES {
+                return Ok((
+                    invalid("search catalog has reached its maximum index count"),
+                    vec![],
+                ));
+            }
+        }
         let mut record = match (existing, update) {
             (None, false) => SearchIndexRecord {
                 name: name.to_string(),

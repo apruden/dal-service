@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -33,6 +34,23 @@ use crate::types::{
 /// giving up. Bounded so a persistently unreachable target fails rather than
 /// spins.
 const MAX_ROUNDS: usize = 16;
+
+fn search_deadline(request: &crate::search::SearchRequest) -> Result<tokio::time::Instant> {
+    if request.deadline_ms == 0 || request.deadline_ms > 60_000 {
+        return Err(Error::Search("deadline_ms must be in 1..=60000".into()));
+    }
+    Ok(tokio::time::Instant::now() + Duration::from_millis(request.deadline_ms as u64))
+}
+
+fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u32> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    // Flooring never extends the caller's deadline; keep sub-millisecond
+    // attempts representable by the protocol's non-zero millisecond field.
+    Some(remaining.as_millis().max(1).min(u32::MAX as u128) as u32)
+}
 
 #[derive(Default)]
 struct Cache {
@@ -177,36 +195,73 @@ impl<T: Transport> Client<T> {
         self.get_with(key, Consistency::Stale { min_version }).await
     }
 
-    /// Scatter a search to every partition leader and merge deterministically.
+    /// Scatter a search from the client itself, one round trip per partition.
     /// The generation must come from a ReadIndex-fenced control-plane lookup.
+    /// Global BM25 needs held shard sessions on the peer-control lane, so this
+    /// direct path only supports partition-local scoring; [`Self::search_active`]
+    /// is the complete implementation.
     pub async fn search(
         &self,
         generation: &crate::search::SearchIndexGeneration,
         request: &crate::search::SearchRequest,
     ) -> Result<crate::search::SearchReply> {
-        let (partitions, _) = self.routing_params().await?;
+        let deadline = search_deadline(request)?;
+        let (partitions, _) = tokio::time::timeout_at(deadline, self.routing_params())
+            .await
+            .map_err(|_| Error::Search("search deadline exceeded during routing".into()))??;
         crate::search::SearchCoordinator::new(partitions, ClientShardSource { client: self })?
-            .search(generation, request)
+            .search_until(generation, request, deadline)
             .await
     }
 
-    /// Resolve the active generation through a meta ReadIndex and execute the
-    /// complete-by-default scatter/gather search.
+    /// Run a coordinated search: one request to any node, which resolves the
+    /// active generation, scatters to every partition leader, and merges the
+    /// result (design §9.1). This is the path that supports global scoring.
     pub async fn search_active(
         &self,
         request: &crate::search::SearchRequest,
     ) -> Result<crate::search::SearchReply> {
-        let record = self
-            .search_index(&request.index)
-            .await?
-            .ok_or_else(|| Error::Search(format!("index {:?} does not exist", request.index)))?;
-        let generation = record.active.ok_or_else(|| {
-            Error::Search(format!(
-                "index {:?} has no active generation",
-                request.index
-            ))
-        })?;
-        self.search(&generation, request).await
+        crate::search::validate_index_name(&request.index)?;
+        let deadline = search_deadline(request)?;
+        let mut last = None;
+        for addr in &self.seeds {
+            let Some(remaining_ms) = remaining_deadline_ms(deadline) else {
+                break;
+            };
+            let mut attempt = request.clone();
+            attempt.deadline_ms = remaining_ms;
+            let envelope = Envelope::new(
+                self.cluster_id,
+                MsgType::SearchOp,
+                GroupId::Meta,
+                self.next_request_id(),
+                codec::encode(&attempt),
+            );
+            let Ok(Ok(reply)) =
+                tokio::time::timeout_at(deadline, self.transport.call(addr, envelope)).await
+            else {
+                continue;
+            };
+            if reply.cluster_id != self.cluster_id || reply.msg_type != MsgType::SearchOp {
+                continue;
+            }
+            match codec::decode::<SearchShardReply>(&reply.payload) {
+                Ok(SearchShardReply::Result(reply)) => return Ok(reply),
+                // A refusal is a decision about the request itself and every
+                // node would repeat it; an error may be local to this node, so
+                // keep it and try the next seed.
+                Ok(SearchShardReply::Refused(error)) => return Err(Error::Search(error)),
+                Ok(SearchShardReply::Error(error)) => last = Some(error),
+                Ok(SearchShardReply::Redirect(_)) | Err(_) => continue,
+            }
+        }
+        Err(Error::Search(last.unwrap_or_else(|| {
+            if tokio::time::Instant::now() >= deadline {
+                "search deadline exceeded".into()
+            } else {
+                "no seed answered the coordinated search".into()
+            }
+        })))
     }
 
     pub async fn search_index(
@@ -217,6 +272,7 @@ impl<T: Transport> Client<T> {
         let payload = codec::encode(&SearchCatalogQuery {
             name: name.to_string(),
             local_only: false,
+            all: false,
         });
         for addr in &self.seeds {
             let request = Envelope::new(
@@ -690,6 +746,47 @@ impl<T: Transport> crate::search::ShardSearchSource for ClientShardSource<'_, T>
     > {
         Box::pin(async move { self.client.route_search(partition, &request).await })
     }
+
+    /// Held sessions live on the shard's peer-control lane, which client
+    /// traffic may not address (ground rule 9). A client asking for global
+    /// scoring is served by a node-side coordinator instead, so this direct
+    /// per-partition source only ever runs the partition-local path.
+    fn prepare(
+        &self,
+        _partition: u16,
+        _request: crate::search::ShardPrepareRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::search::ShardPrepared>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Err(Error::Search(
+                "global BM25 scoring requires the node-side search coordinator".into(),
+            ))
+        })
+    }
+
+    fn execute(
+        &self,
+        _partition: u16,
+        _request: crate::search::ShardExecuteRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::search::SearchReply>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Err(Error::Search(
+                "global BM25 scoring requires the node-side search coordinator".into(),
+            ))
+        })
+    }
+
+    /// This source never prepares a session, so it never holds one.
+    fn release(
+        &self,
+        _partition: u16,
+        _session_id: crate::search::SearchSessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +801,57 @@ mod tests {
         async fn serve(&self, request: Envelope) -> Envelope {
             request
         }
+    }
+
+    struct SlowSearchServer {
+        calls: AtomicU64,
+    }
+
+    impl Server for SlowSearchServer {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Envelope::new(
+                1,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                codec::encode(&SearchShardReply::Error("late".into())),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_seed_retries_share_one_deadline() {
+        let transport = InProcess::new();
+        let server = Arc::new(SlowSearchServer {
+            calls: AtomicU64::new(0),
+        });
+        for seed in ["one", "two", "three"] {
+            transport.register(seed, server.clone());
+        }
+        let client = Client::new(
+            1,
+            1,
+            vec!["one".into(), "two".into(), "three".into()],
+            transport,
+        );
+        let request = crate::search::SearchRequest {
+            index: "articles".into(),
+            generation: crate::search::GenerationSelection::Active,
+            query: crate::search::SearchQuery::MatchAll,
+            limit: 1,
+            offset: 0,
+            sort: Vec::new(),
+            scoring: crate::search::ScoringMode::GlobalBm25,
+            consistency: crate::search::SearchConsistency::Strict,
+            allow_partial: false,
+            deadline_ms: 20,
+        };
+
+        let error = client.search_active(&request).await.unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
     }
 
     /// A client whose cache already knows partition 0's voter set, so

@@ -1,8 +1,8 @@
 use dal::keyspace;
 use dal::meta::state_machine::{MetaApplyResult, MetaReject, MetaStateMachine};
 use dal::search::{
-    FieldKind, PathSegment, SEARCH_ENGINE_REVISION, SearchField, SearchIndexDefinition,
-    SearchIndexReady, SearchIndexRecord,
+    FieldKind, PathSegment, SEARCH_ENGINE_REVISION, SEARCH_MAX_INDEXES, SearchField,
+    SearchIndexDefinition, SearchIndexReady, SearchIndexRecord,
 };
 use dal::storage::Storage;
 use dal::types::{ClusterConfig, GroupId, HashSpec, LogId, MetaCommand, PROTOCOL_VERSION};
@@ -38,6 +38,62 @@ fn definition() -> SearchIndexDefinition {
         }],
         default_search_fields: vec!["body".into()],
     }
+}
+
+#[test]
+fn catalog_count_is_bounded_to_fit_full_catalog_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open_checked(dir.path(), 1, 1).unwrap();
+    storage.ensure_group(GroupId::Meta).unwrap();
+    let state = MetaStateMachine::new();
+    let mut index = 0u64;
+    assert_eq!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::ClusterInit {
+                config: ClusterConfig {
+                    cluster_id: 1,
+                    protocol_version: PROTOCOL_VERSION,
+                    p: 1,
+                    r: 3,
+                    hash_spec: HashSpec::CANONICAL,
+                },
+                meta_voters: vec![1, 2, 3],
+            }
+        ),
+        MetaApplyResult::Applied
+    );
+
+    for ordinal in 0..SEARCH_MAX_INDEXES {
+        assert_eq!(
+            apply(
+                &state,
+                &storage,
+                &mut index,
+                MetaCommand::CreateSearchIndexWithRevision {
+                    name: format!("index-{ordinal}"),
+                    definition: definition(),
+                    engine_revision: SEARCH_ENGINE_REVISION,
+                }
+            ),
+            MetaApplyResult::Applied
+        );
+    }
+    assert!(matches!(
+        apply(
+            &state,
+            &storage,
+            &mut index,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "one-too-many".into(),
+                definition: definition(),
+                engine_revision: SEARCH_ENGINE_REVISION,
+            }
+        ),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
 }
 
 #[test]

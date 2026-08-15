@@ -47,7 +47,15 @@ impl SearchIndexWorker {
     /// keys through one consistent source prefix. Tantivy is committed only
     /// after the RocksDB WAL is known durable through that prefix.
     pub async fn catch_up(&self) -> Result<SearchCatchUp> {
-        self.catch_up_rebuilding(false).await
+        // A consumer released from outbox retention for exceeding its lag
+        // budget cannot resume incrementally: the journal it would have read
+        // was truncated on its behalf (design §6.5).
+        let forced = self.storage.search_consumer_needs_rebuild(
+            self.group,
+            &self.name,
+            self.index.generation().id,
+        )?;
+        self.catch_up_rebuilding(forced).await
     }
 
     /// Catch up this generation, forcing a full authoritative-state rebuild

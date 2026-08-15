@@ -1,8 +1,19 @@
 # DAL Service — Partitioned Full-Text Search Design
 
-Status: **proposed**. This document defines correctness requirements for adding
-Tantivy-backed full-text indexes to DAL. It does not describe implemented
-behavior.
+Status: **implemented**, with one deviation noted below. This document defines
+the correctness requirements for Tantivy-backed full-text indexes in DAL;
+invariants I1–I12 are enforced by the code in `src/search/` and the runtime
+integration points listed in §15.
+
+Not yet implemented:
+
+- **§10.1 dedicated `search_addr` lane.** Search shares the control lane.
+  Admission control (§13) is enforced instead by per-node bounds on concurrent
+  coordinated searches, concurrent shard phases, and held sessions, so search
+  cannot exhaust the handler capacity Raft needs — but it is not yet physically
+  isolated from it.
+- **§9.3 sort-by-fast-field.** `sort` is rejected; ranking is by score.
+- **§8.2 per-shard checkpoints in `Eventual` replies.**
 
 Design priorities remain: **correctness first, simplicity second, availability
 third, performance fourth**.
@@ -280,7 +291,9 @@ struct SearchIndexGeneration {
 
 Definitions are canonically encoded before hashing. Field names, paths,
 tokenizers, flags, field counts, and definition size are bounded and validated
-inside meta state-machine apply.
+inside meta state-machine apply. V1 also bounds the catalog to 64 indexes, which
+keeps a complete reconciliation snapshot within its explicitly bounded control
+frame.
 
 ### 5.1 Generation state machine
 

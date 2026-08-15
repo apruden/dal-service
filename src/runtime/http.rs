@@ -79,6 +79,41 @@ pub struct PartitionStatus {
     pub committed_voters: Vec<NodeId>,
     pub serving: bool,
     pub plan: Option<PlanStatus>,
+    /// Derived search projections hosted for this partition (design §14).
+    /// Search failure never changes `/health` — an unusable index degrades
+    /// search only — so this is where that degradation becomes diagnosable.
+    pub search: Vec<SearchIndexStatus>,
+    /// Retained dirty-key journal for the partition, shared by every
+    /// generation below. Growth here is what the lag budget bounds.
+    pub search_outbox_entries: u64,
+    pub search_outbox_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchIndexState {
+    /// Loaded and reachable as the index's current generation.
+    Active,
+    /// Loaded and projecting, but not yet the generation searches resolve to.
+    Building,
+    /// Released from outbox retention for exceeding its lag budget; it will
+    /// rebuild from authoritative state before it can serve again.
+    NeedsRebuild,
+    /// Loaded but holding no checkpoint valid for the live projection epoch.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchIndexStatus {
+    pub name: String,
+    pub generation: u64,
+    /// Hex-encoded, so a mismatch between replicas is visible at a glance.
+    pub definition_hash: String,
+    pub state: SearchIndexState,
+    pub projection_epoch: u64,
+    /// Source prefix the loaded Tantivy commit covers.
+    pub searchable_through: Option<u64>,
+    /// Applied entries not yet reflected in the loaded commit.
+    pub lag_entries: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +205,17 @@ mod tests {
                     committed_voters: vec![7, 8, 9],
                     serving: true,
                     plan: None,
+                    search: vec![SearchIndexStatus {
+                        name: "articles".into(),
+                        generation: 12,
+                        definition_hash: "ab".repeat(32),
+                        state: SearchIndexState::Active,
+                        projection_epoch: 1,
+                        searchable_through: Some(10),
+                        lag_entries: 0,
+                    }],
+                    search_outbox_entries: 3,
+                    search_outbox_bytes: 96,
                 }],
                 directory: Vec::new(),
             }
@@ -221,5 +267,29 @@ mod tests {
         assert_eq!(got, StubStatus.status());
         assert_eq!(got.node_id, 7);
         assert_eq!(got.partitions[0].role, Role::Leader);
+        assert_eq!(got.partitions[0].search[0].name, "articles");
+        assert_eq!(got.partitions[0].search_outbox_entries, 3);
+    }
+
+    /// Design §14: an unusable derived index degrades search only. It must not
+    /// change the database health result, which is what an operator's failover
+    /// automation keys on.
+    #[tokio::test]
+    async fn a_failed_search_index_does_not_change_health() {
+        struct BrokenIndex;
+        impl StatusSource for BrokenIndex {
+            fn status(&self) -> ClusterStatus {
+                let mut status = StubStatus.status();
+                status.partitions[0].search[0].state = SearchIndexState::Failed;
+                status.partitions[0].search[0].searchable_through = None;
+                status.partitions[0].search[0].lag_entries = 10;
+                status
+            }
+        }
+        let resp = router(Arc::new(BrokenIndex))
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

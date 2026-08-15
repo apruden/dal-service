@@ -8,3 +8,4 @@ pub mod http;
 pub mod node;
 pub mod readiness;
 pub mod rebalance;
+pub mod search;

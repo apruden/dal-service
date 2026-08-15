@@ -5,25 +5,26 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{AllQuery, Query, QueryParser};
+use tantivy::query::{AllQuery, Bm25StatisticsProvider, Query, QueryParser};
 use tantivy::schema::{
     BytesOptions, DateOptions, Facet, FacetOptions, Field, IndexRecordOption, NumericOptions,
     Schema, TextFieldIndexing, TextOptions, Value,
 };
-use tantivy::{DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
+};
 
 use crate::error::{Error, Result};
 use crate::search::{
     ExtractedDocument, ExtractedValue, FieldKind, SearchHit, SearchIndexGeneration, SearchQuery,
-    SearchRequest, StoredField,
+    SearchRequest, ShardStatistics, StoredField,
 };
 use crate::types::{GroupId, Version};
 
 type RaftLogId = openraft::LogId<u64>;
 
 const WRITER_MEMORY_BYTES: usize = 50_000_000;
-const MAX_LIMIT: u32 = 1_000;
-const MAX_WINDOW: u32 = 1_000;
+use crate::search::{SEARCH_MAX_LIMIT as MAX_LIMIT, SEARCH_MAX_WINDOW as MAX_WINDOW};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexCheckpoint {
@@ -49,6 +50,99 @@ struct Fields {
     configured: HashMap<String, Field>,
 }
 
+/// One pinned Tantivy commit plus the query parsed against it. Holding the
+/// searcher for the lifetime of a distributed query is what stops statistics
+/// and scoring from observing different commits (design §8.1); Tantivy keeps
+/// the referenced segment files readable even after a later commit and merge
+/// retire them.
+pub struct HeldSearch {
+    searcher: Searcher,
+    query: Box<dyn Query>,
+    checkpoint: IndexCheckpoint,
+}
+
+impl HeldSearch {
+    pub fn checkpoint(&self) -> &IndexCheckpoint {
+        &self.checkpoint
+    }
+
+    /// The pinned searcher's own statistics, which score this partition in
+    /// isolation. Comparable across shards only when every shard holds the
+    /// whole corpus, so distributed scoring uses summed statistics instead.
+    pub fn local_statistics(&self) -> &dyn Bm25StatisticsProvider {
+        &self.searcher
+    }
+}
+
+/// Cluster-wide BM25 inputs, summed by the coordinator from every shard's
+/// held searcher. A lookup miss is a protocol violation rather than a zero: it
+/// would silently score one shard against different statistics than its peers,
+/// which is exactly the incomparability global scoring exists to remove.
+pub struct GlobalBm25Statistics {
+    schema: Schema,
+    total_docs: u64,
+    field_tokens: HashMap<Field, u64>,
+    term_doc_freq: HashMap<Vec<u8>, u64>,
+}
+
+impl GlobalBm25Statistics {
+    pub fn new(schema: Schema, statistics: &ShardStatistics) -> Result<Self> {
+        let mut field_tokens = HashMap::with_capacity(statistics.field_tokens.len());
+        for (name, tokens) in &statistics.field_tokens {
+            let field = schema.get_field(name).map_err(|_| {
+                Error::Search(format!("global statistics name an unknown field {name:?}"))
+            })?;
+            field_tokens.insert(field, *tokens);
+        }
+        Ok(Self {
+            schema,
+            total_docs: statistics.total_docs,
+            field_tokens,
+            term_doc_freq: statistics.term_doc_freq.iter().cloned().collect(),
+        })
+    }
+}
+
+impl Bm25StatisticsProvider for GlobalBm25Statistics {
+    fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
+        self.field_tokens.get(&field).copied().ok_or_else(|| {
+            tantivy::TantivyError::InvalidArgument(
+                "global search statistics are missing a scored field".into(),
+            )
+        })
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(self.total_docs)
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        self.term_doc_freq
+            .get(&term_key(&self.schema, term))
+            .copied()
+            .ok_or_else(|| {
+                tantivy::TantivyError::InvalidArgument(
+                    "global search statistics are missing a query term".into(),
+                )
+            })
+    }
+}
+
+/// A term identity that is stable across replicas and self-describing on the
+/// wire: the field *name* rather than its schema-position id, then the value's
+/// type tag and bytes. Keying by name means a statistics frame can never be
+/// silently misapplied to a different field.
+fn term_key(schema: &Schema, term: &Term) -> Vec<u8> {
+    let name = schema.get_field_name(term.field());
+    let value = term.serialized_value_bytes();
+    let mut key = Vec::with_capacity(4 + name.len() + 1 + value.len());
+    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key.push(term.typ().to_code());
+    key.extend_from_slice(value);
+    key
+}
+
 /// One local `(partition, index generation)` Tantivy projection.
 pub struct LocalSearchIndex {
     group: GroupId,
@@ -62,6 +156,10 @@ pub struct LocalSearchIndex {
 impl LocalSearchIndex {
     pub fn generation(&self) -> &SearchIndexGeneration {
         &self.generation
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.index.schema()
     }
 
     pub fn open_or_create(
@@ -277,59 +375,114 @@ impl LocalSearchIndex {
         Ok(document)
     }
 
-    /// Execute a bounded local shard query against one loaded commit.
-    pub fn search(
+    /// Pin one loaded Tantivy commit together with the parsed query, so shard
+    /// statistics and the scored result they feed cannot observe two different
+    /// commits (design §8.1). The caller supplies the checkpoint it already
+    /// validated for the current projection epoch.
+    pub fn hold(
         &self,
-        partition: u16,
-        request: &SearchRequest,
-    ) -> Result<crate::search::SearchReply> {
-        if let crate::search::GenerationSelection::Exact(generation) = request.generation
+        query: &SearchQuery,
+        generation: crate::search::GenerationSelection,
+        window: u32,
+        checkpoint: IndexCheckpoint,
+    ) -> Result<HeldSearch> {
+        if let crate::search::GenerationSelection::Exact(generation) = generation
             && generation != self.generation.id
         {
             return Err(Error::Search(
                 "requested index generation is not loaded".into(),
             ));
         }
-        if matches!(request.scoring, crate::search::ScoringMode::GlobalBm25) {
-            return Err(Error::Search(
-                "GlobalBm25 requires the distributed two-phase coordinator".into(),
-            ));
-        }
-        if !request.sort.is_empty() {
-            return Err(Error::Search("field sorting is not implemented".into()));
-        }
-        if request.limit > MAX_LIMIT
-            || request
-                .offset
-                .checked_add(request.limit)
-                .is_none_or(|window| window > MAX_WINDOW)
-        {
+        if window > MAX_WINDOW {
             return Err(Error::Search(format!(
-                "search page exceeds limit {MAX_LIMIT} or result window {MAX_WINDOW}"
+                "search result window exceeds {MAX_WINDOW}"
             )));
         }
-        let wanted = request
-            .limit
-            .checked_add(request.offset)
-            .ok_or_else(|| Error::Search("search page overflow".into()))?
-            as usize;
-        let query = self.parse_query(&request.query)?;
-        let searcher = self.reader.searcher();
+        Ok(HeldSearch {
+            query: self.parse_query(query)?,
+            searcher: self.reader.searcher(),
+            checkpoint,
+        })
+    }
+
+    /// Local scoring inputs for one held searcher: corpus size, indexed tokens
+    /// per field the query touches, and the document frequency of every
+    /// expanded term. Terms are keyed by their serialized Tantivy encoding,
+    /// which is comparable across replicas because an identical
+    /// `definition_hash` implies an identical schema and field numbering.
+    pub fn shard_statistics(&self, held: &HeldSearch) -> Result<ShardStatistics> {
+        let schema = self.index.schema();
+        let mut fields: HashMap<Field, u64> = HashMap::new();
+        let mut terms: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut collect = Vec::new();
+        held.query.query_terms(&mut |term, _positions| {
+            collect.push(term.clone());
+        });
+        for term in collect {
+            let encoded = term_key(&schema, &term);
+            if !seen.insert(encoded.clone()) {
+                continue;
+            }
+            if terms.len() >= crate::search::SEARCH_MAX_QUERY_TERMS {
+                return Err(Error::Search(format!(
+                    "query expands past the {} term statistics limit",
+                    crate::search::SEARCH_MAX_QUERY_TERMS
+                )));
+            }
+            let doc_freq = held.searcher.doc_freq(&term).map_err(search_error)?;
+            terms.push((encoded, doc_freq));
+            if let std::collections::hash_map::Entry::Vacant(slot) = fields.entry(term.field()) {
+                slot.insert(
+                    held.searcher
+                        .total_num_tokens(term.field())
+                        .map_err(search_error)?,
+                );
+            }
+        }
+        let mut field_tokens = Vec::with_capacity(fields.len());
+        for (field, tokens) in fields {
+            field_tokens.push((schema.get_field_name(field).to_string(), tokens));
+        }
+        // Deterministic order keeps the summed statistics — and therefore the
+        // scores every shard computes — independent of hash-map iteration.
+        field_tokens.sort();
+        terms.sort();
+        Ok(ShardStatistics {
+            total_docs: held.searcher.num_docs(),
+            field_tokens,
+            term_doc_freq: terms,
+        })
+    }
+
+    /// Score and collect the top `window` hits from a held searcher, taking
+    /// BM25 inputs from `statistics`. Passing the held searcher itself yields
+    /// partition-local scores; passing summed cluster statistics yields
+    /// globally comparable ones (design §9.2).
+    pub fn execute(
+        &self,
+        partition: u16,
+        held: &HeldSearch,
+        window: usize,
+        statistics: &dyn Bm25StatisticsProvider,
+    ) -> Result<crate::search::SearchReply> {
+        let searcher = &held.searcher;
         let total_hits = searcher
-            .search(query.as_ref(), &Count)
+            .search(held.query.as_ref(), &Count)
             .map_err(search_error)? as u64;
-        let top = if wanted == 0 {
+        let top = if window == 0 {
             Vec::new()
         } else {
             searcher
-                .search(
-                    query.as_ref(),
-                    &TopDocs::with_limit(wanted).order_by_score(),
+                .search_with_statistics_provider(
+                    held.query.as_ref(),
+                    &TopDocs::with_limit(window).order_by_score(),
+                    statistics,
                 )
                 .map_err(search_error)?
         };
-        let mut hits = Vec::with_capacity(request.limit as usize);
-        for (score, address) in top.into_iter().skip(request.offset as usize) {
+        let mut hits = Vec::with_capacity(top.len());
+        for (score, address) in top {
             let document = searcher
                 .doc::<TantivyDocument>(address)
                 .map_err(search_error)?;
@@ -360,6 +513,37 @@ impl LocalSearchIndex {
             partial: false,
             failed_partitions: Vec::new(),
         })
+    }
+
+    /// Execute a bounded local shard query against one loaded commit, scored
+    /// from this partition's own statistics.
+    pub fn search(
+        &self,
+        partition: u16,
+        request: &SearchRequest,
+        checkpoint: IndexCheckpoint,
+    ) -> Result<crate::search::SearchReply> {
+        if matches!(request.scoring, crate::search::ScoringMode::GlobalBm25) {
+            return Err(Error::Search(
+                "GlobalBm25 requires the distributed two-phase coordinator".into(),
+            ));
+        }
+        if !request.sort.is_empty() {
+            return Err(Error::Search("field sorting is not implemented".into()));
+        }
+        if request.limit > MAX_LIMIT {
+            return Err(Error::Search(format!("search limit exceeds {MAX_LIMIT}")));
+        }
+        let window = request
+            .limit
+            .checked_add(request.offset)
+            .ok_or_else(|| Error::Search("search page overflow".into()))?;
+        let held = self.hold(&request.query, request.generation, window, checkpoint)?;
+        let mut reply = self.execute(partition, &held, window as usize, &held.searcher)?;
+        reply
+            .hits
+            .drain(..(request.offset as usize).min(reply.hits.len()));
+        Ok(reply)
     }
 
     fn parse_query(&self, query: &SearchQuery) -> Result<Box<dyn Query>> {

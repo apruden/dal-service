@@ -399,6 +399,124 @@ pub struct SearchReply {
     pub failed_partitions: Vec<PartitionFailure>,
 }
 
+/// BM25 inputs measured against one held searcher, or the coordinator's sum of
+/// them (design §9.2). Local BM25 scores are not comparable across partitions
+/// because document frequency and average field length differ per shard; these
+/// are the values that make them comparable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ShardStatistics {
+    pub total_docs: u64,
+    /// Indexed tokens per scored field, keyed by field name.
+    pub field_tokens: Vec<(String, u64)>,
+    /// Document frequency per expanded query term, keyed by an encoding of
+    /// (field name, value type, value bytes).
+    pub term_doc_freq: Vec<(Vec<u8>, u64)>,
+}
+
+impl ShardStatistics {
+    /// Structural bounds checked on every shard reply before it is summed, so
+    /// a misbehaving or mismatched replica cannot inflate coordinator memory.
+    pub fn validate(&self) -> Result<()> {
+        if self.term_doc_freq.len() > crate::search::SEARCH_MAX_QUERY_TERMS
+            || self.field_tokens.len() > SEARCH_MAX_FIELDS + 3
+        {
+            return Err(Error::Search(
+                "shard statistics exceed the query term or field limit".into(),
+            ));
+        }
+        for (name, _) in &self.field_tokens {
+            validate_name("statistics field", name)?;
+        }
+        for (term, _) in &self.term_doc_freq {
+            if term.len() > crate::search::SEARCH_MAX_TERM_KEY_BYTES {
+                return Err(Error::Search("statistics term key is too long".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Accumulate one shard's contribution. Sums saturate rather than wrap: a
+    /// wrapped corpus size would silently corrupt every score in the response.
+    pub fn merge(&mut self, other: &ShardStatistics) {
+        self.total_docs = self.total_docs.saturating_add(other.total_docs);
+        merge_sums(&mut self.field_tokens, &other.field_tokens);
+        merge_sums(&mut self.term_doc_freq, &other.term_doc_freq);
+    }
+}
+
+fn merge_sums<K: Ord + Clone>(into: &mut Vec<(K, u64)>, from: &[(K, u64)]) {
+    for (key, value) in from {
+        match into.binary_search_by(|(existing, _)| existing.cmp(key)) {
+            Ok(at) => into[at].1 = into[at].1.saturating_add(*value),
+            Err(at) => into.insert(at, (key.clone(), *value)),
+        }
+    }
+}
+
+/// Phase-one shard request: fence the leader, pin a searcher, and report the
+/// statistics the coordinator needs to make scores comparable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardPrepareRequest {
+    pub index: String,
+    pub generation: SearchIndexGenerationId,
+    pub definition_hash: [u8; 32],
+    pub query: SearchQuery,
+    pub consistency: SearchConsistency,
+    /// Top-N the shard must be able to return in phase two.
+    pub window: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardPrepared {
+    pub session_id: SearchSessionId,
+    pub checkpoint_index: u64,
+    pub statistics: ShardStatistics,
+}
+
+/// Node-local held-session identity. The durable incarnation prevents a
+/// delayed phase-two request from aliasing a different query after restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SearchSessionId {
+    pub incarnation: u64,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShardPrepareReply {
+    Prepared(ShardPrepared),
+    NotLeader {
+        leader: Option<crate::types::NodeId>,
+    },
+    Error(String),
+}
+
+/// Phase-two shard request: score the pinned searcher with cluster-wide
+/// statistics and return its top window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardExecuteRequest {
+    pub session_id: SearchSessionId,
+    pub statistics: ShardStatistics,
+}
+
+/// What a `SearchExecute` frame asks of a held session. A search that fails
+/// before phase two must hand its sessions back rather than let them pin
+/// Tantivy segment files until they expire — the failure case is exactly when
+/// the cluster can least afford the extra retention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShardExecuteBody {
+    Execute(ShardExecuteRequest),
+    Release { session_id: SearchSessionId },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ShardExecuteReply {
+    Result(SearchReply),
+    /// The session expired or was never held here; the coordinator must retry
+    /// the whole request rather than silently drop a partition.
+    UnknownSession,
+    Error(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

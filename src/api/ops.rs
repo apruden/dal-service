@@ -37,6 +37,9 @@ pub struct RoutingQuery {
 pub struct SearchCatalogQuery {
     pub name: String,
     pub local_only: bool,
+    /// Return every index instead of `name`. Nodes use this to discover which
+    /// generations they must build; clients look up one index at a time.
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +48,7 @@ pub struct SearchCatalogQuery {
 #[allow(clippy::large_enum_variant)]
 pub enum SearchCatalogReply {
     Record(Option<crate::search::SearchIndexRecord>),
+    Catalog(Vec<crate::search::SearchIndexRecord>),
     Unavailable,
     Error(String),
 }

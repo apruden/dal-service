@@ -1,7 +1,8 @@
 use dal::search::{
-    FieldKind, GenerationSelection, IndexCheckpoint, LocalSearchIndex, PathSegment, ScoringMode,
-    SearchConsistency, SearchField, SearchIndexDefinition, SearchIndexGeneration, SearchQuery,
-    SearchRequest, SearchService, SearchSourceSnapshot, encode_search_value,
+    FieldKind, GenerationSelection, GlobalBm25Statistics, IndexCheckpoint, LocalSearchIndex,
+    PathSegment, ScoringMode, SearchConsistency, SearchField, SearchIndexDefinition,
+    SearchIndexGeneration, SearchQuery, SearchRequest, SearchService, SearchSourceSnapshot,
+    ShardStatistics, encode_search_value,
 };
 use dal::storage::{StateMutation, Storage};
 use dal::types::GroupId;
@@ -38,6 +39,13 @@ struct Article<'a> {
 struct StoredKeyRecord {
     version: u64,
     value: Vec<u8>,
+}
+
+/// The loaded commit's own checkpoint. The service passes the checkpoint it
+/// validated against the live projection epoch; a direct index test has no
+/// epoch to validate against, so it reads back what the last commit wrote.
+fn loaded(index: &LocalSearchIndex) -> IndexCheckpoint {
+    index.checkpoint().unwrap().unwrap()
 }
 
 fn applied_record(log_id: LogId<u64>) -> Vec<u8> {
@@ -93,6 +101,7 @@ fn tantivy_projection_persists_checkpoint_and_searches_stored_identity() {
                 allow_partial: false,
                 deadline_ms: 1_000,
             },
+            loaded(&index),
         )
         .unwrap();
     assert_eq!(reply.total_hits, 1);
@@ -136,19 +145,195 @@ fn tantivy_projection_persists_checkpoint_and_searches_stored_identity() {
         allow_partial: false,
         deadline_ms: 1_000,
     };
-    assert_eq!(reopened.search(2, &updated).unwrap().total_hits, 1);
+    assert_eq!(
+        reopened
+            .search(2, &updated, loaded(&reopened))
+            .unwrap()
+            .total_hits,
+        1
+    );
     updated.query = SearchQuery::Text {
         query: "correctness".into(),
         fields: vec![],
     };
-    assert_eq!(reopened.search(2, &updated).unwrap().total_hits, 0);
+    assert_eq!(
+        reopened
+            .search(2, &updated, loaded(&reopened))
+            .unwrap()
+            .total_hits,
+        0
+    );
 
     reopened.project(b"doc-1", None).unwrap();
     reopened
         .commit(3, Some(LogId::new(CommittedLeaderId::new(4, 1), 24)))
         .unwrap();
     updated.query = SearchQuery::MatchAll;
-    assert_eq!(reopened.search(2, &updated).unwrap().total_hits, 0);
+    assert_eq!(
+        reopened
+            .search(2, &updated, loaded(&reopened))
+            .unwrap()
+            .total_hits,
+        0
+    );
+}
+
+/// Design §9.2 and §16.3: locally computed BM25 is not comparable across
+/// partitions, so a strict global search sums per-shard statistics and scores
+/// every shard against them. The result must be indistinguishable from
+/// searching one index holding the whole corpus.
+#[test]
+fn global_bm25_matches_a_single_index_reference_corpus() {
+    let corpus: Vec<(&[u8], &str)> = vec![
+        (b"a", "distributed search correctness"),
+        (b"b", "search correctness"),
+        (b"c", "distributed systems"),
+        (b"d", "correctness proofs for distributed search"),
+        (b"e", "an unrelated document about gardening"),
+        (b"f", "search search search"),
+    ];
+    let build = |dir: &std::path::Path, partition: u16, rows: &[(&[u8], &str)]| {
+        let index = LocalSearchIndex::open_or_create(
+            dir,
+            GroupId::Data(partition),
+            SearchIndexGeneration::new(9, definition()).unwrap(),
+        )
+        .unwrap();
+        index
+            .rebuild(&SearchSourceSnapshot {
+                epoch: 1,
+                applied: Some(LogId::new(CommittedLeaderId::new(1, 1), 10)),
+                records: rows
+                    .iter()
+                    .map(|(key, title)| (key.to_vec(), 1, value(title)))
+                    .collect(),
+                outbox: Vec::new(),
+            })
+            .unwrap();
+        index
+    };
+
+    let query = SearchQuery::Text {
+        query: "distributed search correctness".into(),
+        fields: vec![],
+    };
+    let window = 10;
+
+    let reference_dir = tempfile::tempdir().unwrap();
+    let reference = build(reference_dir.path(), 0, &corpus);
+    let reference_held = reference
+        .hold(
+            &query,
+            GenerationSelection::Exact(9),
+            window,
+            loaded(&reference),
+        )
+        .unwrap();
+    let expected = reference
+        .execute(
+            0,
+            &reference_held,
+            window as usize,
+            reference_held.local_statistics(),
+        )
+        .unwrap();
+
+    // The same corpus split unevenly across two partitions, so per-shard
+    // document frequencies and average field lengths genuinely differ.
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first = build(first_dir.path(), 0, &corpus[..2]);
+    let second = build(second_dir.path(), 1, &corpus[2..]);
+
+    let shards = [(0u16, &first), (1u16, &second)];
+    let held: Vec<_> = shards
+        .iter()
+        .map(|(_, index)| {
+            index
+                .hold(&query, GenerationSelection::Exact(9), window, loaded(index))
+                .unwrap()
+        })
+        .collect();
+
+    let mut global = ShardStatistics::default();
+    for ((_, index), held) in shards.iter().zip(&held) {
+        global.merge(&index.shard_statistics(held).unwrap());
+    }
+    // Summing must reproduce the reference corpus exactly, or every score
+    // derived from it is measuring a different collection.
+    assert_eq!(
+        global,
+        reference.shard_statistics(&reference_held).unwrap(),
+        "summed shard statistics must equal the whole-corpus statistics"
+    );
+
+    let mut merged = Vec::new();
+    for ((partition, index), held) in shards.iter().zip(&held) {
+        let statistics = GlobalBm25Statistics::new(index.schema(), &global).unwrap();
+        merged.extend(
+            index
+                .execute(*partition, held, window as usize, &statistics)
+                .unwrap()
+                .hits,
+        );
+    }
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .unwrap()
+            .total_cmp(&left.score.unwrap())
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let ranking = |hits: &[dal::search::SearchHit]| {
+        hits.iter()
+            .map(|hit| (hit.key.clone(), hit.score.unwrap().to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let mut reference_hits = expected.hits.clone();
+    reference_hits.sort_by(|left, right| {
+        right
+            .score
+            .unwrap()
+            .total_cmp(&left.score.unwrap())
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    assert_eq!(ranking(&reference_hits), ranking(&merged));
+    assert!(merged.len() >= 4, "corpus should produce several matches");
+}
+
+/// A shard that scores against statistics missing one of its query terms is
+/// scoring a different collection than its peers. That must fail rather than
+/// silently contribute incomparable hits to the merge.
+#[test]
+fn global_statistics_missing_a_term_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = LocalSearchIndex::open_or_create(
+        dir.path(),
+        GroupId::Data(0),
+        SearchIndexGeneration::new(9, definition()).unwrap(),
+    )
+    .unwrap();
+    index
+        .rebuild(&SearchSourceSnapshot {
+            epoch: 1,
+            applied: Some(LogId::new(CommittedLeaderId::new(1, 1), 10)),
+            records: vec![(b"a".to_vec(), 1, value("distributed search"))],
+            outbox: Vec::new(),
+        })
+        .unwrap();
+    let query = SearchQuery::Text {
+        query: "distributed search".into(),
+        fields: vec![],
+    };
+    let held = index
+        .hold(&query, GenerationSelection::Exact(9), 10, loaded(&index))
+        .unwrap();
+
+    let mut truncated = index.shard_statistics(&held).unwrap();
+    truncated.term_doc_freq.pop();
+    let statistics = GlobalBm25Statistics::new(index.schema(), &truncated).unwrap();
+    assert!(index.execute(0, &held, 10, &statistics).is_err());
 }
 
 #[tokio::test]
@@ -425,14 +610,17 @@ async fn a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap() {
         .await
         .unwrap();
 
-    let service = SearchService::new(storage.clone());
+    let service = SearchService::new(storage.clone()).unwrap();
     service
         .install_generation(6, "articles", generation.clone(), false)
         .await
         .unwrap();
-    service
-        .remove_generation(6, "articles", generation.id)
-        .await
+    // Release the writer but leave the committed index on disk, then drop the
+    // durable consumer record. That is the state this test is about: a stale
+    // but valid-looking Tantivy commit whose outbox history is prunable.
+    drop(service);
+    storage
+        .unregister_search_consumer(group, "articles", generation.id)
         .unwrap();
 
     let second = LogId::new(CommittedLeaderId::new(2, 7), 2);
@@ -452,12 +640,9 @@ async fn a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap() {
         .unwrap();
     assert_eq!(storage.prune_search_outbox(group).unwrap(), 1);
 
+    let service = SearchService::new(storage.clone()).unwrap();
     service
         .install_generation(6, "articles", generation.clone(), false)
-        .await
-        .unwrap();
-    service
-        .remove_generation(6, "articles", generation.id)
         .await
         .unwrap();
     drop(service);
@@ -484,7 +669,13 @@ async fn a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap() {
         allow_partial: false,
         deadline_ms: 1_000,
     };
-    assert_eq!(index.search(6, &request).unwrap().total_hits, 1);
+    assert_eq!(
+        index
+            .search(6, &request, loaded(&index))
+            .unwrap()
+            .total_hits,
+        1
+    );
 }
 
 /// A crash after a consumer registration became durable but before its first
@@ -514,16 +705,17 @@ async fn reinstall_after_registration_crash_rebuilds_over_the_pruned_gap() {
         .await
         .unwrap();
 
-    let service = SearchService::new(storage.clone());
+    let service = SearchService::new(storage.clone()).unwrap();
     service
         .install_generation(9, "articles", generation.clone(), false)
         .await
         .unwrap();
-    service
-        .remove_generation(9, "articles", generation.id)
-        .await
-        .unwrap();
+    // Keep the committed index on disk; only the consumer record goes away.
+    // The stale commit is what must not be mistaken for continuity below.
     drop(service);
+    storage
+        .unregister_search_consumer(group, "articles", generation.id)
+        .unwrap();
 
     // While no consumer is registered, the gap is pruned.
     let second = LogId::new(CommittedLeaderId::new(2, 7), 2);
@@ -552,7 +744,7 @@ async fn reinstall_after_registration_crash_rebuilds_over_the_pruned_gap() {
 
     // Restart: registration already exists, yet the install must rebuild
     // rather than resume from the stale on-disk commit.
-    let service = SearchService::new(storage.clone());
+    let service = SearchService::new(storage.clone()).unwrap();
     service
         .install_generation(9, "articles", generation.clone(), false)
         .await
@@ -581,7 +773,131 @@ async fn reinstall_after_registration_crash_rebuilds_over_the_pruned_gap() {
         allow_partial: false,
         deadline_ms: 1_000,
     };
-    assert_eq!(index.search(9, &request).unwrap().total_hits, 1);
+    assert_eq!(
+        index
+            .search(9, &request, loaded(&index))
+            .unwrap()
+            .total_hits,
+        1
+    );
+}
+
+/// Design §6.5 and §12: a projection that stops making progress must not pin
+/// the dirty-key journal forever. Once the journal crosses its budget the
+/// slowest consumer is released, the space is reclaimed, and that consumer is
+/// forced to rebuild rather than resume over a truncated journal.
+#[tokio::test]
+async fn a_lagging_index_is_released_so_the_outbox_cannot_grow_without_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(11);
+    storage.ensure_group(group).unwrap();
+    let generation = SearchIndexGeneration::new(1, definition()).unwrap();
+    storage
+        .register_search_consumer(group, "articles", &generation)
+        .unwrap();
+    storage
+        .record_search_consumer_checkpoint(
+            group,
+            "articles",
+            1,
+            IndexCheckpoint {
+                projection_epoch: 1,
+                definition_hash: generation.definition_hash,
+                engine_revision: generation.engine_revision,
+                source_log_id: Some(LogId::new(CommittedLeaderId::new(2, 7), 1)),
+            },
+        )
+        .unwrap();
+
+    for index in 2..=6u64 {
+        let log_id = LogId::new(CommittedLeaderId::new(2, 7), index);
+        storage
+            .apply_raft(
+                group,
+                &[StateMutation::Put {
+                    key: dal::keyspace::user_key(format!("doc-{index}").as_bytes()),
+                    value: stored_record(index, value("indexed")),
+                }],
+                log_id,
+                &applied_record(log_id),
+                b"committed",
+                1,
+            )
+            .await
+            .unwrap();
+    }
+    // The consumer is stuck at index 1, so nothing is prunable.
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 0);
+    assert_eq!(storage.search_outbox_usage(group).unwrap().0, 5);
+
+    // Under budget: the lagging consumer keeps its claim.
+    assert_eq!(
+        storage
+            .enforce_search_outbox_bounds(group, 100, u64::MAX)
+            .unwrap(),
+        None
+    );
+    assert_eq!(storage.search_outbox_usage(group).unwrap().0, 5);
+
+    // Over budget: it is released and the journal is reclaimed.
+    assert_eq!(
+        storage
+            .enforce_search_outbox_bounds(group, 2, u64::MAX)
+            .unwrap(),
+        Some(("articles".to_string(), 1))
+    );
+    assert_eq!(storage.search_outbox_usage(group).unwrap().0, 0);
+    assert!(
+        storage
+            .search_consumer_needs_rebuild(group, "articles", 1)
+            .unwrap()
+    );
+
+    // Having lost its journal, the consumer may not claim an incremental
+    // checkpoint — that would assert coverage of keys it never projected.
+    let incremental = IndexCheckpoint {
+        projection_epoch: 1,
+        definition_hash: generation.definition_hash,
+        engine_revision: generation.engine_revision,
+        source_log_id: Some(LogId::new(CommittedLeaderId::new(2, 7), 6)),
+    };
+    assert!(
+        storage
+            .record_search_consumer_checkpoint(group, "articles", 1, incremental.clone())
+            .is_err()
+    );
+    // Beginning the full rebuild re-acquires retention before its authoritative
+    // snapshot. A mutation arriving while Tantivy is rebuilding must therefore
+    // remain in the journal until the rebuilt checkpoint is durable.
+    storage
+        .begin_search_consumer_rebuild(group, "articles", &generation)
+        .unwrap();
+    let concurrent = LogId::new(CommittedLeaderId::new(2, 7), 7);
+    storage
+        .apply_raft(
+            group,
+            &[StateMutation::Put {
+                key: dal::keyspace::user_key(b"concurrent"),
+                value: stored_record(7, value("during rebuild")),
+            }],
+            concurrent,
+            &applied_record(concurrent),
+            b"committed",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 0);
+    storage
+        .record_search_consumer_checkpoint(group, "articles", 1, incremental)
+        .unwrap();
+    assert_eq!(storage.scan_search_outbox(group, 1).unwrap().len(), 1);
+    assert!(
+        !storage
+            .search_consumer_needs_rebuild(group, "articles", 1)
+            .unwrap()
+    );
 }
 
 /// Design §7.2: an unreadable index directory is quarantined and replaced,
@@ -639,7 +955,7 @@ async fn forgotten_partitions_reject_installs_until_readmitted() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(Storage::open(dir.path()).unwrap());
     storage.ensure_group(GroupId::Data(8)).unwrap();
-    let service = SearchService::new(storage);
+    let service = SearchService::new(storage).unwrap();
     let generation = SearchIndexGeneration::new(1, definition()).unwrap();
 
     service.forget_partition(8).await;
@@ -690,8 +1006,14 @@ fn catalog_frames_fit_two_maximum_definitions() {
     );
     assert_eq!(
         dal::transport::codec::MsgType::SearchCatalogQuery.max_payload(),
-        dal::search::SEARCH_MAX_CATALOG_BYTES
+        dal::search::SEARCH_MAX_CATALOG_FRAME_BYTES
     );
+    const {
+        assert!(
+            dal::search::SEARCH_MAX_CATALOG_FRAME_BYTES
+                > dal::search::SEARCH_MAX_INDEXES * dal::search::SEARCH_MAX_CATALOG_BYTES
+        );
+    }
 }
 
 #[test]

@@ -139,11 +139,9 @@ impl MsgType {
             MsgType::DataRecoveryFence => 4 * KIB,
             MsgType::SearchOp | MsgType::SearchExecute => 32 * MIB,
             MsgType::SearchPrepare | MsgType::SearchIndexStatus => 64 * KIB,
-            // A catalog record embeds a full definition in both `active` and
-            // `building`, so this must clear two maximum-size definitions
-            // (2 * SEARCH_MAX_DEFINITION_BYTES) plus the record, generation,
-            // and envelope framing around them.
-            MsgType::SearchCatalogQuery => crate::search::SEARCH_MAX_CATALOG_BYTES,
+            // Public lookups return one record, while node reconciliation uses
+            // the complete bounded catalog. The frame must fit the latter.
+            MsgType::SearchCatalogQuery => crate::search::SEARCH_MAX_CATALOG_FRAME_BYTES,
         }
     }
 

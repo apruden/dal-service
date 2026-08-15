@@ -30,14 +30,14 @@ use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::AddrBook;
 use crate::transport::raft_wire::{
     BecomeLearnerBody, LearnerReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
-    SubmitReply,
+    SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
 };
 use crate::types::{
     ClusterId, DataConfigObservation, GroupId, MetaCommand, MovePlan, NodeId, NodeState, Placement,
     ProcessIdentityGate, RegistrationBinding, voter_set,
 };
 
-use crate::api::gateway::PartitionMap;
+use crate::api::gateway::{PartitionMap, SearchCatalogSource};
 use crate::runtime::directory::fetch_authoritative_directory;
 use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::runtime::readiness::RuntimeReadiness;
@@ -70,6 +70,9 @@ pub struct RebalanceDriver {
     registration: RegistrationBinding,
     identity_gate: ProcessIdentityGate,
     readiness: RuntimeReadiness,
+    /// Absent in tests that do not wire search; the promotion fence is then a
+    /// no-op rather than a hard dependency of rebalancing.
+    search_catalog: std::sync::RwLock<Option<Arc<dyn SearchCatalogSource>>>,
 }
 
 impl RebalanceDriver {
@@ -107,7 +110,18 @@ impl RebalanceDriver {
             registration,
             identity_gate,
             readiness,
+            search_catalog: std::sync::RwLock::new(None),
         }
+    }
+
+    pub fn with_search_catalog(self, catalog: Arc<dyn SearchCatalogSource>) -> Self {
+        *self.search_catalog.write().unwrap() = Some(catalog);
+        self
+    }
+
+    /// Snapshot the handle; the guard is dropped before any `.await`.
+    fn search_catalog(&self) -> Option<Arc<dyn SearchCatalogSource>> {
+        self.search_catalog.read().unwrap().clone()
     }
 
     /// Snapshot the meta handle; the guard is dropped before any `.await`.
@@ -662,10 +676,66 @@ impl RebalanceDriver {
         if node.add_learner(learner).await.is_err() {
             return;
         }
+        // Design §11.1: a learner may not become a voter until it can serve
+        // every active index. Promoting first would let a leader election hand
+        // search traffic to a replica with no projection, which fails closed
+        // but needlessly removes a partition from every strict search. A
+        // not-ready learner pauses the move; the next tick retries.
+        if !self.learner_indexes_ready(learner, group).await {
+            return;
+        }
         if node.change_voters(target).await.is_err() {
             return;
         }
         self.report_finalize(node, group, plan_id, target).await;
+    }
+
+    /// Ask a learner whether it has built every active index generation for
+    /// the group it is about to vote in. An unreachable or not-ready learner
+    /// answers `false`, which only delays the move.
+    async fn learner_indexes_ready(&self, learner: NodeId, group: GroupId) -> bool {
+        let Some(catalog) = self.search_catalog() else {
+            return true;
+        };
+        let Ok(records) = catalog.catalog(false).await else {
+            // The catalog is the only source of what must be ready; without it
+            // the fence cannot be evaluated, so hold the move rather than
+            // promote blind.
+            return false;
+        };
+        let generations: Vec<(String, u64, [u8; 32])> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .active
+                    .as_ref()
+                    .map(|active| (record.name.clone(), active.id, active.definition_hash))
+            })
+            .collect();
+        if generations.is_empty() {
+            return true;
+        }
+        let Some(addr) = self.addrs.control(learner) else {
+            return false;
+        };
+        let envelope = Envelope::new(
+            self.cluster_id,
+            MsgType::SearchIndexStatus,
+            group,
+            0,
+            codec::encode(&SearchIndexStatusBody::Query { group, generations }),
+        );
+        match self.control.call(&addr, envelope).await {
+            Ok(reply) => match codec::decode::<SearchIndexStatusReply>(&reply.payload) {
+                Ok(SearchIndexStatusReply::Status { ready: true, .. }) => true,
+                Ok(SearchIndexStatusReply::Status { detail, .. }) => {
+                    tracing::debug!(learner, ?group, detail, "search index fence holding move");
+                    false
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Report the completed move to the meta group. Only submits once the target

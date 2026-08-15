@@ -49,6 +49,24 @@ pub trait SearchCatalogSource: Send + Sync {
                 + '_,
         >,
     >;
+
+    /// Every index definition, used by a node to decide which generations it
+    /// must build for the partitions it hosts. `local_only` stops a node that
+    /// is not the meta leader from re-asking its own peers, which would turn
+    /// one lookup into an exponential fan-out.
+    fn catalog(
+        &self,
+        local_only: bool,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::search::SearchIndexRecord>, String>> + Send + '_>,
+    >;
+}
+
+/// Builds a fresh shard fan-out per coordinated search. One per request
+/// because the two-phase protocol has to remember which replica holds each
+/// partition's pinned searcher for the life of that query only.
+pub trait ShardSourceFactory: Send + Sync {
+    fn open(&self) -> Box<dyn crate::search::ShardSearchSource>;
 }
 
 /// A gateway fronting the partitions this node hosts.
@@ -60,6 +78,7 @@ pub struct ClientGateway {
     routing: Arc<dyn RoutingSource>,
     search: RwLock<Option<Arc<crate::search::SearchService>>>,
     search_catalog: RwLock<Option<Arc<dyn SearchCatalogSource>>>,
+    shard_source: RwLock<Option<Arc<dyn ShardSourceFactory>>>,
 }
 
 impl ClientGateway {
@@ -78,6 +97,7 @@ impl ClientGateway {
             routing,
             search: RwLock::new(None),
             search_catalog: RwLock::new(None),
+            shard_source: RwLock::new(None),
         }
     }
 
@@ -85,8 +105,18 @@ impl ClientGateway {
         *self.search.write().unwrap() = Some(search);
     }
 
+    pub fn search_service(&self) -> Option<Arc<crate::search::SearchService>> {
+        self.search.read().unwrap().clone()
+    }
+
     pub fn set_search_catalog(&self, catalog: Arc<dyn SearchCatalogSource>) {
         *self.search_catalog.write().unwrap() = Some(catalog);
+    }
+
+    /// Supply the fan-out used to answer a coordinated `SearchOp`. Installed
+    /// by the runtime once the transport and address book exist.
+    pub fn set_shard_source(&self, source: Arc<dyn ShardSourceFactory>) {
+        *self.shard_source.write().unwrap() = Some(source);
     }
 
     /// Wrap a reply body in an envelope stamped with *this* node's cluster id,
@@ -185,6 +215,92 @@ impl ClientGateway {
         }
     }
 
+    /// Answer a coordinated search (design §9.1). The receiving node resolves
+    /// the catalog generation, scatters to every partition leader, and merges
+    /// one deterministic result; the client makes a single round trip.
+    async fn handle_coordinated_search(&self, env: &Envelope) -> SearchShardReply {
+        let request: crate::search::SearchRequest = match codec::decode(&env.payload) {
+            Ok(request) => request,
+            Err(error) => return SearchShardReply::Refused(format!("malformed SearchOp: {error}")),
+        };
+        if let Err(error) = crate::search::validate_index_name(&request.index) {
+            return SearchShardReply::Refused(error.to_string());
+        }
+        if request.deadline_ms == 0 || request.deadline_ms > 60_000 {
+            return SearchShardReply::Refused("deadline_ms must be in 1..=60000".into());
+        }
+        if !request.sort.is_empty() {
+            return SearchShardReply::Refused("field sorting is not implemented".into());
+        }
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(request.deadline_ms as u64);
+        let catalog = self.search_catalog.read().unwrap().clone();
+        let Some(catalog) = catalog else {
+            return SearchShardReply::Error("search catalog is not configured".into());
+        };
+        let source = self.shard_source.read().unwrap().clone();
+        let Some(source) = source else {
+            return SearchShardReply::Error("search coordinator is not configured".into());
+        };
+        // Admit before any fan-out or catalog round trip: the point of the
+        // bound is to keep search from consuming the capacity Raft and point
+        // operations need, so it has to be taken before the work starts.
+        let Some(search) = self.search_service() else {
+            return SearchShardReply::Error("search service is not configured".into());
+        };
+        let _slot = match search.admit_coordinated() {
+            Ok(slot) => slot,
+            Err(error) => return SearchShardReply::Error(error.to_string()),
+        };
+
+        // `Active` must be resolved through a ReadIndex-fenced catalog read;
+        // an explicit generation may come from a cached view because every
+        // shard revalidates the generation and definition hash anyway (§10).
+        let local_only = !matches!(
+            request.generation,
+            crate::search::GenerationSelection::Active
+        );
+        let catalog_read =
+            tokio::time::timeout_at(deadline, catalog.index(request.index.clone(), local_only))
+                .await;
+        let record = match catalog_read {
+            Err(_) => return SearchShardReply::Error("search deadline exceeded".into()),
+            Ok(Ok(Some(record))) => record,
+            Ok(Ok(None)) => {
+                return SearchShardReply::Refused(format!(
+                    "index {:?} does not exist",
+                    request.index
+                ));
+            }
+            Ok(Err(error)) => return SearchShardReply::Error(error),
+        };
+        let generation = match request.generation {
+            crate::search::GenerationSelection::Active => record.active,
+            crate::search::GenerationSelection::Exact(wanted) => [record.active, record.building]
+                .into_iter()
+                .flatten()
+                .find(|generation| generation.id == wanted),
+        };
+        let Some(generation) = generation else {
+            return SearchShardReply::Refused(format!(
+                "index {:?} has no such generation available",
+                request.index
+            ));
+        };
+
+        let coordinator = match crate::search::SearchCoordinator::new(self.p, source.open()) {
+            Ok(coordinator) => coordinator,
+            Err(error) => return SearchShardReply::Error(error.to_string()),
+        };
+        match coordinator
+            .search_until(&generation, &request, deadline)
+            .await
+        {
+            Ok(reply) => SearchShardReply::Result(reply),
+            Err(error) => SearchShardReply::Error(error.to_string()),
+        }
+    }
+
     async fn handle_search_op(&self, env: &Envelope) -> SearchShardReply {
         let request: crate::search::SearchRequest = match codec::decode(&env.payload) {
             Ok(request) => request,
@@ -280,8 +396,14 @@ impl Server for ClientGateway {
                 let reply = self.handle_client_op(&request).await;
                 self.client_reply(request.group_id, request.request_id, reply)
             }
+            // Addressing selects the role: the meta group asks this node to
+            // coordinate a whole search, a data partition asks it to serve one
+            // shard of somebody else's.
             MsgType::SearchOp => {
-                let reply = self.handle_search_op(&request).await;
+                let reply = match request.group_id {
+                    GroupId::Meta => self.handle_coordinated_search(&request).await,
+                    GroupId::Data(_) => self.handle_search_op(&request).await,
+                };
                 self.reply(
                     MsgType::SearchOp,
                     request.group_id,
@@ -294,6 +416,12 @@ impl Server for ClientGateway {
                     Ok(query) => {
                         let catalog = self.search_catalog.read().unwrap().clone();
                         match catalog {
+                            Some(catalog) if query.all => {
+                                match catalog.catalog(query.local_only).await {
+                                    Ok(records) => SearchCatalogReply::Catalog(records),
+                                    Err(error) => SearchCatalogReply::Error(error),
+                                }
+                            }
                             Some(catalog) => {
                                 match catalog.index(query.name, query.local_only).await {
                                     Ok(record) => SearchCatalogReply::Record(record),

@@ -132,6 +132,12 @@ pub fn heartbeat_incarnation_key() -> Vec<u8> {
     b"local/heartbeat_incarnation".to_vec()
 }
 
+/// Monotonically increasing process epoch for node-local held-search sessions.
+/// Session sequence numbers may restart at one only when this epoch advances.
+pub fn search_session_incarnation_key() -> Vec<u8> {
+    b"local/search_session_incarnation".to_vec()
+}
+
 /// The exact replicated registration used by this process identity.
 pub fn registration_binding_key() -> Vec<u8> {
     b"local/registration_binding".to_vec()
@@ -187,6 +193,31 @@ pub fn search_consumer_key(group: GroupId, name: &str, generation: u64) -> Vec<u
     key.extend_from_slice(name.as_bytes());
     key.extend_from_slice(&generation.to_be_bytes());
     key
+}
+
+/// Recover `(index name, generation)` from a consumer key.
+pub fn decode_search_consumer_key(
+    group: GroupId,
+    key: &[u8],
+) -> crate::error::Result<(String, u64)> {
+    let corrupt = |detail: &str| {
+        crate::error::Error::Corrupt("search consumer key".into(), detail.to_string())
+    };
+    let rest = key
+        .strip_prefix(search_consumer_prefix(group).as_slice())
+        .ok_or_else(|| corrupt("key has the wrong group prefix"))?;
+    let len_bytes = rest.get(..4).ok_or_else(|| corrupt("key is truncated"))?;
+    let name_len = u32::from_be_bytes(len_bytes.try_into().expect("bounded header")) as usize;
+    let name = rest
+        .get(4..4 + name_len)
+        .ok_or_else(|| corrupt("name runs past the key"))?;
+    let generation = rest
+        .get(4 + name_len..4 + name_len + 8)
+        .ok_or_else(|| corrupt("key has no generation"))?;
+    Ok((
+        String::from_utf8(name.to_vec()).map_err(|_| corrupt("name is not UTF-8"))?,
+        u64::from_be_bytes(generation.try_into().expect("bounded header")),
+    ))
 }
 
 #[cfg(test)]

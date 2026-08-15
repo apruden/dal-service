@@ -25,7 +25,8 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LearnerReply, LeaveBody, ObservationBody,
-    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest, SubmitReply,
+    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
+    SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
 
@@ -118,6 +119,9 @@ impl RootDispatch {
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req).await,
             MsgType::Heartbeat => self.serve_heartbeat(req),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
+            MsgType::SearchPrepare => self.serve_search_prepare(req).await,
+            MsgType::SearchExecute => self.serve_search_execute(req).await,
+            MsgType::SearchIndexStatus => self.serve_search_index_status(req).await,
             // Client/reply types are handled before reaching serve_control (or
             // never arrive as requests); reply unusably so a sender retries.
             _ => self.raft_unavailable(&req),
@@ -305,6 +309,149 @@ impl RootDispatch {
             Err(e) => LearnerReply::Error(e.to_string()),
         };
         self.reply(&req, codec::encode(&reply))
+    }
+
+    /// Phase one of a coordinated search: fence this replica as leader, pin a
+    /// searcher, and report its BM25 statistics. Peer-only, because the held
+    /// session it creates is an internal handle rather than a client result.
+    async fn serve_search_prepare(&self, req: Envelope) -> Envelope {
+        let reply = match (
+            req.group_id,
+            codec::decode::<crate::search::ShardPrepareRequest>(&req.payload),
+        ) {
+            (GroupId::Data(partition), Ok(body)) => {
+                let node = self.partitions.read().unwrap().get(&partition).cloned();
+                match (node, self.gateway.search_service()) {
+                    (Some(node), Some(search)) => match search.shard_prepare(&node, &body).await {
+                        Ok(reply) => reply,
+                        Err(error) => crate::search::ShardPrepareReply::Error(error.to_string()),
+                    },
+                    // Not hosting the partition is a routing miss, not a
+                    // failure: answer as a redirect so the coordinator keeps
+                    // looking instead of failing the whole fan-out.
+                    (None, _) => crate::search::ShardPrepareReply::NotLeader { leader: None },
+                    (_, None) => crate::search::ShardPrepareReply::Error(
+                        "search service is not configured".into(),
+                    ),
+                }
+            }
+            _ => crate::search::ShardPrepareReply::Error(
+                "SearchPrepare must address a data partition".into(),
+            ),
+        };
+        self.reply(&req, codec::encode(&reply))
+    }
+
+    /// Phase two: score the session's pinned searcher with the coordinator's
+    /// summed statistics.
+    async fn serve_search_execute(&self, req: Envelope) -> Envelope {
+        let reply = match codec::decode::<crate::search::ShardExecuteBody>(&req.payload) {
+            Ok(body) => match self.gateway.search_service() {
+                Some(search) => match body {
+                    crate::search::ShardExecuteBody::Execute(request) => {
+                        search.shard_execute(&request).await
+                    }
+                    // The coordinator is abandoning the query; the session is
+                    // gone either way, so report it as such.
+                    crate::search::ShardExecuteBody::Release { session_id } => {
+                        search.release_session(session_id);
+                        crate::search::ShardExecuteReply::UnknownSession
+                    }
+                },
+                None => crate::search::ShardExecuteReply::Error(
+                    "search service is not configured".into(),
+                ),
+            },
+            Err(error) => {
+                crate::search::ShardExecuteReply::Error(format!("malformed SearchExecute: {error}"))
+            }
+        };
+        self.reply(&req, codec::encode(&reply))
+    }
+
+    /// Either relay a replica's readiness observation to the meta group, or
+    /// answer whether this node has built the generations a move driver needs
+    /// before it promotes this node to voter (design §5.2, §11.1).
+    async fn serve_search_index_status(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<SearchIndexStatusBody>(&req.payload) else {
+            return self.reply(
+                &req,
+                codec::encode(&SearchIndexStatusReply::Submitted(SubmitReply::Error(
+                    "malformed".into(),
+                ))),
+            );
+        };
+        match body {
+            SearchIndexStatusBody::Report { name, observation } => {
+                let cmd = MetaCommand::ReportSearchIndexReady { name, observation };
+                let outcome = match self.meta() {
+                    None => SubmitReply::Error("node does not run the meta group".into()),
+                    Some(meta) => match meta.propose(cmd).await {
+                        Ok(ProposeOutcome::Applied(outcome)) => SubmitReply::Outcome(outcome),
+                        Ok(ProposeOutcome::NotLeader { leader }) => {
+                            SubmitReply::NotLeader { leader }
+                        }
+                        Err(error) => SubmitReply::Error(error.to_string()),
+                    },
+                };
+                self.reply(
+                    &req,
+                    codec::encode(&SearchIndexStatusReply::Submitted(outcome)),
+                )
+            }
+            SearchIndexStatusBody::Query { group, generations } => {
+                let reply = self.search_generations_ready(group, &generations).await;
+                self.reply(&req, codec::encode(&reply))
+            }
+        }
+    }
+
+    async fn search_generations_ready(
+        &self,
+        group: GroupId,
+        generations: &[(String, u64, [u8; 32])],
+    ) -> SearchIndexStatusReply {
+        let GroupId::Data(partition) = group else {
+            return SearchIndexStatusReply::Status {
+                ready: false,
+                detail: "search readiness requires a data partition".into(),
+            };
+        };
+        let Some(search) = self.gateway.search_service() else {
+            return SearchIndexStatusReply::Status {
+                ready: false,
+                detail: "search service is not configured".into(),
+            };
+        };
+        if self.partitions.read().unwrap().get(&partition).is_none() {
+            return SearchIndexStatusReply::Status {
+                ready: false,
+                detail: format!("partition {partition} is not hosted here"),
+            };
+        }
+        for (name, generation, definition_hash) in generations {
+            // Bring the projection up to date first: a learner that has just
+            // finished Raft catch-up is usually one outbox tail behind.
+            let _ = search
+                .catch_up_generation(partition, name, *generation)
+                .await;
+            match search
+                .generation_readiness(partition, name, *generation, *definition_hash)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    return SearchIndexStatusReply::Status {
+                        ready: false,
+                        detail: format!("{name}/{generation}: {error}"),
+                    };
+                }
+            }
+        }
+        SearchIndexStatusReply::Status {
+            ready: true,
+            detail: String::new(),
+        }
     }
 
     /// Return a group's placement only after a ReadIndex barrier. Move execution

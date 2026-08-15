@@ -142,6 +142,36 @@ pub struct BootstrapStatusReply {
     pub ready: bool,
 }
 
+/// `MsgType::SearchIndexStatus` — the two peer-only halves of index readiness
+/// (design §5.2, §11.1). `Report` carries a replica's own observation to the
+/// meta group; `Query` asks a replica whether it has built the generations a
+/// move driver is about to promote it for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchIndexStatusBody {
+    Report {
+        name: String,
+        observation: crate::search::SearchIndexReady,
+    },
+    Query {
+        group: GroupId,
+        /// The active generations the caller requires, as
+        /// `(index name, generation id, definition hash)`.
+        generations: Vec<(String, u64, [u8; 32])>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchIndexStatusReply {
+    Submitted(SubmitReply),
+    /// `ready` is true only when every requested generation is loaded at the
+    /// stated definition hash with a checkpoint valid for the live projection
+    /// epoch. `detail` names the first generation that is not.
+    Status {
+        ready: bool,
+        detail: String,
+    },
+}
+
 /// `MsgType::PlacementQuery` — read a group's committed meta placement so a data
 /// leader that is not a meta voter can drive its own move (§7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
