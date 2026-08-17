@@ -26,6 +26,10 @@ struct HeldSession {
     index: Arc<LocalSearchIndex>,
     held: HeldSearch,
     window: usize,
+    /// The epoch this searcher was pinned under. A snapshot install bumps the
+    /// group's epoch, and phase two must not serve a projection from before it
+    /// just because the session has not expired yet (I8).
+    projection_epoch: u64,
     expires_at: Instant,
 }
 
@@ -285,7 +289,10 @@ impl SearchService {
         name: &str,
         generation: u64,
     ) -> Result<()> {
-        let _lifecycle = self.lifecycle.read().await;
+        // Exclusive, like `forget_partition`: a read guard would let a shard
+        // phase prepare a fresh session for this generation after
+        // `expire_sessions` ran and before its directory is deleted.
+        let _lifecycle = self.lifecycle.write().await;
         self.loaded
             .write()
             .unwrap()
@@ -669,6 +676,7 @@ impl SearchService {
         let session = Arc::new(HeldSession {
             partition,
             index: loaded.index.clone(),
+            projection_epoch: held.checkpoint().projection_epoch,
             held,
             window: window as usize,
             expires_at: Instant::now() + Duration::from_millis(SEARCH_SESSION_TTL_MS),
@@ -695,6 +703,11 @@ impl SearchService {
     /// statistics. The session is consumed, releasing the searcher whether or
     /// not scoring succeeds.
     pub async fn shard_execute(&self, request: &ShardExecuteRequest) -> ShardExecuteReply {
+        // Phase two reads the same pinned segment files phase one opened, so it
+        // must hold the serving gate too: reclamation and generation removal
+        // expire sessions under the write guard and then delete those files
+        // (design §11.3).
+        let _lifecycle = self.lifecycle.read().await;
         let _slot = match self.admit_shard() {
             Ok(slot) => slot,
             Err(error) => return ShardExecuteReply::Error(error.to_string()),
@@ -705,6 +718,17 @@ impl SearchService {
         };
         if Instant::now() > session.expires_at {
             return ShardExecuteReply::UnknownSession;
+        }
+        // A snapshot install between the two phases replaced the authoritative
+        // state and bumped the epoch; the pinned commit now describes a prefix
+        // that no longer exists, so it must not be scored (I8).
+        match self
+            .storage
+            .search_projection_epoch(GroupId::Data(session.partition))
+        {
+            Ok(epoch) if epoch == session.projection_epoch => {}
+            Ok(_) => return ShardExecuteReply::UnknownSession,
+            Err(error) => return ShardExecuteReply::Error(error.to_string()),
         }
         if let Err(error) = request.statistics.validate() {
             return ShardExecuteReply::Error(error.to_string());

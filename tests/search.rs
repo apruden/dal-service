@@ -182,6 +182,75 @@ fn tantivy_projection_persists_checkpoint_and_searches_stored_identity() {
 /// partitions, so a strict global search sums per-shard statistics and scores
 /// every shard against them. The result must be indistinguishable from
 /// searching one index holding the whole corpus.
+/// I5: a rebuild publishes exactly the documents its snapshot selects.
+///
+/// `delete_all_documents` only drops committed segments, so adds a failed pass
+/// left buffered in the long-lived writer survive it. Without an explicit
+/// rollback they are committed by the rebuild and counted as part of a source
+/// prefix they were never in.
+#[test]
+fn rebuild_discards_documents_buffered_by_a_failed_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let index = LocalSearchIndex::open_or_create(dir.path(), GroupId::Data(2), generation).unwrap();
+
+    // A healthy incremental pass.
+    index.project(b"k1", Some((1, &value("first")))).unwrap();
+    index.commit(1, Some(log_id(1))).unwrap();
+
+    // A pass that projects k2 and then fails before committing: the add stays
+    // buffered in the writer the index owns.
+    index.project(b"k2", Some((1, &value("second")))).unwrap();
+
+    // Recovery rebuilds from an authoritative snapshot holding only k1.
+    index
+        .rebuild(&SearchSourceSnapshot {
+            epoch: 2,
+            applied: Some(log_id(5)),
+            records: vec![(b"k1".to_vec(), 1, value("first"))],
+            outbox: vec![],
+        })
+        .unwrap();
+
+    let checkpoint = loaded(&index);
+    assert_eq!(checkpoint.projection_epoch, 2);
+    assert_eq!(checkpoint.source_log_id, Some(log_id(5)));
+    assert_eq!(
+        searched_keys(&index, checkpoint),
+        vec![b"k1".to_vec()],
+        "rebuild published a document absent from the snapshot it claims to cover"
+    );
+}
+
+/// Every key the index currently returns for a match-all query.
+fn searched_keys(index: &LocalSearchIndex, checkpoint: IndexCheckpoint) -> Vec<Vec<u8>> {
+    let request = SearchRequest {
+        index: "articles".into(),
+        generation: GenerationSelection::Active,
+        query: SearchQuery::MatchAll,
+        limit: 100,
+        offset: 0,
+        sort: vec![],
+        scoring: ScoringMode::LocalBm25,
+        consistency: SearchConsistency::Eventual,
+        allow_partial: false,
+        deadline_ms: 5_000,
+    };
+    let mut keys: Vec<Vec<u8>> = index
+        .search(0, &request, checkpoint)
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|hit| hit.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn log_id(index: u64) -> LogId<u64> {
+    LogId::new(CommittedLeaderId::new(1, 1), index)
+}
+
 #[test]
 fn global_bm25_matches_a_single_index_reference_corpus() {
     let corpus: Vec<(&[u8], &str)> = vec![

@@ -250,10 +250,25 @@ impl LocalSearchIndex {
         Ok(Some(checkpoint))
     }
 
+    /// Discard everything this writer has buffered since its last commit.
+    ///
+    /// A pass that fails between `project` and `commit` leaves its adds in the
+    /// long-lived writer, where the next commit would publish them under a
+    /// checkpoint that does not describe them (I5).
+    pub fn rollback_uncommitted(&self) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.rollback().map_err(search_error)?;
+        Ok(())
+    }
+
     /// Replace all projected documents and durably commit the exact source
     /// prefix represented by `snapshot`.
     pub fn rebuild(&self, snapshot: &SearchSourceSnapshot) -> Result<u64> {
         let mut writer = self.writer.lock().unwrap();
+        // `delete_all_documents` only drops committed *segments*; documents an
+        // earlier failed pass left buffered in this writer survive it and would
+        // be committed below as part of a prefix they do not belong to.
+        writer.rollback().map_err(search_error)?;
         writer.delete_all_documents().map_err(search_error)?;
         let mut rejected = 0u64;
         for (key, version, value) in &snapshot.records {

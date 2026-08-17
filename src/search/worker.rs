@@ -81,22 +81,28 @@ impl SearchIndexWorker {
             self.begin_rebuild()?;
         }
         let mut snapshot = self.load_source(hint).await?;
-        let mut checkpoint = if force_rebuild {
+        let checkpoint = if force_rebuild {
             None
         } else {
             self.usable_checkpoint(&snapshot)?
         };
         if checkpoint.is_none() && hint.is_some() {
+            // This index's checkpoint was already rejected above, so it must
+            // not be resumed from. Re-testing it against the wider snapshot
+            // would let it back in: an ahead-of-source checkpoint stops looking
+            // ahead as soon as the authoritative prefix advances past it, which
+            // would silently resume the projection just declared untrustworthy
+            // (§7.2) and leave the diverged prefix's documents in place.
             self.begin_rebuild()?;
             snapshot = self.load_source(None).await?;
-            checkpoint = self.usable_checkpoint(&snapshot)?;
         }
 
         let Some(checkpoint) = checkpoint else {
-            let index = self.index.clone();
             let projected_keys = snapshot.records.len();
             let checkpoint_index = snapshot.applied.map(|log_id| log_id.index);
-            let rejected_documents = self.in_blocking(move || index.rebuild(&snapshot)).await?;
+            let rejected_documents = self
+                .project_in_blocking(move |index| index.rebuild(&snapshot))
+                .await?;
             self.persist_checkpoint_and_prune().await?;
             return Ok(SearchCatchUp {
                 rebuilt: true,
@@ -138,10 +144,9 @@ impl SearchIndexWorker {
             });
         }
 
-        let index = self.index.clone();
         let projected_keys = dirty.len();
         let rejected_documents = self
-            .in_blocking(move || {
+            .project_in_blocking(move |index| {
                 let source: HashMap<&[u8], (u64, &[u8])> = snapshot
                     .records
                     .iter()
@@ -221,6 +226,30 @@ impl SearchIndexWorker {
             self.storage.wait_state_durable(self.group, applied).await?;
         }
         Ok(snapshot)
+    }
+
+    /// Run one projection pass, discarding whatever it buffered if it fails.
+    ///
+    /// The writer outlives any single pass, so adds left behind by a failed one
+    /// would be published by whatever commits next — including a rebuild, whose
+    /// `delete_all_documents` does not drop them — under a checkpoint that
+    /// claims a prefix those documents are not part of (I5).
+    async fn project_in_blocking<T, F>(&self, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&LocalSearchIndex) -> Result<T> + Send + 'static,
+    {
+        let index = self.index.clone();
+        self.in_blocking(move || {
+            let outcome = work(&index);
+            if outcome.is_err()
+                && let Err(error) = index.rollback_uncommitted()
+            {
+                tracing::error!(%error, "could not discard a failed search projection pass");
+            }
+            outcome
+        })
+        .await
     }
 
     /// RocksDB scans and Tantivy indexing are synchronous and disk-bound, so
