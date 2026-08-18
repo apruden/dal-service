@@ -17,11 +17,12 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource, SearchCatalogSource};
 use crate::api::ops::{RoutingInfo, RoutingQuery, SearchCatalogQuery, SearchCatalogReply};
-use crate::config::{NodeConfig, RaftTuning, Timeouts, validate_routing_shape};
+use crate::config::{InitConfig, NodeConfig, RaftTuning, Timeouts, validate_routing_shape};
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
@@ -331,6 +332,11 @@ pub struct Node {
     // Background control loops (heartbeat emitter, failure detector); aborted on
     // shutdown.
     tasks: Vec<JoinHandle<()>>,
+    // Search reconciliation may be inside `spawn_blocking`, which Tokio cannot
+    // abort once running. Signal it separately and await it during shutdown so
+    // no RocksDB/Tantivy owner outlives the node.
+    search_shutdown: watch::Sender<bool>,
+    search_task: Option<JoinHandle<()>>,
     // Dropping these stops the poller threads and closes the sockets.
     _control_srv: Option<ZmqServer>,
     _bulk_srv: Option<ZmqServer>,
@@ -634,7 +640,8 @@ impl Node {
         tasks.push(tokio::spawn(driver.run()));
         // Search-index lifecycle: build the generations this node's partitions
         // owe the catalog, report readiness, and (as meta leader) activate.
-        tasks.push(tokio::spawn(
+        let (search_shutdown, search_shutdown_rx) = watch::channel(false);
+        let search_task = tokio::spawn(
             crate::runtime::search::SearchDriver::new(
                 cfg.node_id,
                 cfg.cluster_id,
@@ -646,9 +653,10 @@ impl Node {
                 addrs.clone(),
                 identity_gate.clone(),
                 readiness.clone(),
+                search_shutdown_rx,
             )
             .run(),
-        ));
+        );
         tasks.push(tokio::spawn(recovery_fence_driver(
             cfg.node_id,
             cfg.cluster_id,
@@ -690,6 +698,8 @@ impl Node {
             identity_gate,
             search,
             tasks,
+            search_shutdown,
+            search_task: Some(search_task),
             _control_srv: Some(control_srv),
             _bulk_srv: Some(bulk_srv),
         })
@@ -903,8 +913,7 @@ impl Node {
         self.meta.read().unwrap().is_some()
     }
 
-    /// This node's view of the meta leader, if it hosts the meta group. Used by
-    /// tests to pick a non-leader meta voter to drain.
+    /// This node's view of the meta leader, if it hosts the meta group.
     pub fn meta_leader(&self) -> Option<NodeId> {
         self.meta().and_then(|m| m.current_leader())
     }
@@ -935,10 +944,17 @@ impl Node {
     /// Gracefully stop inbound work and background loops, then shut down every
     /// Raft group and release all storage owners before returning.
     pub async fn shutdown(mut self) -> Result<()> {
+        // Unlike the other loops, search reconciliation can own non-abortable
+        // blocking work. Ask it to stop and let the current pass drain before
+        // releasing storage.
+        let _ = self.search_shutdown.send(true);
         for task in &self.tasks {
             task.abort();
         }
         for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+        if let Some(task) = self.search_task.take() {
             let _ = task.await;
         }
 
@@ -1424,7 +1440,14 @@ impl PartitionStarter {
         let Some(node) = node else {
             return Ok(());
         };
-        node.shutdown().await?;
+        if let Err(error) = node.shutdown().await {
+            // Keep the stopped-or-partially-stopped runtime reachable so the
+            // reconciliation loop can retry shutdown on its next tick. The
+            // lifecycle lock prevents learner admission from publishing a
+            // replacement between removal and restoration.
+            self.partitions.write().unwrap().insert(partition, node);
+            return Err(error);
+        }
         // Release the open Tantivy readers/writers before `reclaim_group_durable`
         // unlinks the index directory, so nothing keeps serving — or later
         // re-adopts — a projection of the partition we no longer host.
@@ -1547,7 +1570,12 @@ impl MetaStarter {
         let Some(node) = node else {
             return Ok(());
         };
-        node.shutdown().await?;
+        if let Err(error) = node.shutdown().await {
+            // As with data partitions, retain the handle after a partial
+            // shutdown so the periodic reclaim role can retry it.
+            *self.meta.write().unwrap() = Some(node);
+            return Err(error);
+        }
         self.storage.reclaim_group_durable(GroupId::Meta).await?;
         Ok(())
     }
@@ -1771,16 +1799,56 @@ fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Res
             crate::types::MAX_CLUSTER_NODES
         )));
     }
-    if desc.directory.iter().any(|entry| {
-        entry.control_addr.is_empty()
-            || entry.bulk_addr.is_empty()
-            || entry.control_addr.len() > crate::types::MAX_ENDPOINT_BYTES
-            || entry.bulk_addr.len() > crate::types::MAX_ENDPOINT_BYTES
-    }) {
+    let init = InitConfig {
+        p: desc.config.p,
+        r: desc.config.r,
+        bootstrap_nodes: desc.directory.iter().map(|entry| entry.node_id).collect(),
+        meta_voters: desc.meta_voters.clone(),
+        hash_spec: desc.config.hash_spec,
+    };
+    init.validate()?;
+
+    let mut addresses = std::collections::HashSet::new();
+    for entry in &desc.directory {
+        for address in [&entry.control_addr, &entry.bulk_addr] {
+            if address.is_empty() || address.len() > crate::types::MAX_ENDPOINT_BYTES {
+                return Err(crate::error::Error::Config(format!(
+                    "bootstrap descriptor endpoints must be 1..={} bytes",
+                    crate::types::MAX_ENDPOINT_BYTES
+                )));
+            }
+            if !addresses.insert(address) {
+                return Err(crate::error::Error::Config(
+                    "bootstrap descriptor endpoints must be globally unique".into(),
+                ));
+            }
+        }
+    }
+
+    if desc.data_placements.len() != desc.config.p as usize {
         return Err(crate::error::Error::Config(format!(
-            "bootstrap descriptor endpoints must be 1..={} bytes",
-            crate::types::MAX_ENDPOINT_BYTES
+            "bootstrap descriptor must contain exactly {} data placements",
+            desc.config.p
         )));
+    }
+    let directory: std::collections::HashSet<NodeId> =
+        desc.directory.iter().map(|entry| entry.node_id).collect();
+    let mut partitions = std::collections::HashSet::new();
+    for (partition, voters) in &desc.data_placements {
+        if *partition >= desc.config.p || !partitions.insert(*partition) {
+            return Err(crate::error::Error::Config(
+                "bootstrap descriptor has an invalid or duplicate partition".into(),
+            ));
+        }
+        let distinct: std::collections::HashSet<NodeId> = voters.iter().copied().collect();
+        if voters.len() != desc.config.r as usize
+            || distinct.len() != voters.len()
+            || !distinct.iter().all(|node| directory.contains(node))
+        {
+            return Err(crate::error::Error::Config(format!(
+                "partition {partition} must have exactly R distinct directory voters"
+            )));
+        }
     }
     Ok(())
 }
@@ -1802,11 +1870,13 @@ mod tests {
                 hash_spec: HashSpec::CANONICAL,
             },
             meta_voters: vec![1, 2, 3],
-            directory: vec![DirEntry {
-                node_id: 1,
-                control_addr: "tcp://node-1-control".into(),
-                bulk_addr: "tcp://node-1-bulk".into(),
-            }],
+            directory: (1..=3)
+                .map(|node_id| DirEntry {
+                    node_id,
+                    control_addr: format!("tcp://node-{node_id}-control"),
+                    bulk_addr: format!("tcp://node-{node_id}-bulk"),
+                })
+                .collect(),
             data_placements: vec![(0, vec![1, 2, 3])],
         }
     }
@@ -1845,6 +1915,21 @@ mod tests {
         desc.config.protocol_version = PROTOCOL_VERSION - 1;
         let err = validate_node_descriptor(&config(1), &desc).unwrap_err();
         assert!(err.to_string().contains("protocol version"));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_malformed_placement_descriptors() {
+        let mut desc = descriptor();
+        desc.data_placements.clear();
+        assert!(validate_node_descriptor(&config(1), &desc).is_err());
+
+        let mut desc = descriptor();
+        desc.data_placements[0].1 = vec![1, 1, 3];
+        assert!(validate_node_descriptor(&config(1), &desc).is_err());
+
+        let mut desc = descriptor();
+        desc.directory[1].control_addr = desc.directory[0].control_addr.clone();
+        assert!(validate_node_descriptor(&config(1), &desc).is_err());
     }
 
     #[tokio::test]

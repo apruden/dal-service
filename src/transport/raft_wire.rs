@@ -108,6 +108,30 @@ pub struct AbortPlanBody {
     pub plan_id: u64,
 }
 
+/// Narrow operator mutations for the search catalog. Engine revision is
+/// stamped by the receiving binary, keeping CLI callers independent of the
+/// replicated implementation revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchIndexAdminBody {
+    Create {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    Rebuild {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    Drop {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeadershipTransferReply {
+    Triggered,
+    Error(String),
+}
+
 /// Reply for frames that submit to the meta group (observation, join, leave,
 /// abort-plan). `NotLeader` tells the sender which voter to retry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

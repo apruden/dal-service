@@ -463,10 +463,12 @@ view. Plus: heartbeat incarnation persists and advances across restarts
 (`runtime::node` unit test).
 
 **Operator CLI** (`runtime/admin.rs`, `main.rs`): `join`, `leave`, `abort-plan`,
-and `status` are wired as thin ZMQ clients that send one typed control frame and
+`index-create`, `index-rebuild`, `index-drop`, and `status` are wired as thin ZMQ
+clients that send one typed control frame and
 render the reply, discovering the live directory before falling back to the
 immutable descriptor and following `NotLeader` hints to the meta leader. `join`/`leave`/
-`abort-plan` submit to the meta group (`SubmitReply`); `status` reads any node's
+`abort-plan` and the index mutations submit to the meta group (`SubmitReply`);
+`status` reads any node's
 cached routing (`MetaQuery`). There is no `init` subcommand — genesis is driven by
 `dal run` from the `--cluster` descriptor.
 
@@ -499,13 +501,15 @@ is corrected by the driver's reclaim pass, so startup + reclaim together
 reconcile the hosted set against the committed placement.
 
 **Meta-voter membership drain** (`runtime/{node,rebalance,dispatch}.rs`,
-`meta/node.rs`): a `leave` on a **non-leader** meta voter triggers a
+`meta/node.rs`): a `leave` on a meta voter triggers a
 size-preserving meta-voter *replacement*. The meta handle is shared and mutable
 (`MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>`) so a node can start or stop
 hosting the meta group at runtime; `MetaStarter` is the meta-group analogue of
 `PartitionStarter` (`admit_meta_learner`/`resume_meta`/`reclaim_meta`), and a
-`BecomeLearner` frame addressed to the meta group routes to it. The rebalance
-driver's meta-leader role creates a `CreatePlan{group: Meta}` (SM-validated as a
+`BecomeLearner` frame addressed to the meta group routes to it. If the draining
+voter currently leads meta, it asks an active voter to campaign immediately and
+steps down before membership work begins. The rebalance driver's new meta-leader
+role creates a `CreatePlan{group: Meta}` (SM-validated as a
 single-voter replacement, floor 3) for an ineligible non-leader meta voter, then
 the meta leader drives its *own* membership change (`add_learner` →
 `change_voters` → `FinalizePlan{Meta}`) — mirroring the data path via
@@ -514,9 +518,8 @@ its meta group once a **current** meta voter reports (over the network) a resolv
 meta placement excluding it — a removed voter's own meta view freezes at removal,
 so it cannot read the finalize locally. `Node::start` skips a durably `NonServing`
 meta group on restart and resumes a meta group gained by an earlier promotion.
-**v1 limitation:** draining the current meta *leader* is not supported (it needs
-Raft leadership transfer); the plan simply waits until leadership moves. Follow-
-ups: leader drain and meta *removal* (shrink) drain.
+Meta *removal* (shrink) drain remains a follow-up; normal drain is a
+size-preserving replacement.
 
 ---
 

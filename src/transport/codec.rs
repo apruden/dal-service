@@ -76,6 +76,11 @@ pub enum MsgType {
     SearchIndexStatus = 20,
     /// ReadIndex-fenced public control-plane index lookup.
     SearchCatalogQuery = 21,
+    /// Operator-control: create, rebuild, or drop a search index.
+    SearchIndexAdmin = 22,
+    /// Peer-control: ask a current meta voter to campaign immediately so a
+    /// draining meta leader can hand leadership off before replacement.
+    TransferLeadership = 23,
 }
 
 impl MsgType {
@@ -103,6 +108,8 @@ impl MsgType {
             19 => MsgType::SearchExecute,
             20 => MsgType::SearchIndexStatus,
             21 => MsgType::SearchCatalogQuery,
+            22 => MsgType::SearchIndexAdmin,
+            23 => MsgType::TransferLeadership,
             _ => return None,
         })
     }
@@ -142,6 +149,8 @@ impl MsgType {
             // Public lookups return one record, while node reconciliation uses
             // the complete bounded catalog. The frame must fit the latter.
             MsgType::SearchCatalogQuery => crate::search::SEARCH_MAX_CATALOG_FRAME_BYTES,
+            MsgType::SearchIndexAdmin => crate::search::SEARCH_MAX_DEFINITION_BYTES + 4 * KIB,
+            MsgType::TransferLeadership => 4 * KIB,
         }
     }
 
@@ -168,6 +177,8 @@ impl MsgType {
                 | MsgType::SearchPrepare
                 | MsgType::SearchExecute
                 | MsgType::SearchIndexStatus
+                | MsgType::SearchIndexAdmin
+                | MsgType::TransferLeadership
         )
     }
 }
@@ -477,6 +488,8 @@ mod tests {
         assert!(MsgType::JoinRequest.is_peer_control());
         assert!(MsgType::LeaveRequest.is_peer_control());
         assert!(MsgType::AbortPlanRequest.is_peer_control());
+        assert!(MsgType::SearchIndexAdmin.is_peer_control());
+        assert!(MsgType::TransferLeadership.is_peer_control());
         assert!(MsgType::DirectoryQuery.is_peer_control());
         assert!(!MsgType::ClientOp.is_peer_control());
         assert!(!MsgType::MetaQuery.is_peer_control());
@@ -490,6 +503,8 @@ mod tests {
             MsgType::AbortPlanRequest,
             MsgType::DirectoryQuery,
             MsgType::DataRecoveryFence,
+            MsgType::SearchIndexAdmin,
+            MsgType::TransferLeadership,
         ] {
             let e = env(t, GroupId::Meta, b"body".to_vec());
             assert_eq!(e, Envelope::decode(&e.encode().unwrap()).unwrap());

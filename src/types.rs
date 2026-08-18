@@ -21,6 +21,9 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CLUSTER_NODES: usize = 1024;
 pub const MAX_ENDPOINT_BYTES: usize = 256;
+/// Semantic value limit. Transport frames reserve additional bytes for request
+/// metadata, but that headroom is never available to the value itself.
+pub const MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stable node identity, assigned at `join` and never reused.
 pub type NodeId = u64;

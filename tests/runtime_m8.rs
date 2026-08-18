@@ -13,6 +13,7 @@ use dal::api::client::Client;
 use dal::config::{NodeConfig, Timeouts};
 use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
 use dal::runtime::node::Node;
+use dal::search::{FieldKind, PathSegment, SearchField, SearchIndexDefinition};
 use dal::transport::Transport;
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::settle;
@@ -66,6 +67,26 @@ fn node_config(id: NodeId, dir: PathBuf) -> NodeConfig {
             .collect(),
         data_dir: dir,
         timeouts: Timeouts::default(),
+    }
+}
+
+fn search_definition() -> SearchIndexDefinition {
+    SearchIndexDefinition {
+        document_type: "article".into(),
+        fields: vec![SearchField {
+            name: "title".into(),
+            source_path: vec![PathSegment::Key("title".into())],
+            kind: FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            required: true,
+            multi_valued: false,
+            indexed: true,
+            stored: true,
+            fast: false,
+        }],
+        default_search_fields: vec!["title".into()],
     }
 }
 
@@ -804,6 +825,7 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
     let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::meta::state_machine::{MetaApplyResult, MetaReject};
     use dal::runtime::admin;
+    use dal::transport::raft_wire::SearchIndexAdminBody;
     use dal::types::{GroupId, NodeState};
 
     let ctx = zmq::Context::new();
@@ -817,6 +839,36 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
     assert_eq!(info.cluster_id, CID);
     assert_eq!(info.p, 1);
     assert_eq!(info.directory.len(), 3);
+
+    // Search catalog mutations are externally operable through both the admin
+    // surface used by the CLI and the public client library.
+    let created = admin::search_index_admin(
+        ctx.clone(),
+        &desc,
+        SearchIndexAdminBody::Create {
+            name: "articles".into(),
+            definition: search_definition(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(created, MetaApplyResult::Applied);
+
+    let client = Client::new(
+        CID,
+        99,
+        VOTERS
+            .iter()
+            .map(|id| format!("inproc://m8-ctrl-{id}"))
+            .collect(),
+        ZmqTransport::new(ctx.clone(), Duration::from_secs(2)),
+    );
+    assert!(client.search_index("articles").await.unwrap().is_some());
+    assert_eq!(
+        client.drop_search_index("articles").await.unwrap(),
+        MetaApplyResult::Applied
+    );
 
     // `abort-plan` for a group with no active plan reaches the meta leader
     // (following `NotLeader`) and is deterministically rejected — exercising the
@@ -1133,7 +1185,7 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
+async fn draining_the_meta_leader_hands_off_and_swaps_in_the_spare() {
     let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::LeaveBody;
@@ -1197,25 +1249,19 @@ async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
         h.await.unwrap().unwrap();
     }
 
-    // Wait for a stable meta and data leader, then drain a voter that leads
-    // neither group (v1 drains a non-leader; a drained data leader would also
-    // step down mid-move).
+    // Wait for a stable meta leader, then drain that leader itself. The
+    // rebalance driver must hand leadership to an active voter before the new
+    // leader can replace it with the spare.
     let mut meta_leader = None;
-    let mut data_leader = None;
     for _ in 0..100 {
         meta_leader = nodes[0].meta_leader();
-        data_leader = nodes[0].partition_leader(0);
-        if meta_leader.is_some() && data_leader.is_some() {
+        if meta_leader.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let meta_leader = meta_leader.expect("meta group never elected a leader");
-    let data_leader = data_leader.expect("partition 0 never elected a leader");
-    let victim = *[1u64, 2, 3]
-        .iter()
-        .find(|&&v| v != meta_leader && v != data_leader)
-        .expect("no meta voter that leads neither group");
+    let victim = meta_leader;
 
     let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
     let leave = Envelope::new(
@@ -1234,8 +1280,11 @@ async fn draining_a_non_leader_meta_voter_swaps_in_the_spare() {
     expected.push(4);
     expected.sort_unstable();
 
-    // The meta leader (a survivor) commits the new meta voter set with the spare.
-    let survivor = &nodes[(meta_leader - 1) as usize];
+    // A surviving voter becomes leader and commits the new meta voter set.
+    let survivor = nodes
+        .iter()
+        .find(|node| node.node_id() != victim && node.hosts_meta())
+        .unwrap();
     let mut swapped = false;
     for _ in 0..200 {
         if let Some(mut voters) = survivor.meta_voters_of() {

@@ -166,6 +166,82 @@ pub struct RoutingInfo {
 }
 
 impl RoutingInfo {
+    /// Reject malformed or cross-cluster advisory snapshots before they enter
+    /// a route cache. Coverage may be incomplete during bootstrap, but every
+    /// supplied directory, placement, and move record must be coherent.
+    pub fn validate(&self, expected_cluster: ClusterId) -> crate::error::Result<()> {
+        use std::collections::HashSet;
+
+        if self.cluster_id != expected_cluster {
+            return Err(crate::error::Error::Config(
+                "routing snapshot has the wrong cluster_id".into(),
+            ));
+        }
+        if self.p == 0 {
+            return Err(crate::error::Error::Config(
+                "routing snapshot has zero partitions".into(),
+            ));
+        }
+        if self.directory.len() > crate::types::MAX_CLUSTER_NODES {
+            return Err(crate::error::Error::Config(
+                "routing directory exceeds the node limit".into(),
+            ));
+        }
+        let mut nodes = HashSet::new();
+        let mut addresses = HashSet::new();
+        for entry in &self.directory {
+            if entry.node_id == 0 || !nodes.insert(entry.node_id) {
+                return Err(crate::error::Error::Config(
+                    "routing directory contains a zero or duplicate node id".into(),
+                ));
+            }
+            for address in [&entry.control_addr, &entry.bulk_addr] {
+                if address.is_empty() || address.len() > crate::types::MAX_ENDPOINT_BYTES {
+                    return Err(crate::error::Error::Config(
+                        "routing directory contains an invalid endpoint".into(),
+                    ));
+                }
+                if !addresses.insert(address) {
+                    return Err(crate::error::Error::Config(
+                        "routing directory contains a duplicate endpoint".into(),
+                    ));
+                }
+            }
+        }
+        let mut partitions = HashSet::new();
+        for (partition, placement) in &self.placements {
+            if *partition >= self.p || !partitions.insert(*partition) {
+                return Err(crate::error::Error::Config(
+                    "routing snapshot contains an invalid or duplicate partition".into(),
+                ));
+            }
+            let voters: HashSet<_> = placement.voters.iter().copied().collect();
+            if voters.is_empty()
+                || voters.len() != placement.voters.len()
+                || !voters.iter().all(|node| nodes.contains(node))
+            {
+                return Err(crate::error::Error::Config(
+                    "routing placement contains invalid voters".into(),
+                ));
+            }
+            if let Some(plan) = &placement.r#move {
+                let target: HashSet<_> = plan.target_voters.iter().copied().collect();
+                if plan.plan_id == 0
+                    || target.len() != plan.target_voters.len()
+                    || target.len() != voters.len()
+                    || !target.iter().all(|node| nodes.contains(node))
+                    || target.difference(&voters).count() != 1
+                    || voters.difference(&target).count() != 1
+                {
+                    return Err(crate::error::Error::Config(
+                        "routing placement contains an invalid move plan".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The control address for a node id, if the directory knows it.
     pub fn control_addr(&self, node: NodeId) -> Option<&str> {
         self.directory
@@ -259,4 +335,50 @@ pub fn check_partition(
         });
     }
     Ok(claimed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::NodeState;
+
+    fn valid_routing() -> RoutingInfo {
+        RoutingInfo {
+            cluster_id: 7,
+            p: 1,
+            hash_spec: HashSpec::CANONICAL,
+            directory: vec![NodeDirectoryEntry {
+                node_id: 1,
+                control_addr: "node-1-control".into(),
+                bulk_addr: "node-1-bulk".into(),
+                state: NodeState::Active,
+                incarnation: 1,
+            }],
+            placements: vec![(
+                0,
+                Placement {
+                    voters: vec![1],
+                    voters_log_id: LogId::new(1, 1),
+                    r#move: None,
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn routing_validation_rejects_cache_poisoning_shapes() {
+        assert!(valid_routing().validate(7).is_ok());
+
+        let mut routing = valid_routing();
+        routing.cluster_id = 8;
+        assert!(routing.validate(7).is_err());
+
+        let mut routing = valid_routing();
+        routing.p = 0;
+        assert!(routing.validate(7).is_err());
+
+        let mut routing = valid_routing();
+        routing.placements.push(routing.placements[0].clone());
+        assert!(routing.validate(7).is_err());
+    }
 }

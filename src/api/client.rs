@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 use crate::perf::WriteStage;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
+use crate::transport::raft_wire::{SearchIndexAdminBody, SubmitReply};
 use crate::types::{
     ClientId, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion, LogId,
     NodeId, Sequence, Version,
@@ -160,6 +161,12 @@ impl<T: Transport> Client<T> {
         value: &[u8],
         if_version: Option<IfVersion>,
     ) -> Result<WriteReply> {
+        if value.len() > crate::types::MAX_VALUE_BYTES {
+            return Err(Error::Config(format!(
+                "value exceeds {} byte limit",
+                crate::types::MAX_VALUE_BYTES
+            )));
+        }
         self.mutate(
             key,
             DataOp::Put {
@@ -301,6 +308,104 @@ impl<T: Transport> Client<T> {
         Err(Error::Search(
             "no seed answered the search catalog query".into(),
         ))
+    }
+
+    pub async fn create_search_index(
+        &self,
+        name: &str,
+        definition: crate::search::SearchIndexDefinition,
+    ) -> Result<crate::meta::state_machine::MetaApplyResult> {
+        crate::search::validate_index_name(name)?;
+        definition.validate()?;
+        self.submit_search_index_admin(SearchIndexAdminBody::Create {
+            name: name.to_string(),
+            definition,
+        })
+        .await
+    }
+
+    pub async fn rebuild_search_index(
+        &self,
+        name: &str,
+        definition: crate::search::SearchIndexDefinition,
+    ) -> Result<crate::meta::state_machine::MetaApplyResult> {
+        crate::search::validate_index_name(name)?;
+        definition.validate()?;
+        self.submit_search_index_admin(SearchIndexAdminBody::Rebuild {
+            name: name.to_string(),
+            definition,
+        })
+        .await
+    }
+
+    pub async fn drop_search_index(
+        &self,
+        name: &str,
+    ) -> Result<crate::meta::state_machine::MetaApplyResult> {
+        crate::search::validate_index_name(name)?;
+        self.submit_search_index_admin(SearchIndexAdminBody::Drop {
+            name: name.to_string(),
+        })
+        .await
+    }
+
+    async fn submit_search_index_admin(
+        &self,
+        body: SearchIndexAdminBody,
+    ) -> Result<crate::meta::state_machine::MetaApplyResult> {
+        let _ = self.refresh_routing().await;
+        let payload = codec::encode(&body);
+        let mut candidates = self.seeds.clone();
+        let mut directory = HashMap::new();
+        if let Some(routing) = self.cache.lock().unwrap().routing.clone() {
+            for entry in routing.directory {
+                directory.insert(entry.node_id, entry.control_addr.clone());
+                if !candidates.contains(&entry.control_addr) {
+                    candidates.push(entry.control_addr);
+                }
+            }
+        }
+        let mut tried = HashSet::new();
+        let mut cursor = 0;
+        let mut last_error = None;
+        while cursor < candidates.len() && tried.len() < MAX_ROUNDS {
+            let addr = candidates[cursor].clone();
+            cursor += 1;
+            if !tried.insert(addr.clone()) {
+                continue;
+            }
+            let request = Envelope::new(
+                self.cluster_id,
+                MsgType::SearchIndexAdmin,
+                GroupId::Meta,
+                self.next_request_id(),
+                payload.clone(),
+            );
+            let Ok(reply) = self.transport.call(&addr, request).await else {
+                continue;
+            };
+            if reply.cluster_id != self.cluster_id || reply.msg_type != MsgType::SearchIndexAdmin {
+                continue;
+            }
+            match codec::decode::<SubmitReply>(&reply.payload) {
+                Ok(SubmitReply::Outcome(outcome)) => return Ok(outcome),
+                Ok(SubmitReply::NotLeader {
+                    leader: Some(leader),
+                }) => {
+                    if let Some(addr) = directory.get(&leader)
+                        && !tried.contains(addr)
+                    {
+                        candidates.push(addr.clone());
+                    }
+                }
+                Ok(SubmitReply::NotLeader { leader: None }) => {}
+                Ok(SubmitReply::Error(error)) => last_error = Some(error),
+                Err(error) => last_error = Some(format!("malformed search admin reply: {error}")),
+            }
+        }
+        Err(Error::Search(last_error.unwrap_or_else(|| {
+            "no seed accepted the search catalog mutation".into()
+        })))
     }
 
     async fn get_with(
@@ -489,6 +594,9 @@ impl<T: Transport> Client<T> {
                 continue;
             }
             if let Ok(info) = codec::decode::<RoutingInfo>(&reply.payload) {
+                if info.validate(self.cluster_id).is_err() {
+                    continue;
+                }
                 let mut cache = self.cache.lock().unwrap();
                 // A snapshot newer than the redirect that taught us a candidate
                 // already lists whoever still serves the partition. Retiring the
@@ -1137,6 +1245,13 @@ mod tests {
                     node_id: 1,
                     control_addr: "node-1".into(),
                     bulk_addr: "node-1-bulk".into(),
+                    state: NodeState::Active,
+                    incarnation: 1,
+                },
+                NodeDirectoryEntry {
+                    node_id: 2,
+                    control_addr: "node-2".into(),
+                    bulk_addr: "node-2-bulk".into(),
                     state: NodeState::Active,
                     incarnation: 1,
                 },

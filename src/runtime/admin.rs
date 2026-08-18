@@ -20,7 +20,9 @@ use crate::runtime::directory::fetch_authoritative_directory;
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::dealer::ZmqTransport;
-use crate::transport::raft_wire::{AbortPlanBody, JoinBody, LeaveBody, SubmitReply};
+use crate::transport::raft_wire::{
+    AbortPlanBody, JoinBody, LeaveBody, SearchIndexAdminBody, SubmitReply,
+};
 use crate::types::{ClusterId, GroupId, NodeId};
 
 /// Per-call request timeout for an operator command. Operator commands are
@@ -302,6 +304,28 @@ pub async fn abort_plan(
         &targets,
         MsgType::AbortPlanRequest,
         body,
+    )
+    .await
+}
+
+/// Create, rebuild, or drop a search index through the meta leader. The body is
+/// deliberately a narrow operator command rather than a generic MetaCommand.
+pub async fn search_index_admin(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    command: SearchIndexAdminBody,
+    seed: Option<&str>,
+) -> Result<MetaApplyResult> {
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    submit(
+        &transport,
+        desc.cluster_id,
+        &targets,
+        MsgType::SearchIndexAdmin,
+        codec::encode(&command),
     )
     .await
 }

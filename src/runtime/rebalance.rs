@@ -222,6 +222,32 @@ impl RebalanceDriver {
             .map(|e| e.node_id)
             .collect();
 
+        // A meta leader cannot remove itself while it is the only process that
+        // drives meta membership. Ask a healthy current voter to campaign; its
+        // higher term makes this node step down, and that new leader can then
+        // plan this node's replacement on the next tick.
+        if state_of(self.node_id) != Some(NodeState::Active)
+            && let Ok(Some(meta_placement)) = meta.local_placement(GroupId::Meta)
+            && meta_placement.voters.contains(&self.node_id)
+            && let Some(target) = meta_placement
+                .voters
+                .iter()
+                .copied()
+                .find(|id| *id != self.node_id && state_of(*id) == Some(NodeState::Active))
+        {
+            if let Some(addr) = self.addrs.control(target) {
+                let request = Envelope::new(
+                    self.cluster_id,
+                    MsgType::TransferLeadership,
+                    GroupId::Meta,
+                    0,
+                    Vec::new(),
+                );
+                let _ = self.control.call(&addr, request).await;
+            }
+            return;
+        }
+
         let mut placements = BTreeMap::new();
         for partition in 0..self.partition_count {
             let group = GroupId::Data(partition);
@@ -272,9 +298,9 @@ impl RebalanceDriver {
         }
 
         // Meta-voter replacement: swap any ineligible non-leader meta voter for
-        // an Active non-voter, keeping the set size (and quorum). v1 never
-        // replaces the current meta leader — this node is the leader here, so
-        // an ineligible leader waits until leadership moves elsewhere.
+        // an Active non-voter, keeping the set size (and quorum). An ineligible
+        // current leader was handed off above, so it becomes eligible for this
+        // branch as soon as the new leader runs it.
         if let Ok(Some(placement)) = meta.local_placement(GroupId::Meta) {
             match &placement.r#move {
                 None => {

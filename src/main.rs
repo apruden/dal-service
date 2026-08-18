@@ -15,6 +15,8 @@ use dal::meta::state_machine::MetaApplyResult;
 use dal::runtime::admin;
 use dal::runtime::config_file::{load_init_descriptor, load_node_config};
 use dal::runtime::node::Node;
+use dal::search::SearchIndexDefinition;
+use dal::transport::raft_wire::SearchIndexAdminBody;
 use dal::types::GroupId;
 
 fn usage() -> &'static str {
@@ -25,6 +27,9 @@ fn usage() -> &'static str {
        join        --config <node.json>                         register this node with its cluster\n\
        leave       --cluster <init.json> --node <id> [--seed <addr>]   gracefully drain a node\n\
        abort-plan  --cluster <init.json> --group <meta|N> --plan <id> [--seed <addr>]   abort a stuck plan\n\
+       index-create  --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
+       index-rebuild --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
+       index-drop    --cluster <init.json> --name <name> [--seed <addr>]\n\
        status      --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n"
 }
 
@@ -77,6 +82,32 @@ fn main() -> ExitCode {
                 eprintln!(
                     "abort-plan: --cluster <init.json>, --group <meta|N>, and --plan <id> required"
                 );
+                ExitCode::FAILURE
+            }
+        },
+        "index-create" | "index-rebuild" => match (
+            flag(rest, "--cluster"),
+            flag(rest, "--name"),
+            flag(rest, "--definition"),
+        ) {
+            (Some(cluster), Some(name), Some(definition)) => search_index_definition_command(
+                command,
+                cluster,
+                name,
+                definition,
+                flag(rest, "--seed"),
+            ),
+            _ => {
+                eprintln!(
+                    "{command}: --cluster <init.json>, --name <name>, and --definition <json> required"
+                );
+                ExitCode::FAILURE
+            }
+        },
+        "index-drop" => match (flag(rest, "--cluster"), flag(rest, "--name")) {
+            (Some(cluster), Some(name)) => search_index_drop(cluster, name, flag(rest, "--seed")),
+            _ => {
+                eprintln!("index-drop: --cluster <init.json> and --name <name> required");
                 ExitCode::FAILURE
             }
         },
@@ -197,6 +228,80 @@ fn abort_plan(cluster: &str, group: &str, plan: &str, seed: Option<&str>) -> Exi
         report(
             "abort-plan",
             admin::abort_plan(zmq::Context::new(), &desc, group, plan_id, seed.as_deref()).await,
+        )
+    })
+}
+
+fn search_index_definition_command(
+    command: &str,
+    cluster: &str,
+    name: &str,
+    definition_path: &str,
+    seed: Option<&str>,
+) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{command}: cluster: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let definition = match std::fs::read_to_string(definition_path)
+        .map_err(|e| e.to_string())
+        .and_then(|json| {
+            serde_json::from_str::<SearchIndexDefinition>(&json).map_err(|e| e.to_string())
+        }) {
+        Ok(definition) => definition,
+        Err(e) => {
+            eprintln!("{command}: definition: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = definition.validate() {
+        eprintln!("{command}: definition: {e}");
+        return ExitCode::FAILURE;
+    }
+    let body = if command == "index-create" {
+        SearchIndexAdminBody::Create {
+            name: name.to_string(),
+            definition,
+        }
+    } else {
+        SearchIndexAdminBody::Rebuild {
+            name: name.to_string(),
+            definition,
+        }
+    };
+    let label = command.to_string();
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        report(
+            &label,
+            admin::search_index_admin(zmq::Context::new(), &desc, body, seed.as_deref()).await,
+        )
+    })
+}
+
+fn search_index_drop(cluster: &str, name: &str, seed: Option<&str>) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("index-drop: cluster: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = dal::search::validate_index_name(name) {
+        eprintln!("index-drop: {e}");
+        return ExitCode::FAILURE;
+    }
+    let body = SearchIndexAdminBody::Drop {
+        name: name.to_string(),
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        report(
+            "index-drop",
+            admin::search_index_admin(zmq::Context::new(), &desc, body, seed.as_deref()).await,
         )
     })
 }

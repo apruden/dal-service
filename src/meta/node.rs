@@ -339,6 +339,16 @@ impl MetaNode {
         self.raft.metrics().borrow().current_leader
     }
 
+    /// Ask this voter to campaign immediately. Used for graceful leadership
+    /// handoff before the current meta leader is removed from membership.
+    pub async fn trigger_election(&self) -> Result<()> {
+        self.raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| Error::Raft(format!("trigger election: {e}")))
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.raft
             .shutdown()

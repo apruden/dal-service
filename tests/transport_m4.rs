@@ -446,6 +446,53 @@ async fn peer_control_on_client_path_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn decoded_values_cannot_consume_client_frame_headroom() {
+    let routing = Arc::new(StaticRouting(Mutex::new(RoutingInfo {
+        cluster_id: CID,
+        p: 1,
+        hash_spec: HashSpec::CANONICAL,
+        directory: Vec::new(),
+        placements: Vec::new(),
+    })));
+    let gw = ClientGateway::new(
+        CID,
+        1,
+        HashSpec::CANONICAL,
+        Arc::new(std::sync::RwLock::new(HashMap::new())),
+        routing as Arc<dyn RoutingSource>,
+    );
+    let switch: InProcess<ClientGateway> = InProcess::new();
+    switch.register("gw", Arc::new(gw));
+    let request = ClientRequest::Mutate(DataRequest {
+        client_id: 1,
+        sequence: 1,
+        op: DataOp::Put {
+            key: b"large".to_vec(),
+            value: vec![0; dal::types::MAX_VALUE_BYTES + 1],
+            if_version: None,
+        },
+    });
+    let reply = switch
+        .call(
+            "gw",
+            Envelope::new(
+                CID,
+                MsgType::ClientOp,
+                GroupId::Data(0),
+                1,
+                codec::encode(&request),
+            ),
+        )
+        .await
+        .unwrap();
+    let decoded: ClientReply = codec::decode(&reply.payload).unwrap();
+    assert!(
+        matches!(decoded, ClientReply::Refused(ref error) if error.contains("value exceeds")),
+        "unexpected reply: {decoded:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Exactly-once across a leader change (asserted via the M2 sequence records:
 // a replayed retry returns the original version, so no second application)

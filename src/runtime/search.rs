@@ -331,6 +331,7 @@ pub struct SearchDriver {
     addrs: AddrBook,
     identity_gate: crate::types::ProcessIdentityGate,
     readiness: RuntimeReadiness,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 impl SearchDriver {
@@ -346,6 +347,7 @@ impl SearchDriver {
         addrs: AddrBook,
         identity_gate: crate::types::ProcessIdentityGate,
         readiness: RuntimeReadiness,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             node_id,
@@ -358,6 +360,7 @@ impl SearchDriver {
             addrs,
             identity_gate,
             readiness,
+            shutdown,
         }
     }
 
@@ -366,15 +369,22 @@ impl SearchDriver {
         self.meta.read().unwrap().clone()
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         loop {
-            if !self.identity_gate.is_open() {
+            if *self.shutdown.borrow() || !self.identity_gate.is_open() {
                 return;
             }
             if self.readiness.is_ready() {
                 self.reconcile().await;
             }
-            tokio::time::sleep(SEARCH_RECONCILE_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(SEARCH_RECONCILE_INTERVAL) => {}
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() || *self.shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
         }
     }
 

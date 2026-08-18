@@ -24,9 +24,10 @@ use crate::transport::Server;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
-    DirectoryQueryReply, HeartbeatBody, JoinBody, LearnerReply, LeaveBody, ObservationBody,
-    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
-    SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
+    DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
+    ObservationBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
+    RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply,
+    SubmitReply,
 };
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
 
@@ -122,6 +123,8 @@ impl RootDispatch {
             MsgType::SearchPrepare => self.serve_search_prepare(req).await,
             MsgType::SearchExecute => self.serve_search_execute(req).await,
             MsgType::SearchIndexStatus => self.serve_search_index_status(req).await,
+            MsgType::SearchIndexAdmin => self.serve_search_index_admin(req).await,
+            MsgType::TransferLeadership => self.serve_transfer_leadership(req).await,
             // Client/reply types are handled before reaching serve_control (or
             // never arrive as requests); reply unusably so a sender retries.
             _ => self.raft_unavailable(&req),
@@ -277,6 +280,41 @@ impl RootDispatch {
             plan_id: body.plan_id,
         };
         self.submit(&req, cmd).await
+    }
+
+    async fn serve_search_index_admin(&self, req: Envelope) -> Envelope {
+        let Ok(body) = codec::decode::<SearchIndexAdminBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        let cmd = match body {
+            SearchIndexAdminBody::Create { name, definition } => {
+                MetaCommand::CreateSearchIndexWithRevision {
+                    name,
+                    definition,
+                    engine_revision: crate::search::SEARCH_ENGINE_REVISION,
+                }
+            }
+            SearchIndexAdminBody::Rebuild { name, definition } => {
+                MetaCommand::CreateSearchIndexGenerationWithRevision {
+                    name,
+                    definition,
+                    engine_revision: crate::search::SEARCH_ENGINE_REVISION,
+                }
+            }
+            SearchIndexAdminBody::Drop { name } => MetaCommand::DropSearchIndex { name },
+        };
+        self.submit(&req, cmd).await
+    }
+
+    async fn serve_transfer_leadership(&self, req: Envelope) -> Envelope {
+        let reply = match self.meta() {
+            Some(meta) => match meta.trigger_election().await {
+                Ok(()) => LeadershipTransferReply::Triggered,
+                Err(error) => LeadershipTransferReply::Error(error.to_string()),
+            },
+            None => LeadershipTransferReply::Error("node does not run the meta group".into()),
+        };
+        self.reply(&req, codec::encode(&reply))
     }
 
     /// Admit this node as a learner for the addressed group under the plan in

@@ -149,6 +149,15 @@ impl ClientGateway {
             Ok(r) => r,
             Err(e) => return ClientReply::Refused(format!("malformed ClientOp: {e}")),
         };
+        if let ClientRequest::Mutate(data) = &req
+            && let DataOp::Put { value, .. } = &data.op
+            && value.len() > crate::types::MAX_VALUE_BYTES
+        {
+            return ClientReply::Refused(format!(
+                "value exceeds {} byte limit",
+                crate::types::MAX_VALUE_BYTES
+            ));
+        }
 
         let partition = match check_partition(&req, env.group_id, self.p, &self.hash_spec) {
             Ok(p) => p,
