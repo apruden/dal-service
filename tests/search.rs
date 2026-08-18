@@ -178,10 +178,6 @@ fn tantivy_projection_persists_checkpoint_and_searches_stored_identity() {
     );
 }
 
-/// Design §9.2 and §16.3: locally computed BM25 is not comparable across
-/// partitions, so a strict global search sums per-shard statistics and scores
-/// every shard against them. The result must be indistinguishable from
-/// searching one index holding the whole corpus.
 /// I5: a rebuild publishes exactly the documents its snapshot selects.
 ///
 /// `delete_all_documents` only drops committed segments, so adds a failed pass
@@ -222,6 +218,69 @@ fn rebuild_discards_documents_buffered_by_a_failed_pass() {
     );
 }
 
+/// A durable commit is not yet safe to serve until its reader reloads. If the
+/// reload fails, validation must keep returning the checkpoint paired with the
+/// old reader so the worker replays from that prefix instead of taking its
+/// caught-up no-op path with stale searchable documents.
+#[test]
+fn reload_failure_keeps_the_serving_checkpoint_paired_with_its_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let index =
+        LocalSearchIndex::open_or_create(dir.path(), GroupId::Data(u16::MAX), generation).unwrap();
+    index
+        .rebuild(&SearchSourceSnapshot {
+            epoch: 1,
+            applied: Some(log_id(1)),
+            records: vec![(b"k1".to_vec(), 1, value("first"))],
+            outbox: vec![],
+        })
+        .unwrap();
+
+    index.project(b"k2", Some((1, &value("second")))).unwrap();
+    let reload_failure =
+        fail::FailGuard::new("search_index::before_reader_reload", "return").unwrap();
+    assert!(index.commit(1, Some(log_id(2))).is_err());
+    drop(reload_failure);
+    // The worker rolls a failed pass back. Because the commit itself succeeded,
+    // this resets the writer to log 2 without changing the still-log-1 reader.
+    index.rollback_uncommitted().unwrap();
+
+    assert_eq!(
+        index.checkpoint().unwrap().unwrap().source_log_id,
+        Some(log_id(2)),
+        "the failpoint must run after the durable commit"
+    );
+    let serving = index.validate_checkpoint(1).unwrap().unwrap();
+    assert_eq!(serving.source_log_id, Some(log_id(1)));
+    assert_eq!(searched_keys(&index, serving.clone()), vec![b"k1".to_vec()]);
+
+    // Replaying from the serving checkpoint publishes and reloads the exact
+    // source prefix, after which validation may expose the newer checkpoint.
+    index.project(b"k2", Some((1, &value("second")))).unwrap();
+    index.commit(1, Some(log_id(2))).unwrap();
+    let serving = index.validate_checkpoint(1).unwrap().unwrap();
+    assert_eq!(serving.source_log_id, Some(log_id(2)));
+    assert!(
+        index
+            .hold(
+                &SearchQuery::MatchAll,
+                GenerationSelection::Active,
+                100,
+                IndexCheckpoint {
+                    source_log_id: Some(log_id(1)),
+                    ..serving.clone()
+                },
+            )
+            .is_err(),
+        "a checkpoint validated before a concurrent reload must fail closed"
+    );
+    assert_eq!(
+        searched_keys(&index, serving),
+        vec![b"k1".to_vec(), b"k2".to_vec()]
+    );
+}
+
 /// Every key the index currently returns for a match-all query.
 fn searched_keys(index: &LocalSearchIndex, checkpoint: IndexCheckpoint) -> Vec<Vec<u8>> {
     let request = SearchRequest {
@@ -251,6 +310,10 @@ fn log_id(index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(1, 1), index)
 }
 
+/// Design §9.2 and §16.3: locally computed BM25 is not comparable across
+/// partitions, so a strict global search sums per-shard statistics and scores
+/// every shard against them. The result must be indistinguishable from
+/// searching one index holding the whole corpus.
 #[test]
 fn global_bm25_matches_a_single_index_reference_corpus() {
     let corpus: Vec<(&[u8], &str)> = vec![

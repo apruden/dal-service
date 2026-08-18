@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
@@ -143,6 +143,15 @@ fn term_key(schema: &Schema, term: &Term) -> Vec<u8> {
     key
 }
 
+/// One live reader generation and the checkpoint stored in that exact commit.
+/// Keeping them behind the same lock prevents either direction of mismatch:
+/// an old searcher with new metadata after reload failure, or a new searcher
+/// with a checkpoint a caller validated just before a concurrent commit.
+struct LoadedCommit {
+    searcher: Searcher,
+    checkpoint: Option<IndexCheckpoint>,
+}
+
 /// One local `(partition, index generation)` Tantivy projection.
 pub struct LocalSearchIndex {
     group: GroupId,
@@ -151,6 +160,7 @@ pub struct LocalSearchIndex {
     fields: Fields,
     writer: Mutex<IndexWriter>,
     reader: IndexReader,
+    loaded: RwLock<LoadedCommit>,
 }
 
 impl LocalSearchIndex {
@@ -202,42 +212,43 @@ impl LocalSearchIndex {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(search_error)?;
+        // No writer can change the index while it is being opened, so this
+        // payload belongs to the same latest commit the new reader loaded.
+        let loaded_checkpoint = match read_checkpoint(&index) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::warn!(
+                    ?group,
+                    %error,
+                    "unreadable search checkpoint; treating index as unprojected"
+                );
+                None
+            }
+        };
         Ok(Self {
             group,
             generation,
             index,
             fields,
             writer: Mutex::new(writer),
+            loaded: RwLock::new(LoadedCommit {
+                searcher: reader.searcher(),
+                checkpoint: loaded_checkpoint,
+            }),
             reader,
         })
     }
 
     pub fn checkpoint(&self) -> Result<Option<IndexCheckpoint>> {
-        let payload = self.index.load_metas().map_err(search_error)?.payload;
-        payload
-            .map(|payload| {
-                serde_json::from_str(&payload).map_err(|error| {
-                    Error::Search(format!("invalid Tantivy checkpoint payload: {error}"))
-                })
-            })
-            .transpose()
+        read_checkpoint(&self.index)
     }
 
+    /// Validate the checkpoint paired with the reader searches will actually
+    /// use, not merely the newest durable commit. A commit can succeed before a
+    /// reader reload fails; in that state the durable checkpoint is useful for
+    /// crash recovery, but it must not describe the still-old live searcher.
     pub fn validate_checkpoint(&self, epoch: u64) -> Result<Option<IndexCheckpoint>> {
-        // An unreadable or unparseable checkpoint payload invalidates the
-        // projection rather than failing every caller forever: `None` routes
-        // the worker into a full rebuild (design §7.2).
-        let checkpoint = match self.checkpoint() {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                tracing::warn!(
-                    group = ?self.group,
-                    %error,
-                    "unreadable search checkpoint; treating index as unprojected"
-                );
-                return Ok(None);
-            }
-        };
+        let checkpoint = self.loaded.read().unwrap().checkpoint.clone();
         let Some(checkpoint) = checkpoint else {
             return Ok(None);
         };
@@ -317,7 +328,19 @@ impl LocalSearchIndex {
         let mut commit = writer.prepare_commit().map_err(search_error)?;
         commit.set_payload(&payload);
         commit.commit().map_err(search_error)?;
-        self.reader.reload().map_err(search_error)
+        fail::fail_point!(
+            "search_index::before_reader_reload",
+            self.group == GroupId::Data(u16::MAX),
+            |_| Err(Error::Search(
+                "injected search reader reload failure".into()
+            ))
+        );
+        self.reader.reload().map_err(search_error)?;
+        *self.loaded.write().unwrap() = LoadedCommit {
+            searcher: self.reader.searcher(),
+            checkpoint: Some(checkpoint),
+        };
+        Ok(())
     }
 
     /// Attempt to index one authoritative record. `Ok(Some(reason))` is a
@@ -413,9 +436,16 @@ impl LocalSearchIndex {
                 "search result window exceeds {MAX_WINDOW}"
             )));
         }
+        let query = self.parse_query(query)?;
+        let loaded = self.loaded.read().unwrap();
+        if loaded.checkpoint.as_ref() != Some(&checkpoint) {
+            return Err(Error::Search(
+                "index checkpoint changed before its searcher was pinned".into(),
+            ));
+        }
         Ok(HeldSearch {
-            query: self.parse_query(query)?,
-            searcher: self.reader.searcher(),
+            query,
+            searcher: loaded.searcher.clone(),
             checkpoint,
         })
     }
@@ -784,6 +814,17 @@ fn quarantine_index_dir(path: &Path, reason: &str) -> Result<()> {
         "quarantined corrupt search index directory"
     );
     Ok(())
+}
+
+fn read_checkpoint(index: &Index) -> Result<Option<IndexCheckpoint>> {
+    let payload = index.load_metas().map_err(search_error)?.payload;
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                Error::Search(format!("invalid Tantivy checkpoint payload: {error}"))
+            })
+        })
+        .transpose()
 }
 
 fn search_error(error: impl std::fmt::Display) -> Error {
