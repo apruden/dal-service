@@ -122,7 +122,7 @@ impl MsgType {
             // A routing snapshot carries the whole directory plus a placement
             // per partition, so it scales with both cluster and `P` — the same
             // reason `DirectoryQuery` is not held to the command-body limit.
-            MsgType::MetaQuery => 4 * MIB,
+            MsgType::MetaQuery => crate::types::MAX_ROUTING_PAYLOAD_BYTES,
             MsgType::Redirect => 64 * KIB,
             MsgType::Heartbeat => 4 * KIB,
             MsgType::BecomeLearner => 4 * KIB,
@@ -137,7 +137,7 @@ impl MsgType {
             // without constraining it to the tiny command-body limit.
             MsgType::DirectoryQuery => 4 * MIB,
             MsgType::DataRecoveryFence => 4 * KIB,
-            MsgType::SearchOp | MsgType::SearchExecute => 32 * MIB,
+            MsgType::SearchOp | MsgType::SearchExecute => crate::search::SEARCH_MAX_FRAME_BYTES,
             MsgType::SearchPrepare | MsgType::SearchIndexStatus => 64 * KIB,
             // Public lookups return one record, while node reconciliation uses
             // the complete bounded catalog. The frame must fit the latter.
@@ -244,10 +244,18 @@ impl Envelope {
         }
     }
 
-    /// Serialize to a single frame. The current [`PROTOCOL_VERSION`] is stamped
-    /// in. Payloads are trusted to be within limits here; the receiver enforces
-    /// them on decode.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Serialize to a single frame. Outbound frames obey the same per-message
+    /// limit as inbound frames, so an oversized reply can never bypass the
+    /// router's memory reservation and fail only after reaching its peer.
+    pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
+        let limit = self.msg_type.max_payload();
+        if self.payload.len() > limit {
+            return Err(FrameError::Oversized {
+                msg_type: self.msg_type,
+                limit,
+                got: self.payload.len(),
+            });
+        }
         let profiled = crate::perf::write_path_enabled().then(Instant::now);
         let mut buf = Vec::with_capacity(HEADER_LEN + self.payload.len());
         buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -265,7 +273,7 @@ impl Envelope {
         if let Some(started) = profiled {
             crate::perf::record_envelope(self.msg_type, true, started.elapsed(), buf.len());
         }
-        buf
+        Ok(buf)
     }
 
     /// Read the `request_id` from an already-framed envelope without decoding or
@@ -364,7 +372,7 @@ mod tests {
     fn round_trip_meta_and_data() {
         for group in [GroupId::Meta, GroupId::Data(0), GroupId::Data(65535)] {
             let e = env(MsgType::ClientOp, group, b"hello".to_vec());
-            let decoded = Envelope::decode(&e.encode()).unwrap();
+            let decoded = Envelope::decode(&e.encode().unwrap()).unwrap();
             assert_eq!(e, decoded);
         }
     }
@@ -372,7 +380,7 @@ mod tests {
     #[test]
     fn empty_payload_round_trips() {
         let e = env(MsgType::MetaQuery, GroupId::Meta, Vec::new());
-        assert_eq!(e, Envelope::decode(&e.encode()).unwrap());
+        assert_eq!(e, Envelope::decode(&e.encode().unwrap()).unwrap());
     }
 
     #[test]
@@ -385,7 +393,9 @@ mod tests {
 
     #[test]
     fn unsupported_version_rejected() {
-        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new()).encode();
+        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new())
+            .encode()
+            .unwrap();
         bytes[0] = 0xFF;
         assert!(matches!(
             Envelope::decode(&bytes),
@@ -395,7 +405,9 @@ mod tests {
 
     #[test]
     fn bad_msg_type_rejected() {
-        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new()).encode();
+        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new())
+            .encode()
+            .unwrap();
         bytes[20] = 200;
         assert!(matches!(
             Envelope::decode(&bytes),
@@ -405,7 +417,9 @@ mod tests {
 
     #[test]
     fn bad_group_tag_rejected() {
-        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new()).encode();
+        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new())
+            .encode()
+            .unwrap();
         bytes[21] = 9;
         assert!(matches!(
             Envelope::decode(&bytes),
@@ -417,7 +431,9 @@ mod tests {
     fn oversized_payload_rejected_before_read() {
         // Claim a payload larger than the Heartbeat limit without actually
         // providing the bytes: rejection must be on the length prefix alone.
-        let mut bytes = env(MsgType::Heartbeat, GroupId::Meta, Vec::new()).encode();
+        let mut bytes = env(MsgType::Heartbeat, GroupId::Meta, Vec::new())
+            .encode()
+            .unwrap();
         let huge = (MsgType::Heartbeat.max_payload() as u32) + 1;
         bytes[32..36].copy_from_slice(&huge.to_le_bytes());
         assert!(matches!(
@@ -427,8 +443,26 @@ mod tests {
     }
 
     #[test]
+    fn oversized_outbound_payload_is_never_encoded() {
+        let envelope = env(
+            MsgType::Heartbeat,
+            GroupId::Meta,
+            vec![0; MsgType::Heartbeat.max_payload() + 1],
+        );
+        assert!(matches!(
+            envelope.encode(),
+            Err(FrameError::Oversized {
+                msg_type: MsgType::Heartbeat,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn trailing_bytes_rejected() {
-        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new()).encode();
+        let mut bytes = env(MsgType::MetaQuery, GroupId::Meta, Vec::new())
+            .encode()
+            .unwrap();
         bytes.push(0);
         assert!(matches!(
             Envelope::decode(&bytes),
@@ -458,7 +492,7 @@ mod tests {
             MsgType::DataRecoveryFence,
         ] {
             let e = env(t, GroupId::Meta, b"body".to_vec());
-            assert_eq!(e, Envelope::decode(&e.encode()).unwrap());
+            assert_eq!(e, Envelope::decode(&e.encode().unwrap()).unwrap());
         }
     }
 }

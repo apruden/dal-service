@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::types::{ClusterId, HashSpec, NodeId};
+use crate::types::{
+    ClusterId, HashSpec, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MAX_ROUTING_PAYLOAD_BYTES, NodeId,
+};
 
 /// Failure-detection and request timeouts (DESIGN §13). Held here so the whole
 /// system reads one source of truth.
@@ -42,6 +44,9 @@ impl Timeouts {
             return Err(Error::Config(
                 "down_timeout must be >= suspect_timeout".into(),
             ));
+        }
+        if self.request.is_zero() {
+            return Err(Error::Config("request_timeout must be > 0".into()));
         }
         Ok(())
     }
@@ -91,8 +96,18 @@ impl NodeConfig {
         if self.control_addr.is_empty() {
             return Err(Error::Config("control_addr must be set".into()));
         }
+        if self.control_addr.len() > MAX_ENDPOINT_BYTES {
+            return Err(Error::Config(format!(
+                "control_addr must be <= {MAX_ENDPOINT_BYTES} bytes"
+            )));
+        }
         if self.bulk_addr.is_empty() {
             return Err(Error::Config("bulk_addr must be set".into()));
+        }
+        if self.bulk_addr.len() > MAX_ENDPOINT_BYTES {
+            return Err(Error::Config(format!(
+                "bulk_addr must be <= {MAX_ENDPOINT_BYTES} bytes"
+            )));
         }
         if self.control_addr == self.bulk_addr {
             return Err(Error::Config(
@@ -153,6 +168,34 @@ pub fn parse_partition_count(n: u64) -> Result<u16> {
     Ok(n as u16)
 }
 
+/// Conservatively bound the largest routing snapshot this immutable cluster
+/// shape can produce: a maximally-sized directory and a move plan on every
+/// partition. The estimate intentionally includes encoding headroom so later
+/// metadata additions cannot silently consume the entire wire frame.
+pub(crate) fn validate_routing_shape(p: u16, r: u8) -> Result<()> {
+    const ROUTING_FIXED_HEADROOM: usize = 64 * 1024;
+    const DIRECTORY_ENTRY_BUDGET: usize = 64 + 2 * MAX_ENDPOINT_BYTES;
+    const PLACEMENT_FIXED_BUDGET: usize = 64;
+
+    let directory = MAX_CLUSTER_NODES
+        .checked_mul(DIRECTORY_ENTRY_BUDGET)
+        .ok_or_else(|| Error::Config("routing directory size overflow".into()))?;
+    let placement = (p as usize)
+        .checked_mul(PLACEMENT_FIXED_BUDGET + 2 * (r as usize) * std::mem::size_of::<NodeId>())
+        .ok_or_else(|| Error::Config("routing placement size overflow".into()))?;
+    let estimate = ROUTING_FIXED_HEADROOM
+        .checked_add(directory)
+        .and_then(|bytes| bytes.checked_add(placement))
+        .ok_or_else(|| Error::Config("routing snapshot size overflow".into()))?;
+    if estimate > MAX_ROUTING_PAYLOAD_BYTES {
+        return Err(Error::Config(format!(
+            "P={p} and R={r} can produce a routing snapshot larger than {} bytes",
+            MAX_ROUTING_PAYLOAD_BYTES
+        )));
+    }
+    Ok(())
+}
+
 impl InitConfig {
     pub fn validate(&self) -> Result<()> {
         if self.p == 0 {
@@ -161,10 +204,16 @@ impl InitConfig {
         if self.r < MIN_REPLICATION {
             return Err(Error::Config(format!("R must be >= {MIN_REPLICATION}")));
         }
+        validate_routing_shape(self.p, self.r)?;
 
         let bootstrap: BTreeSet<NodeId> = self.bootstrap_nodes.iter().copied().collect();
         if bootstrap.len() != self.bootstrap_nodes.len() {
             return Err(Error::Config("bootstrap_nodes must be distinct".into()));
+        }
+        if bootstrap.len() > MAX_CLUSTER_NODES {
+            return Err(Error::Config(format!(
+                "bootstrap node count must be <= {MAX_CLUSTER_NODES}"
+            )));
         }
         if bootstrap.contains(&0) {
             return Err(Error::Config("node ids must be non-zero".into()));
@@ -226,6 +275,14 @@ mod tests {
         assert_eq!(parse_partition_count(u16::MAX as u64).unwrap(), u16::MAX);
         assert!(parse_partition_count(u16::MAX as u64 + 1).is_err());
         assert!(parse_partition_count(1_000_000).is_err());
+    }
+
+    #[test]
+    fn routing_shape_must_fit_the_protocol_frame() {
+        let mut config = base_init();
+        config.p = u16::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("routing snapshot"));
     }
 
     #[test]

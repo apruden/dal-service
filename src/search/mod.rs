@@ -45,6 +45,11 @@ pub const SEARCH_MAX_RETIRING_GENERATIONS: usize = 4096;
 pub const SEARCH_MAX_FIELD_BYTES: usize = 256 * 1024;
 pub const SEARCH_MAX_VALUES_PER_FIELD: usize = 256;
 pub const SEARCH_MAX_EXTRACTED_BYTES: usize = 1024 * 1024;
+/// Search request and reply frames share this hard transport bound. Replies
+/// reserve one MiB for enum/vector framing and partition-failure metadata.
+pub const SEARCH_MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const SEARCH_REPLY_BODY_BUDGET: usize = 31 * 1024 * 1024;
+pub const SEARCH_MAX_FAILURE_REASON_BYTES: usize = 512;
 /// Distributed BM25 costs one document-frequency probe and one wire entry per
 /// expanded term, so term expansion must be bounded before it reaches the
 /// blocking pool (design §9.2, §13).
@@ -52,6 +57,9 @@ pub const SEARCH_MAX_QUERY_TERMS: usize = 1024;
 /// A statistics term key is (field name, type tag, value); the value is a
 /// single token, so this only has to clear a long token plus the name bound.
 pub const SEARCH_MAX_TERM_KEY_BYTES: usize = 4 * 1024;
+/// Leaves framing headroom inside the 64 KiB `SearchPrepare` envelope while
+/// allowing the common case of 1,024 compact terms.
+pub const SEARCH_MAX_STATISTICS_BYTES: usize = 60 * 1024;
 /// Held searcher sessions pin Tantivy segment files, so their count and
 /// lifetime are bounded independently of query concurrency (design §8.1).
 pub const SEARCH_MAX_SESSIONS: usize = 256;
@@ -60,8 +68,14 @@ pub const SEARCH_SESSION_TTL_MS: u64 = 60_000;
 /// storm cannot starve elections or point operations (design §13). A global
 /// search occupies one coordinator slot for its whole two-phase lifetime,
 /// while each shard phase occupies a shard slot only while it runs.
-pub const SEARCH_MAX_CONCURRENT_GLOBAL: usize = 32;
+// A coordinated search may transiently hold one bounded shard reply alongside
+// its bounded global top-K. Eight worst-case searches stay within the router's
+// default 512 MiB reply-memory envelope.
+pub const SEARCH_MAX_CONCURRENT_GLOBAL: usize = 8;
 pub const SEARCH_MAX_CONCURRENT_SHARD: usize = 64;
+/// One coordinated phase never has more shard calls actively polled than this,
+/// independently of the configured partition count.
+pub const SEARCH_MAX_FAN_OUT_CONCURRENCY: usize = 64;
 /// Outbox retention is bounded so a failed or hopelessly lagging projection
 /// cannot fill the disk the authoritative database depends on (design §6.5,
 /// §12). Crossing either bound releases the slowest consumer and rebuilds it.

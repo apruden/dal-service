@@ -334,7 +334,7 @@ impl Transport for ZmqTransport {
             msg_type,
             group_id,
             enqueued_at: crate::perf::write_path_enabled().then(Instant::now),
-            frame: request.encode(),
+            frame: request.encode().map_err(Error::codec)?,
             reply: tx,
         })?;
         let reply = rx.await.map_err(|_| {

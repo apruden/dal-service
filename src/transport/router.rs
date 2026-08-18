@@ -138,6 +138,7 @@ fn max_reply_bytes(msg_type: MsgType) -> usize {
         MsgType::Redirect => MsgType::Redirect.max_payload() + 36,
         MsgType::MetaQuery => MsgType::MetaQuery.max_payload() + 36,
         MsgType::SearchOp | MsgType::SearchExecute => MsgType::SearchOp.max_payload() + 36,
+        MsgType::SearchPrepare => MsgType::SearchPrepare.max_payload() + 36,
         MsgType::SearchCatalogQuery => MsgType::SearchCatalogQuery.max_payload() + 36,
         _ => 4 * 1024 + 36,
     }
@@ -292,7 +293,7 @@ impl ZmqServer {
             );
             let _ = reply_tx.try_send(PendingReply {
                 identity,
-                bytes: shed.encode(),
+                bytes: shed.encode().expect("empty reply fits every frame limit"),
                 queued_at: None,
                 queue_stage: None,
                 send_stage: None,
@@ -349,7 +350,17 @@ impl ZmqServer {
                 crate::perf::record_duration(stage, started.elapsed());
             }
             let reply_completed_at = crate::perf::write_path_enabled().then(Instant::now);
-            let bytes = reply.encode();
+            let bytes = reply.encode().unwrap_or_else(|_| {
+                Envelope::new(
+                    reply.cluster_id,
+                    reply.msg_type,
+                    reply.group_id,
+                    reply.request_id,
+                    Vec::new(),
+                )
+                .encode()
+                .expect("empty reply fits every frame limit")
+            });
             let queued_at = crate::perf::write_path_enabled().then(Instant::now);
             if tx
                 .try_send(PendingReply {

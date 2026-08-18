@@ -232,6 +232,9 @@ impl ClientGateway {
         if !request.sort.is_empty() {
             return SearchShardReply::Refused("field sorting is not implemented".into());
         }
+        if let Err(error) = request.query.validate() {
+            return SearchShardReply::Refused(error.to_string());
+        }
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(request.deadline_ms as u64);
         let catalog = self.search_catalog.read().unwrap().clone();

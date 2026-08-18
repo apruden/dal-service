@@ -62,7 +62,7 @@ proptest! {
     ) {
         let group = if is_data { GroupId::Data(partition) } else { GroupId::Meta };
         let e = Envelope::new(cluster, msg_type_of(mt), group, request_id, payload);
-        let decoded = Envelope::decode(&e.encode()).unwrap();
+        let decoded = Envelope::decode(&e.encode().unwrap()).unwrap();
         prop_assert_eq!(e, decoded);
     }
 
@@ -77,7 +77,9 @@ proptest! {
     #[test]
     fn oversize_prefix_rejected(mt in any::<u8>(), over in 1u32..4096) {
         let mt = msg_type_of(mt);
-        let mut bytes = Envelope::new(CID, mt, GroupId::Meta, 0, Vec::new()).encode();
+        let mut bytes = Envelope::new(CID, mt, GroupId::Meta, 0, Vec::new())
+            .encode()
+            .unwrap();
         let claimed = (mt.max_payload() as u32).saturating_add(over);
         bytes[32..36].copy_from_slice(&claimed.to_le_bytes());
         let rejected = matches!(

@@ -178,6 +178,42 @@ fn tantivy_projection_persists_checkpoint_and_searches_stored_identity() {
     );
 }
 
+#[test]
+fn large_stored_hits_are_refused_before_building_an_oversized_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let generation = SearchIndexGeneration::new(9, definition()).unwrap();
+    let index = LocalSearchIndex::open_or_create(dir.path(), GroupId::Data(2), generation).unwrap();
+    let large_title = "x".repeat(dal::search::SEARCH_MAX_FIELD_BYTES);
+    index
+        .rebuild(&SearchSourceSnapshot {
+            epoch: 3,
+            applied: Some(LogId::new(CommittedLeaderId::new(4, 1), 22)),
+            records: vec![(b"doc-1".to_vec(), 17, value(&large_title))],
+            outbox: Vec::new(),
+        })
+        .unwrap();
+
+    let error = index
+        .search(
+            2,
+            &SearchRequest {
+                index: "articles".into(),
+                generation: GenerationSelection::Exact(9),
+                query: SearchQuery::MatchAll,
+                limit: dal::search::SEARCH_MAX_LIMIT,
+                offset: 0,
+                sort: vec![],
+                scoring: ScoringMode::LocalBm25,
+                consistency: SearchConsistency::Eventual,
+                allow_partial: false,
+                deadline_ms: 1_000,
+            },
+            loaded(&index),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("per-hit budget"));
+}
+
 /// I5: a rebuild publishes exactly the documents its snapshot selects.
 ///
 /// `delete_all_documents` only drops committed segments, so adds a failed pass

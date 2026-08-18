@@ -686,7 +686,8 @@ single-partition implementation.
 1. **Types, configuration, and storage.** Define wire types, `NodeId`,
    `ClusterId`, `GroupId`, log entries, `MutationResult`, and validated static
    configuration. Require `P > 0`, `P <= u16::MAX`, `R >= 3`, at least `R`
-   bootstrap nodes, and an odd meta-voter set of at least three.
+   bootstrap nodes, an odd meta-voter set of at least three, and a worst-case
+   routing snapshot that fits the bounded `MetaQuery` frame.
    Implement `cf_log_<group>` / `cf_state_<group>` creation, crash-safe
    `WriteBatch` application, and restart recovery. Test torn-process recovery
    at every write boundary and reject a mismatched cluster id.

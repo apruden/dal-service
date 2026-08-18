@@ -527,6 +527,7 @@ impl LocalSearchIndex {
                 .map_err(search_error)?
         };
         let mut hits = Vec::with_capacity(top.len());
+        let per_hit_budget = crate::search::SEARCH_REPLY_BODY_BUDGET / window.max(1);
         for (score, address) in top {
             let document = searcher
                 .doc::<TantivyDocument>(address)
@@ -541,23 +542,32 @@ impl LocalSearchIndex {
                 .and_then(|value| value.as_u64())
                 .ok_or_else(|| Error::Search("indexed hit is missing stored _version".into()))?;
             let stored_fields = self.read_stored_fields(&document)?;
-            hits.push(SearchHit {
+            let hit = SearchHit {
                 partition,
                 key,
                 version,
                 score: Some(score),
                 sort_values: Vec::new(),
                 stored_fields,
-            });
+            };
+            let hit_bytes = bincode::serialized_size(&hit).map_err(Error::codec)? as usize;
+            if hit_bytes > per_hit_budget {
+                return Err(Error::Search(format!(
+                    "search hit requires {hit_bytes} bytes, exceeding the {per_hit_budget} byte per-hit budget for this result window"
+                )));
+            }
+            hits.push(hit);
         }
-        Ok(crate::search::SearchReply {
+        let reply = crate::search::SearchReply {
             generation: self.generation.id,
             definition_hash: self.generation.definition_hash,
             hits,
             total_hits,
             partial: false,
             failed_partitions: Vec::new(),
-        })
+        };
+        reply.validate_wire_size()?;
+        Ok(reply)
     }
 
     /// Execute a bounded local shard query against one loaded commit, scored
@@ -592,23 +602,10 @@ impl LocalSearchIndex {
     }
 
     fn parse_query(&self, query: &SearchQuery) -> Result<Box<dyn Query>> {
+        query.validate()?;
         match query {
             SearchQuery::MatchAll => Ok(Box::new(AllQuery)),
             SearchQuery::Text { query, fields } => {
-                if query.is_empty() || query.len() > 4 * 1024 {
-                    return Err(Error::Search("text query must be 1..=4096 bytes".into()));
-                }
-                if query.chars().any(|character| {
-                    matches!(
-                        character,
-                        '*' | '?' | '~' | '/' | '[' | ']' | '{' | '}' | ':'
-                    )
-                }) {
-                    return Err(Error::Search(
-                        "wildcard, fuzzy, regex, range, and field-override syntax is disabled"
-                            .into(),
-                    ));
-                }
                 let names = if fields.is_empty() {
                     &self.generation.definition.default_search_fields
                 } else {

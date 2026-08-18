@@ -14,7 +14,9 @@ use serde::Deserialize;
 use crate::config::{InitConfig, NodeConfig, Timeouts, parse_partition_count};
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{BootstrapDescriptor, DirEntry};
-use crate::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
+use crate::types::{
+    ClusterConfig, ClusterId, HashSpec, MAX_ENDPOINT_BYTES, NodeId, PROTOCOL_VERSION,
+};
 
 fn parse_cluster_id(s: &str) -> Result<ClusterId> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
@@ -145,6 +147,12 @@ pub fn load_init_descriptor(path: &Path) -> Result<BootstrapDescriptor> {
     let mut address_owner = std::collections::HashMap::new();
     for entry in &directory {
         for address in [&entry.control_addr, &entry.bulk_addr] {
+            if address.is_empty() || address.len() > MAX_ENDPOINT_BYTES {
+                return Err(Error::Config(format!(
+                    "node {} addresses must be 1..={MAX_ENDPOINT_BYTES} bytes",
+                    entry.node_id
+                )));
+            }
             if let Some(previous) = address_owner.insert(address.as_str(), entry.node_id) {
                 return Err(Error::Config(format!(
                     "nodes {previous} and {} share address {address}",
@@ -249,6 +257,17 @@ mod tests {
                 "cluster_id": "1", "node_id": 1,
                 "control_addr": "tcp://x", "bulk_addr": "tcp://x",
                 "data_dir": "/tmp/d"
+            }"#,
+        );
+        assert!(load_node_config(f.path()).is_err());
+
+        // A zero request timeout would expire every just-sent RPC.
+        let f = write_tmp(
+            r#"{
+                "cluster_id": "1", "node_id": 1,
+                "control_addr": "tcp://a", "bulk_addr": "tcp://b",
+                "data_dir": "/tmp/d",
+                "timeouts": { "suspect_ms": 1000, "down_ms": 5000, "request_ms": 0 }
             }"#,
         );
         assert!(load_node_config(f.path()).is_err());

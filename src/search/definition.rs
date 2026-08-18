@@ -324,6 +324,42 @@ pub enum SearchQuery {
     MatchAll,
 }
 
+impl SearchQuery {
+    /// Validate all request-controlled query shape before a coordinator clones
+    /// or fans it out. Shard parsing repeats this check for direct callers.
+    pub fn validate(&self) -> Result<()> {
+        let SearchQuery::Text { query, fields } = self else {
+            return Ok(());
+        };
+        if query.is_empty() || query.len() > 4 * 1024 {
+            return Err(Error::Search("text query must be 1..=4096 bytes".into()));
+        }
+        if query.chars().any(|character| {
+            matches!(
+                character,
+                '*' | '?' | '~' | '/' | '[' | ']' | '{' | '}' | ':'
+            )
+        }) {
+            return Err(Error::Search(
+                "wildcard, fuzzy, regex, range, and field-override syntax is disabled".into(),
+            ));
+        }
+        if fields.len() > SEARCH_MAX_FIELDS {
+            return Err(Error::Search(format!(
+                "query fields exceed the {SEARCH_MAX_FIELDS} field limit"
+            )));
+        }
+        let mut unique = HashSet::with_capacity(fields.len());
+        for field in fields {
+            validate_name("query field", field)?;
+            if !unique.insert(field) {
+                return Err(Error::Search(format!("duplicate query field {field:?}")));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ScoringMode {
     #[default]
@@ -399,6 +435,19 @@ pub struct SearchReply {
     pub failed_partitions: Vec<PartitionFailure>,
 }
 
+impl SearchReply {
+    pub fn validate_wire_size(&self) -> Result<()> {
+        let bytes = bincode::serialized_size(self).map_err(Error::codec)? as usize;
+        if bytes > crate::search::SEARCH_REPLY_BODY_BUDGET {
+            return Err(Error::Search(format!(
+                "search reply requires {bytes} bytes, exceeding the {} byte response budget; reduce the result window or stored fields",
+                crate::search::SEARCH_REPLY_BODY_BUDGET
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// BM25 inputs measured against one held searcher, or the coordinator's sum of
 /// them (design §9.2). Local BM25 scores are not comparable across partitions
 /// because document frequency and average field length differ per shard; these
@@ -431,6 +480,13 @@ impl ShardStatistics {
             if term.len() > crate::search::SEARCH_MAX_TERM_KEY_BYTES {
                 return Err(Error::Search("statistics term key is too long".into()));
             }
+        }
+        let bytes = bincode::serialized_size(self).map_err(Error::codec)? as usize;
+        if bytes > crate::search::SEARCH_MAX_STATISTICS_BYTES {
+            return Err(Error::Search(format!(
+                "shard statistics require {bytes} bytes, exceeding the {} byte limit",
+                crate::search::SEARCH_MAX_STATISTICS_BYTES
+            )));
         }
         Ok(())
     }
@@ -495,7 +551,7 @@ pub enum ShardPrepareReply {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardExecuteRequest {
     pub session_id: SearchSessionId,
-    pub statistics: ShardStatistics,
+    pub statistics: std::sync::Arc<ShardStatistics>,
 }
 
 /// What a `SearchExecute` frame asks of a held session. A search that fails
@@ -564,5 +620,61 @@ mod tests {
         let mut value = definition();
         value.fields.push(value.fields[0].clone());
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn query_shape_is_bounded_before_fan_out() {
+        let duplicate = SearchQuery::Text {
+            query: "term".into(),
+            fields: vec!["title".into(), "title".into()],
+        };
+        assert!(duplicate.validate().is_err());
+
+        let too_many = SearchQuery::Text {
+            query: "term".into(),
+            fields: (0..=SEARCH_MAX_FIELDS).map(|i| format!("f{i}")).collect(),
+        };
+        assert!(too_many.validate().is_err());
+    }
+
+    #[test]
+    fn oversized_search_reply_is_refused_before_transport_encoding() {
+        let reply = SearchReply {
+            generation: 1,
+            definition_hash: [0; 32],
+            hits: vec![SearchHit {
+                partition: 0,
+                key: vec![0],
+                version: 1,
+                score: Some(1.0),
+                sort_values: Vec::new(),
+                stored_fields: vec![StoredField {
+                    name: "body".into(),
+                    values: vec![SortValue::String(
+                        "x".repeat(crate::search::SEARCH_REPLY_BODY_BUDGET),
+                    )],
+                }],
+            }],
+            total_hits: 1,
+            partial: false,
+            failed_partitions: Vec::new(),
+        };
+        assert!(reply.validate_wire_size().is_err());
+    }
+
+    #[test]
+    fn aggregate_statistics_must_fit_the_prepare_frame() {
+        let statistics = ShardStatistics {
+            total_docs: 1,
+            field_tokens: vec![("title".into(), 1)],
+            term_doc_freq: (0..crate::search::SEARCH_MAX_QUERY_TERMS)
+                .map(|term| {
+                    let mut key = vec![b'x'; 64];
+                    key.extend_from_slice(&term.to_be_bytes());
+                    (key, 1)
+                })
+                .collect(),
+        };
+        assert!(statistics.validate().is_err());
     }
 }

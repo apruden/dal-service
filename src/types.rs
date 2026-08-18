@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// Protocol-wide bounds used to keep the complete routing snapshot representable
+/// in one `MetaQuery` frame. They are enforced both at configuration admission
+/// and by the replicated node-directory state machine.
+pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CLUSTER_NODES: usize = 1024;
+pub const MAX_ENDPOINT_BYTES: usize = 256;
+
 /// Stable node identity, assigned at `join` and never reused.
 pub type NodeId = u64;
 
@@ -215,7 +222,8 @@ impl HashSpec {
 pub struct ClusterConfig {
     pub cluster_id: ClusterId,
     pub protocol_version: u32,
-    /// Fixed partition count, `1..=u16::MAX`.
+    /// Fixed partition count, additionally constrained with `R` so the complete
+    /// worst-case routing snapshot fits one bounded `MetaQuery` frame.
     pub p: u16,
     /// Replication factor, `>= 3`.
     pub r: u8,

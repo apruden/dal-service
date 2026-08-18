@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::api::gateway::{ClientGateway, PartitionMap, RoutingSource, SearchCatalogSource};
 use crate::api::ops::{RoutingInfo, RoutingQuery, SearchCatalogQuery, SearchCatalogReply};
-use crate::config::{NodeConfig, RaftTuning, Timeouts};
+use crate::config::{NodeConfig, RaftTuning, Timeouts, validate_routing_shape};
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
@@ -1753,6 +1753,7 @@ fn bind_authoritative_registration(
 
 fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Result<()> {
     cfg.validate()?;
+    validate_routing_shape(desc.config.p, desc.config.r)?;
     if cfg.cluster_id != desc.cluster_id || desc.config.cluster_id != desc.cluster_id {
         return Err(crate::error::Error::Config(
             "node config and bootstrap descriptor disagree on cluster_id".into(),
@@ -1762,6 +1763,23 @@ fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Res
         return Err(crate::error::Error::Config(format!(
             "bootstrap descriptor protocol version {} is incompatible with runtime version {PROTOCOL_VERSION}",
             desc.config.protocol_version
+        )));
+    }
+    if desc.directory.len() > crate::types::MAX_CLUSTER_NODES {
+        return Err(crate::error::Error::Config(format!(
+            "bootstrap descriptor has more than {} nodes",
+            crate::types::MAX_CLUSTER_NODES
+        )));
+    }
+    if desc.directory.iter().any(|entry| {
+        entry.control_addr.is_empty()
+            || entry.bulk_addr.is_empty()
+            || entry.control_addr.len() > crate::types::MAX_ENDPOINT_BYTES
+            || entry.bulk_addr.len() > crate::types::MAX_ENDPOINT_BYTES
+    }) {
+        return Err(crate::error::Error::Config(format!(
+            "bootstrap descriptor endpoints must be 1..={} bytes",
+            crate::types::MAX_ENDPOINT_BYTES
         )));
     }
     Ok(())

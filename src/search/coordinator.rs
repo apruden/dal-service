@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 
 use crate::error::{Error, Result};
 use crate::search::{
@@ -28,7 +30,7 @@ pub trait ShardSearchSource: Send + Sync {
     fn search(
         &self,
         partition: u16,
-        request: SearchRequest,
+        request: Arc<SearchRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>>;
 
     /// Phase one of global scoring: fence the shard leader, pin a searcher,
@@ -36,14 +38,14 @@ pub trait ShardSearchSource: Send + Sync {
     fn prepare(
         &self,
         partition: u16,
-        request: ShardPrepareRequest,
+        request: Arc<ShardPrepareRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<ShardPrepared>> + Send + '_>>;
 
     /// Phase two: score the pinned searcher with cluster-wide statistics.
     fn execute(
         &self,
         partition: u16,
-        request: ShardExecuteRequest,
+        request: Arc<ShardExecuteRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>>;
 
     /// Abandon a prepared session without scoring it. Best effort: shards
@@ -59,7 +61,7 @@ impl ShardSearchSource for Box<dyn ShardSearchSource> {
     fn search(
         &self,
         partition: u16,
-        request: SearchRequest,
+        request: Arc<SearchRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>> {
         (**self).search(partition, request)
     }
@@ -67,7 +69,7 @@ impl ShardSearchSource for Box<dyn ShardSearchSource> {
     fn prepare(
         &self,
         partition: u16,
-        request: ShardPrepareRequest,
+        request: Arc<ShardPrepareRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<ShardPrepared>> + Send + '_>> {
         (**self).prepare(partition, request)
     }
@@ -75,7 +77,7 @@ impl ShardSearchSource for Box<dyn ShardSearchSource> {
     fn execute(
         &self,
         partition: u16,
-        request: ShardExecuteRequest,
+        request: Arc<ShardExecuteRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>> {
         (**self).execute(partition, request)
     }
@@ -99,6 +101,38 @@ pub struct SearchCoordinator<S> {
 enum Contribution<T> {
     Value(u16, T),
     Failed(PartitionFailure),
+}
+
+struct ReplyAccumulator {
+    window: usize,
+    total_hits: u64,
+    hits: Vec<crate::search::SearchHit>,
+}
+
+impl ReplyAccumulator {
+    fn new(window: u32) -> Self {
+        Self {
+            window: window as usize,
+            total_hits: 0,
+            hits: Vec::new(),
+        }
+    }
+
+    /// Keep only the globally best requested window as shard replies arrive.
+    /// Memory is therefore bounded by one shard reply plus one result window,
+    /// never `partitions * window`.
+    fn add(&mut self, reply: SearchReply) {
+        self.total_hits = self.total_hits.saturating_add(reply.total_hits);
+        self.hits.extend(reply.hits);
+        self.hits.sort_by(hit_order);
+        self.hits.truncate(self.window);
+    }
+}
+
+fn hit_order(left: &crate::search::SearchHit, right: &crate::search::SearchHit) -> Ordering {
+    score_descending(&left.score, &right.score)
+        .then_with(|| left.partition.cmp(&right.partition))
+        .then_with(|| left.key.cmp(&right.key))
 }
 
 impl<S: ShardSearchSource> SearchCoordinator<S> {
@@ -139,6 +173,7 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
         if !request.sort.is_empty() {
             return Err(Error::Search("field sorting is not implemented".into()));
         }
+        request.query.validate()?;
         if request.limit > crate::search::SEARCH_MAX_LIMIT
             || request
                 .offset
@@ -175,33 +210,28 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
         request: &SearchRequest,
         window: u32,
         deadline: tokio::time::Instant,
-    ) -> (Vec<SearchReply>, Vec<PartitionFailure>) {
+    ) -> (ReplyAccumulator, Vec<PartitionFailure>) {
         let mut shard_request = request.clone();
         shard_request.generation = GenerationSelection::Exact(generation.id);
         shard_request.offset = 0;
         shard_request.limit = window;
 
-        let outcomes = self
-            .fan_out(deadline, |partition| {
-                let request = shard_request.clone();
-                async move { self.shards.search(partition, request).await }
-            })
-            .await;
-
-        let mut replies = Vec::new();
-        let mut failures = Vec::new();
-        for outcome in outcomes {
-            match outcome {
+        let shard_request = Arc::new(shard_request);
+        self.fan_out(
+            deadline,
+            |partition| self.shards.search(partition, shard_request.clone()),
+            (ReplyAccumulator::new(window), Vec::new()),
+            |(replies, failures), outcome| match outcome {
                 Contribution::Value(partition, reply) => {
                     match check_identity(generation, partition, &reply) {
-                        Ok(()) => replies.push(reply),
+                        Ok(()) => replies.add(reply),
                         Err(failure) => failures.push(failure),
                     }
                 }
                 Contribution::Failed(failure) => failures.push(failure),
-            }
-        }
-        (replies, failures)
+            },
+        )
+        .await
     }
 
     /// Exact distributed BM25 (design §9.2): collect per-shard statistics from
@@ -213,71 +243,82 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
         request: &SearchRequest,
         window: u32,
         deadline: tokio::time::Instant,
-    ) -> Result<(Vec<SearchReply>, Vec<PartitionFailure>)> {
-        let prepare = ShardPrepareRequest {
+    ) -> Result<(ReplyAccumulator, Vec<PartitionFailure>)> {
+        let prepare = Arc::new(ShardPrepareRequest {
             index: request.index.clone(),
             generation: generation.id,
             definition_hash: generation.definition_hash,
             query: request.query.clone(),
             consistency: request.consistency,
             window,
-        };
-        let prepared = self
-            .fan_out(deadline, |partition| {
-                let prepare = prepare.clone();
-                async move { self.shards.prepare(partition, prepare).await }
-            })
+        });
+        let (sessions, mut rejected_sessions, mut failures, global) = self
+            .fan_out(
+                deadline,
+                |partition| self.shards.prepare(partition, prepare.clone()),
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    ShardStatistics::default(),
+                ),
+                |(sessions, rejected_sessions, failures, global), outcome| match outcome {
+                    Contribution::Value(partition, prepared) => {
+                        if let Err(error) = prepared.statistics.validate() {
+                            rejected_sessions.push((partition, prepared.session_id));
+                            failures.push(PartitionFailure {
+                                partition,
+                                reason: bounded_failure_reason(error.to_string()),
+                            });
+                            return;
+                        }
+                        global.merge(&prepared.statistics);
+                        sessions.push((partition, prepared.session_id));
+                    }
+                    Contribution::Failed(failure) => failures.push(failure),
+                },
+            )
             .await;
 
-        let mut sessions = Vec::new();
-        let mut failures = Vec::new();
-        let mut global = ShardStatistics::default();
-        for outcome in prepared {
-            match outcome {
-                Contribution::Value(partition, prepared) => {
-                    if let Err(error) = prepared.statistics.validate() {
-                        failures.push(PartitionFailure {
-                            partition,
-                            reason: error.to_string(),
-                        });
-                        continue;
-                    }
-                    global.merge(&prepared.statistics);
-                    sessions.push((partition, prepared.session_id));
-                }
-                Contribution::Failed(failure) => failures.push(failure),
-            }
-        }
         // Fail before phase two rather than after: a partition missing from a
         // strict search must not have its statistics folded into scores the
         // client never receives hits for.
         if !failures.is_empty() && !request.allow_partial {
-            self.release_all(&sessions, deadline).await;
+            // Release valid and rejected preparations in one bounded pass so a
+            // slow rejected-session release cannot consume the whole deadline
+            // before healthy sessions are even scheduled.
+            rejected_sessions.extend(sessions);
+            self.release_all(&rejected_sessions, deadline).await;
             return Err(shard_failure(self.partitions, &mut failures));
         }
+        // In partial mode only malformed preparations are abandoned; healthy
+        // sessions continue to phase two.
+        self.release_all(&rejected_sessions, deadline).await;
 
-        let outcomes = self
-            .fan_out_over(sessions, deadline, |(partition, session_id)| {
-                let request = ShardExecuteRequest {
-                    session_id,
-                    statistics: global.clone(),
-                };
-                async move { self.shards.execute(partition, request).await }
-            })
-            .await;
-
-        let mut replies = Vec::new();
-        for outcome in outcomes {
-            match outcome {
-                Contribution::Value(partition, reply) => {
-                    match check_identity(generation, partition, &reply) {
-                        Ok(()) => replies.push(reply),
-                        Err(failure) => failures.push(failure),
+        let global = Arc::new(global);
+        let (replies, failures) = self
+            .fan_out_over(
+                sessions,
+                deadline,
+                |(partition, session_id)| {
+                    let request = Arc::new(ShardExecuteRequest {
+                        session_id,
+                        statistics: global.clone(),
+                    });
+                    self.shards.execute(partition, request)
+                },
+                (ReplyAccumulator::new(window), failures),
+                |(replies, failures), outcome| match outcome {
+                    Contribution::Value(partition, reply) => {
+                        match check_identity(generation, partition, &reply) {
+                            Ok(()) => replies.add(reply),
+                            Err(failure) => failures.push(failure),
+                        }
                     }
-                }
-                Contribution::Failed(failure) => failures.push(failure),
-            }
-        }
+                    Contribution::Failed(failure) => failures.push(failure),
+                },
+            )
+            .await;
         Ok((replies, failures))
     }
 
@@ -289,109 +330,116 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
         sessions: &[(u16, SearchSessionId)],
         deadline: tokio::time::Instant,
     ) {
-        let mut pending = FuturesUnordered::new();
-        for (partition, session_id) in sessions {
-            pending.push(self.shards.release(*partition, *session_id));
-        }
+        let mut pending = stream::iter(sessions.iter().copied())
+            .map(|(partition, session_id)| self.shards.release(partition, session_id))
+            .buffer_unordered(crate::search::SEARCH_MAX_FAN_OUT_CONCURRENCY);
         let drain = async { while pending.next().await.is_some() {} };
         let _ = tokio::time::timeout_at(deadline, drain).await;
     }
 
-    async fn fan_out<T, F, Fut>(
+    async fn fan_out<T, F, Fut, A, C>(
         &self,
         deadline: tokio::time::Instant,
         call: F,
-    ) -> Vec<Contribution<T>>
+        state: A,
+        consume: C,
+    ) -> A
     where
         F: Fn(u16) -> Fut,
         Fut: Future<Output = Result<T>>,
+        C: FnMut(&mut A, Contribution<T>),
     {
-        self.fan_out_over((0..self.partitions).collect(), deadline, |partition| {
-            call(partition)
-        })
+        self.fan_out_over(
+            (0..self.partitions).collect(),
+            deadline,
+            call,
+            state,
+            consume,
+        )
         .await
     }
 
     /// Run one phase against a set of partitions under a shared deadline. A
     /// partition that neither answered nor failed before the deadline is
     /// reported as a timeout, never silently dropped (I11).
-    async fn fan_out_over<I, T, F, Fut>(
+    async fn fan_out_over<I, T, F, Fut, A, C>(
         &self,
         items: Vec<I>,
         deadline: tokio::time::Instant,
         call: F,
-    ) -> Vec<Contribution<T>>
+        mut state: A,
+        mut consume: C,
+    ) -> A
     where
         I: PartitionOf + Copy,
         F: Fn(I) -> Fut,
         Fut: Future<Output = Result<T>>,
+        C: FnMut(&mut A, Contribution<T>),
     {
-        let mut outstanding: Vec<u16> = items.iter().map(|item| item.partition()).collect();
-        let call = &call;
-        let mut pending = FuturesUnordered::new();
-        for item in items {
-            let partition = item.partition();
-            pending.push(async move { (partition, call(item).await) });
-        }
-
-        let mut outcomes = Vec::new();
+        let mut outstanding: BTreeSet<u16> = items.iter().map(|item| item.partition()).collect();
+        let mut pending = stream::iter(items)
+            .map(|item| {
+                let partition = item.partition();
+                let future = call(item);
+                async move { (partition, future.await) }
+            })
+            .buffer_unordered(crate::search::SEARCH_MAX_FAN_OUT_CONCURRENCY);
         let collect = async {
             while let Some((partition, result)) = pending.next().await {
-                outstanding.retain(|waiting| *waiting != partition);
-                outcomes.push(match result {
-                    Ok(value) => Contribution::Value(partition, value),
-                    Err(error) => Contribution::Failed(PartitionFailure {
-                        partition,
-                        reason: error.to_string(),
-                    }),
-                });
+                outstanding.remove(&partition);
+                consume(
+                    &mut state,
+                    match result {
+                        Ok(value) => Contribution::Value(partition, value),
+                        Err(error) => Contribution::Failed(PartitionFailure {
+                            partition,
+                            reason: bounded_failure_reason(error.to_string()),
+                        }),
+                    },
+                );
             }
         };
         if tokio::time::timeout_at(deadline, collect).await.is_err() {
             for partition in outstanding {
-                outcomes.push(Contribution::Failed(PartitionFailure {
-                    partition,
-                    reason: "search deadline exceeded".into(),
-                }));
+                consume(
+                    &mut state,
+                    Contribution::Failed(PartitionFailure {
+                        partition,
+                        reason: "search deadline exceeded".into(),
+                    }),
+                );
             }
         }
-        outcomes
+        state
     }
 
     fn merge(
         &self,
         generation: &SearchIndexGeneration,
         request: &SearchRequest,
-        replies: Vec<SearchReply>,
+        replies: ReplyAccumulator,
         mut failures: Vec<PartitionFailure>,
     ) -> Result<SearchReply> {
         failures.sort_by_key(|failure| failure.partition);
         if !failures.is_empty() && !request.allow_partial {
             return Err(shard_failure(self.partitions, &mut failures));
         }
-        let total_hits = replies.iter().map(|reply| reply.total_hits).sum();
-        let mut hits = replies
-            .into_iter()
-            .flat_map(|reply| reply.hits)
-            .collect::<Vec<_>>();
-        hits.sort_by(|left, right| {
-            score_descending(&left.score, &right.score)
-                .then_with(|| left.partition.cmp(&right.partition))
-                .then_with(|| left.key.cmp(&right.key))
-        });
-        hits = hits
+        let hits = replies
+            .hits
             .into_iter()
             .skip(request.offset as usize)
             .take(request.limit as usize)
             .collect();
-        Ok(SearchReply {
+        let reply = SearchReply {
             generation: generation.id,
             definition_hash: generation.definition_hash,
             hits,
-            total_hits,
+            total_hits: replies.total_hits,
             partial: !failures.is_empty(),
             failed_partitions: failures,
-        })
+        };
+        reply.validate_wire_size()?;
+        Ok(reply)
     }
 }
 
@@ -427,6 +475,20 @@ fn check_identity(
     })
 }
 
+fn bounded_failure_reason(mut reason: String) -> String {
+    let limit = crate::search::SEARCH_MAX_FAILURE_REASON_BYTES;
+    if reason.len() <= limit {
+        return reason;
+    }
+    let mut end = limit.saturating_sub(3);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason.truncate(end);
+    reason.push_str("...");
+    reason
+}
+
 fn shard_failure(partitions: u16, failures: &mut Vec<PartitionFailure>) -> Error {
     failures.sort_by_key(|failure| failure.partition);
     Error::Search(format!(
@@ -450,6 +512,7 @@ mod tests {
     /// shard was scored against one identical set of global statistics.
     struct MockShards {
         failing: HashSet<u16>,
+        invalid_statistics: HashSet<u16>,
         definition_hash: [u8; 32],
         executed: Mutex<Vec<(u16, ShardStatistics)>>,
         released: Mutex<Vec<(u16, SearchSessionId)>>,
@@ -459,10 +522,16 @@ mod tests {
         fn new(failing: &[u16]) -> Self {
             Self {
                 failing: failing.iter().copied().collect(),
+                invalid_statistics: HashSet::new(),
                 definition_hash: generation().definition_hash,
                 executed: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_invalid_statistics(mut self, partitions: &[u16]) -> Self {
+            self.invalid_statistics = partitions.iter().copied().collect();
+            self
         }
     }
 
@@ -470,7 +539,7 @@ mod tests {
         fn search(
             &self,
             _partition: u16,
-            _request: SearchRequest,
+            _request: Arc<SearchRequest>,
         ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>> {
             Box::pin(async { Err(Error::Search("one-shot path unused".into())) })
         }
@@ -478,12 +547,17 @@ mod tests {
         fn prepare(
             &self,
             partition: u16,
-            _request: ShardPrepareRequest,
+            _request: Arc<ShardPrepareRequest>,
         ) -> Pin<Box<dyn Future<Output = Result<ShardPrepared>> + Send + '_>> {
             Box::pin(async move {
                 if self.failing.contains(&partition) {
                     return Err(Error::Search("shard is down".into()));
                 }
+                let term = if self.invalid_statistics.contains(&partition) {
+                    vec![0; crate::search::SEARCH_MAX_TERM_KEY_BYTES + 1]
+                } else {
+                    b"term".to_vec()
+                };
                 Ok(ShardPrepared {
                     session_id: SearchSessionId {
                         incarnation: 7,
@@ -494,7 +568,7 @@ mod tests {
                     statistics: ShardStatistics {
                         total_docs: 10 * (partition as u64 + 1),
                         field_tokens: vec![("title".into(), partition as u64 + 1)],
-                        term_doc_freq: vec![(b"term".to_vec(), partition as u64 + 1)],
+                        term_doc_freq: vec![(term, partition as u64 + 1)],
                     },
                 })
             })
@@ -503,7 +577,7 @@ mod tests {
         fn execute(
             &self,
             partition: u16,
-            request: ShardExecuteRequest,
+            request: Arc<ShardExecuteRequest>,
         ) -> Pin<Box<dyn Future<Output = Result<SearchReply>> + Send + '_>> {
             Box::pin(async move {
                 assert_eq!(request.session_id.incarnation, 7);
@@ -511,7 +585,7 @@ mod tests {
                 self.executed
                     .lock()
                     .unwrap()
-                    .push((partition, request.statistics));
+                    .push((partition, (*request.statistics).clone()));
                 Ok(SearchReply {
                     generation: 5,
                     definition_hash: self.definition_hash,
@@ -666,6 +740,57 @@ mod tests {
         assert_eq!(reply.failed_partitions.len(), 1);
         assert_eq!(reply.failed_partitions[0].partition, 2);
         assert_eq!(reply.hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_prepared_statistics_release_their_session() {
+        let shards = MockShards::new(&[]).with_invalid_statistics(&[1]);
+        let coordinator = SearchCoordinator::new(3, shards).unwrap();
+        let reply = coordinator
+            .search(&generation(), &request(true))
+            .await
+            .unwrap();
+        assert_eq!(reply.failed_partitions.len(), 1);
+        assert_eq!(reply.failed_partitions[0].partition, 1);
+        assert_eq!(
+            coordinator.shards.released.lock().unwrap().as_slice(),
+            &[(
+                (1),
+                SearchSessionId {
+                    incarnation: 7,
+                    sequence: 101,
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_out_never_polls_more_than_the_configured_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = SearchCoordinator::new(200, MockShards::new(&[])).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = coordinator
+            .fan_out(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                |_partition| {
+                    let active = active.clone();
+                    let maximum = maximum.clone();
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, Error>(())
+                    }
+                },
+                0usize,
+                |completed, _| *completed += 1,
+            )
+            .await;
+        assert_eq!(completed, 200);
+        assert!(maximum.load(Ordering::SeqCst) <= crate::search::SEARCH_MAX_FAN_OUT_CONCURRENCY);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec;
-use crate::config::{MIN_META_VOTERS, MIN_REPLICATION};
+use crate::config::{MIN_META_VOTERS, MIN_REPLICATION, validate_routing_shape};
 use crate::error::Result;
 use crate::keyspace;
 use crate::search::{
@@ -21,8 +21,8 @@ use crate::search::{
 };
 use crate::storage::{StateMutation, Storage};
 use crate::types::{
-    ClusterConfig, GroupId, LogId, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId, NodeState,
-    Placement, voter_set,
+    ClusterConfig, GroupId, LogId, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MetaCommand, MovePlan,
+    NodeDirectoryEntry, NodeId, NodeState, Placement, voter_set,
 };
 
 /// Engine identity implied by the legacy search commands that predate an
@@ -255,12 +255,21 @@ impl MetaStateMachine {
         if config.p == 0 {
             return Ok((invalid("P must be non-zero"), vec![]));
         }
+        if let Err(error) = validate_routing_shape(config.p, config.r) {
+            return Ok((invalid(&error.to_string()), vec![]));
+        }
         let mv = voter_set(meta_voters.to_vec());
         if mv.len() != meta_voters.len() {
             return Ok((invalid("duplicate meta voter"), vec![]));
         }
         if mv.len() < MIN_META_VOTERS || mv.len().is_multiple_of(2) {
             return Ok((invalid("meta voters must be an odd set of >= 3"), vec![]));
+        }
+        if mv.len() > MAX_CLUSTER_NODES {
+            return Ok((
+                invalid("meta voter set exceeds the cluster node limit"),
+                vec![],
+            ));
         }
 
         let muts = vec![
@@ -293,13 +302,22 @@ impl MetaStateMachine {
         if control_addr.is_empty() || bulk_addr.is_empty() {
             return Ok((invalid("node addresses must be non-empty"), vec![]));
         }
+        if control_addr.len() > MAX_ENDPOINT_BYTES || bulk_addr.len() > MAX_ENDPOINT_BYTES {
+            return Ok((
+                invalid(&format!(
+                    "node addresses must be <= {MAX_ENDPOINT_BYTES} bytes"
+                )),
+                vec![],
+            ));
+        }
         if control_addr == bulk_addr {
             return Ok((invalid("control_addr and bulk_addr must differ"), vec![]));
         }
         // Endpoint ownership is part of the replicated identity fence. Reject
         // both same-lane and cross-lane collisions so two node ids can never be
         // routed to the same socket.
-        if self.directory(s)?.iter().any(|other| {
+        let directory = self.directory(s)?;
+        if directory.iter().any(|other| {
             other.node_id != node_id
                 && (other.control_addr == control_addr
                     || other.bulk_addr == control_addr
@@ -308,6 +326,16 @@ impl MetaStateMachine {
         }) {
             return Ok((
                 invalid("node addresses are already registered to another node"),
+                vec![],
+            ));
+        }
+        if directory.len() >= MAX_CLUSTER_NODES
+            && !directory.iter().any(|entry| entry.node_id == node_id)
+        {
+            return Ok((
+                invalid(&format!(
+                    "cluster node count must be <= {MAX_CLUSTER_NODES}"
+                )),
                 vec![],
             ));
         }

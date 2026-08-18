@@ -740,7 +740,7 @@ impl<T: Transport> crate::search::ShardSearchSource for ClientShardSource<'_, T>
     fn search(
         &self,
         partition: u16,
-        request: crate::search::SearchRequest,
+        request: std::sync::Arc<crate::search::SearchRequest>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<crate::search::SearchReply>> + Send + '_>,
     > {
@@ -754,7 +754,7 @@ impl<T: Transport> crate::search::ShardSearchSource for ClientShardSource<'_, T>
     fn prepare(
         &self,
         _partition: u16,
-        _request: crate::search::ShardPrepareRequest,
+        _request: std::sync::Arc<crate::search::ShardPrepareRequest>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<crate::search::ShardPrepared>> + Send + '_>,
     > {
@@ -768,7 +768,7 @@ impl<T: Transport> crate::search::ShardSearchSource for ClientShardSource<'_, T>
     fn execute(
         &self,
         _partition: u16,
-        _request: crate::search::ShardExecuteRequest,
+        _request: std::sync::Arc<crate::search::ShardExecuteRequest>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<crate::search::SearchReply>> + Send + '_>,
     > {

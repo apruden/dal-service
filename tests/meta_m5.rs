@@ -151,6 +151,14 @@ fn init_validates_config_and_meta_voters() {
         }),
         MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
     ));
+    // A topology whose worst-case routing snapshot cannot fit MetaQuery.
+    assert!(matches!(
+        m.apply(MetaCommand::ClusterInit {
+            config: config(u16::MAX, 3),
+            meta_voters: vec![1, 2, 3],
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
     // Even meta voter set.
     assert!(matches!(
         m.apply(MetaCommand::ClusterInit {
@@ -217,6 +225,15 @@ fn registration_rejects_addresses_owned_by_another_node() {
         MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
     ));
     assert!(m.node(4).is_none());
+
+    assert!(matches!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 4,
+            control_addr: "c".repeat(dal::types::MAX_ENDPOINT_BYTES + 1),
+            bulk_addr: "b4".into(),
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------

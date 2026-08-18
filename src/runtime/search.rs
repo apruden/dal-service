@@ -644,7 +644,7 @@ impl crate::search::ShardSearchSource for NodeShardSource {
     fn search(
         &self,
         partition: u16,
-        request: SearchRequest,
+        request: std::sync::Arc<SearchRequest>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearchReply>> + Send + '_>> {
         Box::pin(async move { self.search_shard(partition, &request).await })
     }
@@ -652,7 +652,7 @@ impl crate::search::ShardSearchSource for NodeShardSource {
     fn prepare(
         &self,
         partition: u16,
-        request: ShardPrepareRequest,
+        request: std::sync::Arc<ShardPrepareRequest>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ShardPrepared>> + Send + '_>>
     {
         Box::pin(async move { self.prepare_shard(partition, &request).await })
@@ -661,7 +661,7 @@ impl crate::search::ShardSearchSource for NodeShardSource {
     fn execute(
         &self,
         partition: u16,
-        request: ShardExecuteRequest,
+        request: std::sync::Arc<ShardExecuteRequest>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SearchReply>> + Send + '_>> {
         Box::pin(async move { self.execute_shard(partition, &request).await })
     }

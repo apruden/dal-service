@@ -808,6 +808,11 @@ Search work is bounded independently from ordinary client and Raft work:
 - outbox byte/age limits with rebuild fallback;
 - end-to-end deadline propagated to every phase.
 
+The 32 MiB search frame is enforced on both encode and decode. Shards derive a
+per-hit stored-field budget from the requested result window, and coordinators
+retain only the global top window while replies arrive; a result that cannot fit
+is rejected explicitly rather than materialized as an oversized frame.
+
 Timeout alone is not cancellation for arbitrary blocking Tantivy work. Query
 validation and admission are required before entering the blocking pool.
 

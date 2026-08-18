@@ -666,6 +666,11 @@ impl SearchService {
         .await
         .map_err(|error| Error::Search(format!("shard prepare task failed: {error}")))??;
 
+        // Never publish a session whose accompanying statistics violate the
+        // coordinator's wire contract. Otherwise the coordinator must reject
+        // the reply after this replica has already pinned a searcher.
+        statistics.validate()?;
+
         let checkpoint_index = held
             .checkpoint()
             .source_log_id
