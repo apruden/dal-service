@@ -9,7 +9,7 @@
 //! a retry across a leader change applies exactly once (asserted by the M2
 //! sequence records).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,6 +62,9 @@ struct Cache {
     /// Next unused sequence per partition for this client (DESIGN §8.4).
     /// Sequence 0 is never decided, so streams start at 1.
     next_seq: HashMap<u16, Sequence>,
+    /// Partitions whose stream has successfully decided `u64::MAX`. There is no
+    /// representable next sequence; callers must start a new client identity.
+    exhausted_streams: HashSet<u16>,
 }
 
 /// Candidates a redirect advertised, tagged with the placement generation they
@@ -430,6 +433,18 @@ impl<T: Transport> Client<T> {
             )));
         }
 
+        if self
+            .cache
+            .lock()
+            .unwrap()
+            .exhausted_streams
+            .contains(&partition)
+        {
+            return Err(Error::Raft(format!(
+                "mutation sequence space is exhausted for partition {partition}; use a new client_id"
+            )));
+        }
+
         let sequence = self.reserve_sequence(partition);
         pending.insert(
             partition,
@@ -446,7 +461,12 @@ impl<T: Transport> Client<T> {
         let slot = cache.next_seq.entry(partition).or_insert(1);
         // Only advance forward; a late duplicate reply must not rewind.
         if *slot <= decided {
-            *slot = decided + 1;
+            if let Some(next) = decided.checked_add(1) {
+                *slot = next;
+            } else {
+                cache.next_seq.remove(&partition);
+                cache.exhausted_streams.insert(partition);
+            }
         }
     }
 
@@ -1168,5 +1188,28 @@ mod tests {
             client.get(b"key").await.unwrap(),
             Some((7, b"new".to_vec()))
         );
+    }
+
+    #[test]
+    fn deciding_the_last_sequence_exhausts_the_stream_without_overflow() {
+        let client = Client::new(1, 9, Vec::new(), InProcess::<ScriptedServer>::new());
+        client
+            .cache
+            .lock()
+            .unwrap()
+            .next_seq
+            .insert(0, Sequence::MAX);
+        client.commit_sequence(0, Sequence::MAX);
+
+        let error = client
+            .pending_sequence(
+                0,
+                &DataOp::Delete {
+                    key: b"key".to_vec(),
+                    if_version: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("sequence space is exhausted"));
     }
 }

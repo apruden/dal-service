@@ -62,6 +62,12 @@ pub struct RaftTuning {
     pub heartbeat_interval: u64,
 }
 
+/// OpenRaft limits replication batches by entry count rather than encoded
+/// bytes. A single client entry always fits the RaftAppend envelope, while two
+/// or more maximum-sized values may not. Keep production replication batches
+/// at one entry until the network layer supports byte-aware splitting.
+pub const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 1;
+
 impl Default for RaftTuning {
     fn default() -> Self {
         RaftTuning {
@@ -260,6 +266,14 @@ mod tests {
             meta_voters: vec![1, 2, 3],
             hash_spec: HashSpec::CANONICAL,
         }
+    }
+
+    #[test]
+    fn raft_replication_batch_is_safe_for_maximum_client_frames() {
+        use crate::transport::codec::MsgType;
+
+        assert_eq!(RAFT_MAX_PAYLOAD_ENTRIES, 1);
+        assert!(MsgType::ClientOp.max_payload() < MsgType::RaftAppend.max_payload());
     }
 
     #[test]

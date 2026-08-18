@@ -15,6 +15,7 @@ pub mod perf;
 pub mod placement;
 pub mod runtime;
 pub mod search;
+pub(crate) mod snapshot;
 pub mod storage;
 pub mod transport;
 pub mod types;

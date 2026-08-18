@@ -262,6 +262,13 @@ fn snapshot_replace_is_atomic_at_both_crash_boundaries() {
     fail::remove("snapshot_install::after_write");
     assert_eq!(read(&s, b"old"), None);
     assert_eq!(read(&s, b"new"), Some(b"v2".to_vec()));
+
+    // The durable generation pointer, rather than an in-memory cache update,
+    // is authoritative after a process restart.
+    drop(s);
+    let reopened = Storage::open(dir.path()).unwrap();
+    assert_eq!(read(&reopened, b"old"), None);
+    assert_eq!(read(&reopened, b"new"), Some(b"v2".to_vec()));
 }
 
 #[test]

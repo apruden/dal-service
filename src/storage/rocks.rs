@@ -1,10 +1,12 @@
 //! RocksDB handle and per-group column-family lifecycle (DESIGN §6).
 //!
-//! One RocksDB instance per node. Two CFs per Raft group
-//! (`cf_log_<group>` / `cf_state_<group>`) created and dropped on demand; the
-//! default CF holds node-local authority state that must survive both snapshot
-//! install and CF reclamation.
+//! One RocksDB instance per node. Every Raft group has one log CF and one active
+//! state-CF generation; snapshot install fills a new inactive generation and
+//! atomically switches a durable pointer. The default CF holds that pointer and
+//! node-local authority state that must survive snapshot install and reclamation.
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -53,9 +55,144 @@ pub struct Storage {
     db: Arc<Db>,
     profile_options: Option<Options>,
     path: PathBuf,
+    /// The complete state generation visible for each group. Switching this
+    /// cache follows a sync-durable pointer write, so readers see either the old
+    /// complete CF or the new complete CF.
+    active_state_cfs: std::sync::Mutex<HashMap<GroupId, String>>,
+    /// Serializes short CF-generation allocation/switch/drop critical sections.
+    snapshot_lifecycle: std::sync::Mutex<()>,
     /// Serializes consumer registration with outbox pruning so a new backfill
     /// cannot lose a mutation between registration and its source snapshot.
     search_lifecycle: std::sync::Mutex<()>,
+}
+
+/// A point-in-time RocksDB view whose iterator remains valid after the Raft
+/// apply mutex is released.
+pub(crate) struct StateSnapshot<'a> {
+    snapshot: rocksdb::SnapshotWithThreadMode<'a, Db>,
+    cf: Arc<BoundColumnFamily<'a>>,
+}
+
+impl StateSnapshot<'_> {
+    pub(crate) fn write_to(&self, writer: &mut impl Write) -> Result<()> {
+        let records = self
+            .snapshot
+            .iterator_cf(&self.cf, rocksdb::IteratorMode::Start)
+            .map(|item| item.map_err(Error::from));
+        crate::snapshot::encode_records(writer, records)
+    }
+}
+
+/// Incremental builder for a complete, inactive state-CF generation. Nothing
+/// becomes visible until [`StateInstaller::finish`] durably switches the local
+/// generation pointer.
+pub(crate) struct StateInstaller<'a> {
+    storage: &'a Storage,
+    group: GroupId,
+    name: String,
+    batch: rocksdb::WriteBatch,
+    last_key: Option<Vec<u8>>,
+    activated: bool,
+}
+
+impl StateInstaller<'_> {
+    const BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+    pub(crate) fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        if self
+            .last_key
+            .as_ref()
+            .is_some_and(|previous| previous.as_slice() >= key.as_slice())
+        {
+            return Err(Error::Codec(
+                "snapshot state keys must be strictly increasing".into(),
+            ));
+        }
+        let cf = self.storage.db.cf_handle(&self.name).ok_or_else(|| {
+            Error::Corrupt(self.name.clone(), "snapshot staging CF disappeared".into())
+        })?;
+        self.batch.put_cf(&cf, &key, value);
+        self.last_key = Some(key);
+        if self.batch.size_in_bytes() >= Self::BATCH_BYTES {
+            self.flush_batch(false)?;
+        }
+        Ok(())
+    }
+
+    fn flush_batch(&mut self, sync: bool) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.batch);
+        let mut options = WriteOptions::default();
+        options.set_sync(sync);
+        self.storage.db.write_opt(batch, &options)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self, applied_record: &[u8]) -> Result<()> {
+        let cf = self.storage.db.cf_handle(&self.name).ok_or_else(|| {
+            Error::Corrupt(self.name.clone(), "snapshot staging CF disappeared".into())
+        })?;
+        self.batch
+            .put_cf(&cf, keyspace::raft_applied_key(), applied_record);
+        drop(cf);
+        self.flush_batch(false)?;
+        // Every staged chunk must survive before the pointer can expose it.
+        self.storage.db.flush_wal(true)?;
+
+        fail::fail_point!("snapshot_install::before_write", |_| Err(Error::Io(
+            std::io::Error::other("injected crash at snapshot_install::before_write")
+        )));
+
+        let _lifecycle = self.storage.snapshot_lifecycle.lock().unwrap();
+        let mut active = self.storage.active_state_cfs.lock().unwrap();
+        let old_name = self
+            .storage
+            .active_state_cf_name_locked(self.group, &mut active)?;
+        let old_cf = self.storage.db.cf_handle(&old_name);
+        let mut pointer = rocksdb::WriteBatch::default();
+        pointer.put(
+            keyspace::state_cf_pointer_key(self.group),
+            codec::encode(&self.name),
+        );
+        if matches!(self.group, GroupId::Data(_)) {
+            let next_epoch = self
+                .storage
+                .search_projection_epoch(self.group)?
+                .checked_add(1)
+                .ok_or_else(|| Error::Search("search projection epoch exhausted".into()))?;
+            pointer.put(
+                keyspace::search_epoch_key(self.group),
+                codec::encode(&next_epoch),
+            );
+        }
+        self.storage.db.write_opt(pointer, &sync_write())?;
+        active.insert(self.group, self.name.clone());
+        self.activated = true;
+        drop(active);
+        drop(_lifecycle);
+
+        fail::fail_point!("snapshot_install::after_write", |_| Err(Error::Io(
+            std::io::Error::other("injected crash at snapshot_install::after_write")
+        )));
+
+        if old_name != self.name
+            && let Some(old_cf) = old_cf
+        {
+            self.storage.retire_state_cf(&old_name, old_cf)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StateInstaller<'_> {
+    fn drop(&mut self) {
+        self.batch = rocksdb::WriteBatch::default();
+        if !self.activated && self.storage.db.cf_handle(&self.name).is_some() {
+            let _ = self.storage.db.drop_cf(&self.name);
+        }
+    }
 }
 
 fn sync_write() -> WriteOptions {
@@ -128,14 +265,18 @@ impl Storage {
             },
         )?;
         apply_durability.set_failure_hook(durability.failure_hook());
-        Ok(Storage {
+        let storage = Storage {
             durability,
             apply_durability,
             db,
             profile_options: crate::perf::write_path_enabled().then_some(opts),
             path,
+            active_state_cfs: std::sync::Mutex::new(HashMap::new()),
+            snapshot_lifecycle: std::sync::Mutex::new(()),
             search_lifecycle: std::sync::Mutex::new(()),
-        })
+        };
+        storage.cleanup_snapshot_cfs(&existing)?;
+        Ok(storage)
     }
 
     #[cfg(test)]
@@ -336,10 +477,20 @@ impl Storage {
 
     /// Idempotently create both CFs for a group.
     pub fn ensure_group(&self, group: GroupId) -> Result<()> {
-        for name in [group.cf_log(), group.cf_state()] {
-            if self.db.cf_handle(&name).is_none() {
-                self.db.create_cf(&name, &Options::default())?;
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
+        let log_name = group.cf_log();
+        if self.db.cf_handle(&log_name).is_none() {
+            self.db.create_cf(&log_name, &Options::default())?;
+        }
+        let state_name = self.active_state_cf_name(group)?;
+        if self.db.cf_handle(&state_name).is_none() {
+            if state_name != group.cf_state() {
+                return Err(Error::Corrupt(
+                    state_name,
+                    "active snapshot state CF is missing".into(),
+                ));
             }
+            self.db.create_cf(&state_name, &Options::default())?;
         }
         self.apply_durability
             .register(group, self.recovered_raft_applied(group)?);
@@ -350,11 +501,20 @@ impl Storage {
     pub fn drop_group(&self, group: GroupId) -> Result<()> {
         self.apply_durability.begin_close(group);
         self.apply_durability.ensure_drained(group)?;
-        for name in [group.cf_log(), group.cf_state()] {
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
+        self.active_state_cfs.lock().unwrap().remove(&group);
+        let mut names =
+            Db::list_cf(&Options::default(), &self.path).unwrap_or_else(|_| vec!["default".into()]);
+        let state_prefix = format!("{}__snapshot_", group.cf_state());
+        names.retain(|name| {
+            name == &group.cf_log() || name == &group.cf_state() || name.starts_with(&state_prefix)
+        });
+        for name in names {
             if self.db.cf_handle(&name).is_some() {
                 self.db.drop_cf(&name)?;
             }
         }
+        self.delete_local(&keyspace::state_cf_pointer_key(group))?;
         self.apply_durability.remove(group);
         if matches!(group, GroupId::Data(_)) {
             self.delete_local_prefix(&keyspace::search_prefix(group))?;
@@ -472,7 +632,10 @@ impl Storage {
     }
 
     pub fn group_exists(&self, group: GroupId) -> bool {
-        self.db.cf_handle(&group.cf_state()).is_some()
+        self.active_state_cf_name(group)
+            .ok()
+            .and_then(|name| self.db.cf_handle(&name))
+            .is_some()
             && self.db.cf_handle(&group.cf_log()).is_some()
     }
 
@@ -526,9 +689,90 @@ impl Storage {
     }
 
     pub(crate) fn state_cf(&self, group: GroupId) -> Result<Arc<BoundColumnFamily<'_>>> {
+        // Keep the cache lock through `cf_handle`: once an installer switches
+        // the cached name, no later caller can acquire a handle to the retired
+        // generation, allowing it to be dropped after outstanding handles drain.
+        let mut active = self.active_state_cfs.lock().unwrap();
+        let name = self.active_state_cf_name_locked(group, &mut active)?;
         self.db
-            .cf_handle(&group.cf_state())
-            .ok_or_else(|| Error::Corrupt(group.cf_state(), "state CF not open".into()))
+            .cf_handle(&name)
+            .ok_or_else(|| Error::Corrupt(name, "state CF not open".into()))
+    }
+
+    fn active_state_cf_name(&self, group: GroupId) -> Result<String> {
+        let mut active = self.active_state_cfs.lock().unwrap();
+        self.active_state_cf_name_locked(group, &mut active)
+    }
+
+    fn active_state_cf_name_locked(
+        &self,
+        group: GroupId,
+        active: &mut HashMap<GroupId, String>,
+    ) -> Result<String> {
+        if let Some(name) = active.get(&group) {
+            return Ok(name.clone());
+        }
+        let name = self
+            .get_local::<String>(&keyspace::state_cf_pointer_key(group))?
+            .unwrap_or_else(|| group.cf_state());
+        let base = group.cf_state();
+        if name != base && !name.starts_with(&format!("{base}__snapshot_")) {
+            return Err(Error::Corrupt(
+                base,
+                format!("invalid active state CF pointer {name:?}"),
+            ));
+        }
+        active.insert(group, name.clone());
+        Ok(name)
+    }
+
+    fn cleanup_snapshot_cfs(&self, existing: &[String]) -> Result<()> {
+        let mut active_generations = HashSet::new();
+        let mut switched_families = Vec::new();
+        let prefix = keyspace::state_cf_pointer_prefix();
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let active = codec::decode::<String>(&value)?;
+            let token = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|error| Error::Corrupt("state CF pointer".into(), error.to_string()))?;
+            switched_families.push((format!("cf_state_{token}"), active.clone()));
+            active_generations.insert(active);
+        }
+        for name in existing {
+            let belongs_to_switched_family = switched_families.iter().any(|(base, active)| {
+                name != active && (name == base || name.starts_with(&format!("{base}__snapshot_")))
+            });
+            if (name.contains("__snapshot_") && !active_generations.contains(name))
+                || belongs_to_switched_family
+            {
+                self.db.drop_cf(name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_state_cf(&self, name: &str, cf: Arc<BoundColumnFamily<'_>>) -> Result<()> {
+        // `state_cf()` takes the active-name lock through handle acquisition, so
+        // after the pointer switch no new handle to `name` can appear. Wait a
+        // short bounded interval for reads already in progress; if a long scan
+        // still owns the generation, startup cleanup will reclaim it safely.
+        for _ in 0..100 {
+            if Arc::strong_count(&cf) <= 2 {
+                drop(cf);
+                if self.db.cf_handle(name).is_some() {
+                    self.db.drop_cf(name)?;
+                }
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
     }
 
     // Used by the Raft log store (M3).
@@ -793,6 +1037,49 @@ impl Storage {
             out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
+    }
+
+    /// Capture a stable state view in O(1); callers may release the Raft apply
+    /// mutex before streaming its records to disk.
+    pub(crate) fn state_snapshot(&self, group: GroupId) -> Result<StateSnapshot<'_>> {
+        let cf = self.state_cf(group)?;
+        Ok(StateSnapshot {
+            snapshot: self.db.snapshot(),
+            cf,
+        })
+    }
+
+    pub(crate) fn snapshot_temp_dir(&self) -> PathBuf {
+        self.path.join("raft-snapshots")
+    }
+
+    pub(crate) fn begin_state_install(&self, group: GroupId) -> Result<StateInstaller<'_>> {
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
+        let generation = self
+            .get_local::<u64>(&keyspace::state_cf_generation_key(group))?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("snapshot state generation exhausted".into()))?;
+        self.put_local(&keyspace::state_cf_generation_key(group), &generation)?;
+        let name = format!("{}__snapshot_{generation}", group.cf_state());
+        if self.db.cf_handle(&name).is_some() {
+            return Err(Error::Corrupt(
+                name,
+                "new snapshot state generation already exists".into(),
+            ));
+        }
+        self.db.create_cf(&name, &Options::default())?;
+        self.db.cf_handle(&name).ok_or_else(|| {
+            Error::Corrupt(name.clone(), "created snapshot state CF is missing".into())
+        })?;
+        Ok(StateInstaller {
+            storage: self,
+            group,
+            name,
+            batch: rocksdb::WriteBatch::default(),
+            last_key: None,
+            activated: false,
+        })
     }
 
     /// Current local search projection epoch. Epoch one is implicit on stores
@@ -1258,48 +1545,20 @@ impl Storage {
         })
     }
 
-    /// Atomically replace a group's replicated state from a snapshot. Clearing
-    /// the existing keys and writing the replacement happen in one durable
-    /// WriteBatch, so a crash exposes either the old complete state or the new
-    /// complete state—never an empty CF between drop/recreate operations.
-    /// The log CF and node-local authority state are untouched.
+    /// Atomically replace a group's replicated state from a snapshot using a
+    /// bounded staged generation. This compatibility helper accepts an existing
+    /// slice; the Raft path streams records directly into the same installer.
     pub fn install_state(
         &self,
         group: GroupId,
         pairs: &[(Vec<u8>, Vec<u8>)],
         applied_record: &[u8],
     ) -> Result<()> {
-        let cf = self.state_cf(group)?;
-        let mut batch = rocksdb::WriteBatch::default();
-        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item?;
-            batch.delete_cf(&cf, key);
-        }
+        let mut installer = self.begin_state_install(group)?;
         for (k, v) in pairs {
-            batch.put_cf(&cf, k, v);
+            installer.put(k.clone(), v.clone())?;
         }
-        batch.put_cf(&cf, keyspace::raft_applied_key(), applied_record);
-        if matches!(group, GroupId::Data(_)) {
-            let next_epoch = self
-                .search_projection_epoch(group)?
-                .checked_add(1)
-                .ok_or_else(|| Error::Search("search projection epoch exhausted".into()))?;
-            batch.put(
-                keyspace::search_epoch_key(group),
-                codec::encode(&next_epoch),
-            );
-        }
-        fail::fail_point!("snapshot_install::before_write", |_| Err(Error::Io(
-            std::io::Error::other("injected crash at snapshot_install::before_write")
-        )));
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        self.db.write_opt(batch, &wo)?;
-        fail::fail_point!("snapshot_install::after_write", |_| Err(Error::Io(
-            std::io::Error::other("injected crash at snapshot_install::after_write")
-        )));
-        Ok(())
+        installer.finish(applied_record)
     }
 
     fn recovered_raft_applied(&self, group: GroupId) -> Result<Option<RaftLogId>> {

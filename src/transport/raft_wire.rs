@@ -277,6 +277,31 @@ mod tests {
     }
 
     #[test]
+    fn one_maximum_value_entry_fits_the_production_raft_frame() {
+        let req = AppendEntriesRequest::<TypeConfig> {
+            vote: Vote::new_committed(1, 1),
+            prev_log_id: None,
+            entries: vec![Entry {
+                log_id: log_id(1, 1),
+                payload: EntryPayload::Normal(DataRequest {
+                    client_id: 1,
+                    sequence: 1,
+                    op: DataOp::Put {
+                        key: b"k".to_vec(),
+                        value: vec![0; 16 * 1024 * 1024],
+                        if_version: None,
+                    },
+                }),
+            }],
+            leader_commit: None,
+        };
+        assert!(
+            codec::encoded_len(&req) <= crate::transport::codec::MsgType::RaftAppend.max_payload()
+        );
+        assert_eq!(crate::config::RAFT_MAX_PAYLOAD_ENTRIES, 1);
+    }
+
+    #[test]
     fn append_entries_round_trips_for_meta_group() {
         let req = AppendEntriesRequest::<MetaTypeConfig> {
             vote: Vote::new_committed(1, 2),

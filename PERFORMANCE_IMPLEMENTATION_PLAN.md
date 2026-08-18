@@ -598,17 +598,21 @@ A/B showing that any additional queueing improves the durability/latency trade.
 
 ## Phase 6: Stream snapshots and isolate their I/O
 
+Implementation status: the bounded file-backed format, stable RocksDB view,
+bounded OpenRaft chunks, staged-CF install, and atomic generation pointer are
+implemented. Sustained large-dataset latency and memory benchmarks remain part
+of the release qualification suite.
+
 ### Implementation
 
-- Replace full-CF materialization with RocksDB checkpoint/SST-based snapshot
-  production or a bounded streaming format.
+- Use the bounded file-backed snapshot format instead of full-CF materialization.
 - Build snapshots on the storage executor from a stable RocksDB snapshot or
   checkpoint. Do not hold the apply mutex while copying and serializing the
   entire partition.
 - Transfer bounded chunks over the bulk lane and apply explicit I/O and
   concurrency limits so migration does not saturate the device.
-- Install through verified staged files and atomic/restartable SST ingestion,
-  following the journaling design in `IMPLEMENTATION.md` and `DESIGN.md`.
+- Install through verified staged state-CF generations and activate them with a
+  sync-durable pointer, following `IMPLEMENTATION.md` and `DESIGN.md`.
 - Bound memory by chunk size plus fixed metadata, independent of partition
   size.
 - Separate snapshot/compaction metrics from foreground log/apply I/O.

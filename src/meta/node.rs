@@ -104,6 +104,7 @@ impl MetaNode {
             election_timeout_min: tuning.election_timeout_min,
             election_timeout_max: tuning.election_timeout_max,
             heartbeat_interval: tuning.heartbeat_interval,
+            max_payload_entries: crate::config::RAFT_MAX_PAYLOAD_ENTRIES,
             ..Default::default()
         };
         let config = Arc::new(

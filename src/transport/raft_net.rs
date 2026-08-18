@@ -232,6 +232,22 @@ where
     ))))
 }
 
+fn validate_reply_envelope(
+    target: NodeId,
+    reply: &Envelope,
+    cluster_id: ClusterId,
+    msg_type: MsgType,
+    group: GroupId,
+) -> std::io::Result<()> {
+    if reply.cluster_id != cluster_id || reply.msg_type != msg_type || reply.group_id != group {
+        return Err(std::io::Error::other(format!(
+            "node {target}: reply envelope mismatch: expected cluster={cluster_id} type={msg_type:?} group={group:?}, got cluster={} type={:?} group={:?}",
+            reply.cluster_id, reply.msg_type, reply.group_id
+        )));
+    }
+    Ok(())
+}
+
 impl<C, T> RaftNetworkFactory<C> for RaftPeerFactory<T>
 where
     C: RaftTypeConfig<NodeId = NodeId, Node = Node>,
@@ -287,6 +303,14 @@ where
             .call(&addr, env)
             .await
             .map_err(|e| transport_err(self.target, e))?;
+        validate_reply_envelope(
+            self.target,
+            &reply,
+            self.cluster_id,
+            MsgType::RaftAppend,
+            self.group,
+        )
+        .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
         let reply: AppendReply =
             codec::decode(&reply.payload).map_err(|e| bad_reply(self.target, e))?;
         reply.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -316,6 +340,14 @@ where
             .call(&addr, env)
             .await
             .map_err(|e| transport_err(self.target, e))?;
+        validate_reply_envelope(
+            self.target,
+            &reply,
+            self.cluster_id,
+            MsgType::RaftVote,
+            self.group,
+        )
+        .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
         let reply: VoteReply =
             codec::decode(&reply.payload).map_err(|e| bad_reply(self.target, e))?;
         reply.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -348,6 +380,14 @@ where
             .call(&addr, env)
             .await
             .map_err(|e| transport_err(self.target, e))?;
+        validate_reply_envelope(
+            self.target,
+            &reply,
+            self.cluster_id,
+            MsgType::RaftSnapshot,
+            self.group,
+        )
+        .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
         let reply: SnapshotReply =
             codec::decode(&reply.payload).map_err(|e| bad_reply(self.target, e))?;
         reply.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -386,6 +426,25 @@ mod tests {
         }
     }
 
+    struct WrongClusterPeer;
+    impl Server for WrongClusterPeer {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            let req: VoteRequest<NodeId> = codec::decode(&request.payload).unwrap();
+            let reply: VoteReply = Ok(VoteResponse {
+                vote: req.vote,
+                vote_granted: true,
+                last_log_id: None,
+            });
+            Envelope::new(
+                request.cluster_id + 1,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                codec::encode(&reply),
+            )
+        }
+    }
+
     #[tokio::test]
     async fn vote_round_trips_over_transport() {
         let switch = InProcess::new();
@@ -413,6 +472,30 @@ mod tests {
         .unwrap();
         assert!(resp.vote_granted);
         assert_eq!(resp.vote, Vote::new(5, 1));
+    }
+
+    #[tokio::test]
+    async fn raft_reply_from_the_wrong_cluster_is_rejected_before_payload_decode() {
+        let switch = InProcess::new();
+        switch.register("peer-2", Arc::new(WrongClusterPeer));
+        let addrs = AddrBook::new();
+        addrs.set(2, "peer-2".into(), "peer-2-bulk".into());
+        let mut factory =
+            RaftPeerFactory::new(GroupId::Meta, 0x1234, addrs, switch.clone(), switch);
+        let mut peer = <RaftPeerFactory<_> as RaftNetworkFactory<MetaTypeConfig>>::new_client(
+            &mut factory,
+            2,
+            &Node::default(),
+        )
+        .await;
+
+        let result = <RaftPeer<_> as RaftNetwork<MetaTypeConfig>>::vote(
+            &mut peer,
+            VoteRequest::<NodeId>::new(Vote::new(5, 1), None),
+            RPCOption::new(std::time::Duration::from_secs(1)),
+        )
+        .await;
+        assert!(matches!(result, Err(RPCError::Network(_))));
     }
 
     #[tokio::test]

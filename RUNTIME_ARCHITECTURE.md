@@ -35,7 +35,8 @@ reclamation are assembled; remaining items are listed under "Status".
 - One `Storage`/DB per process, **column-family per group**. `RocksLogStore` per
   group holds the raft log; the state machine plus durable control records
   (serving gate, learner admission, bootstrap markers, sequence/idempotency
-  records, snapshots via SST export/ingest) live in `Storage`.
+  records, snapshots via checksummed files and staged state-CF generations) live
+  in `Storage`.
 
 ### 4. Transport planes — built
 - **Control lane** (`control_addr`): small RPCs. Inbound = ZMQ `ROUTER`

@@ -22,7 +22,7 @@ use crate::search::{
 use crate::storage::{StateMutation, Storage};
 use crate::types::{
     ClusterConfig, GroupId, LogId, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MetaCommand, MovePlan,
-    NodeDirectoryEntry, NodeId, NodeState, Placement, voter_set,
+    NodeDirectoryEntry, NodeId, NodeState, PROTOCOL_VERSION, Placement, voter_set,
 };
 
 /// Engine identity implied by the legacy search commands that predate an
@@ -249,6 +249,22 @@ impl MetaStateMachine {
             return Ok((reject(MetaReject::ClusterConflict), vec![]));
         }
 
+        let Some(identity) = s.identity()? else {
+            return Ok((
+                invalid("cluster init requires a bound storage identity"),
+                vec![],
+            ));
+        };
+        if config.cluster_id != identity.cluster_id {
+            return Ok((
+                invalid("cluster_id differs from the storage identity"),
+                vec![],
+            ));
+        }
+        if config.protocol_version != PROTOCOL_VERSION {
+            return Ok((invalid("unsupported protocol version"), vec![]));
+        }
+
         if config.r < MIN_REPLICATION {
             return Ok((invalid("R below minimum"), vec![]));
         }
@@ -430,6 +446,12 @@ impl MetaStateMachine {
         };
         if group == GroupId::Meta {
             return Ok((reject(MetaReject::SeedMetaForbidden), vec![]));
+        }
+        let GroupId::Data(partition) = group else {
+            unreachable!("meta group rejected above")
+        };
+        if partition >= config.p {
+            return Ok((illegal("partition is outside the configured range"), vec![]));
         }
         let vs = voter_set(voters.to_vec());
         if vs.len() != voters.len() {

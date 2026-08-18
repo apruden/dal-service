@@ -151,6 +151,24 @@ fn init_validates_config_and_meta_voters() {
         }),
         MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
     ));
+    let mut wrong_cluster = config(8, 3);
+    wrong_cluster.cluster_id = CID + 1;
+    assert!(matches!(
+        m.apply(MetaCommand::ClusterInit {
+            config: wrong_cluster,
+            meta_voters: vec![1, 2, 3],
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
+    let mut wrong_protocol = config(8, 3);
+    wrong_protocol.protocol_version = PROTOCOL_VERSION + 1;
+    assert!(matches!(
+        m.apply(MetaCommand::ClusterInit {
+            config: wrong_protocol,
+            meta_voters: vec![1, 2, 3],
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
     // A topology whose worst-case routing snapshot cannot fit MetaQuery.
     assert!(matches!(
         m.apply(MetaCommand::ClusterInit {
@@ -269,6 +287,11 @@ fn seed_placement_rules() {
         m.seed(GroupId::Meta, &[1, 2, 3]),
         MetaApplyResult::Rejected(MetaReject::SeedMetaForbidden)
     );
+    assert!(matches!(
+        m.seed(GroupId::Data(8), &[1, 2, 3]),
+        MetaApplyResult::Rejected(MetaReject::IllegalVoterChange(_))
+    ));
+    assert!(m.placement(GroupId::Data(8)).is_none());
 }
 
 // ---------------------------------------------------------------------------

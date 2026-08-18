@@ -158,27 +158,24 @@ create-only; malformed/gapped/stale committed entries advance only
 
 ### M3 — One Raft group (DESIGN §6, §7.4, §8.3, §12.3)
 
-**Scope:** `partition/log_store.rs`, `partition/node.rs`,
-`partition/snapshot.rs`, `ChannelNetwork`.
+**Scope:** `partition/log_store.rs`, `partition/node.rs`, `snapshot.rs`,
+`ChannelNetwork`.
 
 - `RaftLogStorage` over `cf_log_<group>`: append (sync before ack), vote/hard
   state, truncate, purge (only past durable snapshot point), committed
   membership recovery on open.
-- `RaftStateMachine` wraps M2. Snapshot build: sorted scan of
-  `cf_state_<group>` → `SstFileWriter` chunks + manifest (per-file checksums,
-  last-applied `LogId`, membership). The snapshot contains replicated records
+- `RaftStateMachine` wraps M2. Snapshot build captures a point-in-time RocksDB
+  view under the apply mutex, then releases the mutex and streams sorted records
+  into a checksummed temporary file. Memory is bounded by one record, buffered
+  file I/O, and OpenRaft's wire chunk. The snapshot contains replicated records
   only (keys, sequence records, and replicated metadata), never node-local
-  serving/admission state. Install uses a sync-durable journal in the log CF:
-  `Prepared` (verified staged manifest), `Replacing` (old CF may be destroyed),
-  `Ingesting`, and `Installed` (new CF + snapshot metadata + `last_applied`).
-  Before `Replacing`, recovery may discard the stage; at or after `Replacing`,
-  it must recreate a clean CF and finish ingestion from the verified stage.
-  The serving gate remains closed until recovery reaches `Installed`. Multi-SST
-  ingestion is restartable from a clean CF, never resumed over an unknown
-  partial ingest; every journal transition, manifest, and staging directory is
-  fsync-durable before the next destructive action. The final snapshot metadata,
-  `last_applied`, and `Installed` journal transition are one sync-durable
-  RocksDB `WriteBatch` across their CFs.
+  serving/admission state. Install verifies the stream while filling a uniquely
+  named inactive state CF in bounded batches. After its WAL is sync-durable, a
+  sync-durable pointer in the default CF atomically activates the complete
+  generation together with the search projection epoch. The previous generation
+  is retained until outstanding readers drain. Recovery discards unreferenced
+  generations, so the pointer always selects either the old or new complete
+  state without a destructive partial-replace window.
 - `PartitionHandle` — the serving gate as an API: `write(cmd)` →
   `MutationResult` or `NotLeader{hint}`; `read(key)` → `ensure_linearizable()`
   then local get. There is no other path to the state machine.
@@ -188,8 +185,8 @@ create-only; malformed/gapped/stale committed entries advance only
 acknowledged loss; message loss/duplication/reorder; follower restart from
 log; restart from snapshot + suffix log; snapshot install mid-stream crash;
 ReadIndex never returns a stale value while a deposed leader is isolated;
-crash at every snapshot-journal transition (including CF drop and each SST
-ingest) never exposes a partial state machine.
+crash before and after snapshot-generation activation never exposes a partial
+state machine; corrupt/truncated streams never activate.
 
 ### M4 — Transport and client (DESIGN §8, §10, §12.4)
 

@@ -3,9 +3,9 @@
 //! acknowledged loss, follower restart from log, and isolated-old-leader
 //! read safety.
 //!
-//! The full snapshot-journal crash matrix (SST ingest form) is tracked as
-//! remaining M3 work; these tests exercise the log store, state machine,
-//! network, and the ReadIndex serving gate end to end.
+//! Snapshot stream framing/checksum and generation-switch crash boundaries are
+//! covered by the storage and state-machine suites; these tests exercise the
+//! log store, network, recovery, and ReadIndex serving gate end to end.
 
 use std::sync::Arc;
 use std::time::Duration;

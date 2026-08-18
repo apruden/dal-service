@@ -7,7 +7,6 @@
 // box it without immediately unboxing at the trait boundary.
 #![allow(clippy::result_large_err)]
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -69,21 +68,28 @@ impl MetaRaftStateMachine {
     }
 
     async fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
-        let _view = self.state_view.lock().await;
-        let (last_log_id, membership) = self.read_applied()?;
-        if let Some(log_id) = &last_log_id {
-            self.storage
-                .wait_state_durable_for_snapshot(GroupId::Meta, log_id)
-                .await
-                .map_err(|error| {
-                    self.write_failure("meta snapshot durability fence failed", error)
-                })?;
-        }
-        let pairs = self
-            .storage
-            .scan_state(GroupId::Meta)
-            .map_err(|error| self.read_failure("meta snapshot state scan failed", error))?;
-        let data = codec::encode(&pairs);
+        let (last_log_id, membership, state) = {
+            let _view = self.state_view.lock().await;
+            let (last_log_id, membership) = self.read_applied()?;
+            if let Some(log_id) = &last_log_id {
+                self.storage
+                    .wait_state_durable_for_snapshot(GroupId::Meta, log_id)
+                    .await
+                    .map_err(|error| {
+                        self.write_failure("meta snapshot durability fence failed", error)
+                    })?;
+            }
+            let state = self
+                .storage
+                .state_snapshot(GroupId::Meta)
+                .map_err(|error| self.read_failure("meta snapshot state capture failed", error))?;
+            (last_log_id, membership, state)
+        };
+        let snapshot_file =
+            crate::snapshot::SnapshotFile::build(&self.storage.snapshot_temp_dir(), |writer| {
+                state.write_to(writer)
+            })
+            .map_err(|error| self.read_failure("meta snapshot state stream failed", error))?;
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
             None => "empty".to_string(),
@@ -95,7 +101,7 @@ impl MetaRaftStateMachine {
         };
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(snapshot_file),
         })
     }
 }
@@ -172,7 +178,9 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         &mut self,
     ) -> Result<Box<SnapshotData>, StorageError<NodeId>> {
         self.storage.require_healthy().map_err(write_err)?;
-        Ok(Box::new(Cursor::new(Vec::new())))
+        crate::snapshot::SnapshotFile::receiving(&self.storage.snapshot_temp_dir())
+            .map(Box::new)
+            .map_err(write_err)
     }
 
     async fn install_snapshot(
@@ -181,14 +189,20 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
         let _view = self.state_view.lock().await;
-        let bytes = (*snapshot).into_inner();
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = codec::decode(&bytes).map_err(read_err)?;
         self.storage
             .validate_state_install(GroupId::Meta, meta.last_log_id.as_ref())
             .map_err(write_err)?;
+        let mut installer = self
+            .storage
+            .begin_state_install(GroupId::Meta)
+            .map_err(write_err)?;
+        let mut snapshot = *snapshot;
+        crate::snapshot::decode_records(&mut snapshot, |key, value| installer.put(key, value))
+            .await
+            .map_err(|error| self.write_failure("meta snapshot stream/install failed", error))?;
         let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
-        self.storage
-            .install_state(GroupId::Meta, &pairs, &codec::encode(&applied))
+        installer
+            .finish(&codec::encode(&applied))
             .map_err(|error| self.write_failure("meta snapshot state install failed", error))?;
         self.storage
             .record_state_installed(GroupId::Meta, meta.last_log_id);

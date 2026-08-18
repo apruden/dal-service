@@ -261,14 +261,18 @@ Implementation notes:
   database-wide durability worker described below; votes retain direct
   `WriteOptions{ sync: true }` writes. The leader only counts durable replies
   toward commit.
-- **Snapshots** are produced as a manifest of immutable, checksummed SST files
-  plus the exact last-applied `LogId` and membership/config state. Installation
-  stages files in a unique directory, verifies every checksum, fsyncs the
-  manifest and directory, then atomically installs it with the corresponding
-  last-applied state. Install progress is tracked in a sync-durable journal in
-  `cf_log_<group>`, so a crash at any point either resumes the install from
-  the verified stage or discards it — a partially installed state machine is
-  never served. Log truncation is allowed only after that durable snapshot
+- **Snapshots** are produced from a point-in-time RocksDB view as a bounded,
+  checksummed record stream in a temporary file, plus the exact last-applied
+  `LogId` and membership/config state. Creating the RocksDB view is serialized
+  with apply, but copying it is not: foreground apply resumes while the stable
+  view streams to disk. OpenRaft transfers bounded chunks on the bulk lane.
+  Installation verifies framing, ordering, count, and checksum while writing a
+  new inactive state-CF generation in bounded batches. After those writes are
+  durable, one sync-durable default-CF pointer atomically exposes the complete
+  generation (and advances the search projection epoch). A crash before the
+  pointer retains the old complete state and discards the orphan on restart; a
+  crash after it recovers the new complete state. A partially installed state
+  machine is never served. Log truncation remains fenced on the durable snapshot
   point. This is also the mechanism used for learner catch-up.
 - Applying a committed entry (`put`/`delete`) and advancing `last_applied` occur
   in **one atomic `WriteBatch`** against `cf_state_<group>`, so recovery never

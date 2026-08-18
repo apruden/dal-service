@@ -138,6 +138,26 @@ pub fn search_session_incarnation_key() -> Vec<u8> {
     b"local/search_session_incarnation".to_vec()
 }
 
+/// Durable pointer to the complete state-CF generation currently visible for a
+/// group. Absent means the original `cf_state_<group>` generation.
+pub fn state_cf_pointer_key(group: GroupId) -> Vec<u8> {
+    let mut key = b"local/state_cf/".to_vec();
+    key.extend_from_slice(group.token().as_bytes());
+    key
+}
+
+pub fn state_cf_pointer_prefix() -> &'static [u8] {
+    b"local/state_cf/"
+}
+
+/// Monotonic allocator for snapshot staging CF names. It is deliberately kept
+/// after reclamation so a re-admitted group cannot reuse an orphan's name.
+pub fn state_cf_generation_key(group: GroupId) -> Vec<u8> {
+    let mut key = b"local/state_cf_generation/".to_vec();
+    key.extend_from_slice(group.token().as_bytes());
+    key
+}
+
 /// The exact replicated registration used by this process identity.
 pub fn registration_binding_key() -> Vec<u8> {
     b"local/registration_binding".to_vec()
