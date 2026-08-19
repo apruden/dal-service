@@ -276,6 +276,7 @@ impl Storage {
             search_lifecycle: std::sync::Mutex::new(()),
         };
         storage.cleanup_snapshot_cfs(&existing)?;
+        storage.cleanup_snapshot_temp_files();
         Ok(storage)
     }
 
@@ -724,6 +725,31 @@ impl Storage {
         }
         active.insert(group, name.clone());
         Ok(name)
+    }
+
+    /// Discard snapshot scratch files left behind by a previous process.
+    ///
+    /// `SnapshotFile` unlinks its own file on drop, so these only survive a
+    /// crash — but nothing else ever collects them, so without this they
+    /// accumulate across crashes until the disk fills. Every file in this
+    /// directory is scratch owned by whoever is running: the build and receive
+    /// paths both unlink before any durable state refers to them, so none of it
+    /// is load-bearing at open. Best-effort by design — a file that resists
+    /// removal is a disk-space problem, never a correctness one, and must not
+    /// keep the node from starting.
+    fn cleanup_snapshot_temp_files(&self) {
+        let dir = self.snapshot_temp_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "tmp")
+                && let Err(error) = std::fs::remove_file(&path)
+            {
+                tracing::warn!(?path, %error, "failed to remove orphaned snapshot temp file");
+            }
+        }
     }
 
     fn cleanup_snapshot_cfs(&self, existing: &[String]) -> Result<()> {
@@ -1178,6 +1204,23 @@ impl Storage {
             .is_some_and(|state| state.needs_rebuild))
     }
 
+    /// The checkpoint currently recorded for a consumer, which is what pins
+    /// outbox retention — distinct from the checkpoint inside the loaded
+    /// Tantivy commit, which is the projection's own truth (I4). The two are
+    /// equal in steady state and diverge only between a commit and the record
+    /// write that follows it.
+    pub fn search_consumer_checkpoint(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+    ) -> Result<Option<crate::search::IndexCheckpoint>> {
+        let key = keyspace::search_consumer_key(group, name, generation);
+        Ok(self
+            .get_local::<crate::search::SearchConsumerState>(&key)?
+            .and_then(|state| state.checkpoint))
+    }
+
     pub fn record_search_consumer_checkpoint(
         &self,
         group: GroupId,
@@ -1473,8 +1516,20 @@ impl Storage {
                 "search projection requires a data group".into(),
             ));
         }
+        // The state CF handle and the RocksDB snapshot must describe the same
+        // generation. A snapshot install switches the CF pointer and bumps the
+        // projection epoch in one write, so resolving the handle outside this
+        // lock lets an install land in between: the handle would still name the
+        // pre-install CF while the snapshot already reports the post-install
+        // epoch, and the projection would then commit pre-install documents
+        // under the new epoch — accepted by `validate_checkpoint`, violating
+        // both the exact-prefix (I5) and epoch-fence (I8) invariants.
+        //
+        // `StateInstaller::finish` takes these in the same order.
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
         let cf = self.state_cf(group)?;
         let snapshot = self.db.snapshot();
+        drop(_lifecycle);
         let epoch = match snapshot.get(keyspace::search_epoch_key(group))? {
             Some(bytes) => codec::decode(&bytes)?,
             None => 1,

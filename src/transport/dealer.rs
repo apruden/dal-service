@@ -28,13 +28,19 @@ use tokio::sync::oneshot;
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::Envelope;
-use crate::transport::codec::MsgType;
+use crate::transport::codec::{MAX_BULK_FRAME_BYTES, MsgType};
 use crate::types::GroupId;
 
 /// Bounds the burst of not-yet-dispatched requests held for one peer. The I/O
 /// thread drains this almost immediately, so it fills only under extreme load;
 /// a full queue surfaces as a retryable `WouldBlock` to the caller.
 const OUTBOUND_QUEUE_DEPTH: usize = 1024;
+
+/// Inbound reply queue depth for one peer socket. In-flight requests are
+/// already bounded by `OUTBOUND_QUEUE_DEPTH` and the request timeout, so this
+/// only needs to absorb a reply burst without letting a peer stream unbounded
+/// assembled messages into memory.
+const INBOUND_REPLY_HWM: i32 = 256;
 
 /// How often an otherwise-idle I/O thread wakes to expire timed-out requests.
 /// This bounds timeout granularity, not the timeout itself.
@@ -72,24 +78,27 @@ struct PeerConn {
 }
 
 impl PeerConn {
-    fn new(ctx: zmq::Context, addr: String, timeout: Duration) -> PeerConn {
+    /// Fallible because every step here consumes a process-wide resource (file
+    /// descriptors, threads). Exhausting those is a transient operational
+    /// condition the caller can retry, not a reason to abort the process.
+    fn new(ctx: zmq::Context, addr: String, timeout: Duration) -> Result<PeerConn> {
         let wake_id = WAKE_SEQ.fetch_add(1, Ordering::Relaxed);
         let wake_addr = format!("inproc://dal-dealer-wake-{wake_id}");
         // Bind before connect (inproc requires it) so there is no startup race.
-        let signal = ctx.socket(zmq::PAIR).expect("create wake PAIR");
-        signal.bind(&wake_addr).expect("bind wake PAIR");
-        let waker = ctx.socket(zmq::PAIR).expect("create wake sender");
-        waker.connect(&wake_addr).expect("connect wake sender");
+        let signal = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        signal.bind(&wake_addr).map_err(zmq_io)?;
+        let waker = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        waker.connect(&wake_addr).map_err(zmq_io)?;
 
         let (tx, rx) = mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         std::thread::Builder::new()
             .name("zmq-dealer".into())
             .spawn(move || conn_loop(ctx, addr, timeout, signal, rx))
-            .expect("spawn ZeroMQ DEALER connection");
-        PeerConn {
+            .map_err(Error::Io)?;
+        Ok(PeerConn {
             tx,
             waker: Mutex::new(waker),
-        }
+        })
     }
 
     fn submit(&self, out: Outbound) -> Result<()> {
@@ -119,18 +128,18 @@ struct TransportInner {
 }
 
 impl TransportInner {
-    fn peer(&self, addr: &str) -> Arc<PeerConn> {
+    fn peer(&self, addr: &str) -> Result<Arc<PeerConn>> {
         let mut peers = self.peers.lock().unwrap();
-        peers
-            .entry(addr.to_string())
-            .or_insert_with(|| {
-                Arc::new(PeerConn::new(
-                    self.ctx.clone(),
-                    addr.to_string(),
-                    self.timeout,
-                ))
-            })
-            .clone()
+        if let Some(existing) = peers.get(addr) {
+            return Ok(existing.clone());
+        }
+        let conn = Arc::new(PeerConn::new(
+            self.ctx.clone(),
+            addr.to_string(),
+            self.timeout,
+        )?);
+        peers.insert(addr.to_string(), conn.clone());
+        Ok(conn)
     }
 }
 
@@ -162,6 +171,13 @@ fn zmq_io(e: zmq::Error) -> Error {
 fn open_socket(ctx: &zmq::Context, addr: &str) -> Result<zmq::Socket> {
     let socket = ctx.socket(zmq::DEALER).map_err(zmq_io)?;
     socket.set_linger(0).map_err(zmq_io)?;
+    // A peer's reply is remote input too: cap it during assembly rather than
+    // trusting the far side to respect the reply budget. One transport serves
+    // both lanes, so this is the larger of the two caps.
+    socket
+        .set_maxmsgsize(MAX_BULK_FRAME_BYTES as i64)
+        .map_err(zmq_io)?;
+    socket.set_rcvhwm(INBOUND_REPLY_HWM).map_err(zmq_io)?;
     socket.connect(addr).map_err(zmq_io)?;
     Ok(socket)
 }
@@ -329,7 +345,7 @@ impl Transport for ZmqTransport {
         let group_id = request.group_id;
 
         let (tx, rx) = oneshot::channel();
-        self.inner.peer(addr).submit(Outbound {
+        self.inner.peer(addr)?.submit(Outbound {
             id,
             msg_type,
             group_id,

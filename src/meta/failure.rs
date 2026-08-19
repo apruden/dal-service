@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::config::Timeouts;
-use crate::types::{NodeId, NodeState};
+use crate::types::{MAX_CLUSTER_NODES, NodeId, NodeState};
 
 /// Liveness inferred from time since the last heartbeat (DESIGN §9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,12 @@ pub struct HeartbeatTracker {
     unobserved_since_ms: HashMap<NodeId, (u64, u64)>,
 }
 
+/// Ceiling on distinct nodes tracked at once. Heartbeat frames are
+/// unauthenticated and carry a caller-chosen `node_id`, so without this the
+/// maps grow with whatever a peer sends rather than with the cluster. A
+/// legitimate cluster never exceeds [`MAX_CLUSTER_NODES`].
+const MAX_TRACKED_NODES: usize = MAX_CLUSTER_NODES;
+
 impl HeartbeatTracker {
     pub fn new() -> Self {
         HeartbeatTracker::default()
@@ -88,6 +94,13 @@ impl HeartbeatTracker {
     /// fresh stream and only a strictly increasing sequence is accepted. Thus a
     /// clean restart can begin at sequence one while its old process can no
     /// longer refresh liveness.
+    ///
+    /// Once [`MAX_TRACKED_NODES`] distinct nodes are held, an *unknown* node is
+    /// refused rather than evicting an existing one: eviction would clear a
+    /// live node's stamp and restart its grace period, letting a flood of
+    /// synthetic ids push real nodes toward `Down`. Refusing instead caps
+    /// memory while leaving established liveness untouched; [`Self::evaluate`]
+    /// reclaims the slots of nodes the directory no longer lists.
     pub fn observe(
         &mut self,
         node: NodeId,
@@ -96,14 +109,18 @@ impl HeartbeatTracker {
         seq: u64,
         now_ms: u64,
     ) -> bool {
-        if let Some(&(previous_incarnation, previous_process, previous_seq)) =
-            self.last_stamp.get(&node)
-            && (incarnation < previous_incarnation
-                || (incarnation == previous_incarnation
-                    && (process_incarnation < previous_process
-                        || (process_incarnation == previous_process && seq <= previous_seq))))
-        {
-            return false;
+        match self.last_stamp.get(&node) {
+            Some(&(previous_incarnation, previous_process, previous_seq)) => {
+                if incarnation < previous_incarnation
+                    || (incarnation == previous_incarnation
+                        && (process_incarnation < previous_process
+                            || (process_incarnation == previous_process && seq <= previous_seq)))
+                {
+                    return false;
+                }
+            }
+            None if self.last_stamp.len() >= MAX_TRACKED_NODES => return false,
+            None => {}
         }
         self.last_stamp
             .insert(node, (incarnation, process_incarnation, seq));
@@ -152,6 +169,17 @@ impl HeartbeatTracker {
         timeouts: &Timeouts,
         states: &[(NodeId, NodeState, u64)],
     ) -> Vec<(NodeId, NodeState)> {
+        // The committed directory is the authority on which nodes exist, so
+        // anything absent from it is either departed or never real. Dropping
+        // those here is what keeps the `observe` cap from being held down by
+        // ids the cluster has no record of.
+        let known: std::collections::HashSet<NodeId> =
+            states.iter().map(|&(node, _, _)| node).collect();
+        self.last_stamp.retain(|node, _| known.contains(node));
+        self.last_seen_ms.retain(|node, _| known.contains(node));
+        self.unobserved_since_ms
+            .retain(|node, _| known.contains(node));
+
         states
             .iter()
             .filter_map(|&(node, current, incarnation)| {
@@ -189,6 +217,46 @@ mod tests {
         assert!(t.observe(1, 1, 2, 1, 4000));
         // The prior process cannot refresh liveness after that restart.
         assert!(!t.observe(1, 1, 1, 7, 5000));
+    }
+
+    /// Heartbeat frames are unauthenticated and name their own `node_id`, so a
+    /// peer must not be able to grow the tracker past the cluster bound.
+    #[test]
+    fn tracker_refuses_unknown_nodes_past_the_cap() {
+        let mut t = HeartbeatTracker::new();
+        for node in 0..MAX_TRACKED_NODES as u64 {
+            assert!(t.observe(node, 1, 1, 1, 1000));
+        }
+        assert_eq!(t.last_stamp.len(), MAX_TRACKED_NODES);
+
+        // A further distinct id is refused rather than admitted or swapped in.
+        assert!(!t.observe(9_999_999, 1, 1, 1, 2000));
+        assert_eq!(t.last_stamp.len(), MAX_TRACKED_NODES);
+
+        // An already-tracked node still refreshes at capacity, so a flood
+        // cannot stall liveness for nodes that are already established.
+        assert!(t.observe(0, 1, 1, 2, 3000));
+        assert_eq!(t.last_seen_ms.get(&0), Some(&3000));
+    }
+
+    /// Evaluating against the committed directory reclaims slots held by ids
+    /// the cluster does not list, so a flood cannot permanently lock out a
+    /// genuinely new node.
+    #[test]
+    fn evaluate_prunes_nodes_absent_from_the_directory() {
+        let mut t = HeartbeatTracker::new();
+        for node in 0..MAX_TRACKED_NODES as u64 {
+            assert!(t.observe(node, 1, 1, 1, 1000));
+        }
+        assert!(!t.observe(4242, 1, 1, 1, 1000));
+
+        // The directory lists only node 0; everything else was never real.
+        let states = [(0u64, NodeState::Active, 1u64)];
+        t.evaluate(1500, &timeouts(), &states);
+        assert_eq!(t.last_stamp.len(), 1);
+
+        // The freed capacity now admits the new node.
+        assert!(t.observe(4242, 1, 1, 1, 2000));
     }
 
     #[test]

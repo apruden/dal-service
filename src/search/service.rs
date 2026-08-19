@@ -123,63 +123,75 @@ impl SearchService {
         generation: SearchIndexGeneration,
         active: bool,
     ) -> Result<()> {
-        let _lifecycle = self.lifecycle.read().await;
-        let _install = self.install.lock().await;
-        if self.unavailable.read().unwrap().contains(&partition) {
-            return Err(Error::Search(format!(
-                "partition {partition} is closed for search"
-            )));
-        }
-        validate_index_name(name)?;
         let group = GroupId::Data(partition);
-        let path = self
-            .storage
-            .path()
-            .join("search")
-            .join(group.token())
-            .join(name)
-            .join(generation.id.to_string());
         let key = (partition, name.to_string(), generation.id);
         let generation_id = generation.id;
         let definition_hash = generation.definition_hash;
-        // A registered consumer with no checkpoint holds outbox retention for
-        // the whole partition, so every failure past this point must undo
-        // whatever this call created — and only what this call created, since
-        // an earlier healthy install may own the same records.
-        let registration = self
-            .storage
-            .register_search_consumer(group, name, &generation)?;
-        let registered = registration.created;
 
-        let cached = self.loaded.read().unwrap().get(&key).cloned();
-        let (loaded, opened) = match cached {
-            Some(loaded) => {
-                if loaded.index.generation().definition_hash != definition_hash {
-                    self.roll_back(group, name, generation_id, registered, None);
-                    return Err(Error::Search("loaded generation identity mismatch".into()));
-                }
-                (loaded, false)
+        // Open and register under the guards; the backfill below runs without
+        // them.
+        let (loaded, opened, registered, needs_rebuild) = {
+            let _lifecycle = self.lifecycle.read().await;
+            let _install = self.install.lock().await;
+            if self.unavailable.read().unwrap().contains(&partition) {
+                return Err(Error::Search(format!(
+                    "partition {partition} is closed for search"
+                )));
             }
-            None => match self.open(group, &path, name, generation) {
-                Ok(loaded) => {
-                    self.loaded
-                        .write()
-                        .unwrap()
-                        .insert(key.clone(), loaded.clone());
-                    (loaded, true)
+            validate_index_name(name)?;
+            let path = self
+                .storage
+                .path()
+                .join("search")
+                .join(group.token())
+                .join(name)
+                .join(generation.id.to_string());
+            // A registered consumer with no checkpoint holds outbox retention
+            // for the whole partition, so every failure past this point must
+            // undo whatever this call created — and only what this call
+            // created, since an earlier healthy install may own the same
+            // records.
+            let registration = self
+                .storage
+                .register_search_consumer(group, name, &generation)?;
+            let registered = registration.created;
+
+            let cached = self.loaded.read().unwrap().get(&key).cloned();
+            let (loaded, opened) = match cached {
+                Some(loaded) => {
+                    if loaded.index.generation().definition_hash != definition_hash {
+                        self.roll_back(group, name, generation_id, registered, None);
+                        return Err(Error::Search("loaded generation identity mismatch".into()));
+                    }
+                    (loaded, false)
                 }
-                Err(error) => {
-                    self.roll_back(group, name, generation_id, registered, None);
-                    return Err(error);
-                }
-            },
+                None => match self.open(group, &path, name, generation) {
+                    Ok(loaded) => {
+                        self.loaded
+                            .write()
+                            .unwrap()
+                            .insert(key.clone(), loaded.clone());
+                        (loaded, true)
+                    }
+                    Err(error) => {
+                        self.roll_back(group, name, generation_id, registered, None);
+                        return Err(error);
+                    }
+                },
+            };
+            (loaded, opened, registered, registration.needs_rebuild)
         };
 
-        if let Err(error) = loaded
-            .worker
-            .catch_up_rebuilding(registration.needs_rebuild)
-            .await
-        {
+        // A new generation backfills the whole partition, so this await can run
+        // for minutes. Holding the lifecycle guard across it would block every
+        // writer — `forget_partition`, `allow_partition`, `remove_generation` —
+        // and so stall reclamation and rebalance for the same duration. The
+        // worker serializes its own passes, so a concurrent install of this
+        // generation is safe here.
+        let backfill = loaded.worker.catch_up_rebuilding(needs_rebuild).await;
+
+        let _lifecycle = self.lifecycle.read().await;
+        if let Err(error) = backfill {
             self.roll_back(
                 group,
                 name,
@@ -188,6 +200,23 @@ impl SearchService {
                 opened.then_some(key),
             );
             return Err(error);
+        }
+        // Reclamation may have dropped this partition or generation while the
+        // backfill ran unguarded. Publishing now would re-adopt an index the
+        // node no longer hosts, so re-check before touching `active`.
+        if self.unavailable.read().unwrap().contains(&partition)
+            || !self.loaded.read().unwrap().contains_key(&key)
+        {
+            self.roll_back(
+                group,
+                name,
+                generation_id,
+                registered,
+                opened.then_some(key),
+            );
+            return Err(Error::Search(format!(
+                "partition {partition} was closed for search during install"
+            )));
         }
         if active {
             self.active
@@ -599,11 +628,26 @@ impl SearchService {
             }
         };
         let request = request.clone();
+        let pinned_epoch = checkpoint.projection_epoch;
         let reply = tokio::task::spawn_blocking(move || {
             loaded.index.search(partition, &request, checkpoint)
         })
         .await
         .map_err(|error| Error::Search(format!("shard search task failed: {error}")))??;
+
+        // `gate` read the epoch before the searcher was pinned, and pinning
+        // only re-checks that the loaded checkpoint is unchanged — which an
+        // install does not alter, since it replaces the authoritative state
+        // rather than the already-loaded commit. Re-reading here settles it
+        // after the fact: an unchanged epoch proves no install completed before
+        // the pin, so this reply cannot be a previous-epoch commit (I8). The
+        // two-phase path gets the same treatment in `shard_execute`.
+        let epoch = self.storage.search_projection_epoch(node.group())?;
+        if epoch != pinned_epoch {
+            return Err(Error::Search(
+                "snapshot install replaced the projection during this search".into(),
+            ));
+        }
         Ok(ShardSearchOutcome::Reply(reply))
     }
 

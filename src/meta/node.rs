@@ -175,6 +175,35 @@ impl MetaNode {
             .map_err(|e| Error::Raft(format!("add_learner: {e}")))
     }
 
+    /// Drop a node that is only a learner during abort rollback. The absent
+    /// case returns without proposing an unchanged membership entry, so a
+    /// retrying abort cannot grow the meta log while its report is unavailable.
+    pub async fn remove_learner(&self, id: NodeId) -> Result<()> {
+        let membership = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        if !membership.learner_ids().any(|learner| learner == id) {
+            if membership.voter_ids().any(|voter| voter == id) {
+                return Err(Error::Raft(format!(
+                    "remove_learner: node {id} is still a voter"
+                )));
+            }
+            return Ok(());
+        }
+        self.raft
+            .change_membership(
+                openraft::ChangeMembers::<NodeId, Node>::RemoveNodes(std::iter::once(id).collect()),
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("remove_learner: {e}")))
+    }
+
     /// Replace the voter set (openraft `ReplaceAllVoters`); removed voters are
     /// dropped, not retained. Meta-specific policy (replacement or single-voter
     /// removal, floor of three) is enforced by the meta state machine plan

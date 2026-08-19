@@ -561,6 +561,12 @@ impl RootDispatch {
     /// dropped by the tracker; the meta leader's detector loop turns accepted
     /// evidence into `SetNodeState` transitions.
     fn serve_heartbeat(&self, req: Envelope) -> Envelope {
+        // Only the meta leader's detector ever reads this evidence, and it is
+        // reachable only from a node hosting meta. Recording it elsewhere would
+        // accumulate state from unauthenticated frames that nothing consumes.
+        if self.meta().is_none() {
+            return self.reply(&req, Vec::new());
+        }
         if let Ok(body) = codec::decode::<HeartbeatBody>(&req.payload) {
             self.heartbeats.lock().unwrap().observe(
                 body.node_id,

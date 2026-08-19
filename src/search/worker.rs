@@ -136,6 +136,21 @@ impl SearchIndexWorker {
         // whole log id must match, not just the index, so a term change is
         // still recorded.
         if dirty.is_empty() && checkpoint.source_log_id == snapshot.applied {
+            // The Tantivy commit is already correct, but the durable consumer
+            // record may not be: a crash between a commit and the record write
+            // that follows it leaves the retention watermark behind the commit,
+            // and on an idle partition nothing would ever advance it again — so
+            // the outbox stays pinned until the lag budget forces a rebuild.
+            // Re-publishing is cheap; what the early return avoids is the
+            // Tantivy commit and reader reload, not this point read.
+            let durable = self.storage.search_consumer_checkpoint(
+                self.group,
+                &self.name,
+                self.index.generation().id,
+            )?;
+            if durable.as_ref() != Some(&checkpoint) {
+                self.persist_checkpoint_and_prune().await?;
+            }
             return Ok(SearchCatchUp {
                 rebuilt: false,
                 projected_keys: 0,

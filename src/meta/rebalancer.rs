@@ -20,6 +20,24 @@ use crate::types::{
     DataConfigObservation, GroupId, MetaCommand, NodeId, NodeState, Placement, voter_set,
 };
 
+/// A quorum-confirmed reading of the data group's committed configuration.
+///
+/// §7.5 requires every observation these drivers act on to be fenced. Local
+/// Raft metrics are not: a deposed leader still reports the voter set it last
+/// knew, so reporting from them can roll back a move the real leader already
+/// completed, or gate a decision on membership that no longer holds. The
+/// ReadIndex barrier inside `confirmed_committed_config` is what makes the
+/// observation safe to submit.
+async fn confirmed_voters(
+    data_leader: &PartitionNode,
+) -> Result<(
+    Option<crate::types::LogId>,
+    std::collections::BTreeSet<NodeId>,
+)> {
+    let (config_log_id, voters) = data_leader.confirmed_committed_config().await?;
+    Ok((config_log_id, voters.into_iter().collect()))
+}
+
 /// Commit a `CreatePlan` for `group` and return its assigned `plan_id` (the meta
 /// log index of creation — DESIGN §5.2).
 pub async fn create_plan(
@@ -72,7 +90,8 @@ pub async fn execute_move(
 
     // §7.1 gate: the leader re-checks the record against its own committed
     // config before starting or resuming.
-    match gate(&placement, &data_leader.committed_voter_set()) {
+    let (_, gate_voters) = confirmed_voters(data_leader).await?;
+    match gate(&placement, &gate_voters) {
         GateDecision::Accept => {}
         other => return Err(Error::Raft(format!("move gate refused: {other:?}"))),
     }
@@ -109,7 +128,7 @@ async fn finalize(
 ) -> Result<()> {
     let target_set = voter_set(target.to_vec());
     wait_committed(data_leader, &target_set).await?;
-    let (config_log_id, _) = data_leader.committed_config();
+    let (config_log_id, _) = confirmed_voters(data_leader).await?;
     let config_log_id =
         config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
     let observation = DataConfigObservation {
@@ -148,7 +167,7 @@ pub async fn resume_move(
     let Some(plan) = placement.r#move.clone() else {
         return Ok(());
     };
-    let committed = data_leader.committed_voter_set();
+    let (_, committed) = confirmed_voters(data_leader).await?;
 
     match reconcile(&placement, &committed) {
         ReconcileAction::NoPlan => Ok(()),
@@ -208,8 +227,7 @@ pub async fn execute_abort(
 
     let voters = voter_set(placement.voters.clone());
     let target = voter_set(plan.target_voters.clone());
-    let committed = data_leader.committed_voter_set();
-    let (config_log_id, _) = data_leader.committed_config();
+    let (config_log_id, committed) = confirmed_voters(data_leader).await?;
     let config_log_id =
         config_log_id.ok_or_else(|| Error::Raft("committed config has no log id".into()))?;
 
@@ -217,7 +235,8 @@ pub async fn execute_abort(
     // single voter set (§7.5). The abort report always carries exactly `voters`
     // (roll back / clear) or exactly `target_voters` (the move completed before
     // the abort — meta finalizes benignly).
-    let voter_set_report = if committed == voters {
+    let rollback = committed == voters;
+    let voter_set_report = if rollback {
         placement.voters.clone()
     } else if committed == target {
         plan.target_voters.clone()
@@ -226,6 +245,15 @@ pub async fn execute_abort(
             "joint config in flight; leader must complete the change first".into(),
         ));
     };
+
+    // Remove before clearing the plan, while its target still identifies the
+    // learner. `remove_learner` is a true no-op once a previous attempt has
+    // already committed the removal.
+    if rollback {
+        for learner in target.difference(&voters) {
+            data_leader.remove_learner(*learner).await?;
+        }
+    }
 
     let observation = DataConfigObservation {
         group,

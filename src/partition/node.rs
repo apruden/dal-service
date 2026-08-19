@@ -297,6 +297,44 @@ impl PartitionNode {
             .map_err(|e| Error::Raft(format!("add_learner: {e}")))
     }
 
+    /// Drop a node that is only a learner (DESIGN §7.5 step 2, the abort
+    /// rollback). openraft refuses this while the node is still a voter, so an
+    /// abort racing a promotion that already committed cannot strip a voter out
+    /// of the group. Removing an already-absent node is a no-op, which makes
+    /// the caller safe to retry.
+    pub async fn remove_learner(&self, id: NodeId) -> Result<()> {
+        // `ChangeMembers::RemoveNodes` accepts an absent id, but openraft still
+        // commits the resulting (unchanged) membership. Abort reconciliation
+        // retries until meta acknowledges its report, so issuing that command
+        // unconditionally would append a membership entry on every tick during
+        // a meta outage. Inspect the committed membership first to make the
+        // absent case a real no-op. A concurrent promotion is still protected
+        // by openraft's voter check below.
+        let membership = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        if !membership.learner_ids().any(|learner| learner == id) {
+            if membership.voter_ids().any(|voter| voter == id) {
+                return Err(Error::Raft(format!(
+                    "remove_learner: node {id} is still a voter"
+                )));
+            }
+            return Ok(());
+        }
+        self.raft
+            .change_membership(
+                openraft::ChangeMembers::<NodeId, Node>::RemoveNodes(std::iter::once(id).collect()),
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Raft(format!("remove_learner: {e}")))
+    }
+
     /// Change the voter set via joint consensus (DESIGN §7.2 step 4); removed
     /// voters are dropped, not retained.
     pub async fn change_voters(&self, voters: &[NodeId]) -> Result<()> {

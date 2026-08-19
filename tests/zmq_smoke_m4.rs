@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use dal::transport::codec::{Envelope, MsgType};
+use dal::transport::codec::{Envelope, Lane, MsgType};
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::{ZmqServer, settle};
 use dal::transport::{Server, Transport};
@@ -56,7 +56,7 @@ impl Server for Blocking {
 async fn zmq_dealer_router_round_trip() {
     let ctx = zmq::Context::new();
     let addr = "inproc://m4-zmq-smoke";
-    let server = ZmqServer::bind(ctx.clone(), addr, Arc::new(Echo)).unwrap();
+    let server = ZmqServer::bind(ctx.clone(), addr, Arc::new(Echo), Lane::Control).unwrap();
     settle();
 
     let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
@@ -89,6 +89,7 @@ async fn shutdown_yields_while_an_inflight_handler_finishes() {
             started: Mutex::new(Some(started_tx)),
             release: Mutex::new(Some(release_rx)),
         }),
+        Lane::Control,
     )
     .unwrap();
     settle();
@@ -121,4 +122,37 @@ async fn shutdown_yields_while_an_inflight_handler_finishes() {
         .expect("shutdown blocked the current-thread runtime")
         .expect("shutdown task panicked");
     request.abort();
+}
+
+/// `ZmqServer` caps inbound frames with `ZMQ_MAXMSGSIZE` so libzmq refuses an
+/// oversized message during assembly, long before `Envelope::decode` could
+/// reject it. libzmq enforces that in the TCP engine, which is the transport
+/// every production endpoint uses (see the `config.rs` defaults), so the
+/// mechanism is exercised here over TCP rather than the inproc used elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_router_refuses_frames_over_maxmsgsize() {
+    let ctx = zmq::Context::new();
+    let router = ctx.socket(zmq::ROUTER).unwrap();
+    router.set_maxmsgsize(1024).unwrap();
+    router.set_rcvtimeo(1000).unwrap();
+    router.bind("tcp://127.0.0.1:*").unwrap();
+    let endpoint = router.get_last_endpoint().unwrap().unwrap();
+
+    let dealer = ctx.socket(zmq::DEALER).unwrap();
+    dealer.set_linger(0).unwrap();
+    dealer.connect(&endpoint).unwrap();
+
+    // Under the cap: delivered normally.
+    dealer.send(vec![7u8; 512], 0).unwrap();
+    let parts = router
+        .recv_multipart(0)
+        .expect("conforming frame was dropped");
+    assert_eq!(parts.last().unwrap().len(), 512);
+
+    // Over the cap: libzmq drops the peer instead of handing up the message.
+    dealer.send(vec![7u8; 8192], 0).unwrap();
+    assert!(
+        router.recv_multipart(0).is_err(),
+        "oversized frame reached the application despite ZMQ_MAXMSGSIZE",
+    );
 }

@@ -42,7 +42,7 @@ use crate::transport::raft_net::{AddrBook, RaftPeerFactory};
 use crate::transport::router::ZmqServer;
 use crate::transport::{
     Transport,
-    codec::{Envelope, MsgType},
+    codec::{Envelope, Lane, MsgType},
     raft_wire::{
         BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, PlacementQueryBody,
         PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
@@ -587,8 +587,13 @@ impl Node {
             .with_identity_gate(identity_gate.clone()),
         );
 
-        let control_srv = ZmqServer::bind(ctx.clone(), &cfg.control_addr, dispatch.clone())?;
-        let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone())?;
+        let control_srv = ZmqServer::bind(
+            ctx.clone(),
+            &cfg.control_addr,
+            dispatch.clone(),
+            Lane::Control,
+        )?;
+        let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone(), Lane::Bulk)?;
 
         // Control loops: every node beats to every node it knows, so a node
         // promoted to meta voter later already holds liveness evidence; the

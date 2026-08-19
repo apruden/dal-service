@@ -17,6 +17,23 @@ pub const TAG_SEQ: u8 = 0x02;
 /// Tag byte for meta-group records (cluster/directory/placement, M5).
 pub const TAG_META: u8 = 0x03;
 
+/// Length prefix for a name embedded in a key.
+///
+/// Names are length-prefixed so a name containing the delimiter cannot be
+/// confused with a longer one, which only holds while the prefix is exact: a
+/// truncated length would let two different names encode to the same key.
+/// `validate_name` caps every name at `SEARCH_MAX_NAME_BYTES`, orders of
+/// magnitude below the `u32` range, so the truncation is unreachable — this
+/// pins that dependency so it fails loudly in tests if a caller ever encodes a
+/// name that skipped validation.
+fn name_len_prefix(name: &str) -> [u8; 4] {
+    debug_assert!(
+        u32::try_from(name.len()).is_ok(),
+        "name length must fit its u32 key prefix",
+    );
+    (name.len() as u32).to_be_bytes()
+}
+
 /// The single reserved key holding a group's `last_applied` `LogId`.
 pub fn last_applied_key() -> Vec<u8> {
     vec![TAG_INTERNAL, b'L']
@@ -85,7 +102,7 @@ pub fn meta_search_index_prefix() -> [u8; 2] {
 pub fn meta_search_index_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + 4 + name.len());
     key.extend_from_slice(&meta_search_index_prefix());
-    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(&name_len_prefix(name));
     key.extend_from_slice(name.as_bytes());
     key
 }
@@ -93,7 +110,7 @@ pub fn meta_search_index_key(name: &str) -> Vec<u8> {
 pub fn meta_search_ready_prefix(name: &str, generation: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + 4 + name.len() + 8);
     key.extend_from_slice(&[TAG_META, b's']);
-    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(&name_len_prefix(name));
     key.extend_from_slice(name.as_bytes());
     key.extend_from_slice(&generation.to_be_bytes());
     key
@@ -209,7 +226,7 @@ pub fn search_consumer_prefix(group: GroupId) -> Vec<u8> {
 
 pub fn search_consumer_key(group: GroupId, name: &str, generation: u64) -> Vec<u8> {
     let mut key = search_consumer_prefix(group);
-    key.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    key.extend_from_slice(&name_len_prefix(name));
     key.extend_from_slice(name.as_bytes());
     key.extend_from_slice(&generation.to_be_bytes());
     key

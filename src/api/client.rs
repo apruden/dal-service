@@ -467,6 +467,17 @@ impl<T: Transport> Client<T> {
             .await?;
 
         match reply {
+            // A rejection is decided *before* the state machine reaches
+            // `decide`, so it writes no sequence record and leaves `highest`
+            // exactly where it was. Advancing the stream here would leave the
+            // client permanently one ahead of the partition and every later
+            // mutation would fail the sequence gate, wedging the stream for
+            // good. The sequence was never consumed, so release it — the same
+            // treatment a refusal gets.
+            ClientReply::Mutation(WriteReply::Rejected(reason)) => {
+                self.pending.lock().unwrap().remove(&partition);
+                Ok(WriteReply::Rejected(reason))
+            }
             ClientReply::Mutation(w) => {
                 // The mutation is decided: advance the client's stream so the
                 // next mutation uses a fresh sequence (DESIGN §8.4).

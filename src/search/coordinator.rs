@@ -14,6 +14,11 @@ use crate::search::{
     ShardStatistics,
 };
 
+/// Minimum time allowed for handing prepared sessions back, independent of the
+/// request deadline. Small enough to stay negligible against any deadline,
+/// large enough for one round trip to each shard.
+const RELEASE_GRACE: Duration = Duration::from_millis(250);
+
 /// Total descending score order: scored hits before unscored, and NaN handled
 /// via `total_cmp` so the distributed merge stays deterministic (I12).
 fn score_descending(left: &Option<f32>, right: &Option<f32>) -> Ordering {
@@ -324,17 +329,24 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
 
     /// Hand back sessions this query will never execute, so a strict failure
     /// does not leave a pinned searcher on every healthy shard until it times
-    /// out. Bounded by the request's own deadline.
+    /// out.
+    ///
+    /// Releases get a small budget of their own rather than whatever remains of
+    /// the request deadline. The most common way to reach here is that the
+    /// deadline already expired, which would leave zero time to release and
+    /// strand a pinned searcher on every healthy shard for the full session
+    /// TTL — precisely the cost this exists to avoid.
     async fn release_all(
         &self,
         sessions: &[(u16, SearchSessionId)],
         deadline: tokio::time::Instant,
     ) {
+        let budget = deadline.max(tokio::time::Instant::now() + RELEASE_GRACE);
         let mut pending = stream::iter(sessions.iter().copied())
             .map(|(partition, session_id)| self.shards.release(partition, session_id))
             .buffer_unordered(crate::search::SEARCH_MAX_FAN_OUT_CONCURRENCY);
         let drain = async { while pending.next().await.is_some() {} };
-        let _ = tokio::time::timeout_at(deadline, drain).await;
+        let _ = tokio::time::timeout_at(budget, drain).await;
     }
 
     async fn fan_out<T, F, Fut, A, C>(

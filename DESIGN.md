@@ -642,6 +642,33 @@ ZeroMQ gives us framing and reconnection but **not** delivery guarantees, and a
 - Backpressure: bounded send high-water-marks; when a peer is slow, Raft's own
   flow control (inflight limits) plus migration throttling prevent unbounded
   queue growth.
+- Inbound frames are bounded at three layers: `ZMQ_MAXMSGSIZE` per lane limits
+  one message while libzmq assembles it, the ROUTER receive HWM limits queued
+  messages per peer, and a byte semaphore limits decoded frames owned by
+  concurrent handlers. The per-type `max_payload` check in `Envelope::decode`
+  then enforces the protocol limit. `ZMQ_MAXMSGSIZE` is a per-frame bound, not
+  by itself an aggregate process-memory bound.
+
+### 10.4 Trust model
+
+The control plane is **unauthenticated**. Any process that can reach a node's
+control endpoint and knows the `cluster_id` — which every frame on the wire
+carries in clear — can submit mutating operator commands (`JoinRequest`,
+`LeaveRequest`, `AbortPlanRequest`, `SearchIndexAdmin`, `TransferLeadership`)
+as well as heartbeat and observation frames.
+
+v1 therefore assumes the cluster runs on a trusted network with the control and
+bulk ports reachable only by cluster members and operators. That isolation is
+a **safety precondition**, not merely an availability measure: a reachable
+attacker can impersonate Raft peers, and can forge a configuration observation
+whose plan id and target set satisfy the meta state machine even though the
+reported data-Raft membership never committed. Authentication must therefore
+cover all peer/control traffic, including Raft RPCs and observations; protecting
+operator commands alone is insufficient.
+
+Authenticating this entire plane (for example, message authentication over all
+peer/control frames or libzmq CURVE across all sockets) is deliberately
+deferred; see §15.
 
 ---
 
@@ -779,6 +806,10 @@ gate).
 
 ## 15. Open questions / future work
 
+- **Control-plane authentication:** the operator/peer plane is unauthenticated
+  (§10.4). Authentication must cover Raft RPCs, observations, and operator
+  commands, either at the frame level or with libzmq CURVE across all sockets,
+  so the network is no longer the safety boundary.
 - **Load-aware placement:** current placement balances replica counts only; a
   future balancer could move partitions off hot/full nodes (the migration
   mechanism already exists; only the *decision* input changes).

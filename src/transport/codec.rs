@@ -27,6 +27,35 @@ const HEADER_LEN: usize = 36;
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 
+/// The largest encoded envelope each lane may legally carry.
+///
+/// [`MsgType::max_payload`] is enforced inside [`Envelope::decode`], which is
+/// too late to bound memory: libzmq assembles a whole message on the heap
+/// before the frame ever reaches decode. Sockets carry these as
+/// `ZMQ_MAXMSGSIZE` so an oversized frame is refused during assembly
+/// (DESIGN §10.3). `lane_limits_cover_every_msg_type` keeps them in sync with
+/// `max_payload`.
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * MIB + HEADER_LEN;
+pub const MAX_BULK_FRAME_BYTES: usize = 256 * MIB + HEADER_LEN;
+
+/// Which bound endpoint a frame arrives on. The two lanes exist so that large
+/// transfers stay off the control path (DESIGN §10.1), which also means they
+/// warrant very different socket-level size caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Control,
+    Bulk,
+}
+
+impl Lane {
+    pub fn max_frame_bytes(self) -> usize {
+        match self {
+            Lane::Control => MAX_CONTROL_FRAME_BYTES,
+            Lane::Bulk => MAX_BULK_FRAME_BYTES,
+        }
+    }
+}
+
 /// The kinds of message the transport carries (DESIGN §10.2). The `u8` tag is
 /// stable on the wire; never renumber an existing variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +181,13 @@ impl MsgType {
             MsgType::SearchIndexAdmin => crate::search::SEARCH_MAX_DEFINITION_BYTES + 4 * KIB,
             MsgType::TransferLeadership => 4 * KIB,
         }
+    }
+
+    /// Whether this type rides the bulk lane (`bulk_addr`). Only these may
+    /// reach [`MAX_BULK_FRAME_BYTES`]; everything else is held to the much
+    /// smaller control-lane cap.
+    pub fn is_bulk(self) -> bool {
+        matches!(self, MsgType::RaftSnapshot | MsgType::MigrationChunk)
     }
 
     /// Whether this type is peer/operator-control (dispatched on the node
@@ -377,6 +413,30 @@ mod tests {
             42,
             payload,
         )
+    }
+
+    /// The socket-level caps are hand-written constants while `max_payload` is
+    /// per-type; a new or widened type must not silently exceed the cap for
+    /// the lane it lands on, or the socket would drop legal traffic.
+    #[test]
+    fn lane_limits_cover_every_msg_type() {
+        let mut seen = 0;
+        for tag in 0..=u8::MAX {
+            let Some(msg_type) = MsgType::from_u8(tag) else {
+                continue;
+            };
+            seen += 1;
+            let lane = if msg_type.is_bulk() {
+                Lane::Bulk
+            } else {
+                Lane::Control
+            };
+            assert!(
+                msg_type.max_payload() + HEADER_LEN <= lane.max_frame_bytes(),
+                "{msg_type:?} exceeds the {lane:?} lane frame cap",
+            );
+        }
+        assert!(seen > 0, "no message types enumerated");
     }
 
     #[test]

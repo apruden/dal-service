@@ -564,6 +564,67 @@ async fn abort_racing_a_completed_move_finalizes_benignly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn abort_after_add_learner_removes_it_once() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    c.start_data(4).await;
+    let (target, _) = follower_target(&c);
+    let leader = c.data_leader().unwrap();
+
+    let plan_id = create_plan(&c.meta_slice(), GroupId::Data(PART), &target)
+        .await
+        .unwrap();
+    leader.add_learner(4).await.unwrap();
+    let before_abort = leader.committed_config().0.unwrap();
+
+    mark_aborting(&c.meta_slice(), GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    execute_abort(&c.meta_slice(), &leader, GroupId::Data(PART), plan_id)
+        .await
+        .unwrap();
+    let after_abort = leader.committed_config().0.unwrap();
+    assert!(
+        after_abort.index > before_abort.index,
+        "abort must commit removal of the learner"
+    );
+
+    // The retry path must not append an identical membership once the learner
+    // is gone; otherwise a meta outage grows the data log every driver tick.
+    leader.remove_learner(4).await.unwrap();
+    assert_eq!(leader.committed_config().0.unwrap(), after_abort);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn meta_learner_removal_is_safe_and_idempotent() {
+    let mut c = Cluster::new();
+    bootstrap(&mut c).await;
+    ensure_learner_admission(
+        &c.storage(4),
+        &LearnerAdmission {
+            cluster_id: CID,
+            group: GroupId::Meta,
+            plan_id: 0,
+        },
+    )
+    .unwrap();
+    c.start_meta(4).await;
+    let leader = c.meta_leader().unwrap();
+    leader.add_learner(4).await.unwrap();
+    let before_removal = leader.committed_config().0.unwrap();
+
+    leader.remove_learner(4).await.unwrap();
+    let after_removal = leader.committed_config().0.unwrap();
+    assert!(after_removal.index > before_removal.index);
+    leader.remove_learner(4).await.unwrap();
+    assert_eq!(leader.committed_config().0.unwrap(), after_removal);
+    assert!(
+        leader.remove_learner(META_VOTERS[0]).await.is_err(),
+        "learner cleanup must never remove a voter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn cleared_plan_cannot_be_resurrected() {
     let mut c = Cluster::new();
     bootstrap(&mut c).await;

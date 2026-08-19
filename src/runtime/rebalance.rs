@@ -463,7 +463,20 @@ impl RebalanceDriver {
                             .await;
                     }
                 }
-                ReconcileAction::NoPlan | ReconcileAction::Error => {}
+                ReconcileAction::NoPlan => {}
+                // The committed config matches neither `voters`, the joint
+                // config, nor `target_voters`, so no driver step applies and
+                // retrying cannot resolve it. §5.2 wants this visible to an
+                // operator rather than absorbed by a silent tick.
+                ReconcileAction::Error => {
+                    tracing::error!(
+                        ?group,
+                        plan_id = plan.plan_id,
+                        voters = ?placement.voters,
+                        target_voters = ?plan.target_voters,
+                        "reconcile: committed data config matches no plan phase",
+                    );
+                }
             }
         }
     }
@@ -543,7 +556,16 @@ impl RebalanceDriver {
                         .await;
                 }
             }
-            ReconcileAction::NoPlan | ReconcileAction::Error => {}
+            ReconcileAction::NoPlan => {}
+            // As above, but for the meta group's own membership plan.
+            ReconcileAction::Error => {
+                tracing::error!(
+                    plan_id = plan.plan_id,
+                    voters = ?placement.voters,
+                    target_voters = ?plan.target_voters,
+                    "reconcile: committed meta config matches no plan phase",
+                );
+            }
         }
     }
 
@@ -612,7 +634,9 @@ impl RebalanceDriver {
             return;
         };
         let committed = voter_set(committed);
-        let report = if committed == voter_set(placement.voters.clone()) {
+        let voters = voter_set(placement.voters.clone());
+        let rollback = committed == voters;
+        let report = if rollback {
             placement.voters.clone()
         } else if committed == voter_set(plan.target_voters.clone()) {
             plan.target_voters.clone()
@@ -622,6 +646,19 @@ impl RebalanceDriver {
         let Some(config_log_id) = config_log_id else {
             return;
         };
+
+        // The meta group is subject to the same learner leak as a data group:
+        // once the report clears the plan there is no durable target left from
+        // which to derive cleanup. Remove first, and retry the whole operation
+        // if the membership write fails.
+        if rollback {
+            for learner in voter_set(plan.target_voters.clone()).difference(&voters) {
+                if let Err(error) = meta.remove_learner(*learner).await {
+                    tracing::warn!(learner, %error, "failed to remove aborted meta learner");
+                    return;
+                }
+            }
+        }
         let observation = DataConfigObservation {
             group: GroupId::Meta,
             plan_id: plan.plan_id,
@@ -811,7 +848,9 @@ impl RebalanceDriver {
             return;
         };
         let committed = voter_set(committed);
-        let report = if committed == voter_set(placement.voters.clone()) {
+        let voters = voter_set(placement.voters.clone());
+        let rollback = committed == voters;
+        let report = if rollback {
             placement.voters.clone()
         } else if committed == voter_set(plan.target_voters.clone()) {
             plan.target_voters.clone()
@@ -821,6 +860,23 @@ impl RebalanceDriver {
         let Some(config_log_id) = config_log_id else {
             return;
         };
+
+        // §7.5 step 2: on a rollback the leader drops whatever learner the plan
+        // added, or the group keeps replicating forever to a node it will never
+        // promote. This runs before the report because the report clears the
+        // plan, and with it the record of which node to remove. Removing first
+        // is safe: `aborting` is one-way and the §7.1 gate refuses an aborting
+        // plan, so the move cannot resume and reclaim this learner. A failure
+        // just retries on the next tick.
+        if rollback {
+            for learner in voter_set(plan.target_voters.clone()).difference(&voters) {
+                if let Err(error) = node.remove_learner(*learner).await {
+                    tracing::warn!(?group, learner, %error, "failed to remove aborted learner");
+                    return;
+                }
+            }
+        }
+
         let observation = DataConfigObservation {
             group,
             plan_id: plan.plan_id,

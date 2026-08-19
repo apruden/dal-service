@@ -19,7 +19,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use crate::error::{Error, Result};
 use crate::transport::Server;
 use crate::transport::codec::Envelope;
-use crate::transport::codec::MsgType;
+use crate::transport::codec::{Lane, MsgType};
 
 const MAX_HANDLERS: usize = 1024;
 const MAX_CLIENT_HANDLERS: usize = 768;
@@ -28,28 +28,78 @@ const MAX_CLIENT_HANDLERS: usize = 768;
 /// what bounds concurrent client ops, at `REPLY_BUDGET_MIB / 17`. Raise it to
 /// trade resident reply memory for client concurrency.
 const REPLY_BUDGET_MIB: usize = 512;
+/// Ceiling on decoded request frames owned by in-flight handlers on one bound
+/// endpoint. libzmq has already assembled a frame before application admission
+/// runs, but holding this reservation through the request prevents a burst of
+/// large frames from multiplying by `MAX_HANDLERS`.
+const CONTROL_REQUEST_BUDGET_MIB: usize = 512;
+const BULK_REQUEST_BUDGET_MIB: usize = 512;
 const MIB: usize = 1024 * 1024;
+/// Inbound queue depth per connected peer. libzmq buffers whole assembled
+/// messages here before a handler sees them, and a ROUTER silently *drops*
+/// inbound messages once the queue is full.
+///
+/// `ZMQ_MAXMSGSIZE` bounds one assembled frame, the application request budget
+/// bounds frames owned by handlers, and this depth limits queued messages per
+/// peer. The control depth is set for flow control and sized generously against
+/// real traffic: one node multiplexes every Raft group it hosts
+/// (`P` partitions plus meta, so ~129 at the default `P = 128`) onto this one
+/// socket, and a single heartbeat round from one peer is already ~129 frames.
+/// This leaves room for tens of rounds plus concurrent appends, so ordinary
+/// bursts never reach it and Raft never eats a silent drop.
+///
+/// Bulk is the opposite case: frames are 256 MiB, transfers are sequential per
+/// peer, so a shallow per-peer queue is ample depth without multiplying large
+/// queued frames unnecessarily.
+const CONTROL_RECV_HWM: usize = 4096;
+const BULK_RECV_HWM: usize = 4;
 
 struct RouterLimits {
     total_handlers: usize,
     client_handlers: usize,
     reply_budget_mib: usize,
+    request_budget_mib: usize,
+    recv_hwm: usize,
 }
 
 impl RouterLimits {
-    fn from_env() -> Result<Self> {
+    fn from_env(lane: Lane) -> Result<Self> {
         let total_handlers = env_limit("DAL_ROUTER_MAX_HANDLERS", MAX_HANDLERS)?;
         let client_handlers = env_limit("DAL_ROUTER_MAX_CLIENT_HANDLERS", MAX_CLIENT_HANDLERS)?;
         let reply_budget_mib = env_limit("DAL_ROUTER_REPLY_BUDGET_MIB", REPLY_BUDGET_MIB)?;
+        let request_budget_mib = match lane {
+            Lane::Control => env_limit(
+                "DAL_ROUTER_CONTROL_REQUEST_BUDGET_MIB",
+                CONTROL_REQUEST_BUDGET_MIB,
+            )?,
+            Lane::Bulk => env_limit(
+                "DAL_ROUTER_BULK_REQUEST_BUDGET_MIB",
+                BULK_REQUEST_BUDGET_MIB,
+            )?,
+        };
+        let recv_hwm = match lane {
+            Lane::Control => env_limit("DAL_ROUTER_CONTROL_RECV_HWM", CONTROL_RECV_HWM)?,
+            Lane::Bulk => env_limit("DAL_ROUTER_BULK_RECV_HWM", BULK_RECV_HWM)?,
+        };
         if client_handlers >= total_handlers {
             return Err(Error::Config(
                 "DAL_ROUTER_MAX_CLIENT_HANDLERS must be less than DAL_ROUTER_MAX_HANDLERS".into(),
             ));
         }
+        let request_budget_bytes = request_budget_mib
+            .checked_mul(MIB)
+            .ok_or_else(|| Error::Config("DAL_ROUTER_*_REQUEST_BUDGET_MIB is too large".into()))?;
+        if request_budget_bytes < lane.max_frame_bytes() {
+            return Err(Error::Config(format!(
+                "the {lane:?} request budget must fit one maximum-size frame"
+            )));
+        }
         Ok(Self {
             total_handlers,
             client_handlers,
             reply_budget_mib,
+            request_budget_mib,
+            recv_hwm,
         })
     }
 }
@@ -94,24 +144,42 @@ struct PendingReply {
 struct Admission {
     total: Arc<Semaphore>,
     clients: Arc<Semaphore>,
+    request_bytes: Arc<Semaphore>,
     reply_bytes: Arc<Semaphore>,
 }
 
 struct HeldAdmission {
     _total: OwnedSemaphorePermit,
     _client: Option<OwnedSemaphorePermit>,
+    _request_bytes: OwnedSemaphorePermit,
     _reply_bytes: OwnedSemaphorePermit,
 }
 
 impl Admission {
-    fn try_acquire(&self, peer: bool, max_reply_bytes: usize) -> Option<HeldAdmission> {
+    fn try_acquire(
+        &self,
+        peer: bool,
+        request_bytes: usize,
+        max_reply_bytes: usize,
+    ) -> Option<HeldAdmission> {
         let total = self.total.clone().try_acquire_owned().ok()?;
-        let mib = max_reply_bytes.div_ceil(MIB).max(1) as u32;
-        let reply_bytes = self.reply_bytes.clone().try_acquire_many_owned(mib).ok()?;
+        let request_mib = u32::try_from(request_bytes.div_ceil(MIB).max(1)).ok()?;
+        let request_bytes = self
+            .request_bytes
+            .clone()
+            .try_acquire_many_owned(request_mib)
+            .ok()?;
+        let reply_mib = u32::try_from(max_reply_bytes.div_ceil(MIB).max(1)).ok()?;
+        let reply_bytes = self
+            .reply_bytes
+            .clone()
+            .try_acquire_many_owned(reply_mib)
+            .ok()?;
         if peer {
             Some(HeldAdmission {
                 _total: total,
                 _client: None,
+                _request_bytes: request_bytes,
                 _reply_bytes: reply_bytes,
             })
         } else {
@@ -119,6 +187,7 @@ impl Admission {
             Some(HeldAdmission {
                 _total: total,
                 _client: Some(client),
+                _request_bytes: request_bytes,
                 _reply_bytes: reply_bytes,
             })
         }
@@ -186,14 +255,21 @@ impl ZmqServer {
     /// Bind `addr` on a `ROUTER` socket and serve inbound frames with `server`,
     /// spawning handler futures on the current Tokio runtime. Must be called
     /// from within a Tokio runtime (`Handle::current`).
-    pub fn bind<S>(ctx: zmq::Context, addr: &str, server: Arc<S>) -> Result<ZmqServer>
+    pub fn bind<S>(ctx: zmq::Context, addr: &str, server: Arc<S>, lane: Lane) -> Result<ZmqServer>
     where
         S: Server + 'static,
     {
-        let limits = RouterLimits::from_env()?;
+        let limits = RouterLimits::from_env(lane)?;
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
         socket.set_rcvtimeo(1).map_err(zmq_io)?;
+        // Refuse oversized frames during assembly. `Envelope::decode` enforces
+        // the same bound, but only once libzmq has already materialized the
+        // whole message on the heap — far too late to bound memory.
+        socket
+            .set_maxmsgsize(lane.max_frame_bytes() as i64)
+            .map_err(zmq_io)?;
+        socket.set_rcvhwm(limits.recv_hwm as i32).map_err(zmq_io)?;
         socket.bind(addr).map_err(zmq_io)?;
 
         let handle = Handle::current();
@@ -207,6 +283,7 @@ impl ZmqServer {
         let admission = Admission {
             total: Arc::new(Semaphore::new(limits.total_handlers)),
             clients: Arc::new(Semaphore::new(limits.client_handlers)),
+            request_bytes: Arc::new(Semaphore::new(limits.request_budget_mib)),
             reply_bytes: Arc::new(Semaphore::new(limits.reply_budget_mib)),
         };
         let (reply_tx, reply_rx) = mpsc::sync_channel::<PendingReply>(limits.total_handlers);
@@ -277,8 +354,11 @@ impl ZmqServer {
             return;
         };
         let max_reply_bytes = max_reply_bytes(env.msg_type);
-        let Some(permit) = admission.try_acquire(env.msg_type.is_peer_control(), max_reply_bytes)
-        else {
+        let Some(permit) = admission.try_acquire(
+            env.msg_type.is_peer_control(),
+            payload.len(),
+            max_reply_bytes,
+        ) else {
             ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             // Shed loudly: an empty-bodied reply carries no outcome, so the
             // caller treats it as "this node is not participating" and moves to
@@ -301,6 +381,9 @@ impl ZmqServer {
             });
             return;
         };
+        // `Envelope::decode` owns its payload. Release the original ZMQ frame
+        // before scheduling so only the byte-budgeted copy remains resident.
+        drop(payload);
         let profile_class = crate::perf::write_path_enabled()
             .then(|| crate::perf::transport_profile_class(env.msg_type, env.group_id))
             .flatten();
@@ -456,39 +539,55 @@ pub fn settle() {
 mod tests {
     use super::*;
 
-    fn admission(total: usize, clients: usize, reply_mib: usize) -> Admission {
+    fn admission(total: usize, clients: usize, request_mib: usize, reply_mib: usize) -> Admission {
         Admission {
             total: Arc::new(Semaphore::new(total)),
             clients: Arc::new(Semaphore::new(clients)),
+            request_bytes: Arc::new(Semaphore::new(request_mib)),
             reply_bytes: Arc::new(Semaphore::new(reply_mib)),
         }
     }
 
     #[test]
     fn peer_control_uses_capacity_reserved_from_clients() {
-        let admission = admission(2, 1, 8);
+        let admission = admission(2, 1, 8, 8);
         let client = admission
-            .try_acquire(false, 1)
+            .try_acquire(false, 1, 1)
             .expect("first client admitted");
-        assert!(admission.try_acquire(false, 1).is_none());
+        assert!(admission.try_acquire(false, 1, 1).is_none());
 
         let peer = admission
-            .try_acquire(true, 1)
+            .try_acquire(true, 1, 1)
             .expect("peer control must use reserved capacity");
-        assert!(admission.try_acquire(true, 1).is_none());
+        assert!(admission.try_acquire(true, 1, 1).is_none());
         drop(peer);
         drop(client);
-        assert!(admission.try_acquire(false, 1).is_some());
+        assert!(admission.try_acquire(false, 1, 1).is_some());
     }
 
     #[test]
     fn reply_byte_reservation_is_held_until_admission_drops() {
-        let admission = admission(2, 2, 2);
+        let admission = admission(2, 2, 8, 2);
         let held = admission
-            .try_acquire(false, 2 * MIB)
+            .try_acquire(false, 1, 2 * MIB)
             .expect("two-MiB reservation admitted");
-        assert!(admission.try_acquire(false, 1).is_none());
+        assert!(admission.try_acquire(false, 1, 1).is_none());
         drop(held);
-        assert!(admission.try_acquire(false, 1).is_some());
+        assert!(admission.try_acquire(false, 1, 1).is_some());
+    }
+
+    #[test]
+    fn request_byte_reservation_bounds_large_inflight_frames() {
+        let admission = admission(3, 3, 3, 8);
+        let held = admission
+            .try_acquire(false, 2 * MIB, 1)
+            .expect("two-MiB request admitted");
+        assert!(
+            admission.try_acquire(false, 2 * MIB, 1).is_none(),
+            "request budget must reject a frame that would exceed it"
+        );
+        assert!(admission.try_acquire(false, MIB, 1).is_some());
+        drop(held);
+        assert!(admission.try_acquire(false, 2 * MIB, 1).is_some());
     }
 }

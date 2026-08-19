@@ -38,6 +38,28 @@ fn eligible_nodes(directory: &[NodeDirectoryEntry]) -> BTreeSet<NodeId> {
         .collect()
 }
 
+/// Nodes whose replicas must be moved elsewhere: `Draining` for a graceful
+/// decommission (§7.3a) and `Down` for a sudden failure (§7.3b).
+///
+/// This is deliberately narrower than the inverse of [`eligible_nodes`].
+/// `Suspect` bars a node from *receiving* new replicas, but it is a transient
+/// classification that one fresh heartbeat clears (§9.1) — evacuating on it
+/// would drain a merely slow node and re-place it on every flap. A voter the
+/// directory does not list at all is still evacuated: it can host no replica
+/// the cluster knows about.
+fn evacuating_voters(directory: &[NodeDirectoryEntry], voters: &[NodeId]) -> BTreeSet<NodeId> {
+    voters
+        .iter()
+        .copied()
+        .filter(
+            |voter| match directory.iter().find(|e| e.node_id == *voter) {
+                Some(entry) => matches!(entry.state, NodeState::Down | NodeState::Draining),
+                None => true,
+            },
+        )
+        .collect()
+}
+
 /// Anticipated replica load per node. A healthy move already reserves capacity
 /// at its target voter set even though the placement record's durable `voters`
 /// field remains the old set until finalization. Counting the old set here lets
@@ -92,11 +114,8 @@ pub fn propose(
             continue;
         }
         let voters: BTreeSet<NodeId> = placement.voters.iter().copied().collect();
-        if let Some(&drop) = placement
-            .voters
-            .iter()
-            .filter(|v| !eligible.contains(v))
-            .min()
+        let evacuating = evacuating_voters(directory, &placement.voters);
+        if let Some(&drop) = evacuating.iter().min()
             && let Some(dest) = least_loaded_non_replica(&eligible, &voters, &load_of)
         {
             return Some(replacement(
@@ -228,6 +247,32 @@ mod tests {
         let dir = active(&[1, 2]);
         let pl = map(&[(0, &[1, 2, 3])]);
         assert_eq!(propose(&dir, &pl, 3), None);
+    }
+
+    /// `Suspect` is transient — a single heartbeat clears it (§9.1) — so it
+    /// bars a node from receiving replicas without evacuating the ones it has.
+    /// Draining on it would re-place every replica each time a node flaps.
+    #[test]
+    fn suspect_voter_is_not_drained() {
+        let mut dir = active(&[1, 2, 4]);
+        dir.push(node(3, NodeState::Suspect));
+        let pl = map(&[(0, &[1, 2, 3])]);
+        assert_eq!(propose(&dir, &pl, 3), None);
+
+        // The same node held Down does move, so this is about the state and not
+        // about the partition being unmovable.
+        let mut down = active(&[1, 2, 4]);
+        down.push(node(3, NodeState::Down));
+        assert_eq!(propose(&down, &pl, 3).unwrap().target_voters, vec![1, 2, 4]);
+    }
+
+    /// A voter the directory does not list at all cannot be reasoned about, so
+    /// it is still evacuated even though it is not `Down`.
+    #[test]
+    fn voter_missing_from_the_directory_is_drained() {
+        let dir = active(&[1, 2, 4]);
+        let pl = map(&[(0, &[1, 2, 9])]);
+        assert_eq!(propose(&dir, &pl, 3).unwrap().target_voters, vec![1, 2, 4]);
     }
 
     #[test]
