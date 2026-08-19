@@ -15,6 +15,7 @@ use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
 use dal::runtime::node::Node;
 use dal::search::{FieldKind, PathSegment, SearchField, SearchIndexDefinition};
 use dal::transport::Transport;
+use dal::transport::codec::Lane;
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::settle;
 use dal::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
@@ -166,7 +167,7 @@ async fn draining_a_node_migrates_its_partition() {
     let leader = leader.expect("partition 0 never elected a leader");
     let victim = *[1u64, 2, 3].iter().find(|&&v| v != leader).unwrap();
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
         CID,
         MsgType::LeaveRequest,
@@ -315,7 +316,7 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
         .await
         .unwrap();
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
         CID,
         MsgType::LeaveRequest,
@@ -413,7 +414,7 @@ async fn become_learner_requires_a_live_plan() {
     settle();
     assert!(!node.hosts_partition(0), "node 4 should host nothing yet");
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(6));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(6), Lane::Control);
     let admit = || async {
         let env = Envelope::new(
             CID,
@@ -517,7 +518,7 @@ async fn non_meta_voter_data_leader_drives_a_move() {
     );
     let victim = *[4u64, 5, 6].iter().find(|&&v| v != leader).unwrap();
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
         CID,
         MsgType::LeaveRequest,
@@ -787,7 +788,7 @@ async fn three_node_cluster_serves_a_client_op() {
     }
 
     // Client over the real ZMQ transport, seeded with every node's control addr.
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let client = Client::new(
         CID,
         1,
@@ -862,7 +863,7 @@ async fn operator_cli_commands_query_and_mutate_the_cluster() {
             .iter()
             .map(|id| format!("inproc://m8-ctrl-{id}"))
             .collect(),
-        ZmqTransport::new(ctx.clone(), Duration::from_secs(2)),
+        ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control),
     );
     assert!(client.search_index("articles").await.unwrap().is_some());
     assert_eq!(
@@ -1133,7 +1134,7 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
     let leader = leader.expect("partition 0 never elected a leader");
     let victim = *[1u64, 2, 3].iter().find(|&&v| v != leader).unwrap();
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
         CID,
         MsgType::LeaveRequest,
@@ -1263,7 +1264,7 @@ async fn draining_the_meta_leader_hands_off_and_swaps_in_the_spare() {
     let meta_leader = meta_leader.expect("meta group never elected a leader");
     let victim = meta_leader;
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
         CID,
         MsgType::LeaveRequest,
@@ -1296,7 +1297,21 @@ async fn draining_the_meta_leader_hands_off_and_swaps_in_the_spare() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(swapped, "meta voter set never swapped in the spare");
+    let meta_states: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            (
+                node.node_id(),
+                node.hosts_meta(),
+                node.meta_leader(),
+                node.meta_voters_of(),
+            )
+        })
+        .collect();
+    assert!(
+        swapped,
+        "meta voter set never swapped in the spare: {meta_states:?}"
+    );
 
     // The drained node, now a committed meta non-voter, reclaims its meta group.
     let victim_node = &nodes[(victim - 1) as usize];

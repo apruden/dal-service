@@ -17,6 +17,14 @@ pub struct SearchConsumerState {
     pub definition_hash: [u8; 32],
     pub engine_revision: u32,
     pub checkpoint: Option<crate::search::IndexCheckpoint>,
+    /// `(projection_epoch, applied_index)` of the authoritative source
+    /// snapshot a rebuild pass captured. Entries at or below this point are
+    /// covered by that snapshot (I5) — the pass's first commit lands exactly
+    /// there, and a failed pass re-snapshots at a point at least this high —
+    /// so a builder without a checkpoint pins retention only above its floor
+    /// instead of freezing the whole journal (I7 "that needs it"). `None`, or
+    /// a floor from another epoch, retains everything.
+    pub retention_floor: Option<(u64, u64)>,
     /// Set when this consumer fell past its outbox lag budget (design §6.5).
     /// It stops holding retention — so the primary database can reclaim the
     /// space — and its next catch-up must be a full rebuild rather than an

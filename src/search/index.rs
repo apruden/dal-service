@@ -518,17 +518,45 @@ impl LocalSearchIndex {
         let top = if window == 0 {
             Vec::new()
         } else {
+            // Tantivy's plain `order_by_score` breaks score ties by
+            // `DocAddress`, which depends on segment layout and therefore
+            // differs across replicas of the same checkpoint. Tie-break on the
+            // raw key instead (ascending, matching the coordinator's I12
+            // order): keys are unique per shard, so the window cut is total
+            // and replica-deterministic. Validate the fast column up front —
+            // the per-doc closure cannot surface errors.
+            for segment in searcher.segment_readers() {
+                segment
+                    .fast_fields()
+                    .bytes("_key")
+                    .map_err(search_error)?
+                    .ok_or_else(|| {
+                        Error::Search("segment is missing the _key fast column".into())
+                    })?;
+            }
+            let collector = TopDocs::with_limit(window).tweak_score(
+                |segment_reader: &tantivy::SegmentReader| {
+                    let keys = segment_reader
+                        .fast_fields()
+                        .bytes("_key")
+                        .expect("fast field read failed after validation")
+                        .expect("validated above: every segment has the _key fast column");
+                    move |doc: tantivy::DocId, score: tantivy::Score| {
+                        let mut key = Vec::new();
+                        if let Some(ord) = keys.term_ords(doc).next() {
+                            let _ = keys.ord_to_bytes(ord, &mut key);
+                        }
+                        (score, std::cmp::Reverse(key))
+                    }
+                },
+            );
             searcher
-                .search_with_statistics_provider(
-                    held.query.as_ref(),
-                    &TopDocs::with_limit(window).order_by_score(),
-                    statistics,
-                )
+                .search_with_statistics_provider(held.query.as_ref(), &collector, statistics)
                 .map_err(search_error)?
         };
         let mut hits = Vec::with_capacity(top.len());
         let per_hit_budget = crate::search::SEARCH_REPLY_BODY_BUDGET / window.max(1);
-        for (score, address) in top {
+        for ((score, _), address) in top {
             let document = searcher
                 .doc::<TantivyDocument>(address)
                 .map_err(search_error)?;
@@ -684,7 +712,16 @@ impl LocalSearchIndex {
 
 fn build_schema(generation: &SearchIndexGeneration) -> Result<(Schema, Fields)> {
     let mut builder = Schema::builder();
-    let key = builder.add_bytes_field("_key", BytesOptions::default().set_indexed().set_stored());
+    // `_key` is also a fast field so shard collection can tie-break equal
+    // scores on the raw key (engine revision 2): unique keys make the shard
+    // window cut deterministic across replicas and rebuilds.
+    let key = builder.add_bytes_field(
+        "_key",
+        BytesOptions::default()
+            .set_indexed()
+            .set_stored()
+            .set_fast(),
+    );
     let version = builder.add_u64_field(
         "_version",
         NumericOptions::default().set_stored().set_fast(),

@@ -97,6 +97,14 @@ impl GroupId {
         }
     }
 
+    /// Inverse of [`GroupId::token`] for keys derived from on-disk identifiers.
+    pub fn from_token(token: &str) -> Option<GroupId> {
+        if token == "meta" {
+            return Some(GroupId::Meta);
+        }
+        token.strip_prefix("data_")?.parse().ok().map(GroupId::Data)
+    }
+
     pub fn cf_log(&self) -> String {
         format!("cf_log_{}", self.token())
     }

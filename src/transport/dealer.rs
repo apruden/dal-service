@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::Envelope;
-use crate::transport::codec::{MAX_BULK_FRAME_BYTES, MsgType};
+use crate::transport::codec::{Lane, MsgType};
 use crate::types::GroupId;
 
 /// Bounds the burst of not-yet-dispatched requests held for one peer. The I/O
@@ -41,6 +41,12 @@ const OUTBOUND_QUEUE_DEPTH: usize = 1024;
 /// only needs to absorb a reply burst without letting a peer stream unbounded
 /// assembled messages into memory.
 const INBOUND_REPLY_HWM: i32 = 256;
+
+/// Explicit send high-water-mark (DESIGN §10.3 "bounded send
+/// high-water-marks") rather than libzmq's default. Matches the outbound
+/// queue depth; a full send queue surfaces as a per-request retryable error,
+/// not a socket fault.
+const OUTBOUND_SEND_HWM: i32 = OUTBOUND_QUEUE_DEPTH as i32;
 
 /// How often an otherwise-idle I/O thread wakes to expire timed-out requests.
 /// This bounds timeout granularity, not the timeout itself.
@@ -81,7 +87,7 @@ impl PeerConn {
     /// Fallible because every step here consumes a process-wide resource (file
     /// descriptors, threads). Exhausting those is a transient operational
     /// condition the caller can retry, not a reason to abort the process.
-    fn new(ctx: zmq::Context, addr: String, timeout: Duration) -> Result<PeerConn> {
+    fn new(ctx: zmq::Context, addr: String, timeout: Duration, lane: Lane) -> Result<PeerConn> {
         let wake_id = WAKE_SEQ.fetch_add(1, Ordering::Relaxed);
         let wake_addr = format!("inproc://dal-dealer-wake-{wake_id}");
         // Bind before connect (inproc requires it) so there is no startup race.
@@ -93,7 +99,7 @@ impl PeerConn {
         let (tx, rx) = mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         std::thread::Builder::new()
             .name("zmq-dealer".into())
-            .spawn(move || conn_loop(ctx, addr, timeout, signal, rx))
+            .spawn(move || conn_loop(ctx, addr, timeout, lane, signal, rx))
             .map_err(Error::Io)?;
         Ok(PeerConn {
             tx,
@@ -123,6 +129,7 @@ impl PeerConn {
 struct TransportInner {
     ctx: zmq::Context,
     timeout: Duration,
+    lane: Lane,
     next_id: AtomicU64,
     peers: Mutex<HashMap<String, Arc<PeerConn>>>,
 }
@@ -137,6 +144,7 @@ impl TransportInner {
             self.ctx.clone(),
             addr.to_string(),
             self.timeout,
+            self.lane,
         )?);
         peers.insert(addr.to_string(), conn.clone());
         Ok(conn)
@@ -152,11 +160,15 @@ pub struct ZmqTransport {
 }
 
 impl ZmqTransport {
-    pub fn new(ctx: zmq::Context, timeout: Duration) -> ZmqTransport {
+    /// `lane` scopes the socket-level frame cap: transports are lane-pure
+    /// (the runtime constructs separate control and bulk instances), so a
+    /// control transport must not accept bulk-sized replies during assembly.
+    pub fn new(ctx: zmq::Context, timeout: Duration, lane: Lane) -> ZmqTransport {
         ZmqTransport {
             inner: Arc::new(TransportInner {
                 ctx,
                 timeout,
+                lane,
                 next_id: AtomicU64::new(1),
                 peers: Mutex::new(HashMap::new()),
             }),
@@ -168,16 +180,16 @@ fn zmq_io(e: zmq::Error) -> Error {
     Error::Io(std::io::Error::other(format!("zmq: {e}")))
 }
 
-fn open_socket(ctx: &zmq::Context, addr: &str) -> Result<zmq::Socket> {
+fn open_socket(ctx: &zmq::Context, addr: &str, lane: Lane) -> Result<zmq::Socket> {
     let socket = ctx.socket(zmq::DEALER).map_err(zmq_io)?;
     socket.set_linger(0).map_err(zmq_io)?;
     // A peer's reply is remote input too: cap it during assembly rather than
-    // trusting the far side to respect the reply budget. One transport serves
-    // both lanes, so this is the larger of the two caps.
+    // trusting the far side to respect the reply budget (DESIGN §10.3).
     socket
-        .set_maxmsgsize(MAX_BULK_FRAME_BYTES as i64)
+        .set_maxmsgsize(lane.max_frame_bytes() as i64)
         .map_err(zmq_io)?;
     socket.set_rcvhwm(INBOUND_REPLY_HWM).map_err(zmq_io)?;
+    socket.set_sndhwm(OUTBOUND_SEND_HWM).map_err(zmq_io)?;
     socket.connect(addr).map_err(zmq_io)?;
     Ok(socket)
 }
@@ -190,16 +202,17 @@ fn conn_loop(
     ctx: zmq::Context,
     addr: String,
     timeout: Duration,
+    lane: Lane,
     signal: zmq::Socket,
     rx: mpsc::Receiver<Outbound>,
 ) {
-    let mut dealer = open_socket(&ctx, &addr).ok();
+    let mut dealer = open_socket(&ctx, &addr, lane).ok();
     let mut pending: HashMap<u64, (Instant, MsgType, GroupId, ReplyTx)> = HashMap::new();
     let poll_timeout = SWEEP_INTERVAL.as_millis() as i64;
 
     loop {
         if dealer.is_none() {
-            dealer = open_socket(&ctx, &addr).ok();
+            dealer = open_socket(&ctx, &addr, lane).ok();
         }
 
         // Block until a reply or a wake arrives, or the sweep interval elapses.
@@ -274,6 +287,16 @@ fn conn_loop(
                                 crate::perf::record_duration(stage, started.elapsed());
                             }
                             pending.insert(id, (Instant::now(), msg_type, group_id, reply));
+                        }
+                        // A full send queue (SNDHWM) is the normal slow-peer
+                        // signal (DESIGN §10.3), not a socket fault: fail only
+                        // this request so the caller retries, and keep the
+                        // socket — in-flight replies remain deliverable.
+                        Err(zmq::Error::EAGAIN) => {
+                            let _ = reply.send(Err(io_err(
+                                ErrorKind::WouldBlock,
+                                "ZeroMQ peer send queue is full",
+                            )));
                         }
                         Err(_) => {
                             socket_faulted = true;
@@ -377,16 +400,19 @@ impl Transport for ZmqTransport {
 #[cfg(test)]
 mod tests {
     use super::ZmqTransport;
+    use crate::transport::codec::Lane;
     use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
     fn clone_shares_the_peer_connection_directory() {
-        let transport = ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1));
+        let transport =
+            ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1), Lane::Control);
         let clone = transport.clone();
         assert!(Arc::ptr_eq(&transport.inner, &clone.inner));
 
-        let independent = ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1));
+        let independent =
+            ZmqTransport::new(zmq::Context::new(), Duration::from_secs(1), Lane::Control);
         assert!(!Arc::ptr_eq(&transport.inner, &independent.inner));
     }
 }

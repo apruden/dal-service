@@ -374,8 +374,8 @@ impl Node {
             cfg.cluster_id,
             cfg.node_id,
         )?);
-        let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
-        let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request);
+        let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request, Lane::Control);
+        let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request, Lane::Bulk);
         let registration = resolve_registration_binding(&cfg, &desc, &storage, &control).await?;
         let identity_gate = ProcessIdentityGate::default();
         let readiness = RuntimeReadiness::default();
@@ -601,7 +601,7 @@ impl Node {
         // is O(N) frames per node per interval — revisit if clusters outgrow it.
         let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
         let directory_timeout = cfg.timeouts.request;
-        let hb_control = ZmqTransport::new(ctx.clone(), hb_interval);
+        let hb_control = ZmqTransport::new(ctx.clone(), hb_interval, Lane::Control);
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn(heartbeat_emitter(
             registration.clone(),

@@ -100,6 +100,17 @@ impl SearchIndexWorker {
         let Some(checkpoint) = checkpoint else {
             let projected_keys = snapshot.records.len();
             let checkpoint_index = snapshot.applied.map(|log_id| log_id.index);
+            // Everything at or below the snapshot point is covered by this
+            // pass (its first commit lands exactly there), so publish that
+            // floor before the long projection: the journal below it becomes
+            // prunable and this builder stops looking like the group's
+            // furthest-behind consumer to the lag-budget enforcer.
+            self.storage.record_search_consumer_retention_floor(
+                self.group,
+                &self.name,
+                self.index.generation().id,
+                (snapshot.epoch, checkpoint_index.unwrap_or(0)),
+            )?;
             let rejected_documents = self
                 .project_in_blocking(move |index| index.rebuild(&snapshot))
                 .await?;

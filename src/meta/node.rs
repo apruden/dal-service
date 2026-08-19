@@ -164,15 +164,73 @@ impl MetaNode {
             .map_err(|e| Error::Raft(format!("is_initialized: {e}")))
     }
 
-    /// Admit `id` as a non-voting learner and block until it has caught up
-    /// (DESIGN §7.2 — learner-first membership change). The caller is
-    /// responsible for the durable admission record on the joining node.
+    /// Admit `id` as a non-voting learner without waiting for catch-up
+    /// (DESIGN §7.2 — learner-first membership change; `learner_caught_up` is
+    /// the completion condition). The caller is responsible for the durable
+    /// admission record on the joining node. Already-present nodes are skipped
+    /// so a retrying driver cannot grow the meta log, and openraft's blocking
+    /// variant is not used because its unbounded wait would park the caller
+    /// forever on a learner that dies mid-catch-up (see
+    /// `PartitionNode::add_learner`).
     pub async fn add_learner(&self, id: NodeId) -> Result<()> {
+        let membership = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        if membership.learner_ids().any(|learner| learner == id)
+            || membership.voter_ids().any(|voter| voter == id)
+        {
+            return Ok(());
+        }
         self.raft
-            .add_learner(id, Node::default(), true)
+            .add_learner(id, Node::default(), false)
             .await
             .map(|_| ())
             .map_err(|e| Error::Raft(format!("add_learner: {e}")))
+    }
+
+    /// DESIGN §7.2 step 3 completion for the meta group: exact catch-up to
+    /// the fixed membership entry that admitted the learner. Mirrors
+    /// `PartitionNode::learner_caught_up`; using the membership entry rather
+    /// than the current committed tail prevents the barrier from moving under
+    /// concurrent meta writes.
+    pub async fn learner_caught_up(&self, id: NodeId) -> Result<bool> {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let Some(barrier) = metrics.membership_config.log_id() else {
+            return Ok(false);
+        };
+        let Some(replication) = &metrics.replication else {
+            return Ok(false); // not (or no longer) the leader
+        };
+        Ok(matches!(
+            replication.get(&id),
+            Some(Some(matched)) if matched.index >= barrier.index
+        ))
+    }
+
+    /// Bounded blocking form of the §7.2 step-3 barrier. Mirrors
+    /// `PartitionNode::wait_learner_caught_up`.
+    pub async fn wait_learner_caught_up(
+        &self,
+        id: NodeId,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.learner_caught_up(id).await? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Raft(format!(
+                    "meta learner {id} did not reach its admission barrier within {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Drop a node that is only a learner during abort rollback. The absent
@@ -366,6 +424,28 @@ impl MetaNode {
 
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
+    }
+
+    /// Pick a leadership-transfer candidate that is known to have the
+    /// leader's complete current log. Triggering an arbitrary voter can let a
+    /// lagging candidate raise the term (deposing this leader) and then lose
+    /// the election on Raft's log-freshness check, leaving the group without a
+    /// leader until a later timeout. Callers retry when no candidate has caught
+    /// up yet.
+    pub fn leadership_transfer_target(&self, candidates: &[NodeId]) -> Option<NodeId> {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        if metrics.current_leader != Some(self.node_id) {
+            return None;
+        }
+        let last_log_index = metrics.last_log_index?;
+        let replication = metrics.replication.as_ref()?;
+        candidates.iter().copied().find(|candidate| {
+            matches!(
+                replication.get(candidate),
+                Some(Some(matched)) if matched.index >= last_log_index
+            )
+        })
     }
 
     /// Ask this voter to campaign immediately. Used for graceful leadership

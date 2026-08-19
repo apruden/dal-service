@@ -206,12 +206,6 @@ impl RebalanceDriver {
             return; // not a meta node; nothing to plan
         };
         let meta = &meta;
-        if meta.current_leader() != Some(self.node_id) {
-            return;
-        }
-        if !self.genesis_data_ready(meta).await {
-            return;
-        }
         let Ok(directory) = meta.local_directory() else {
             return;
         };
@@ -223,19 +217,32 @@ impl RebalanceDriver {
             .collect();
 
         // A meta leader cannot remove itself while it is the only process that
-        // drives meta membership. Ask a healthy current voter to campaign; its
-        // higher term makes this node step down, and that new leader can then
-        // plan this node's replacement on the next tick.
+        // drives meta membership. Ask a healthy, fully caught-up current voter
+        // to campaign; its higher term makes this node step down, and that new
+        // leader can then plan this node's replacement on the next tick.
+        //
+        // The first forced campaign may overlap the old leader lease: it can
+        // depose this node by raising the term yet fail to collect a quorum.
+        // Keep retrying from the drained former leader while its metrics report
+        // no replacement. This recovery must run before the leader-only gate.
         if state_of(self.node_id) != Some(NodeState::Active)
             && let Ok(Some(meta_placement)) = meta.local_placement(GroupId::Meta)
             && meta_placement.voters.contains(&self.node_id)
-            && let Some(target) = meta_placement
+        {
+            let candidates: Vec<_> = meta_placement
                 .voters
                 .iter()
                 .copied()
-                .find(|id| *id != self.node_id && state_of(*id) == Some(NodeState::Active))
-        {
-            if let Some(addr) = self.addrs.control(target) {
+                .filter(|id| *id != self.node_id && state_of(*id) == Some(NodeState::Active))
+                .collect();
+            let target = match meta.current_leader() {
+                Some(leader) if leader != self.node_id => return,
+                Some(_) => meta.leadership_transfer_target(&candidates),
+                None => candidates.first().copied(),
+            };
+            if let Some(target) = target
+                && let Some(addr) = self.addrs.control(target)
+            {
                 let request = Envelope::new(
                     self.cluster_id,
                     MsgType::TransferLeadership,
@@ -245,6 +252,13 @@ impl RebalanceDriver {
                 );
                 let _ = self.control.call(&addr, request).await;
             }
+            return;
+        }
+
+        if meta.current_leader() != Some(self.node_id) {
+            return;
+        }
+        if !self.genesis_data_ready(meta).await {
             return;
         }
 
@@ -522,8 +536,13 @@ impl RebalanceDriver {
         if meta.current_leader() != Some(self.node_id) {
             return; // only the meta leader drives its own membership change
         }
-        let Some(placement) = meta.local_placement(GroupId::Meta).ok().flatten() else {
-            return;
+        // §7.1 gate: a linearizable read of the plan record, exactly like the
+        // data path. A newly elected meta leader whose applied state lags a
+        // committed `MarkAborting` must not resume the move off its local
+        // (possibly stale) view.
+        let placement = match meta.read_placement(GroupId::Meta).await {
+            Ok(MetaRead::Value(Some(placement))) => placement,
+            _ => return,
         };
         let Some(plan) = placement.r#move.clone() else {
             return;
@@ -594,6 +613,12 @@ impl RebalanceDriver {
         }
         if meta.add_learner(learner).await.is_err() {
             return;
+        }
+        // §7.2 step 3 exact catch-up barrier; per-tick check, never awaited
+        // (see execute_move).
+        match meta.learner_caught_up(learner).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
         }
         if meta.change_voters(target).await.is_err() {
             return;
@@ -738,6 +763,15 @@ impl RebalanceDriver {
         }
         if node.add_learner(learner).await.is_err() {
             return;
+        }
+        // §7.2 step 3: promotion requires the learner's durable match index to
+        // reach its fixed admission-membership entry exactly. Checked once per
+        // tick rather than awaited, so a learner that dies mid-catch-up never
+        // parks this driver — the plan is re-gated next tick and a §7.5 abort
+        // remains reportable by this leader.
+        match node.learner_caught_up(learner).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
         }
         // Design §11.1: a learner may not become a voter until it can serve
         // every active index. Promoting first would let a leader election hand

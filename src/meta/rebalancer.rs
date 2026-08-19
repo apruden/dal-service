@@ -20,6 +20,11 @@ use crate::types::{
     DataConfigObservation, GroupId, MetaCommand, NodeId, NodeState, Placement, voter_set,
 };
 
+/// Bound on the §7.2 step-3 catch-up wait in this linear driver. Generous
+/// enough for a snapshot-fed learner in tests; a learner that dies mid-move is
+/// surfaced as an error instead of parking the caller forever.
+const LEARNER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A quorum-confirmed reading of the data group's committed configuration.
 ///
 /// §7.5 requires every observation these drivers act on to be fenced. Local
@@ -106,8 +111,12 @@ pub async fn execute_move(
         .next()
         .ok_or_else(|| Error::Raft("target adds no learner".into()))?;
 
-    // Step 3: add as learner and block for durable catch-up.
+    // Step 3: add as learner and block (bounded) for exact durable catch-up
+    // to the fixed membership entry that admitted it.
     data_leader.add_learner(learner).await?;
+    data_leader
+        .wait_learner_caught_up(learner, LEARNER_CATCHUP_TIMEOUT)
+        .await?;
     // Step 4: joint-consensus change to the target voter set.
     data_leader.change_voters(&target).await?;
     // Step 5: barrier on the new config, then a single-voter-set observation.

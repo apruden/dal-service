@@ -300,6 +300,7 @@ impl ZmqServer {
                     reply_tx,
                     reply_rx,
                     admission,
+                    lane,
                 )
             })
             .map_err(Error::Io)?;
@@ -321,17 +322,21 @@ impl ZmqServer {
         reply_tx: mpsc::SyncSender<PendingReply>,
         reply_rx: mpsc::Receiver<PendingReply>,
         admission: Admission,
+        lane: Lane,
     ) where
         S: Server + 'static,
     {
         while running.load(Ordering::Relaxed) {
             Self::flush_replies(&socket, &reply_rx);
             if let Ok(parts) = socket.recv_multipart(0) {
-                Self::dispatch(parts, &server, &handle, &active, &reply_tx, &admission);
+                Self::dispatch(
+                    parts, &server, &handle, &active, &reply_tx, &admission, lane,
+                );
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch<S>(
         mut parts: Vec<Vec<u8>>,
         server: &Arc<S>,
@@ -339,6 +344,7 @@ impl ZmqServer {
         active: &Arc<ActiveHandlers>,
         reply_tx: &mpsc::SyncSender<PendingReply>,
         admission: &Admission,
+        lane: Lane,
     ) where
         S: Server + 'static,
     {
@@ -353,6 +359,13 @@ impl ZmqServer {
         let Ok(env) = Envelope::decode(&payload) else {
             return;
         };
+        // A message type is bound to its lane (DESIGN §10.1): bulk types stay
+        // off the control path and vice versa. Legitimate senders always pick
+        // the lane by type, so a mismatch is a misbehaving peer — drop it
+        // before it consumes this lane's admission budget.
+        if env.msg_type.is_bulk() != (lane == Lane::Bulk) {
+            return;
+        }
         let max_reply_bytes = max_reply_bytes(env.msg_type);
         let Some(permit) = admission.try_acquire(
             env.msg_type.is_peer_control(),

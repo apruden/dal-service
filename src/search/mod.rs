@@ -25,7 +25,9 @@ pub use value::{ExtractedDocument, ExtractedValue, encode_search_value, extract_
 pub use worker::{SearchCatchUp, SearchIndexWorker};
 
 /// Bump when the on-disk schema or scoring implementation changes.
-pub const SEARCH_ENGINE_REVISION: u32 = 1;
+/// Revision 2: `_key` became a fast field so the shard window cut tie-breaks
+/// on the key instead of segment-dependent `DocAddress` order (I12/§16.4).
+pub const SEARCH_ENGINE_REVISION: u32 = 2;
 pub const SEARCH_MAX_KEY_BYTES: usize = 4 * 1024;
 pub const SEARCH_MAX_FIELDS: usize = 64;
 pub const SEARCH_MAX_NAME_BYTES: usize = 128;

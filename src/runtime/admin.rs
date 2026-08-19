@@ -18,7 +18,7 @@ use crate::meta::bootstrap::BootstrapDescriptor;
 use crate::meta::state_machine::MetaApplyResult;
 use crate::runtime::directory::fetch_authoritative_directory;
 use crate::transport::Transport;
-use crate::transport::codec::{Envelope, MsgType};
+use crate::transport::codec::{Envelope, Lane, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
     AbortPlanBody, JoinBody, LeaveBody, SearchIndexAdminBody, SubmitReply,
@@ -195,7 +195,7 @@ pub async fn status(
     desc: &BootstrapDescriptor,
     seed: Option<&str>,
 ) -> Result<RoutingInfo> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let contact_ids: Vec<NodeId> = desc.directory.iter().map(|e| e.node_id).collect();
     let targets = Targets::from_descriptor(desc, seed, &contact_ids)
         .discover_live(&transport, desc.cluster_id)
@@ -239,7 +239,7 @@ pub async fn join(ctx: zmq::Context, cfg: &NodeConfig) -> Result<MetaApplyResult
             "join needs at least one seed in the node config".into(),
         ));
     }
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let targets = Targets {
         candidates: cfg.seeds.clone(),
         directory: HashMap::new(),
@@ -269,7 +269,7 @@ pub async fn leave(
     node_id: NodeId,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;
@@ -293,7 +293,7 @@ pub async fn abort_plan(
     plan_id: u64,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;
@@ -316,7 +316,7 @@ pub async fn search_index_admin(
     command: SearchIndexAdminBody,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT);
+    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;

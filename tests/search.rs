@@ -1068,6 +1068,83 @@ async fn a_lagging_index_is_released_so_the_outbox_cannot_grow_without_bound() {
     );
 }
 
+/// A mid-backfill generation records a retention floor at its snapshot point
+/// (I5/I7): the journal below the floor becomes prunable, and the lag-budget
+/// enforcer releases the genuinely lagging consumer instead of restarting the
+/// build forever.
+#[tokio::test]
+async fn a_backfilling_generation_is_not_victimized_by_the_lag_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let group = GroupId::Data(12);
+    storage.ensure_group(group).unwrap();
+    let generation = SearchIndexGeneration::new(1, definition()).unwrap();
+    storage
+        .register_search_consumer(group, "slow", &generation)
+        .unwrap();
+    storage
+        .record_search_consumer_checkpoint(
+            group,
+            "slow",
+            1,
+            IndexCheckpoint {
+                projection_epoch: 1,
+                definition_hash: generation.definition_hash,
+                engine_revision: generation.engine_revision,
+                source_log_id: Some(LogId::new(CommittedLeaderId::new(2, 7), 1)),
+            },
+        )
+        .unwrap();
+    for index in 2..=6u64 {
+        let log_id = LogId::new(CommittedLeaderId::new(2, 7), index);
+        storage
+            .apply_raft(
+                group,
+                &[StateMutation::Put {
+                    key: dal::keyspace::user_key(format!("doc-{index}").as_bytes()),
+                    value: stored_record(index, value("indexed")),
+                }],
+                log_id,
+                &applied_record(log_id),
+                b"committed",
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    // A second generation starts a backfill. Before its floor is recorded it
+    // retains everything.
+    storage
+        .register_search_consumer(group, "builder", &generation)
+        .unwrap();
+    assert_eq!(storage.prune_search_outbox(group).unwrap(), 0);
+    storage
+        .record_search_consumer_retention_floor(group, "builder", 1, (1, 6))
+        .unwrap();
+
+    // Over budget: the enforcer must release the genuinely lagging consumer,
+    // not the builder, and the builder's floor lets pruning reclaim the
+    // journal the released consumer pinned.
+    assert_eq!(
+        storage
+            .enforce_search_outbox_bounds(group, 2, u64::MAX)
+            .unwrap(),
+        Some(("slow".to_string(), 1))
+    );
+    assert_eq!(storage.search_outbox_usage(group).unwrap().0, 0);
+    assert!(
+        !storage
+            .search_consumer_needs_rebuild(group, "builder", 1)
+            .unwrap()
+    );
+    assert!(
+        storage
+            .search_consumer_needs_rebuild(group, "slow", 1)
+            .unwrap()
+    );
+}
+
 /// Design §7.2: an unreadable index directory is quarantined and replaced,
 /// never a permanent failure — Tantivy files are derived, rebuildable state.
 #[test]

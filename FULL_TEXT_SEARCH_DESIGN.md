@@ -439,7 +439,14 @@ and reload.
 
 The retained outbox begins after the minimum checkpoint of all active/building
 local consumers. A new generation registers itself as a consumer before taking
-its backfill snapshot, preventing a cleanup race.
+its backfill snapshot, preventing a cleanup race. Once its backfill snapshot at
+applied `A` exists, the builder durably records `(epoch, A)` as its **retention
+floor**: entries at or below `A` are covered by that snapshot (the pass's first
+commit lands exactly at `A`, and a failed pass re-snapshots at least as high),
+so a checkpoint-less builder pins only the journal above its floor. The floor
+is also its watermark for lag-budget victim selection, so a fresh backfill is
+not released — and restarted forever — while a checkpointed consumer lags
+further behind. A builder without a current-epoch floor retains everything.
 
 If one consumer exceeds its configured lag/bytes limit:
 

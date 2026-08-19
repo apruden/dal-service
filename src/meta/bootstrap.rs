@@ -221,14 +221,18 @@ pub async fn seed_cluster_if_leader(node: &MetaNode, desc: &BootstrapDescriptor)
 }
 
 /// Learner-first meta membership change (DESIGN §7.2): admit the new node as a
-/// learner, block for durable catch-up, then replace the voter set. The joining
-/// node's durable admission record must already be written (ground rule 8).
+/// learner, block (bounded) for exact durable catch-up, then replace the voter
+/// set. The joining node's durable admission record must already be written
+/// (ground rule 8).
 pub async fn admit_and_promote(
     leader: &MetaNode,
     new_id: NodeId,
     new_voters: &[NodeId],
 ) -> Result<()> {
     leader.add_learner(new_id).await?;
+    leader
+        .wait_learner_caught_up(new_id, std::time::Duration::from_secs(60))
+        .await?;
     leader.change_voters(new_voters).await?;
     Ok(())
 }

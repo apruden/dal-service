@@ -47,6 +47,7 @@ use dal::config::{NodeConfig, Timeouts};
 use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
 use dal::perf::RocksCounters;
 use dal::runtime::node::Node;
+use dal::transport::codec::Lane;
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::router::{counters as router_counters, settle};
 use dal::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
@@ -293,7 +294,7 @@ async fn end_to_end_benchmark_three_nodes() {
     let concurrent_ops = env_usize("DAL_BENCH_OPS", 6000);
 
     let ctx = zmq::Context::new();
-    let shared_transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(5));
+    let shared_transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(5), Lane::Control);
     let transport_per_client = env_enabled("DAL_BENCH_TRANSPORT_PER_CLIENT");
     let desc = descriptor(partitions);
     let (dirs, data_root, explicit_data_root) = benchmark_dirs(3);
@@ -535,7 +536,7 @@ async fn run_concurrent(
     let mut clients_to_run = Vec::with_capacity(clients);
     for c in 0..clients {
         let transport = if transport_per_client {
-            ZmqTransport::new(ctx.clone(), Duration::from_secs(5))
+            ZmqTransport::new(ctx.clone(), Duration::from_secs(5), Lane::Control)
         } else {
             shared_transport.clone()
         };
@@ -603,7 +604,7 @@ async fn run_concurrent_reads(
     let mut clients_to_run = Vec::with_capacity(clients);
     for c in 0..clients {
         let transport = if transport_per_client {
-            ZmqTransport::new(ctx.clone(), Duration::from_secs(5))
+            ZmqTransport::new(ctx.clone(), Duration::from_secs(5), Lane::Control)
         } else {
             shared_transport.clone()
         };

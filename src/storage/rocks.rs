@@ -755,6 +755,7 @@ impl Storage {
     fn cleanup_snapshot_cfs(&self, existing: &[String]) -> Result<()> {
         let mut active_generations = HashSet::new();
         let mut switched_families = Vec::new();
+        let mut interrupted_reclaims = Vec::new();
         let prefix = keyspace::state_cf_pointer_prefix();
         for item in self.db.iterator(rocksdb::IteratorMode::From(
             prefix,
@@ -767,6 +768,23 @@ impl Storage {
             let active = codec::decode::<String>(&value)?;
             let token = std::str::from_utf8(&key[prefix.len()..])
                 .map_err(|error| Error::Corrupt("state CF pointer".into(), error.to_string()))?;
+            // A pointer is written (sync-durable) only after its generation CF
+            // exists and is complete, and only `drop_group` removes a
+            // generation still named by its pointer — so a pointer naming a
+            // missing CF means a reclaim crashed between the CF drops and the
+            // pointer delete. Complete that reclaim below; left in place, the
+            // dangling pointer would make `ensure_group` refuse every future
+            // re-admission of the group on this node.
+            if !existing.iter().any(|name| name == &active) {
+                let group = GroupId::from_token(token).ok_or_else(|| {
+                    Error::Corrupt(
+                        "state CF pointer".into(),
+                        format!("bad group token {token:?}"),
+                    )
+                })?;
+                interrupted_reclaims.push(group);
+                continue;
+            }
             switched_families.push((format!("cf_state_{token}"), active.clone()));
             active_generations.insert(active);
         }
@@ -779,6 +797,25 @@ impl Storage {
             {
                 self.db.drop_cf(name)?;
             }
+        }
+        // Finish interrupted reclamations (mirrors `drop_group`). The pointer
+        // delete is deliberately last: it is the marker that re-runs this
+        // cleanup after a crash mid-way through, and deleting it first would
+        // let a later re-admission resurrect a stale base state CF.
+        for group in interrupted_reclaims {
+            for name in [group.cf_log(), group.cf_state()] {
+                if self.db.cf_handle(&name).is_some() {
+                    self.db.drop_cf(&name)?;
+                }
+            }
+            if matches!(group, GroupId::Data(_)) {
+                self.delete_local_prefix(&keyspace::search_prefix(group))?;
+                let index_path = self.path.join("search").join(group.token());
+                if index_path.exists() {
+                    std::fs::remove_dir_all(index_path)?;
+                }
+            }
+            self.delete_local(&keyspace::state_cf_pointer_key(group))?;
         }
         Ok(())
     }
@@ -1181,6 +1218,7 @@ impl Storage {
                 definition_hash: generation.definition_hash,
                 engine_revision: generation.engine_revision,
                 checkpoint: None,
+                retention_floor: None,
                 needs_rebuild: false,
             },
         )?;
@@ -1188,6 +1226,29 @@ impl Storage {
             created: true,
             needs_rebuild: true,
         })
+    }
+
+    /// Record the retention floor of a rebuild pass: the `(epoch, applied)`
+    /// point of the source snapshot it will project from. Safe to write for a
+    /// released (`needs_rebuild`) consumer — the floor never grants retention,
+    /// it only narrows what an unreleased builder pins — and a floor left by
+    /// an abandoned pass stays safe because a later pass snapshots at a point
+    /// at least as high. A missing record is a benign race with
+    /// unregistration; the pass fails later at its checkpoint write.
+    pub fn record_search_consumer_retention_floor(
+        &self,
+        group: GroupId,
+        name: &str,
+        generation: u64,
+        floor: (u64, u64),
+    ) -> Result<()> {
+        let _lifecycle = self.search_lifecycle.lock().unwrap();
+        let key = keyspace::search_consumer_key(group, name, generation);
+        let Some(mut state) = self.get_local::<crate::search::SearchConsumerState>(&key)? else {
+            return Ok(());
+        };
+        state.retention_floor = Some(floor);
+        self.put_local(&key, &state)
     }
 
     /// Whether this consumer was marked past its lag budget and owes a full
@@ -1284,19 +1345,27 @@ impl Storage {
         }
         let laggard = {
             let _lifecycle = self.search_lifecycle.lock().unwrap();
+            let epoch = self.search_projection_epoch(group)?;
             let mut laggard: Option<(Vec<u8>, crate::search::SearchConsumerState, u64)> = None;
             for (key, state) in self.search_consumers(group)? {
                 if !state.holds_retention() {
                     continue;
                 }
-                // No checkpoint means "retain everything", so it is the most
-                // constraining watermark there is.
-                let watermark = state
-                    .checkpoint
-                    .as_ref()
-                    .and_then(|checkpoint| checkpoint.source_log_id.as_ref())
-                    .map(|log_id| log_id.index)
-                    .unwrap_or(0);
+                // A builder without a checkpoint retains only above its
+                // current-epoch snapshot floor; without one it retains
+                // everything and is the most constraining watermark there is.
+                // Using the floor keeps a fresh backfill from being released
+                // (and restarted forever) when a checkpointed consumer is the
+                // one actually pinning the journal.
+                let watermark = match (&state.checkpoint, state.retention_floor) {
+                    (Some(checkpoint), _) => checkpoint
+                        .source_log_id
+                        .as_ref()
+                        .map(|log_id| log_id.index)
+                        .unwrap_or(0),
+                    (None, Some((floor_epoch, floor))) if floor_epoch == epoch => floor,
+                    (None, _) => 0,
+                };
                 if laggard
                     .as_ref()
                     .is_none_or(|(_, _, lowest)| watermark < *lowest)
@@ -1308,6 +1377,7 @@ impl Storage {
                 Some((key, mut state, _)) => {
                     state.needs_rebuild = true;
                     state.checkpoint = None;
+                    state.retention_floor = None;
                     self.put_local(&key, &state)?;
                     Some(key)
                 }
@@ -1437,34 +1507,32 @@ impl Storage {
             .filter(|state| state.holds_retention())
             .collect();
         let epoch = self.search_projection_epoch(group)?;
-        let minimum = if consumers.is_empty() {
-            None
-        } else {
-            let checkpoints: Option<Vec<_>> = consumers
-                .iter()
-                .map(|consumer| consumer.checkpoint.as_ref())
-                .collect();
-            let Some(checkpoints) = checkpoints else {
-                return Ok(0);
+        let mut minimum: Option<u64> = None;
+        for consumer in &consumers {
+            let watermark = match (&consumer.checkpoint, consumer.retention_floor) {
+                (Some(checkpoint), _) => {
+                    if checkpoint.projection_epoch != epoch {
+                        return Ok(0);
+                    }
+                    // A consumer that has committed a checkpoint but not yet
+                    // projected any Raft entry still needs every retained
+                    // entry: it must count as a watermark of zero, never be
+                    // skipped.
+                    match checkpoint.source_log_id.as_ref() {
+                        Some(log_id) => log_id.index,
+                        None => return Ok(0),
+                    }
+                }
+                // A builder's rebuild pass projects from its authoritative
+                // source snapshot, so entries at or below its recorded
+                // current-epoch floor are covered (I5/I7) and prunable even
+                // before its first checkpoint exists.
+                (None, Some((floor_epoch, floor))) if floor_epoch == epoch => floor,
+                // No checkpoint and no usable floor: retain everything.
+                (None, _) => return Ok(0),
             };
-            if checkpoints
-                .iter()
-                .any(|checkpoint| checkpoint.projection_epoch != epoch)
-            {
-                return Ok(0);
-            }
-            // A consumer that has committed a checkpoint but not yet projected
-            // any Raft entry still needs every retained entry: it must count as
-            // a watermark of zero, never be skipped.
-            let projected: Option<Vec<u64>> = checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.source_log_id.as_ref().map(|log_id| log_id.index))
-                .collect();
-            let Some(projected) = projected else {
-                return Ok(0);
-            };
-            projected.into_iter().min()
-        };
+            minimum = Some(minimum.map_or(watermark, |lowest| lowest.min(watermark)));
+        }
 
         let prefix = keyspace::search_outbox_prefix(group);
         let mut batch = rocksdb::WriteBatch::default();

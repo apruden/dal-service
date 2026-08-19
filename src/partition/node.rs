@@ -286,15 +286,79 @@ impl PartitionNode {
             .map_err(|e| Error::Raft(format!("is_initialized: {e}")))
     }
 
-    /// Admit `id` as a learner and block until it reaches this leader's
-    /// committed log point (DESIGN §7.2 step 3). Only a caught-up learner may
-    /// later be promoted.
+    /// Admit `id` as a learner without waiting for catch-up (DESIGN §7.2 step
+    /// 3 begins here; `learner_caught_up` is the completion condition).
+    /// Proposing `AddNodes` for a node already in the membership would commit
+    /// a fresh (unchanged) membership entry on every rebalance tick, so the
+    /// proposal is skipped when `id` is already present. openraft's blocking
+    /// variant is deliberately not used: its wait is unbounded, so a learner
+    /// that dies mid-catch-up would park the caller forever and the §7.5
+    /// abort could never be reported by this leader.
     pub async fn add_learner(&self, id: NodeId) -> Result<()> {
+        let membership = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        if membership.learner_ids().any(|learner| learner == id)
+            || membership.voter_ids().any(|voter| voter == id)
+        {
+            return Ok(());
+        }
         self.raft
-            .add_learner(id, Node::default(), true)
+            .add_learner(id, Node::default(), false)
             .await
             .map(|_| ())
             .map_err(|e| Error::Raft(format!("add_learner: {e}")))
+    }
+
+    /// DESIGN §7.2 step 3 completion: the learner's durably acknowledged
+    /// match index must reach the fixed membership entry that admitted it. The
+    /// effective membership stays at that entry until promotion, so retrying
+    /// this check cannot chase a moving committed-log tail under write load.
+    /// This is still an exact barrier, unlike openraft's
+    /// lag-under-threshold heuristic (which would promote a voter up to
+    /// `replication_lag_threshold` entries behind). Returns `false` when this
+    /// node is not leader, membership has not been stored, the learner is
+    /// unknown, or it is still behind; the caller retries on its next tick.
+    pub async fn learner_caught_up(&self, id: NodeId) -> Result<bool> {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let Some(barrier) = metrics.membership_config.log_id() else {
+            return Ok(false);
+        };
+        let Some(replication) = &metrics.replication else {
+            return Ok(false); // not (or no longer) the leader
+        };
+        Ok(matches!(
+            replication.get(&id),
+            Some(Some(matched)) if matched.index >= barrier.index
+        ))
+    }
+
+    /// Bounded blocking form of the §7.2 step-3 barrier for linear drivers
+    /// (meta bootstrap joins and the test rebalancer): polls
+    /// `learner_caught_up` and fails after `timeout` instead of parking
+    /// forever on a dead learner.
+    pub async fn wait_learner_caught_up(
+        &self,
+        id: NodeId,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.learner_caught_up(id).await? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::Raft(format!(
+                    "learner {id} did not reach its admission barrier within {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Drop a node that is only a learner (DESIGN §7.5 step 2, the abort

@@ -241,6 +241,51 @@ fn a_new_verified_plan_can_readmit_a_reclaimed_group() {
 }
 
 #[test]
+fn interrupted_reclaim_with_dangling_pointer_is_completed_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+        s.record_verified_learner_admission(&LearnerAdmission {
+            cluster_id: 0xABCD,
+            group: G,
+            plan_id: 10,
+        })
+        .unwrap();
+        s.authorize_group_start(G, 42).unwrap();
+        s.apply_state(G, &[put(b"k", b"v")], LogId::new(1, 1))
+            .unwrap();
+        // Simulate `drop_group` crashing between the CF drops and the pointer
+        // delete: a durable pointer naming a generation CF that no longer
+        // exists. (`reclaim_group` records NonServing first, like the real
+        // reclaim path did before the crash.)
+        s.set_serving_state(G, ServingState::NonServing).unwrap();
+        s.put_local(
+            &keyspace::state_cf_pointer_key(G),
+            &format!("{}__snapshot_1", G.cf_state()),
+        )
+        .unwrap();
+    }
+    // Open completes the interrupted reclaim: pointer and group CFs are gone.
+    let s = Storage::open_checked(dir.path(), 0xABCD, 42).unwrap();
+    assert_eq!(
+        s.get_local::<String>(&keyspace::state_cf_pointer_key(G))
+            .unwrap(),
+        None
+    );
+    assert!(!s.group_exists(G));
+    // Re-admission through a fresh verified plan works instead of wedging on
+    // a Corrupt("active snapshot state CF is missing") error.
+    s.record_verified_learner_admission(&LearnerAdmission {
+        cluster_id: 0xABCD,
+        group: G,
+        plan_id: 11,
+    })
+    .unwrap();
+    s.authorize_group_start(G, 42).unwrap();
+    assert!(s.group_exists(G));
+}
+
+#[test]
 fn snapshot_replace_is_atomic_at_both_crash_boundaries() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();

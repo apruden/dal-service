@@ -59,7 +59,7 @@ async fn zmq_dealer_router_round_trip() {
     let server = ZmqServer::bind(ctx.clone(), addr, Arc::new(Echo), Lane::Control).unwrap();
     settle();
 
-    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let payload = b"ping-through-zmq".to_vec();
     let env = Envelope::new(
         CID,
@@ -94,7 +94,7 @@ async fn shutdown_yields_while_an_inflight_handler_finishes() {
     .unwrap();
     settle();
 
-    let transport = ZmqTransport::new(ctx, Duration::from_secs(2));
+    let transport = ZmqTransport::new(ctx, Duration::from_secs(2), Lane::Control);
     let request = tokio::spawn(async move {
         transport
             .call(
