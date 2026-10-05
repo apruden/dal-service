@@ -70,6 +70,16 @@ struct BudgetState {
     status: WorkerStatus,
     pending_requests: usize,
     pending_bytes: usize,
+    peak_pending_requests: usize,
+    peak_pending_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WalQueueStatus {
+    pub(crate) pending_requests: usize,
+    pub(crate) pending_bytes: usize,
+    pub(crate) peak_pending_requests: usize,
+    pub(crate) peak_pending_bytes: usize,
 }
 
 struct Shared {
@@ -85,6 +95,8 @@ impl Shared {
                 status: WorkerStatus::Running,
                 pending_requests: 0,
                 pending_bytes: 0,
+                peak_pending_requests: 0,
+                peak_pending_bytes: 0,
             }),
             capacity_available: Notify::new(),
             config,
@@ -126,6 +138,8 @@ impl Shared {
 
         state.pending_requests += 1;
         state.pending_bytes += charged_bytes;
+        state.peak_pending_requests = state.peak_pending_requests.max(state.pending_requests);
+        state.peak_pending_bytes = state.peak_pending_bytes.max(state.pending_bytes);
         Ok(Some(Reservation {
             shared: self.clone(),
             charged_bytes,
@@ -240,6 +254,16 @@ pub(crate) struct WalDurability {
 }
 
 impl WalDurability {
+    pub(crate) fn queue_status(&self) -> WalQueueStatus {
+        let state = self.shared.state.lock().unwrap();
+        WalQueueStatus {
+            pending_requests: state.pending_requests,
+            pending_bytes: state.pending_bytes,
+            peak_pending_requests: state.peak_pending_requests,
+            peak_pending_bytes: state.peak_pending_bytes,
+        }
+    }
+
     pub(super) fn with_config<W, F>(
         config: DurabilityConfig,
         write_batch: W,

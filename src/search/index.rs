@@ -164,6 +164,9 @@ pub struct LocalSearchIndex {
 }
 
 impl LocalSearchIndex {
+    pub(crate) fn writer_memory_budget_bytes() -> usize {
+        WRITER_MEMORY_BYTES
+    }
     pub fn generation(&self) -> &SearchIndexGeneration {
         &self.generation
     }

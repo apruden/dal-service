@@ -160,6 +160,73 @@ static CLIENT_ENVELOPE_ENCODE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CLIENT_ENVELOPE_DECODE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RAFT_ENVELOPE_ENCODE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RAFT_ENVELOPE_DECODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_BUILDS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_BUILD_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_INSTALLS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_INSTALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+static SEARCH_USER_RECORDS_SCANNED: AtomicU64 = AtomicU64::new(0);
+static SEARCH_OUTBOX_ENTRIES_SCANNED: AtomicU64 = AtomicU64::new(0);
+static SEARCH_SOURCE_ROW_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_RECORD_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SnapshotCounters {
+    pub builds: u64,
+    pub build_max_micros: u64,
+    pub installs: u64,
+    pub install_max_micros: u64,
+}
+
+pub fn snapshot_counters() -> SnapshotCounters {
+    SnapshotCounters {
+        builds: SNAPSHOT_BUILDS.load(Ordering::Relaxed),
+        build_max_micros: SNAPSHOT_BUILD_MAX_MICROS.load(Ordering::Relaxed),
+        installs: SNAPSHOT_INSTALLS.load(Ordering::Relaxed),
+        install_max_micros: SNAPSHOT_INSTALL_MAX_MICROS.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn record_snapshot_build(duration: Duration) {
+    let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+    SNAPSHOT_BUILDS.fetch_add(1, Ordering::Relaxed);
+    SNAPSHOT_BUILD_MAX_MICROS.fetch_max(micros, Ordering::Relaxed);
+}
+
+pub(crate) fn record_snapshot_install(duration: Duration) {
+    let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+    SNAPSHOT_INSTALLS.fetch_add(1, Ordering::Relaxed);
+    SNAPSHOT_INSTALL_MAX_MICROS.fetch_max(micros, Ordering::Relaxed);
+}
+
+pub(crate) fn record_search_user_scan(records: usize) {
+    SEARCH_USER_RECORDS_SCANNED.fetch_add(records as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_search_outbox_scan(entries: usize) {
+    SEARCH_OUTBOX_ENTRIES_SCANNED.fetch_add(entries as u64, Ordering::Relaxed);
+}
+
+pub fn search_scan_counts() -> (u64, u64) {
+    (
+        SEARCH_USER_RECORDS_SCANNED.load(Ordering::Relaxed),
+        SEARCH_OUTBOX_ENTRIES_SCANNED.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn record_search_source_row_bytes(bytes: usize) {
+    SEARCH_SOURCE_ROW_PEAK_BYTES.fetch_max(bytes as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_snapshot_record_bytes(bytes: usize) {
+    SNAPSHOT_RECORD_PEAK_BYTES.fetch_max(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn source_record_peaks() -> (u64, u64) {
+    (
+        SEARCH_SOURCE_ROW_PEAK_BYTES.load(Ordering::Relaxed),
+        SNAPSHOT_RECORD_PEAK_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransportProfileClass {

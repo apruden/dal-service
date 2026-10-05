@@ -5,9 +5,10 @@ Date: 2026-10-04
 Scope: address the correctness defects and performance risks found in the current
 implementation review. The maximum user value is **1 MiB (1,048,576 bytes)**,
 inclusive. The correctness and bounded-work changes in phases 0–5 are
-implemented. Phase 6 now has three-process TCP measurements across all four
-value sizes and a recovery workload. Its baseline is too variable to approve
-throughput tuning; controlled baseline/candidate comparisons remain pending.
+implemented. Phase 6 has three-process TCP measurements, recovery workloads,
+resource counters, and paired batching trials. The batching candidate failed
+the latency gate, so the production one-entry policy remains in place. The
+1 MiB baseline is still too variable to support a speedup claim.
 
 This plan follows the project's current-binary, new-cluster scope in
 [Async Materialized State Implementation Plan](ASYNC_MATERIALIZED_STATE_IMPLEMENTATION_PLAN.md).
@@ -25,7 +26,7 @@ numbers below are diagnostic measurements of this working tree.
 | 3 | Implemented | Reject oversized complete requests before reserving a sequence | Phase 0 framing |
 | 4 | Implemented | Bound search scans and projection memory | Phase 1 ownership |
 | 5 | Implemented | Buffer snapshot I/O and move blocking work off Tokio | Preserve existing durability fences |
-| 6 | Initial measurements complete; tuning gate pending | Benchmark realistic workloads and gate further tuning | Same hardware and workload for baseline/candidate |
+| 6 | Measurements complete; batching candidate rejected | Benchmark realistic workloads and gate further tuning | Same hardware and workload for baseline/candidate |
 
 ## Delivered implementation
 
@@ -470,15 +471,105 @@ test now cover it. Multi-partition process bootstrap compared rotated genesis
 voters by vector order against sorted committed voters; both local and remote
 readiness checks now compare sets, with a normal-suite regression test.
 
-Logs for all measurements and recovery diagnostics are retained in
-`/var/tmp/dal-phase6-20261004/`. The harness still needs controlled A/B trials
-for a specific tuning candidate, exact application buffer and queue occupancy
-peaks, search scan counts, and direct snapshot build/install duration before
-Phase 6 can be marked complete. Keep one-entry Raft replication batching and
-the timeout-driven ROUTER loop until those gates supply a stable comparison.
+Logs for these initial measurements and recovery diagnostics are retained in
+`/var/tmp/dal-phase6-20261004/`. At this point the harness still needed paired
+tuning trials, buffer and queue measurements, search scan counts, and direct
+snapshot timing. The continuation below records those measurements and the
+decision to keep one-entry Raft replication batching and the timeout-driven
+ROUTER loop.
 
 The combined working tree passed `cargo test --all-targets --locked`: 341 tests
 passed, none failed, and the two explicit benchmarks stayed ignored. This
 includes the 100-seed leader-crash campaign. Output is in
 `/var/tmp/dal-phase6-20261004/all-targets.log`. `cargo fmt --all -- --check`
 and `git diff --check` also passed.
+
+## Phase 6 continuation: resource gates and batching decision (2026-10-04)
+
+Commit `94d89a3` was pushed to `origin/main` before these measurements. The
+host, ext4/NVMe filesystem, and three-process TCP topology were the same as
+above. The harness now reserves all nine listening ports together and retains
+node logs on a bootstrap failure. One pre-fix trial aborted before measurement
+with `Address already in use`; its retained log identified the port collision.
+Aborted trials are excluded from the tables below.
+
+Three longer clean-cluster 1 MiB baseline trials each completed 800 writes and
+800 reads with zero errors and retries. They produced 53.4, 23.8, and 59.7
+operations/s, with write p95 of 372, 623, and 278 ms. Longer trials therefore
+did not remove the spread. The host uses the `powersave` CPU governor, and
+measured I/O pressure varied considerably between nearby trials. Throughput
+numbers from this host are diagnostic, not an acceptance target.
+
+The batching experiment offered up to 32 entries with an 8 MiB encoded-RPC
+target, then eight entries with 4 MiB and 2 MiB targets. It checked the full
+encoded AppendEntries request, including the largest legal client key and a
+membership entry, and used OpenRaft's `PayloadTooLarge` hint to split an
+oversized offer. A final variant avoided measuring and then reserializing
+single-entry requests. The production binary was compared with the saved
+`94d89a3` release binary in alternating order. Each trial used a fresh
+three-node cluster and zero client errors or retries.
+
+| Workload | One-entry baseline | Final eight-entry, 2 MiB candidate | Decision |
+| --- | ---: | ---: | --- |
+| 4 KiB, follower paused for 1,000 of 1,200 writes: catch-up | 3.17–3.38 s (two adjacent trials) | 0.93–0.94 s | Catch-up improved |
+| Same workload: write p95 | 10.9–11.0 ms | 19.8–25.6 ms | Latency regression |
+| 1 MiB, follower paused for 300 of 400 writes: catch-up | 6.4–19.4 s (nearby trials) | 5.9–10.4 s (three trials) | Too variable for a gain claim |
+| Same workload: adjacent write p95 | 92.4 ms | 230.7 ms | Latency regression in one pair |
+
+The 4 MiB byte-target candidate also had two 1 MiB catch-up trials at
+13.6–15.1 seconds, compared with nearby baseline trials at 6.4–8.7 seconds.
+The acceptance guard was zero errors and no more than 20% paired regression in
+write p95 or peak node RSS while improving catch-up. The final candidate
+exceeded the p95 guard in both value classes. The one-entry production setting
+and existing ROUTER reply loop therefore remain unchanged. No speedup is
+claimed. Paired logs, including CPU ticks, host I/O pressure, and sampled RSS,
+are in `/var/tmp/dal-phase6-20261004/` under `small-*` and `large-*` names.
+
+The final one-entry binary then ran two profiled 1 MiB search workloads. Each
+used two partitions, 200 writes, 200 reads, 20 searches, and a concurrent
+rebuild. Both had zero errors and retries. Waiting for all active projections
+to catch up verified **201 hits** for indexable values and **one hit** for
+opaque values (the seeded search document). The indexable rebuild activated in
+1.05 s; the opaque rebuild in 0.67 s. Completed full-source scans visited
+7–25 records per node because the rebuild began early; incremental outbox
+scans visited 207–219 entries per node to cover the remaining writes. The
+largest application-owned source row observed was 2,097,252 bytes, including
+the RocksDB-encoded value and its decoded copy. WAL queues peaked at roughly
+3–4 MiB, and RocksDB reported zero write-stall time in these runs.
+
+RocksDB's approximate memtable peak was 238–245 MB per node, with about 13 KiB
+of table-reader memory reported and no cache bytes returned by its memory
+consumer API. Four loaded Tantivy generations had a combined configured writer
+budget of 200 MB per node; Tantivy does not expose actual writer allocation
+through the API used here. Peak process RSS was 384,672 KiB in the indexable run
+and 353,492 KiB in the opaque run. The source-row and RocksDB numbers describe distinct
+known components; RSS is the combined process measure. Profiling adds overhead,
+so these figures do not replace the unprofiled throughput baseline.
+
+A profiled recovery workload crossed the 5,000-entry snapshot threshold while
+running 6,000 writes, 6,000 reads, 800 searches, a rebuild, and a paused
+follower. It completed with zero errors and retries. The follower's snapshot
+catch-up took 5.54 s; maximum observed snapshot build and install work took
+36.75 and 77.34 ms respectively. Rebuild activation took 23.14 s. The highest
+sampled node RSS was 75,128 KiB and the exact WAL reservation peak was 1,635
+bytes. A separate 512-record stream of 1 MiB values built at 166.7 MiB/s and
+decoded at 193.4 MiB/s. Installing the same 512 MiB through the staged
+RocksDB generation and durable pointer switch took 4.61 s (111.0 MiB/s);
+the build for that install took 2.84 s (180.6 MiB/s). The largest snapshot
+record buffer was 1,048,584 bytes. The existing checksum, corruption,
+generation-switch, and crash-cut tests remain in the normal suite.
+
+Phase 6's measurement and tuning decision are complete. Future optimization
+work needs a quieter host or paired trials with host I/O pressure controlled;
+the current measurements support rejecting batching, not predicting a stable
+throughput gain. The new status fields report exact application reservation
+peaks, completed scan counts, snapshot work durations, approximate RocksDB
+internal memory, and Tantivy's configured writer budget. They do not claim
+allocator-level attribution of all process RSS.
+
+The continuation working tree based on `94d89a3` passed
+`cargo test --all-targets --locked`: **341 passed, zero failed, four ignored**
+(the four explicit measurements). The 100-seed leader-crash campaign passed in
+309.65 seconds. Output is retained at
+`/var/tmp/dal-phase6-20261004/all-targets-continuation.log`.
+`cargo fmt --all -- --check` and `git diff --check` passed.

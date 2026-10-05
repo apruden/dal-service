@@ -8,6 +8,12 @@
 //! run with more than 5,500 writes can set DAL_BENCH_PAUSE_FOLLOWER=1 to force
 //! one voter to recover through a snapshot. DAL_BENCH_BINARY selects a node
 //! binary; DAL_BENCH_KEEP_DIR=1 retains its node files and logs.
+//! DAL_BENCH_RESUME_AFTER_WRITES and DAL_BENCH_REQUIRE_SNAPSHOT=0 can instead
+//! exercise lagging-follower log catch-up below the snapshot threshold.
+//! DAL_BENCH_INDEXABLE_VALUES=1 fills each benchmark value with an indexed
+//! title and an unindexed padding field up to the selected value size.
+//! DAL_BENCH_WAIT_SEARCH=1 waits for every active local projection to catch up
+//! and checks the distributed hit count after foreground timing stops.
 
 use std::fs::File;
 use std::net::TcpListener;
@@ -41,9 +47,17 @@ impl Drop for Processes {
     }
 }
 
-fn tcp_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    format!("tcp://{}", listener.local_addr().unwrap())
+fn tcp_addrs(count: usize) -> Vec<String> {
+    // Keep every reservation live until all endpoints are selected. Releasing
+    // one ephemeral port before choosing the next can return the same port
+    // twice and make a node fail bootstrap with EADDRINUSE.
+    let listeners: Vec<_> = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    listeners
+        .iter()
+        .map(|listener| format!("tcp://{}", listener.local_addr().unwrap()))
+        .collect()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -84,6 +98,16 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
     Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
 }
 
+#[cfg(target_os = "linux")]
+fn io_pressure_full_micros() -> Option<u64> {
+    let pressure = std::fs::read_to_string("/proc/pressure/io").ok()?;
+    pressure.lines().find_map(|line| {
+        line.strip_prefix("full ")?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("total=")?.parse().ok())
+    })
+}
+
 fn search_definition() -> SearchIndexDefinition {
     SearchIndexDefinition {
         document_type: "article".into(),
@@ -122,6 +146,42 @@ fn search_request() -> SearchRequest {
     }
 }
 
+fn benchmark_value(value_bytes: usize, indexable: bool) -> Vec<u8> {
+    if !indexable {
+        return vec![b'x'; value_bytes];
+    }
+    #[derive(Serialize)]
+    struct SearchDocument<'a> {
+        title: &'a str,
+        padding: &'a str,
+    }
+    let padding = "x".repeat(value_bytes);
+    let encode = |length: usize| {
+        let payload = flexbuffers::to_vec(SearchDocument {
+            title: "benchmark",
+            padding: &padding[..length],
+        })
+        .unwrap();
+        encode_search_value("article", &payload).unwrap()
+    };
+    assert!(
+        encode(0).len() <= value_bytes,
+        "value size too small for an indexable document"
+    );
+    let (mut low, mut high) = (0, value_bytes);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if encode(middle).len() <= value_bytes {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let value = encode(low);
+    assert!(value.len() <= value_bytes);
+    value
+}
+
 async fn status(addr: &str) -> Option<serde_json::Value> {
     let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
     stream
@@ -158,7 +218,22 @@ struct NodeSamples {
     peak_outbox_entries: u64,
     peak_outbox_bytes: u64,
     peak_pending_bytes: usize,
+    peak_wal_pending_requests: usize,
+    peak_wal_pending_bytes: usize,
+    peak_rocks_memtables_bytes: u64,
+    peak_rocks_unflushed_memtables_bytes: u64,
+    peak_rocks_table_readers_bytes: u64,
+    peak_rocks_cache_bytes: u64,
+    peak_tantivy_writer_budget_bytes: u64,
     max_snapshot_index: u64,
+    snapshot_builds: u64,
+    snapshot_build_max_micros: u64,
+    snapshot_installs: u64,
+    snapshot_install_max_micros: u64,
+    search_user_records_scanned: u64,
+    search_outbox_entries_scanned: u64,
+    search_source_row_peak_bytes: u64,
+    snapshot_record_peak_bytes: u64,
     status_samples: usize,
     first_wal_syncs: Option<u64>,
     last_wal_syncs: Option<u64>,
@@ -212,6 +287,21 @@ async fn sample_nodes(
                                 samples[i].max_snapshot_index = samples[i].max_snapshot_index.max(partition["raft_snapshot_index"].as_u64().unwrap_or(0));
                             }
                         }
+                        samples[i].peak_wal_pending_requests = samples[i].peak_wal_pending_requests.max(state["storage_wal_peak_pending_requests"].as_u64().unwrap_or(0) as usize);
+                        samples[i].peak_wal_pending_bytes = samples[i].peak_wal_pending_bytes.max(state["storage_wal_peak_pending_bytes"].as_u64().unwrap_or(0) as usize);
+                        samples[i].peak_rocks_memtables_bytes = samples[i].peak_rocks_memtables_bytes.max(state["storage_rocks_memtables_bytes"].as_u64().unwrap_or(0));
+                        samples[i].peak_rocks_unflushed_memtables_bytes = samples[i].peak_rocks_unflushed_memtables_bytes.max(state["storage_rocks_unflushed_memtables_bytes"].as_u64().unwrap_or(0));
+                        samples[i].peak_rocks_table_readers_bytes = samples[i].peak_rocks_table_readers_bytes.max(state["storage_rocks_table_readers_bytes"].as_u64().unwrap_or(0));
+                        samples[i].peak_rocks_cache_bytes = samples[i].peak_rocks_cache_bytes.max(state["storage_rocks_cache_bytes"].as_u64().unwrap_or(0));
+                        samples[i].peak_tantivy_writer_budget_bytes = samples[i].peak_tantivy_writer_budget_bytes.max(state["search_tantivy_writer_budget_bytes"].as_u64().unwrap_or(0));
+                        samples[i].snapshot_builds = samples[i].snapshot_builds.max(state["snapshot_builds"].as_u64().unwrap_or(0));
+                        samples[i].snapshot_build_max_micros = samples[i].snapshot_build_max_micros.max(state["snapshot_build_max_micros"].as_u64().unwrap_or(0));
+                        samples[i].snapshot_installs = samples[i].snapshot_installs.max(state["snapshot_installs"].as_u64().unwrap_or(0));
+                        samples[i].snapshot_install_max_micros = samples[i].snapshot_install_max_micros.max(state["snapshot_install_max_micros"].as_u64().unwrap_or(0));
+                        samples[i].search_user_records_scanned = samples[i].search_user_records_scanned.max(state["search_user_records_scanned"].as_u64().unwrap_or(0));
+                        samples[i].search_outbox_entries_scanned = samples[i].search_outbox_entries_scanned.max(state["search_outbox_entries_scanned"].as_u64().unwrap_or(0));
+                        samples[i].search_source_row_peak_bytes = samples[i].search_source_row_peak_bytes.max(state["search_source_row_peak_bytes"].as_u64().unwrap_or(0));
+                        samples[i].snapshot_record_peak_bytes = samples[i].snapshot_record_peak_bytes.max(state["snapshot_record_peak_bytes"].as_u64().unwrap_or(0));
                     }
                 }
             }
@@ -228,11 +318,23 @@ async fn three_process_tcp_mixed_workload() {
     let clients = env_usize("DAL_BENCH_CLIENTS", 4).max(1);
     let writes_per_client = env_usize("DAL_BENCH_WRITES", 50).max(1);
     let searches_per_client = env_usize("DAL_BENCH_SEARCHES", 0);
+    let indexable_values = env_usize("DAL_BENCH_INDEXABLE_VALUES", 0) != 0;
+    let wait_search = env_usize("DAL_BENCH_WAIT_SEARCH", 0) != 0;
     let rebuild = env_usize("DAL_BENCH_REBUILD", 0) != 0;
     let pause_follower = env_usize("DAL_BENCH_PAUSE_FOLLOWER", 0) != 0;
+    let resume_after_writes = env_usize("DAL_BENCH_RESUME_AFTER_WRITES", 5_500);
+    let require_follower_snapshot = env_usize("DAL_BENCH_REQUIRE_SNAPSHOT", 1) != 0;
     assert!(
         !rebuild || searches_per_client > 0,
         "rebuild requires search workload"
+    );
+    assert!(
+        !indexable_values || searches_per_client > 0,
+        "indexable values require search workload"
+    );
+    assert!(
+        !wait_search || searches_per_client > 0,
+        "search catch-up requires search workload"
     );
     let partitions = env_usize("DAL_BENCH_PARTITIONS", 4);
     assert!((1..=u16::MAX as usize).contains(&partitions));
@@ -242,21 +344,23 @@ async fn three_process_tcp_mixed_workload() {
     );
     if pause_follower {
         assert!(
-            clients * writes_per_client > 5_500,
-            "follower pause needs more than 5,500 writes"
+            clients * writes_per_client > resume_after_writes,
+            "follower pause needs more writes than its resume point"
         );
     }
     let binary =
         std::env::var_os("DAL_BENCH_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_dal").into());
 
-    let root = match std::env::var_os("DAL_BENCH_DIR") {
+    let mut root = match std::env::var_os("DAL_BENCH_DIR") {
         Some(path) => tempfile::tempdir_in(path).unwrap(),
         None => tempfile::tempdir().unwrap(),
     };
-    let controls: Vec<_> = (0..3).map(|_| tcp_addr()).collect();
-    let bulks: Vec<_> = (0..3).map(|_| tcp_addr()).collect();
-    let http_addrs: Vec<_> = (0..3)
-        .map(|_| tcp_addr().trim_start_matches("tcp://").to_string())
+    let addrs = tcp_addrs(9);
+    let controls = addrs[0..3].to_vec();
+    let bulks = addrs[3..6].to_vec();
+    let http_addrs: Vec<_> = addrs[6..9]
+        .iter()
+        .map(|addr| addr.trim_start_matches("tcp://").to_string())
         .collect();
     let nodes: Vec<_> = (0..3)
         .map(|i| {
@@ -317,6 +421,7 @@ async fn three_process_tcp_mixed_workload() {
         loop {
             for (index, child) in processes.0.iter_mut().enumerate() {
                 if let Some(exit) = child.try_wait().expect("cannot query node status") {
+                    root.disable_cleanup(true);
                     panic!(
                         "node {} exited during bootstrap ({exit}); see {}",
                         index + 1,
@@ -340,7 +445,13 @@ async fn three_process_tcp_mixed_workload() {
         }
     })
     .await
-    .expect("three-process cluster did not become ready");
+    .unwrap_or_else(|_| {
+        root.disable_cleanup(true);
+        panic!(
+            "three-process cluster did not become ready; logs at {}",
+            root.path().display()
+        );
+    });
 
     if searches_per_client > 0 {
         ready
@@ -400,11 +511,13 @@ async fn three_process_tcp_mixed_workload() {
         samples_done,
     ));
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let io_pressure_before = io_pressure_full_micros();
     let follower_task = paused_follower.map(|(pid, follower_addr)| {
         let progress = completed_writes.clone();
         tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(120), async {
-                while progress.load(Ordering::Relaxed) < 5_500 {
+                while progress.load(Ordering::Relaxed) < resume_after_writes {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             })
@@ -416,11 +529,13 @@ async fn three_process_tcp_mixed_workload() {
             tokio::time::timeout(Duration::from_secs(120), async {
                 loop {
                     if let Some(state) = status(&follower_addr).await {
-                        if state["partitions"][0]["raft_snapshot_index"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            > 0
-                        {
+                        let partition = &state["partitions"][0];
+                        let caught_up = if require_follower_snapshot {
+                            partition["raft_snapshot_index"].as_u64().unwrap_or(0) > 0
+                        } else {
+                            partition["applied"].as_u64().unwrap_or(0) >= resume_after_writes as u64
+                        };
+                        if caught_up {
                             break;
                         }
                     }
@@ -428,7 +543,7 @@ async fn three_process_tcp_mixed_workload() {
                 }
             })
             .await
-            .expect("lagging follower did not receive a snapshot");
+            .expect("lagging follower did not catch up");
             began.elapsed()
         })
     });
@@ -495,6 +610,8 @@ async fn three_process_tcp_mixed_workload() {
     } else {
         None
     };
+    let value = Arc::new(benchmark_value(value_bytes, indexable_values));
+    let actual_value_bytes = value.len();
     let mut tasks = Vec::new();
     for client_no in 0..clients {
         let client = Client::new(
@@ -504,12 +621,12 @@ async fn three_process_tcp_mixed_workload() {
             transport.clone(),
         );
         let progress = completed_writes.clone();
+        let value = value.clone();
         tasks.push(tokio::spawn(async move {
             let mut writes = Vec::new();
             let mut reads = Vec::new();
             let mut errors = 0usize;
             let mut retries = 0usize;
-            let value = vec![b'x'; value_bytes];
             for i in 0..writes_per_client {
                 let key = format!("bench-{client_no}-{i}");
                 let begin = Instant::now();
@@ -518,7 +635,7 @@ async fn three_process_tcp_mixed_workload() {
                     if attempt > 0 {
                         retries += 1;
                     }
-                    match client.put(key.as_bytes(), &value, None).await {
+                    match client.put(key.as_bytes(), value.as_slice(), None).await {
                         Ok(WriteReply::Applied { .. }) => {
                             applied = true;
                             break;
@@ -537,7 +654,7 @@ async fn three_process_tcp_mixed_workload() {
                 progress.fetch_add(1, Ordering::Relaxed);
                 let begin = Instant::now();
                 match client.get(key.as_bytes()).await {
-                    Ok(Some((_, read))) if read == value => reads.push(begin.elapsed()),
+                    Ok(Some((_, read))) if read.as_slice() == value.as_slice() => reads.push(begin.elapsed()),
                     Ok(Some((_, read))) => {
                         eprintln!(
                             "read mismatch client={client_no} key={key} bytes={} expected={value_bytes}",
@@ -582,6 +699,8 @@ async fn three_process_tcp_mixed_workload() {
         None => None,
     };
     let elapsed = started.elapsed();
+    #[cfg(target_os = "linux")]
+    let io_pressure_after = io_pressure_full_micros();
     let snapshot_wait = if env_usize("DAL_BENCH_WAIT_SNAPSHOT", 0) != 0 {
         let began = Instant::now();
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -606,18 +725,68 @@ async fn three_process_tcp_mixed_workload() {
     } else {
         None
     };
+    let search_catchup = if wait_search {
+        let began = Instant::now();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let mut all_caught_up = true;
+                for addr in &http_addrs {
+                    let Some(state) = status(addr).await else {
+                        all_caught_up = false;
+                        break;
+                    };
+                    let ready = state["partitions"].as_array().is_some_and(|partitions| {
+                        !partitions.is_empty()
+                            && partitions.iter().all(|partition| {
+                                partition["search"].as_array().is_some_and(|indexes| {
+                                    indexes.iter().any(|index| {
+                                        index["name"] == "benchmark"
+                                            && index["state"] == "Active"
+                                            && index["lag_entries"].as_u64() == Some(0)
+                                    })
+                                })
+                            })
+                    });
+                    if !ready {
+                        all_caught_up = false;
+                        break;
+                    }
+                }
+                if all_caught_up {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("search projections did not catch up");
+        let reply = ready.search_active(&search_request()).await.unwrap();
+        let expected_hits = if indexable_values {
+            writes.len() + 1
+        } else {
+            1
+        };
+        assert_eq!(reply.total_hits, expected_hits as u64);
+        Some((began.elapsed(), reply.total_hits))
+    } else {
+        None
+    };
+    // Ensure status counters updated by the final background pass are sampled.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let _ = stop_samples.send(());
     let samples = samples.await.unwrap();
     assert!(!writes.is_empty(), "no successful writes");
     assert!(!reads.is_empty(), "no successful reads");
     println!(
-        "trial={} binary={} topology=3-process TCP filesystem_root={} partitions={} clients={} value_bytes={} writes={} reads={} searches={} errors={} retries={} elapsed_s={:.2} ops_per_s={:.1}",
+        "trial={} binary={} topology=3-process TCP filesystem_root={} partitions={} clients={} value_bytes={} requested_value_bytes={} indexable_values={} writes={} reads={} searches={} errors={} retries={} elapsed_s={:.2} ops_per_s={:.1}",
         std::env::var("DAL_BENCH_TRIAL_ID").unwrap_or_else(|_| "unset".into()),
         std::path::Path::new(&binary).display(),
         root.path().display(),
         partitions,
         clients,
+        actual_value_bytes,
         value_bytes,
+        indexable_values,
         writes.len(),
         reads.len(),
         searches.len(),
@@ -643,6 +812,13 @@ async fn three_process_tcp_mixed_workload() {
         writes.last().unwrap().as_secs_f64() * 1000.0,
         reads.last().unwrap().as_secs_f64() * 1000.0,
     );
+    #[cfg(target_os = "linux")]
+    println!(
+        "host_io_full_ms={:?}",
+        io_pressure_after
+            .zip(io_pressure_before)
+            .map(|(after, before)| after.saturating_sub(before) as f64 / 1000.0)
+    );
     if !searches.is_empty() {
         println!(
             "search_p50_ms={:.2} search_p95_ms={:.2} search_p99_ms={:.2}",
@@ -663,15 +839,26 @@ async fn three_process_tcp_mixed_workload() {
             duration.as_secs_f64() * 1000.0
         );
     }
+    if let Some((duration, hits)) = search_catchup {
+        println!(
+            "search_catchup_after_foreground_ms={:.2} final_search_total_hits={hits}",
+            duration.as_secs_f64() * 1000.0
+        );
+    }
     if let Some(duration) = follower_catchup {
         println!(
-            "follower_snapshot_catchup_ms={:.2}",
+            "follower_{}_catchup_ms={:.2}",
+            if require_follower_snapshot {
+                "snapshot"
+            } else {
+                "log"
+            },
             duration.as_secs_f64() * 1000.0
         );
     }
     for (child, sample) in processes.0.iter().zip(samples) {
         println!(
-            "node_pid={} peak_rss_kib={} cpu_ticks={:?} peak_outbox_entries={} peak_outbox_bytes={} peak_pending_bytes={} snapshot_index={} wal_syncs={:?} wal_bytes={:?} stall_micros={:?} status_samples={}",
+            "node_pid={} peak_rss_kib={} cpu_ticks={:?} peak_outbox_entries={} peak_outbox_bytes={} peak_pending_bytes={} peak_wal_pending_requests={} peak_wal_pending_bytes={} peak_rocks_memtables_bytes={} peak_rocks_unflushed_memtables_bytes={} peak_rocks_table_readers_bytes={} peak_rocks_cache_bytes={} peak_tantivy_writer_budget_bytes={} snapshot_index={} snapshot_builds={} snapshot_build_max_ms={:.2} snapshot_installs={} snapshot_install_max_ms={:.2} search_user_records_scanned={} search_outbox_entries_scanned={} search_source_row_peak_bytes={} snapshot_record_peak_bytes={} wal_syncs={:?} wal_bytes={:?} stall_micros={:?} status_samples={}",
             child.id(),
             sample.peak_rss_kib,
             sample
@@ -681,7 +868,22 @@ async fn three_process_tcp_mixed_workload() {
             sample.peak_outbox_entries,
             sample.peak_outbox_bytes,
             sample.peak_pending_bytes,
+            sample.peak_wal_pending_requests,
+            sample.peak_wal_pending_bytes,
+            sample.peak_rocks_memtables_bytes,
+            sample.peak_rocks_unflushed_memtables_bytes,
+            sample.peak_rocks_table_readers_bytes,
+            sample.peak_rocks_cache_bytes,
+            sample.peak_tantivy_writer_budget_bytes,
             sample.max_snapshot_index,
+            sample.snapshot_builds,
+            sample.snapshot_build_max_micros as f64 / 1000.0,
+            sample.snapshot_installs,
+            sample.snapshot_install_max_micros as f64 / 1000.0,
+            sample.search_user_records_scanned,
+            sample.search_outbox_entries_scanned,
+            sample.search_source_row_peak_bytes,
+            sample.snapshot_record_peak_bytes,
             sample
                 .last_wal_syncs
                 .zip(sample.first_wal_syncs)

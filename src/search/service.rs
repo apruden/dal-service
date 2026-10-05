@@ -61,6 +61,9 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    pub(crate) fn writer_memory_budget_bytes(&self) -> usize {
+        self.loaded.read().unwrap().len() * LocalSearchIndex::writer_memory_budget_bytes()
+    }
     pub fn new(storage: Arc<Storage>) -> Result<Self> {
         let session_incarnation = storage.next_search_session_incarnation()?;
         Ok(Self {

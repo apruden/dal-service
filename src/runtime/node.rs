@@ -1193,6 +1193,15 @@ impl StatusSource for NodeStatus {
         partitions.sort_by_key(|s| s.partition);
 
         let rocks = crate::perf::write_path_enabled().then(|| self.storage.rocks_counters());
+        let rocks_memory = crate::perf::write_path_enabled()
+            .then(|| self.storage.rocks_memory_estimates())
+            .flatten();
+        let wal_queue = self.storage.wal_queue_status();
+        let snapshots = crate::perf::snapshot_counters();
+        let (search_user_records_scanned, search_outbox_entries_scanned) =
+            crate::perf::search_scan_counts();
+        let (search_source_row_peak_bytes, snapshot_record_peak_bytes) =
+            crate::perf::source_record_peaks();
         let router = crate::transport::router::counters();
         ClusterStatus {
             node_id: self.node_id,
@@ -1202,6 +1211,23 @@ impl StatusSource for NodeStatus {
             storage_wal_syncs: rocks.map(|counters| counters.wal_syncs),
             storage_wal_bytes: rocks.map(|counters| counters.wal_bytes),
             storage_stall_micros: rocks.map(|counters| counters.stall_micros),
+            storage_wal_pending_requests: wal_queue.pending_requests,
+            storage_wal_pending_bytes: wal_queue.pending_bytes,
+            storage_wal_peak_pending_requests: wal_queue.peak_pending_requests,
+            storage_wal_peak_pending_bytes: wal_queue.peak_pending_bytes,
+            storage_rocks_memtables_bytes: rocks_memory.map(|memory| memory.0),
+            storage_rocks_unflushed_memtables_bytes: rocks_memory.map(|memory| memory.1),
+            storage_rocks_table_readers_bytes: rocks_memory.map(|memory| memory.2),
+            storage_rocks_cache_bytes: rocks_memory.map(|memory| memory.3),
+            search_tantivy_writer_budget_bytes: self.search.writer_memory_budget_bytes(),
+            snapshot_builds: snapshots.builds,
+            snapshot_build_max_micros: snapshots.build_max_micros,
+            snapshot_installs: snapshots.installs,
+            snapshot_install_max_micros: snapshots.install_max_micros,
+            search_user_records_scanned,
+            search_outbox_entries_scanned,
+            search_source_row_peak_bytes,
+            snapshot_record_peak_bytes,
             router_admission_rejections: router.admission_rejections,
             router_reply_send_eagain: router.reply_send_eagain,
             router_reply_send_failures: router.reply_send_failures,

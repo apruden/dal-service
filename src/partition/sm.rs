@@ -330,6 +330,7 @@ impl RocksStateMachine {
         };
         let storage = self.storage.clone();
         let group = self.group;
+        let build_started = std::time::Instant::now();
         let snapshot_file = tokio::task::spawn_blocking(move || {
             // Keep the view lock until both the metadata and RocksDB snapshot
             // name the same applied prefix. The source then pins its CF while
@@ -348,6 +349,7 @@ impl RocksStateMachine {
             )
         })?
         .map_err(|error| self.read_failure("snapshot state stream failed", error))?;
+        crate::perf::record_snapshot_build(build_started.elapsed());
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
             None => "empty".to_string(),
@@ -425,6 +427,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         let group = self.group;
         let last_log_id = meta.last_log_id;
         let applied: Applied = (last_log_id, meta.last_membership.clone());
+        let install_started = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
             let _view = view;
             storage.validate_state_install(group, last_log_id.as_ref())?;
@@ -442,6 +445,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
             )
         })?
         .map_err(|error| self.write_failure("snapshot stream/install failed", error))?;
+        crate::perf::record_snapshot_install(install_started.elapsed());
         Ok(())
     }
 

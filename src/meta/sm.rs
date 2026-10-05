@@ -82,6 +82,7 @@ impl MetaRaftStateMachine {
             (last_log_id, membership, view)
         };
         let storage = self.storage.clone();
+        let build_started = std::time::Instant::now();
         let snapshot_file = tokio::task::spawn_blocking(move || {
             let state = storage.state_snapshot(GroupId::Meta)?;
             drop(view);
@@ -97,6 +98,7 @@ impl MetaRaftStateMachine {
             )
         })?
         .map_err(|error| self.read_failure("meta snapshot state stream failed", error))?;
+        crate::perf::record_snapshot_build(build_started.elapsed());
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
             None => "empty".to_string(),
@@ -204,6 +206,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         let storage = self.storage.clone();
         let last_log_id = meta.last_log_id;
         let applied: Applied = (last_log_id, meta.last_membership.clone());
+        let install_started = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
             let _view = view;
             storage.validate_state_install(GroupId::Meta, last_log_id.as_ref())?;
@@ -221,6 +224,7 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
             )
         })?
         .map_err(|error| self.write_failure("meta snapshot stream/install failed", error))?;
+        crate::perf::record_snapshot_install(install_started.elapsed());
         Ok(())
     }
 

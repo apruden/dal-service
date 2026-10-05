@@ -24,7 +24,9 @@ use crate::perf::{RocksCounters, WriteStage};
 use crate::storage::apply_durability::{
     ApplyDurabilityLimits, ApplyDurabilityRegistry, ApplyDurabilitySnapshot, DurabilityWaitKind,
 };
-use crate::storage::durability::{DurabilityConfig, DurabilityKind, OnDurable, WalDurability};
+use crate::storage::durability::{
+    DurabilityConfig, DurabilityKind, OnDurable, WalDurability, WalQueueStatus,
+};
 use crate::types::{
     BootstrapGroup, ClusterId, GroupId, LearnerAdmission, LogId, NodeId, RegistrationBinding,
     ServingState,
@@ -105,9 +107,15 @@ impl SearchSourceView<'_> {
                 break;
             };
             let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+            crate::perf::record_search_source_row_bytes(
+                key.len()
+                    .saturating_add(value.len())
+                    .saturating_add(record.value.len()),
+            );
             visit(user_key, record.version, &record.value)?;
             count += 1;
         }
+        crate::perf::record_search_user_scan(count);
         Ok(count)
     }
 
@@ -140,12 +148,19 @@ impl SearchSourceView<'_> {
             match self.snapshot.get_cf(&self.cf, &state_key)? {
                 Some(value) => {
                     let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+                    crate::perf::record_search_source_row_bytes(
+                        key.len()
+                            .saturating_add(state_key.len())
+                            .saturating_add(value.len())
+                            .saturating_add(record.value.len()),
+                    );
                     visit(&entry.user_key, Some((record.version, &record.value)))?;
                 }
                 None => visit(&entry.user_key, None)?,
             }
             count += 1;
         }
+        crate::perf::record_search_outbox_scan(count);
         Ok(count)
     }
 }
@@ -995,6 +1010,25 @@ impl Storage {
         }
     }
 
+    /// RocksDB's approximate internal memory, separate from process RSS and
+    /// application-owned source records. Cache usage only covers caches known
+    /// to RocksDB's memory-consumer API.
+    pub(crate) fn rocks_memory_estimates(&self) -> Option<(u64, u64, u64, u64)> {
+        let mut builder = rocksdb::perf::MemoryUsageBuilder::new().ok()?;
+        builder.add_db(&*self.db);
+        let usage = builder.build().ok()?;
+        Some((
+            usage.approximate_mem_table_total(),
+            usage.approximate_mem_table_unflushed(),
+            usage.approximate_mem_table_readers_total(),
+            usage.approximate_cache_total(),
+        ))
+    }
+
+    pub(crate) fn wal_queue_status(&self) -> WalQueueStatus {
+        self.durability.queue_status()
+    }
+
     /// Ask the database worker to WAL-write a Raft log batch. Return once the
     /// entries are readable; complete `callback` only after the shared durable
     /// flush covers them.
@@ -1785,6 +1819,67 @@ mod tests {
     use openraft::CommittedLeaderId;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "release snapshot install measurement; set DAL_BENCH_DIR to a durable filesystem"]
+    fn maximum_value_snapshot_install_measurement() {
+        let records: usize = std::env::var("DAL_BENCH_SNAPSHOT_RECORDS")
+            .ok()
+            .map(|value| value.parse().expect("invalid snapshot record count"))
+            .unwrap_or(512);
+        assert!((1..=2048).contains(&records));
+        let root = match std::env::var_os("DAL_BENCH_DIR") {
+            Some(path) => tempfile::tempdir_in(path).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let storage = Storage::open(root.path().join("db")).unwrap();
+        let group = GroupId::Data(42);
+        storage.ensure_group(group).unwrap();
+        let value = vec![b'v'; crate::types::MAX_VALUE_BYTES];
+        let began = std::time::Instant::now();
+        let file = crate::snapshot::SnapshotFile::build(&storage.snapshot_temp_dir(), |writer| {
+            crate::snapshot::encode_records(
+                writer,
+                (0..records).map(|index| Ok((index.to_be_bytes(), value.as_slice()))),
+            )
+        })
+        .unwrap();
+        let build = began.elapsed();
+        let began = std::time::Instant::now();
+        let mut installer = storage.begin_state_install(group).unwrap();
+        file.decode_records_sync(|key, value| installer.put(key, value))
+            .unwrap();
+        let applied: RaftApplied = (None, openraft::StoredMembership::default());
+        installer.finish(&codec::encode(&applied)).unwrap();
+        let install = began.elapsed();
+        assert_eq!(
+            storage
+                .get_state(group, &0usize.to_be_bytes())
+                .unwrap()
+                .unwrap(),
+            value
+        );
+        assert_eq!(
+            storage
+                .get_state(group, &(records - 1).to_be_bytes())
+                .unwrap()
+                .unwrap(),
+            value
+        );
+        let mib = records as f64 * value.len() as f64 / (1024.0 * 1024.0);
+        println!(
+            "snapshot_install root={} records={} value_bytes={} logical_mib={:.1} build_s={:.3} build_mib_per_s={:.1} install_s={:.3} install_mib_per_s={:.1} record_peak_bytes={}",
+            root.path().display(),
+            records,
+            value.len(),
+            mib,
+            build.as_secs_f64(),
+            mib / build.as_secs_f64(),
+            install.as_secs_f64(),
+            mib / install.as_secs_f64(),
+            crate::perf::source_record_peaks().1,
+        );
+    }
 
     fn delayed_config(delay: Duration) -> DurabilityConfig {
         DurabilityConfig {

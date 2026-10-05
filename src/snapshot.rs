@@ -138,6 +138,7 @@ impl SnapshotFile {
             validate_lengths(key_len, value_len)?;
             let mut key = vec![0u8; key_len];
             let mut value = vec![0u8; value_len];
+            crate::perf::record_snapshot_record_bytes(key_len.saturating_add(value_len));
             reader.read_exact(&mut key)?;
             reader.read_exact(&mut value)?;
             hasher.update(key_len_bytes);
@@ -232,6 +233,7 @@ where
         let key = key.as_ref();
         let value = value.as_ref();
         validate_lengths(key.len(), value.len())?;
+        crate::perf::record_snapshot_record_bytes(key.len().saturating_add(value.len()));
         let key_len = u32::try_from(key.len())
             .map_err(|_| Error::codec("snapshot key length exceeds u32"))?;
         let value_len = u32::try_from(value.len())
@@ -396,5 +398,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 1001);
+    }
+
+    #[test]
+    #[ignore = "release snapshot stream measurement; set DAL_BENCH_DIR to a durable filesystem"]
+    fn maximum_value_snapshot_stream_measurement() {
+        let records: usize = std::env::var("DAL_BENCH_SNAPSHOT_RECORDS")
+            .ok()
+            .map(|value| value.parse().expect("invalid snapshot record count"))
+            .unwrap_or(512);
+        assert!((1..=2048).contains(&records));
+        let root = match std::env::var_os("DAL_BENCH_DIR") {
+            Some(path) => tempfile::tempdir_in(path).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let value = vec![b'v'; crate::types::MAX_VALUE_BYTES];
+        let began = std::time::Instant::now();
+        let file = SnapshotFile::build(root.path(), |writer| {
+            encode_records(
+                writer,
+                (0..records).map(|index| Ok((index.to_be_bytes(), value.as_slice()))),
+            )
+        })
+        .unwrap();
+        let build = began.elapsed();
+        let began = std::time::Instant::now();
+        let mut decoded = 0usize;
+        file.decode_records_sync(|key, read| {
+            assert_eq!(key, decoded.to_be_bytes());
+            assert_eq!(read.len(), value.len());
+            assert_eq!(read[0], b'v');
+            decoded += 1;
+            Ok(())
+        })
+        .unwrap();
+        let decode = began.elapsed();
+        assert_eq!(decoded, records);
+        let mib = records as f64 * value.len() as f64 / (1024.0 * 1024.0);
+        println!(
+            "snapshot_stream root={} records={} value_bytes={} logical_mib={:.1} build_s={:.3} build_mib_per_s={:.1} decode_s={:.3} decode_mib_per_s={:.1} record_peak_bytes={}",
+            root.path().display(),
+            records,
+            value.len(),
+            mib,
+            build.as_secs_f64(),
+            mib / build.as_secs_f64(),
+            decode.as_secs_f64(),
+            mib / decode.as_secs_f64(),
+            crate::perf::source_record_peaks().1,
+        );
     }
 }
