@@ -24,9 +24,9 @@ use crate::transport::codec::{Lane, MsgType};
 const MAX_HANDLERS: usize = 1024;
 const MAX_CLIENT_HANDLERS: usize = 768;
 /// Ceiling on concurrently reserved reply bytes. A client op reserves its worst
-/// case (a 16 MiB value read), so this budget — not `MAX_CLIENT_HANDLERS` — is
-/// what bounds concurrent client ops, at `REPLY_BUDGET_MIB / 17`. Raise it to
-/// trade resident reply memory for client concurrency.
+/// case (a 1 MiB value read plus framing), rounded up to 2 MiB per operation.
+/// This budget bounds concurrent client ops at `REPLY_BUDGET_MIB / 2`. Raise
+/// it to trade resident reply memory for client concurrency.
 const REPLY_BUDGET_MIB: usize = 512;
 /// Ceiling on decoded request frames owned by in-flight handlers on one bound
 /// endpoint. libzmq has already assembled a frame before application admission
@@ -59,6 +59,8 @@ struct RouterLimits {
     client_handlers: usize,
     reply_budget_mib: usize,
     request_budget_mib: usize,
+    client_request_budget_mib: usize,
+    client_reply_budget_mib: usize,
     recv_hwm: usize,
 }
 
@@ -86,6 +88,15 @@ impl RouterLimits {
                 "DAL_ROUTER_MAX_CLIENT_HANDLERS must be less than DAL_ROUTER_MAX_HANDLERS".into(),
             ));
         }
+        if total_handlers > Semaphore::MAX_PERMITS
+            || request_budget_mib > Semaphore::MAX_PERMITS
+            || reply_budget_mib > Semaphore::MAX_PERMITS
+            || recv_hwm > i32::MAX as usize
+        {
+            return Err(Error::Config(
+                "router limits exceed platform semaphore or socket bounds".into(),
+            ));
+        }
         let request_budget_bytes = request_budget_mib
             .checked_mul(MIB)
             .ok_or_else(|| Error::Config("DAL_ROUTER_*_REQUEST_BUDGET_MIB is too large".into()))?;
@@ -94,11 +105,30 @@ impl RouterLimits {
                 "the {lane:?} request budget must fit one maximum-size frame"
             )));
         }
+        let peer_request_reserve = lane.max_frame_bytes().div_ceil(MIB);
+        let peer_reply_reserve = peer_reply_reserve_mib(lane);
+        let client_request_budget_mib = request_budget_mib.saturating_sub(peer_request_reserve);
+        let client_reply_budget_mib = reply_budget_mib.saturating_sub(peer_reply_reserve);
+        if lane == Lane::Control
+            && (client_request_budget_mib < (MsgType::ClientOp.max_payload() + 36).div_ceil(MIB)
+                || client_reply_budget_mib < max_reply_bytes(MsgType::ClientOp).div_ceil(MIB))
+        {
+            return Err(Error::Config(format!(
+                "router byte budgets must fit one client operation plus {peer_request_reserve} MiB of peer request capacity and {peer_reply_reserve} MiB of peer reply capacity"
+            )));
+        }
+        if reply_budget_mib < peer_reply_reserve {
+            return Err(Error::Config(format!(
+                "router reply budget must reserve {peer_reply_reserve} MiB for peer traffic"
+            )));
+        }
         Ok(Self {
             total_handlers,
             client_handlers,
             reply_budget_mib,
             request_budget_mib,
+            client_request_budget_mib,
+            client_reply_budget_mib,
             recv_hwm,
         })
     }
@@ -146,6 +176,8 @@ struct Admission {
     clients: Arc<Semaphore>,
     request_bytes: Arc<Semaphore>,
     reply_bytes: Arc<Semaphore>,
+    client_request_bytes: Arc<Semaphore>,
+    client_reply_bytes: Arc<Semaphore>,
 }
 
 struct HeldAdmission {
@@ -153,6 +185,8 @@ struct HeldAdmission {
     _client: Option<OwnedSemaphorePermit>,
     _request_bytes: OwnedSemaphorePermit,
     _reply_bytes: OwnedSemaphorePermit,
+    _client_request_bytes: Option<OwnedSemaphorePermit>,
+    _client_reply_bytes: Option<OwnedSemaphorePermit>,
 }
 
 impl Admission {
@@ -163,35 +197,61 @@ impl Admission {
         max_reply_bytes: usize,
     ) -> Option<HeldAdmission> {
         let total = self.total.clone().try_acquire_owned().ok()?;
+        let client = (!peer)
+            .then(|| self.clients.clone().try_acquire_owned().ok())
+            .flatten();
+        if !peer && client.is_none() {
+            return None;
+        }
         let request_mib = u32::try_from(request_bytes.div_ceil(MIB).max(1)).ok()?;
+        let reply_mib = u32::try_from(max_reply_bytes.div_ceil(MIB).max(1)).ok()?;
+        let client_request_bytes = (!peer)
+            .then(|| {
+                self.client_request_bytes
+                    .clone()
+                    .try_acquire_many_owned(request_mib)
+                    .ok()
+            })
+            .flatten();
+        let client_reply_bytes = (!peer)
+            .then(|| {
+                self.client_reply_bytes
+                    .clone()
+                    .try_acquire_many_owned(reply_mib)
+                    .ok()
+            })
+            .flatten();
+        if !peer && (client_request_bytes.is_none() || client_reply_bytes.is_none()) {
+            return None;
+        }
         let request_bytes = self
             .request_bytes
             .clone()
             .try_acquire_many_owned(request_mib)
             .ok()?;
-        let reply_mib = u32::try_from(max_reply_bytes.div_ceil(MIB).max(1)).ok()?;
         let reply_bytes = self
             .reply_bytes
             .clone()
             .try_acquire_many_owned(reply_mib)
             .ok()?;
-        if peer {
-            Some(HeldAdmission {
-                _total: total,
-                _client: None,
-                _request_bytes: request_bytes,
-                _reply_bytes: reply_bytes,
-            })
-        } else {
-            let client = self.clients.clone().try_acquire_owned().ok()?;
-            Some(HeldAdmission {
-                _total: total,
-                _client: Some(client),
-                _request_bytes: request_bytes,
-                _reply_bytes: reply_bytes,
-            })
-        }
+        Some(HeldAdmission {
+            _total: total,
+            _client: client,
+            _request_bytes: request_bytes,
+            _reply_bytes: reply_bytes,
+            _client_request_bytes: client_request_bytes,
+            _client_reply_bytes: client_reply_bytes,
+        })
     }
+}
+
+fn peer_reply_reserve_mib(lane: Lane) -> usize {
+    (0..=u8::MAX)
+        .filter_map(MsgType::from_u8)
+        .filter(|msg_type| msg_type.is_peer_control() && msg_type.is_bulk() == (lane == Lane::Bulk))
+        .map(|msg_type| max_reply_bytes(msg_type).div_ceil(MIB))
+        .max()
+        .unwrap_or(1)
 }
 
 fn max_reply_bytes(msg_type: MsgType) -> usize {
@@ -209,7 +269,18 @@ fn max_reply_bytes(msg_type: MsgType) -> usize {
         MsgType::SearchOp | MsgType::SearchExecute => MsgType::SearchOp.max_payload() + 36,
         MsgType::SearchPrepare => MsgType::SearchPrepare.max_payload() + 36,
         MsgType::SearchCatalogQuery => MsgType::SearchCatalogQuery.max_payload() + 36,
-        _ => 4 * 1024 + 36,
+        MsgType::RaftAppend
+        | MsgType::RaftVote
+        | MsgType::RaftSnapshot
+        | MsgType::MigrationChunk
+        | MsgType::Heartbeat
+        | MsgType::BecomeLearner
+        | MsgType::DataConfigObservation
+        | MsgType::BootstrapStatus
+        | MsgType::PlacementQuery
+        | MsgType::DataRecoveryFence
+        | MsgType::TransferLeadership => 4 * 1024 + 36,
+        _ => msg_type.max_payload() + 36,
     }
 }
 
@@ -260,6 +331,19 @@ impl ZmqServer {
         S: Server + 'static,
     {
         let limits = RouterLimits::from_env(lane)?;
+        Self::bind_with_limits(ctx, addr, server, lane, limits)
+    }
+
+    fn bind_with_limits<S>(
+        ctx: zmq::Context,
+        addr: &str,
+        server: Arc<S>,
+        lane: Lane,
+        limits: RouterLimits,
+    ) -> Result<ZmqServer>
+    where
+        S: Server + 'static,
+    {
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
         socket.set_rcvtimeo(1).map_err(zmq_io)?;
@@ -285,6 +369,8 @@ impl ZmqServer {
             clients: Arc::new(Semaphore::new(limits.client_handlers)),
             request_bytes: Arc::new(Semaphore::new(limits.request_budget_mib)),
             reply_bytes: Arc::new(Semaphore::new(limits.reply_budget_mib)),
+            client_request_bytes: Arc::new(Semaphore::new(limits.client_request_budget_mib)),
+            client_reply_bytes: Arc::new(Semaphore::new(limits.client_reply_budget_mib)),
         };
         let (reply_tx, reply_rx) = mpsc::sync_channel::<PendingReply>(limits.total_handlers);
 
@@ -446,7 +532,12 @@ impl ZmqServer {
                 crate::perf::record_duration(stage, started.elapsed());
             }
             let reply_completed_at = crate::perf::write_path_enabled().then(Instant::now);
-            let bytes = reply.encode().unwrap_or_else(|_| {
+            let bytes = if reply.payload.len().saturating_add(36) > max_reply_bytes {
+                None
+            } else {
+                reply.encode().ok()
+            }
+            .unwrap_or_else(|| {
                 Envelope::new(
                     reply.cluster_id,
                     reply.msg_type,
@@ -551,13 +642,50 @@ pub fn settle() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Transport;
+    use crate::transport::dealer::ZmqTransport;
+    use crate::types::GroupId;
+
+    struct HeldClients {
+        active: AtomicUsize,
+        release: Notify,
+    }
+
+    impl Server for HeldClients {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            if request.msg_type == MsgType::ClientOp {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+            }
+            Envelope::new(
+                request.cluster_id,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                b"served".to_vec(),
+            )
+        }
+    }
 
     fn admission(total: usize, clients: usize, request_mib: usize, reply_mib: usize) -> Admission {
+        with_reserves(total, clients, request_mib, reply_mib, 1, 1)
+    }
+
+    fn with_reserves(
+        total: usize,
+        clients: usize,
+        request_mib: usize,
+        reply_mib: usize,
+        peer_request_mib: usize,
+        peer_reply_mib: usize,
+    ) -> Admission {
         Admission {
             total: Arc::new(Semaphore::new(total)),
             clients: Arc::new(Semaphore::new(clients)),
             request_bytes: Arc::new(Semaphore::new(request_mib)),
             reply_bytes: Arc::new(Semaphore::new(reply_mib)),
+            client_request_bytes: Arc::new(Semaphore::new(request_mib - peer_request_mib)),
+            client_reply_bytes: Arc::new(Semaphore::new(reply_mib - peer_reply_mib)),
         }
     }
 
@@ -580,11 +708,12 @@ mod tests {
 
     #[test]
     fn reply_byte_reservation_is_held_until_admission_drops() {
-        let admission = admission(2, 2, 8, 2);
+        let admission = admission(3, 2, 8, 3);
         let held = admission
             .try_acquire(false, 1, 2 * MIB)
             .expect("two-MiB reservation admitted");
         assert!(admission.try_acquire(false, 1, 1).is_none());
+        assert!(admission.try_acquire(true, 1, 1).is_some());
         drop(held);
         assert!(admission.try_acquire(false, 1, 1).is_some());
     }
@@ -599,8 +728,90 @@ mod tests {
             admission.try_acquire(false, 2 * MIB, 1).is_none(),
             "request budget must reject a frame that would exceed it"
         );
-        assert!(admission.try_acquire(false, MIB, 1).is_some());
+        assert!(admission.try_acquire(true, MIB, 1).is_some());
         drop(held);
         assert!(admission.try_acquire(false, 2 * MIB, 1).is_some());
+    }
+
+    #[test]
+    fn client_byte_saturation_preserves_maximum_peer_request_and_reply() {
+        let admission = with_reserves(16, 12, 69, 37, 65, 33);
+        let clients: Vec<_> = (0..2)
+            .map(|_| admission.try_acquire(false, MIB + 36, MIB + 36).unwrap())
+            .collect();
+        assert!(admission.try_acquire(false, 1, 1).is_none());
+        let peer = admission
+            .try_acquire(true, 64 * MIB + 36, 32 * MIB + 36)
+            .expect("peer reserves must survive client saturation");
+        drop(peer);
+        drop(clients);
+        assert!(admission.try_acquire(false, MIB + 36, MIB + 36).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zmq_peer_append_progresses_with_client_byte_budgets_saturated() {
+        let ctx = zmq::Context::new();
+        let addr = "inproc://dal-router-peer-byte-reserve";
+        let held = Arc::new(HeldClients {
+            active: AtomicUsize::new(0),
+            release: Notify::new(),
+        });
+        let server = ZmqServer::bind_with_limits(
+            ctx.clone(),
+            addr,
+            held.clone(),
+            Lane::Control,
+            RouterLimits {
+                total_handlers: 8,
+                client_handlers: 4,
+                request_budget_mib: 69,
+                client_request_budget_mib: 4,
+                reply_budget_mib: 37,
+                client_reply_budget_mib: 4,
+                recv_hwm: 32,
+            },
+        )
+        .unwrap();
+        settle();
+        let transport = ZmqTransport::new(ctx, Duration::from_secs(5), Lane::Control);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let transport = transport.clone();
+            clients.push(tokio::spawn(async move {
+                transport
+                    .call(
+                        addr,
+                        Envelope::new(7, MsgType::ClientOp, GroupId::Data(0), 0, vec![0; MIB + 1]),
+                    )
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while held.active.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let peer = transport
+            .call(
+                addr,
+                Envelope::new(
+                    7,
+                    MsgType::RaftAppend,
+                    GroupId::Data(0),
+                    0,
+                    vec![0; 64 * MIB],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(peer.payload, b"served");
+        held.release.notify_waiters();
+        for client in clients {
+            assert_eq!(client.await.unwrap().unwrap().payload, b"served");
+        }
+        server.shutdown().await;
     }
 }

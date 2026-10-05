@@ -292,6 +292,24 @@ impl LocalSearchIndex {
         Ok(rejected)
     }
 
+    pub(crate) fn rebuild_from_view(
+        &self,
+        source: &crate::storage::rocks::SearchSourceView<'_>,
+    ) -> Result<(usize, u64)> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.rollback().map_err(search_error)?;
+        writer.delete_all_documents().map_err(search_error)?;
+        let mut rejected = 0u64;
+        let count = source.for_each_user(|key, version, value| {
+            if let Some(error) = self.add_if_indexable(&mut writer, key, version, value)? {
+                tracing::warn!(group = ?self.group, key_bytes = key.len(), %error, "search document rejected");
+                rejected += 1;
+            }
+            Ok(())
+        })?;
+        Ok((count, rejected))
+    }
+
     /// Idempotent delete-then-add projection for one authoritative key.
     pub fn project(&self, key: &[u8], source: Option<(Version, &[u8])>) -> Result<bool> {
         let mut writer = self.writer.lock().unwrap();

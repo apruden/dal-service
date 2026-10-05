@@ -15,6 +15,7 @@ pub mod router;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use codec::Envelope;
@@ -26,7 +27,30 @@ pub trait Transport: Send + Sync {
     /// Send `request` to `addr` and await the reply frame. An `Err` means the
     /// peer was unreachable or the exchange timed out — the caller retries
     /// another candidate with the same idempotency key (DESIGN §8.4).
+    ///
+    /// An implementation may overwrite `request.request_id` with its own
+    /// correlation id before the frame leaves this process (the ZeroMQ
+    /// transport does; the in-process switch preserves the caller's value).
+    /// Callers must not assume the id they set is the one the peer echoes, and
+    /// must correlate through the returned future, never through the id.
     fn call(&self, addr: &str, request: Envelope) -> impl Future<Output = Result<Envelope>> + Send;
+
+    /// Like [`Transport::call`], but bounds this one exchange by `timeout` on
+    /// carriers that enforce deadlines. `Some(ttl)` overrides the transport's
+    /// constructed default for this call only — the Raft peer path uses it to
+    /// honor openraft's per-RPC TTL (large snapshot chunks legitimately need
+    /// longer than a control round-trip). `None` preserves the transport's
+    /// default policy, as does this default implementation (the deterministic
+    /// in-process switch has no timeouts at all).
+    fn call_with_timeout(
+        &self,
+        addr: &str,
+        request: Envelope,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<Envelope>> + Send {
+        let _ = timeout;
+        self.call(addr, request)
+    }
 }
 
 /// A node-side request handler: consumes an inbound frame and produces its

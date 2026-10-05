@@ -219,7 +219,21 @@ impl ClientGateway {
                         candidates: self.candidates(partition).await,
                     })
                 }
-                Err(e) => ClientReply::Error(format!("read failed: {e}")),
+                // Every error `node.read` can produce is node-local: a serving-
+                // gate refusal, a failed ReadIndex quorum wait (e.g. a minority-
+                // partitioned stale leader), or local storage trouble. Malformed
+                // requests are refused before reaching the node, so nothing here
+                // is terminal for the client. Reads are idempotent, so DESIGN
+                // §8.2 applies: redirect and let the client walk the candidate
+                // set rather than hard-failing on one bad replica.
+                Err(e) => {
+                    tracing::warn!(partition, %e, "read failed locally; redirecting client");
+                    ClientReply::Redirect(Redirect {
+                        cluster_id: self.cluster_id,
+                        leader: None,
+                        candidates: self.candidates(partition).await,
+                    })
+                }
             },
         }
     }

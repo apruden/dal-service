@@ -127,7 +127,7 @@ rebalancer action may start or advance without meta-group quorum.
 
 ### 4.1 Value model
 - Key: opaque bytes (≤ 4 KiB recommended).
-- Value: opaque bytes (≤ 16 MiB, configurable).
+- Value: opaque bytes (≤ 1 MiB, exactly 1,048,576 bytes; fixed project limit).
 - Each key carries internal metadata: a monotonic per-key version (the Raft log
   index of its last mutation). Versions are log indexes, so they are strictly
   monotonic per partition and never reused — even across delete/recreate. A
@@ -784,7 +784,7 @@ gate).
 | `max_concurrent_migrations` | cluster-wide rebalance throttle | N (node count) |
 | `snapshot_chunk` | migration stream chunk size | 4 MiB |
 | control/bulk ports | independent ZMQ endpoints per node | configured |
-| value size cap | max value bytes | 16 MiB |
+| value size cap | fixed maximum value bytes | 1 MiB (1,048,576 bytes) |
 
 ---
 

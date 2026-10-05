@@ -68,6 +68,31 @@ fn basic_put_get_delete() {
 }
 
 #[test]
+fn value_limit_rejects_an_oversized_committed_entry_without_consuming_sequence() {
+    let (sm, _d, s, _g) = sm_storage();
+    let maximum = vec![b'v'; dal::types::MAX_VALUE_BYTES];
+    assert_eq!(maximum.len(), 1_048_576);
+    assert_eq!(
+        sm.apply(&s, &put(1, 1, b"k", &maximum, None), 10).unwrap(),
+        ApplyResult::Decided(MutationResult::Applied { version: 10 })
+    );
+
+    let oversized = vec![b'x'; maximum.len() + 1];
+    assert_eq!(
+        sm.apply(&s, &put(1, 2, b"k", &oversized, None), 11)
+            .unwrap(),
+        ApplyResult::Rejected(RejectReason::Malformed)
+    );
+    assert_eq!(s.last_applied(G).unwrap().unwrap().index, 11);
+    assert_eq!(sm.get(&s, b"k").unwrap(), Some((10, maximum)));
+    assert_eq!(
+        sm.apply(&s, &put(1, 2, b"k", b"replacement", None), 12)
+            .unwrap(),
+        ApplyResult::Decided(MutationResult::Applied { version: 12 })
+    );
+}
+
+#[test]
 fn retry_returns_stored_result_without_reapplying() {
     let (sm, _d, s, _g) = sm_storage();
     sm.apply(&s, &put(1, 1, b"k", b"v", None), 10).unwrap();

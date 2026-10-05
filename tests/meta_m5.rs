@@ -592,11 +592,44 @@ fn set_node_state_guards_incarnation() {
         }),
         MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
     );
-    // Reactivation is a rejoin and must carry a new incarnation.
+    // Nor may a fabricated-higher incarnation force the reactivation. Only
+    // `RegisterNode` advances the committed incarnation (§9.1), so liveness
+    // evidence quoting anything but the recorded value is refused — otherwise
+    // a forged `SetNodeState` could revive a Down node without the rejoin.
     assert_eq!(
         m.apply(MetaCommand::SetNodeState {
             node_id: 3,
             state: NodeState::Active,
+            incarnation: 2,
+        }),
+        MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
+    );
+    // Reactivation is the explicit operator-authorized rejoin, which advances
+    // the incarnation itself.
+    assert_eq!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 3,
+            control_addr: "c3".into(),
+            bulk_addr: "b3".into(),
+        }),
+        MetaApplyResult::Applied
+    );
+    let entry = m.node(3).unwrap();
+    assert_eq!(entry.state, NodeState::Active);
+    assert_eq!(entry.incarnation, 2);
+    // Liveness evidence must now quote the post-rejoin incarnation.
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Suspect,
+            incarnation: 1,
+        }),
+        MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
+    );
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Suspect,
             incarnation: 2,
         }),
         MetaApplyResult::Applied

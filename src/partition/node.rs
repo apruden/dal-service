@@ -552,10 +552,31 @@ impl PartitionNode {
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
         self.storage.require_serving(self.group)?;
+        if let crate::types::DataOp::Put { value, .. } = &req.op
+            && value.len() > crate::types::MAX_VALUE_BYTES
+        {
+            return Err(Error::Config(format!(
+                "value exceeds {} byte limit",
+                crate::types::MAX_VALUE_BYTES
+            )));
+        }
         let _profile = crate::perf::timer(WriteStage::RaftClientWrite);
         match self.raft.client_write(req).await {
             Ok(resp) => {
-                self.open_state_recovery(Some(resp.log_id))?;
+                // The entry is committed and applied: the outcome is decided
+                // and known. Failing to open the recovery gate here (a
+                // concurrent snapshot install bumping the recovery epoch, or
+                // shutdown racing the reply) affects only *subsequent*
+                // operations — surfacing it as Err would convert a known
+                // outcome into an ambiguous one and push the client into a
+                // needless retry of an already-applied write.
+                if let Err(error) = self.open_state_recovery(Some(resp.log_id)) {
+                    tracing::warn!(
+                        group = ?self.group,
+                        %error,
+                        "recovery gate did not open after a committed write; returning the decided outcome"
+                    );
+                }
                 Ok(WriteOutcome::Applied(resp.data))
             }
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
@@ -580,7 +601,23 @@ impl PartitionNode {
             Consistency::Linearizable => {
                 return match self.raft.ensure_linearizable().await {
                     Ok(target) => {
-                        self.open_state_recovery(target)?;
+                        // Unlike the write path, nothing has been served yet: a
+                        // gate that will not open means local applied state is
+                        // not yet known to cover the ReadIndex target, so
+                        // serving it could violate linearizability. Redirect
+                        // (TooStale reuses the redirect channel) instead of
+                        // hard-failing — the client walks candidates and reads
+                        // are idempotent (DESIGN §8.1/§8.2).
+                        if let Err(error) = self.open_state_recovery(target) {
+                            tracing::warn!(
+                                group = ?self.group,
+                                %error,
+                                "recovery gate not open for linearizable read; redirecting"
+                            );
+                            return Ok(ReadOutcome::TooStale {
+                                leader: self.current_leader(),
+                            });
+                        }
                         Ok(ReadOutcome::Value(
                             self.data.get(self.storage.as_ref(), key)?,
                         ))
@@ -616,7 +653,14 @@ impl PartitionNode {
         }
         if leader == Some(self.node_id) {
             match self.raft.ensure_linearizable().await {
-                Ok(target) => self.open_state_recovery(target)?,
+                // A gate that will not open is the same freshness refusal the
+                // `state_recovery_ready` check below expresses: redirect, do
+                // not hard-fail the idempotent read.
+                Ok(target) => {
+                    if self.open_state_recovery(target).is_err() {
+                        return Ok(ReadOutcome::TooStale { leader });
+                    }
+                }
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                     return Ok(ReadOutcome::TooStale {
                         leader: f.leader_id,

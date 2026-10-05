@@ -379,7 +379,14 @@ impl GroupTracker {
 
     async fn wait_durable(&self, target: &RaftLogId) -> Result<()> {
         loop {
+            // `enable()` registers with the `Notify` before the predicate
+            // check. `notify_waiters()` wakes only registered waiters and
+            // stores no permit, so an advance signalled between the check and
+            // the first poll of an unregistered future would be lost and this
+            // waiter could hang forever on a then-idle group.
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let state = self.state.lock().unwrap();
                 if let Some(error) = &state.failed {
@@ -395,7 +402,10 @@ impl GroupTracker {
 
     async fn wait_visible(&self, target: &RaftLogId) -> Result<()> {
         loop {
+            // Register before the predicate check; see `wait_durable`.
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let state = self.state.lock().unwrap();
                 if let Some(error) = &state.failed {
@@ -427,7 +437,10 @@ impl GroupTracker {
 
     async fn drain(&self) -> Result<()> {
         loop {
+            // Register before the predicate check; see `wait_durable`.
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let state = self.state.lock().unwrap();
                 if let Some(error) = &state.failed {
@@ -549,7 +562,10 @@ impl ApplyDurabilityRegistry {
         let tracker = self.tracker(group);
         loop {
             self.expire_dirty();
+            // Register before the admission check; see `GroupTracker::wait_durable`.
             let notified = tracker.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if tracker.begin(log_id, entries, bytes, self.limits)? {
                 return Ok(());
             }
@@ -622,9 +638,13 @@ impl ApplyDurabilityRegistry {
 
     pub(crate) async fn wait_for_failure(&self) -> String {
         loop {
-            // Register before checking the predicate so a concurrent failure
-            // cannot be lost between the check and the await.
+            // `enable()` registers with the `Notify` before the predicate
+            // check — merely creating the future does not — so a concurrent
+            // first failure signalled via `notify_waiters()` cannot be lost
+            // between the check and the await.
             let notified = self.failure_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(error) = self.failure() {
                 return error;
             }

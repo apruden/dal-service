@@ -52,9 +52,7 @@ impl Timeouts {
     }
 }
 
-/// Raft timing knobs for one group's runtime (milliseconds). The default keeps
-/// a multi-Raft node from spending most of its time sending heartbeats while
-/// leaving election time safely above normal network and fsync jitter.
+/// Raft timing knobs for one group's runtime (milliseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RaftTuning {
     pub election_timeout_min: u64,
@@ -63,9 +61,9 @@ pub struct RaftTuning {
 }
 
 /// OpenRaft limits replication batches by entry count rather than encoded
-/// bytes. A single client entry always fits the RaftAppend envelope, while two
-/// or more maximum-sized values may not. Keep production replication batches
-/// at one entry until the network layer supports byte-aware splitting.
+/// bytes. Keep the conservative one-entry limit until batching accounts for
+/// complete encoded requests, including keys and membership metadata, and is
+/// validated under the 1 MiB value cap.
 pub const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 1;
 
 impl Default for RaftTuning {
@@ -74,6 +72,19 @@ impl Default for RaftTuning {
             election_timeout_min: 750,
             election_timeout_max: 1_500,
             heartbeat_interval: 250,
+        }
+    }
+}
+
+impl RaftTuning {
+    /// Production TCP and durable-storage timing. OpenRaft uses the heartbeat
+    /// interval as the hard deadline for an append RPC; a legal 1 MiB entry
+    /// can exceed the shorter in-process test deadline on a follower.
+    pub fn durable_tcp() -> Self {
+        Self {
+            election_timeout_min: 3_000,
+            election_timeout_max: 6_000,
+            heartbeat_interval: 1_000,
         }
     }
 }

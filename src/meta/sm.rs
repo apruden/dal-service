@@ -68,8 +68,8 @@ impl MetaRaftStateMachine {
     }
 
     async fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
-        let (last_log_id, membership, state) = {
-            let _view = self.state_view.lock().await;
+        let (last_log_id, membership, view) = {
+            let view = self.state_view.clone().lock_owned().await;
             let (last_log_id, membership) = self.read_applied()?;
             if let Some(log_id) = &last_log_id {
                 self.storage
@@ -79,17 +79,24 @@ impl MetaRaftStateMachine {
                         self.write_failure("meta snapshot durability fence failed", error)
                     })?;
             }
-            let state = self
-                .storage
-                .state_snapshot(GroupId::Meta)
-                .map_err(|error| self.read_failure("meta snapshot state capture failed", error))?;
-            (last_log_id, membership, state)
+            (last_log_id, membership, view)
         };
-        let snapshot_file =
-            crate::snapshot::SnapshotFile::build(&self.storage.snapshot_temp_dir(), |writer| {
+        let storage = self.storage.clone();
+        let snapshot_file = tokio::task::spawn_blocking(move || {
+            let state = storage.state_snapshot(GroupId::Meta)?;
+            drop(view);
+            crate::snapshot::SnapshotFile::build(&storage.snapshot_temp_dir(), |writer| {
                 state.write_to(writer)
             })
-            .map_err(|error| self.read_failure("meta snapshot state stream failed", error))?;
+        })
+        .await
+        .map_err(|error| {
+            self.read_failure(
+                "meta snapshot build task failed",
+                crate::error::Error::Io(std::io::Error::other(error)),
+            )
+        })?
+        .map_err(|error| self.read_failure("meta snapshot state stream failed", error))?;
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
             None => "empty".to_string(),
@@ -188,24 +195,32 @@ impl RaftStateMachine<MetaTypeConfig> for MetaRaftStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        let _view = self.state_view.lock().await;
-        self.storage
-            .validate_state_install(GroupId::Meta, meta.last_log_id.as_ref())
-            .map_err(write_err)?;
-        let mut installer = self
-            .storage
-            .begin_state_install(GroupId::Meta)
-            .map_err(write_err)?;
         let mut snapshot = *snapshot;
-        crate::snapshot::decode_records(&mut snapshot, |key, value| installer.put(key, value))
+        snapshot
+            .prepare_for_blocking_read()
             .await
             .map_err(|error| self.write_failure("meta snapshot stream/install failed", error))?;
-        let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
-        installer
-            .finish(&codec::encode(&applied))
-            .map_err(|error| self.write_failure("meta snapshot state install failed", error))?;
-        self.storage
-            .record_state_installed(GroupId::Meta, meta.last_log_id);
+        let view = self.state_view.clone().lock_owned().await;
+        let storage = self.storage.clone();
+        let last_log_id = meta.last_log_id;
+        let applied: Applied = (last_log_id, meta.last_membership.clone());
+        tokio::task::spawn_blocking(move || {
+            let _view = view;
+            storage.validate_state_install(GroupId::Meta, last_log_id.as_ref())?;
+            let mut installer = storage.begin_state_install(GroupId::Meta)?;
+            snapshot.decode_records_sync(|key, value| installer.put(key, value))?;
+            installer.finish(&codec::encode(&applied))?;
+            storage.record_state_installed(GroupId::Meta, last_log_id);
+            Ok::<(), crate::error::Error>(())
+        })
+        .await
+        .map_err(|error| {
+            self.write_failure(
+                "meta snapshot install task failed",
+                crate::error::Error::Io(std::io::Error::other(error)),
+            )
+        })?
+        .map_err(|error| self.write_failure("meta snapshot stream/install failed", error))?;
         Ok(())
     }
 

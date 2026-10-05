@@ -111,7 +111,7 @@ pub(crate) struct KeyRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SeqRecord {
     highest: Sequence,
-    /// 128-bit xxh3 of the canonical command bytes. Values reach 16 MiB, so raw
+    /// 128-bit xxh3 of the canonical command bytes. Values reach 1 MiB, so raw
     /// bytes are not retained; collision is negligible under the non-Byzantine
     /// model (IMPLEMENTATION §M2).
     digest: u128,
@@ -182,8 +182,8 @@ pub enum RejectReason {
     StaleSequence { highest: Sequence, got: Sequence },
     /// Idempotency key reused for a *different* command (DESIGN §8.4).
     SequenceMismatch,
-    /// Structurally invalid command that slipped past the API gate, e.g. a
-    /// `delete` carrying the `ABSENT` sentinel (DESIGN §4.2).
+    /// Invalid command that slipped past the API gate, e.g. an oversized value
+    /// or a `delete` carrying the `ABSENT` sentinel (DESIGN §4.2).
     Malformed,
     /// The client exhausted the `u64` sequence space. Further commands are
     /// refused deterministically instead of overflowing during Raft apply.
@@ -257,6 +257,11 @@ impl DataStateMachine {
         log_index: u64,
     ) -> Result<(ApplyResult, Vec<StateMutation>)> {
         // Structural validation of commands the API layer should have caught.
+        if let DataOp::Put { value, .. } = &req.op
+            && value.len() > crate::types::MAX_VALUE_BYTES
+        {
+            return Ok((ApplyResult::Rejected(RejectReason::Malformed), vec![]));
+        }
         if let DataOp::Delete {
             if_version: Some(IfVersion::Absent),
             ..

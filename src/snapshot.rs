@@ -5,14 +5,16 @@
 //! wire chunk are resident in memory at a time.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
 
@@ -63,10 +65,17 @@ impl SnapshotFile {
 
     /// Build a complete file synchronously from a stable RocksDB snapshot, then
     /// rewind it for OpenRaft's asynchronous chunk reader.
-    pub fn build(dir: &Path, encode: impl FnOnce(&mut File) -> Result<()>) -> Result<SnapshotFile> {
+    pub fn build(
+        dir: &Path,
+        encode: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
+    ) -> Result<SnapshotFile> {
         let (mut file, path) = Self::create_std(dir)?;
         let result = (|| {
-            encode(&mut file)?;
+            {
+                let mut writer = BufWriter::with_capacity(64 * 1024, &mut file);
+                encode(&mut writer)?;
+                writer.flush()?;
+            }
             file.sync_all()?;
             file.seek(SeekFrom::Start(0))?;
             Ok(())
@@ -93,6 +102,67 @@ impl SnapshotFile {
 
     pub async fn rewind(&mut self) -> Result<()> {
         self.seek(SeekFrom::Start(0)).await?;
+        Ok(())
+    }
+
+    /// Finish Tokio's pending file writes before a blocking installer opens
+    /// its own buffered reader for the complete snapshot.
+    pub async fn prepare_for_blocking_read(&mut self) -> Result<()> {
+        tokio::io::AsyncWriteExt::flush(&mut self.file).await?;
+        Ok(())
+    }
+
+    pub fn decode_records_sync(
+        &self,
+        mut record: impl FnMut(Vec<u8>, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut reader = BufReader::with_capacity(64 * 1024, File::open(&self.path)?);
+        let mut magic = [0u8; MAGIC.len()];
+        reader.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(Error::codec("invalid snapshot magic"));
+        }
+        let mut hasher = Sha256::new();
+        let mut count = 0u64;
+        loop {
+            let mut key_len_bytes = [0u8; 4];
+            reader.read_exact(&mut key_len_bytes)?;
+            let key_len = u32::from_le_bytes(key_len_bytes);
+            if key_len == END {
+                break;
+            }
+            let mut value_len_bytes = [0u8; 4];
+            reader.read_exact(&mut value_len_bytes)?;
+            let value_len = u32::from_le_bytes(value_len_bytes) as usize;
+            let key_len = key_len as usize;
+            validate_lengths(key_len, value_len)?;
+            let mut key = vec![0u8; key_len];
+            let mut value = vec![0u8; value_len];
+            reader.read_exact(&mut key)?;
+            reader.read_exact(&mut value)?;
+            hasher.update(key_len_bytes);
+            hasher.update(value_len_bytes);
+            hasher.update(&key);
+            hasher.update(&value);
+            record(key, value)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::codec("snapshot record count exhausted"))?;
+        }
+        let mut expected_count = [0u8; 8];
+        let mut expected_digest = [0u8; 32];
+        reader.read_exact(&mut expected_count)?;
+        reader.read_exact(&mut expected_digest)?;
+        if u64::from_le_bytes(expected_count) != count {
+            return Err(Error::codec("snapshot record count mismatch"));
+        }
+        if hasher.finalize().as_slice() != expected_digest {
+            return Err(Error::codec("snapshot checksum mismatch"));
+        }
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            return Err(Error::codec("trailing bytes after snapshot footer"));
+        }
         Ok(())
     }
 }
@@ -193,11 +263,13 @@ fn validate_lengths(key_len: usize, value_len: usize) -> Result<()> {
 /// Decode and verify a snapshot, handing one bounded record at a time to the
 /// staged state installer. The callback is never invoked after a checksum or
 /// framing failure has been discovered for a preceding record.
+#[cfg(test)]
 pub async fn decode_records(
     reader: &mut SnapshotFile,
     mut record: impl FnMut(Vec<u8>, Vec<u8>) -> Result<()>,
 ) -> Result<()> {
     reader.rewind().await?;
+    let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, reader);
     let mut magic = [0u8; MAGIC.len()];
     reader.read_exact(&mut magic).await?;
     if &magic != MAGIC {
@@ -277,6 +349,13 @@ mod tests {
                 (b"b".to_vec(), b"two".to_vec())
             ]
         );
+        let mut blocking_decoded = Vec::new();
+        file.decode_records_sync(|key, value| {
+            blocking_decoded.push((key, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(blocking_decoded, decoded);
     }
 
     #[tokio::test]
@@ -293,5 +372,29 @@ mod tests {
 
         let error = decode_records(&mut file, |_, _| Ok(())).await.unwrap_err();
         assert!(error.to_string().contains("checksum mismatch"));
+        let error = file.decode_records_sync(|_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn buffered_install_reads_records_across_buffer_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let maximum = vec![b'v'; crate::types::MAX_VALUE_BYTES];
+        let records: Vec<_> = (0..1000)
+            .map(|i| Ok((format!("key-{i:04}").into_bytes(), vec![b'x'; 128])))
+            .chain(std::iter::once(Ok((b"last".to_vec(), maximum.clone()))))
+            .collect();
+        let file =
+            SnapshotFile::build(dir.path(), |writer| encode_records(writer, records)).unwrap();
+        let mut count = 0;
+        file.decode_records_sync(|key, value| {
+            if key == b"last" {
+                assert_eq!(value, maximum);
+            }
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1001);
     }
 }

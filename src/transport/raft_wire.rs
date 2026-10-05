@@ -312,7 +312,7 @@ mod tests {
                     sequence: 1,
                     op: DataOp::Put {
                         key: b"k".to_vec(),
-                        value: vec![0; 16 * 1024 * 1024],
+                        value: vec![0; crate::types::MAX_VALUE_BYTES],
                         if_version: None,
                     },
                 }),

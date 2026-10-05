@@ -130,7 +130,7 @@ impl SearchService {
 
         // Open and register under the guards; the backfill below runs without
         // them.
-        let (loaded, opened, registered, needs_rebuild) = {
+        let (loaded, _opened, registered, needs_rebuild) = {
             let _lifecycle = self.lifecycle.read().await;
             let _install = self.install.lock().await;
             if self.unavailable.read().unwrap().contains(&partition) {
@@ -192,12 +192,13 @@ impl SearchService {
 
         let _lifecycle = self.lifecycle.read().await;
         if let Err(error) = backfill {
+            loaded.worker.close_and_drain().await;
             self.roll_back(
                 group,
                 name,
                 generation_id,
                 registered,
-                opened.then_some(key),
+                Some((key, loaded.clone())),
             );
             return Err(error);
         }
@@ -207,12 +208,13 @@ impl SearchService {
         if self.unavailable.read().unwrap().contains(&partition)
             || !self.loaded.read().unwrap().contains_key(&key)
         {
+            loaded.worker.close_and_drain().await;
             self.roll_back(
                 group,
                 name,
                 generation_id,
                 registered,
-                opened.then_some(key),
+                Some((key, loaded.clone())),
             );
             return Err(Error::Search(format!(
                 "partition {partition} was closed for search during install"
@@ -246,12 +248,24 @@ impl SearchService {
         name: &str,
         generation: u64,
         registered: bool,
-        opened: Option<(u16, String, u64)>,
+        opened: Option<((u16, String, u64), Arc<LoadedGeneration>)>,
     ) {
-        if let Some(key) = opened {
-            self.loaded.write().unwrap().remove(&key);
-        }
+        let still_owned = if let Some((key, generation_ref)) = opened {
+            let mut loaded = self.loaded.write().unwrap();
+            if loaded
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &generation_ref))
+            {
+                loaded.remove(&key);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
         if registered
+            && still_owned
             && let Err(error) = self
                 .storage
                 .unregister_search_consumer(group, name, generation)
@@ -267,6 +281,17 @@ impl SearchService {
     pub async fn forget_partition(&self, partition: u16) {
         let _lifecycle = self.lifecycle.write().await;
         self.unavailable.write().unwrap().insert(partition);
+        let retired: Vec<_> = self
+            .loaded
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|((hosted, _, _), _)| *hosted == partition)
+            .map(|(_, loaded)| loaded.clone())
+            .collect();
+        for loaded in &retired {
+            loaded.worker.close_and_drain().await;
+        }
         // Close the search serving gate before the caller drops the group's
         // files: no in-flight query may reopen them afterwards (design §11.3).
         self.expire_sessions(partition);
@@ -322,6 +347,15 @@ impl SearchService {
         // phase prepare a fresh session for this generation after
         // `expire_sessions` ran and before its directory is deleted.
         let _lifecycle = self.lifecycle.write().await;
+        let retired = self
+            .loaded
+            .read()
+            .unwrap()
+            .get(&(partition, name.to_string(), generation))
+            .cloned();
+        if let Some(loaded) = &retired {
+            loaded.worker.close_and_drain().await;
+        }
         self.loaded
             .write()
             .unwrap()
@@ -469,12 +503,21 @@ impl SearchService {
 
     /// Hold the group's dirty-key journal inside its budget, releasing the
     /// slowest projection for rebuild if it has grown past it (design §6.5).
-    pub fn enforce_outbox_bounds(&self, partition: u16) -> Result<Option<(String, u64)>> {
-        self.storage.enforce_search_outbox_bounds(
-            GroupId::Data(partition),
-            crate::search::SEARCH_MAX_OUTBOX_ENTRIES,
-            crate::search::SEARCH_MAX_OUTBOX_BYTES,
-        )
+    pub async fn enforce_outbox_bounds(&self, partition: u16) -> Result<Option<(String, u64)>> {
+        let _lifecycle = self.lifecycle.read().await;
+        if self.unavailable.read().unwrap().contains(&partition) {
+            return Ok(None);
+        }
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage.enforce_search_outbox_bounds(
+                GroupId::Data(partition),
+                crate::search::SEARCH_MAX_OUTBOX_ENTRIES,
+                crate::search::SEARCH_MAX_OUTBOX_BYTES,
+            )
+        })
+        .await
+        .map_err(|error| Error::Search(format!("search outbox maintenance task failed: {error}")))?
     }
 
     /// Advance one loaded generation over its outbox. Searches catch the
@@ -641,7 +684,8 @@ impl SearchService {
         // rather than the already-loaded commit. Re-reading here settles it
         // after the fact: an unchanged epoch proves no install completed before
         // the pin, so this reply cannot be a previous-epoch commit (I8). The
-        // two-phase path gets the same treatment in `shard_execute`.
+        // two-phase path re-reads the epoch the same way after phase-two
+        // scoring in `shard_execute`.
         let epoch = self.storage.search_projection_epoch(node.group())?;
         if epoch != pinned_epoch {
             return Err(Error::Search(
@@ -782,7 +826,13 @@ impl SearchService {
         if let Err(error) = request.statistics.validate() {
             return ShardExecuteReply::Error(error.to_string());
         }
+        // Test hook modeling a snapshot install that completes while the
+        // blocking scoring below runs: after the pre-check above passed, but
+        // before the re-check below.
+        fail::fail_point!("search_service::execute_scoring");
         let statistics = request.statistics.clone();
+        let partition = session.partition;
+        let pinned_epoch = session.projection_epoch;
         let outcome = tokio::task::spawn_blocking(move || {
             let global = GlobalBm25Statistics::new(session.index.schema(), &statistics)?;
             session
@@ -791,7 +841,22 @@ impl SearchService {
         })
         .await;
         match outcome {
-            Ok(Ok(reply)) => ShardExecuteReply::Result(reply),
+            Ok(Ok(reply)) => {
+                // Re-check the fence after scoring, not just before: a snapshot
+                // install that completes while the blocking execute runs bumps
+                // the epoch, and the reply just produced describes a prefix
+                // that no longer exists. An unchanged epoch here proves no
+                // install finished before the searcher was read, so the reply
+                // cannot come from a previous-epoch commit (I8).
+                match self
+                    .storage
+                    .search_projection_epoch(GroupId::Data(partition))
+                {
+                    Ok(epoch) if epoch == pinned_epoch => ShardExecuteReply::Result(reply),
+                    Ok(_) => ShardExecuteReply::UnknownSession,
+                    Err(error) => ShardExecuteReply::Error(error.to_string()),
+                }
+            }
             Ok(Err(error)) => ShardExecuteReply::Error(error.to_string()),
             Err(error) => ShardExecuteReply::Error(format!("shard execute task failed: {error}")),
         }
@@ -801,6 +866,20 @@ impl SearchService {
     /// searcher immediately instead of at expiry.
     pub fn release_session(&self, session_id: SearchSessionId) {
         self.sessions.write().unwrap().remove(&session_id);
+    }
+
+    /// Drop every held session whose TTL elapsed. `shard_prepare` purges
+    /// expired sessions opportunistically, but a replica that receives no
+    /// further prepares would otherwise keep an abandoned session's `Searcher`
+    /// — and the Tantivy segment files it pins — alive indefinitely. The
+    /// periodic search reconcile loop calls this so a held searcher's lifetime
+    /// stays bounded by the TTL plus one tick (design §13).
+    pub fn sweep_expired_sessions(&self) {
+        let now = Instant::now();
+        self.sessions
+            .write()
+            .unwrap()
+            .retain(|_, session| session.expires_at > now);
     }
 
     /// Drop every held session for a partition leaving this node. Reclamation
@@ -828,6 +907,141 @@ enum GateOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::{
+        FieldKind, PathSegment, SearchField, SearchIndexDefinition, SearchQuery,
+        SearchSourceSnapshot,
+    };
+
+    fn test_definition() -> SearchIndexDefinition {
+        SearchIndexDefinition {
+            document_type: "article".into(),
+            fields: vec![SearchField {
+                name: "title".into(),
+                source_path: vec![PathSegment::Key("title".into())],
+                kind: FieldKind::Text {
+                    tokenizer: "default".into(),
+                    positions: true,
+                },
+                required: true,
+                multi_valued: false,
+                indexed: true,
+                stored: true,
+                fast: false,
+            }],
+            default_search_fields: vec!["title".into()],
+        }
+    }
+
+    /// A service with one empty generation loaded far enough to hold sessions
+    /// against, plus the group whose projection epoch fences them.
+    fn held_fixture(
+        dir: &std::path::Path,
+    ) -> (Arc<Storage>, Arc<LocalSearchIndex>, SearchService, GroupId) {
+        let storage = Arc::new(Storage::open(dir).unwrap());
+        let group = GroupId::Data(2);
+        storage.ensure_group(group).unwrap();
+        let generation = SearchIndexGeneration::new(9, test_definition()).unwrap();
+        let index = Arc::new(
+            LocalSearchIndex::open_or_create(&dir.join("search-test"), group, generation).unwrap(),
+        );
+        index
+            .rebuild(&SearchSourceSnapshot {
+                epoch: storage.search_projection_epoch(group).unwrap(),
+                applied: None,
+                records: Vec::new(),
+                outbox: Vec::new(),
+            })
+            .unwrap();
+        let service = SearchService::new(storage.clone()).unwrap();
+        (storage, index, service, group)
+    }
+
+    fn hold_session(
+        service: &SearchService,
+        index: &Arc<LocalSearchIndex>,
+        epoch: u64,
+        expires_at: Instant,
+    ) -> (SearchSessionId, crate::search::ShardStatistics) {
+        let query = SearchQuery::Text {
+            query: "term".into(),
+            fields: vec![],
+        };
+        let checkpoint = index.checkpoint().unwrap().unwrap();
+        let held = index
+            .hold(&query, GenerationSelection::Exact(9), 10, checkpoint)
+            .unwrap();
+        let statistics = index.shard_statistics(&held).unwrap();
+        let session_id = service.next_session_id().unwrap();
+        service.sessions.write().unwrap().insert(
+            session_id,
+            Arc::new(HeldSession {
+                partition: 2,
+                index: index.clone(),
+                held,
+                window: 10,
+                projection_epoch: epoch,
+                expires_at,
+            }),
+        );
+        (session_id, statistics)
+    }
+
+    /// I8: an install that completes during phase-two scoring — after the
+    /// pre-`spawn_blocking` fence passed — must not let the pre-install commit
+    /// serve. The failpoint bumps the epoch exactly in that window.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn phase_two_result_is_fenced_when_an_install_lands_during_scoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, index, service, group) = held_fixture(dir.path());
+        let expires = Instant::now() + Duration::from_secs(60);
+
+        // Control: with no install racing the scoring, the session serves.
+        let (session_id, statistics) = hold_session(&service, &index, 1, expires);
+        let reply = service
+            .shard_execute(&ShardExecuteRequest {
+                session_id,
+                statistics: Arc::new(statistics),
+            })
+            .await;
+        assert!(matches!(reply, ShardExecuteReply::Result(_)));
+
+        // Now complete a snapshot install between the pre-check and scoring.
+        let (session_id, statistics) = hold_session(&service, &index, 1, expires);
+        let raced = storage.clone();
+        fail::cfg_callback("search_service::execute_scoring", move || {
+            raced
+                .install_state(group, &[], b"snapshot-applied")
+                .unwrap();
+        })
+        .unwrap();
+        let reply = service
+            .shard_execute(&ShardExecuteRequest {
+                session_id,
+                statistics: Arc::new(statistics),
+            })
+            .await;
+        fail::remove("search_service::execute_scoring");
+        assert!(storage.search_projection_epoch(group).unwrap() > 1);
+        assert!(matches!(reply, ShardExecuteReply::UnknownSession));
+    }
+
+    /// Design §13: an abandoned session must not pin its searcher past the
+    /// TTL. The periodic sweep reaps it without waiting for another prepare.
+    #[tokio::test]
+    async fn sweep_reaps_expired_sessions_without_a_new_prepare() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_storage, index, service, _group) = held_fixture(dir.path());
+        let now = Instant::now();
+        let (expired, _) = hold_session(&service, &index, 1, now);
+        let (live, _) = hold_session(&service, &index, 1, now + Duration::from_secs(60));
+
+        service.sweep_expired_sessions();
+
+        let sessions = service.sessions.read().unwrap();
+        assert!(!sessions.contains_key(&expired));
+        assert!(sessions.contains_key(&live));
+    }
 
     #[test]
     fn session_ids_do_not_alias_across_service_restarts() {

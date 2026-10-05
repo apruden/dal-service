@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -35,6 +35,10 @@ use crate::types::{
 /// giving up. Bounded so a persistently unreachable target fails rather than
 /// spins.
 const MAX_ROUNDS: usize = 16;
+/// A live cluster can briefly report no leader during election or snapshot
+/// recovery. Fast redirects otherwise exhaust `MAX_ROUNDS` in milliseconds.
+const NO_LEADER_RETRY_WINDOW: Duration = Duration::from_secs(8);
+const NO_LEADER_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn search_deadline(request: &crate::search::SearchRequest) -> Result<tokio::time::Instant> {
     if request.deadline_ms == 0 || request.deadline_ms > 60_000 {
@@ -433,7 +437,7 @@ impl<T: Transport> Client<T> {
                 partition,
                 MsgType::ClientOp,
                 GroupId::Data(partition),
-                &request,
+                codec::encode(&request),
                 order,
             )
             .await?;
@@ -449,19 +453,30 @@ impl<T: Transport> Client<T> {
         let partition = self.partition_of(key).await?;
         let lock = self.mutation_lock(partition);
         let _stream = lock.lock().await;
-        let sequence = self.pending_sequence(partition, &op)?;
+        let sequence = self.next_mutation_sequence(partition, &op)?;
         let request = ClientRequest::Mutate(DataRequest {
             client_id: self.client_id,
             sequence,
             op: op.clone(),
         });
+        // A local frame error is certain to be unsent. Check the complete
+        // serialized request before marking this sequence ambiguous.
+        let payload = codec::encode(&request);
+        MsgType::ClientOp
+            .validate_payload_len(payload.len())
+            .map_err(|error| Error::Config(format!("client request cannot be encoded: {error}")))?;
+        self.pending
+            .lock()
+            .unwrap()
+            .entry(partition)
+            .or_insert(PendingMutation { sequence, op });
 
         let reply = self
             .route(
                 partition,
                 MsgType::ClientOp,
                 GroupId::Data(partition),
-                &request,
+                payload,
                 RouteOrder::LeaderFirst,
             )
             .await?;
@@ -537,8 +552,8 @@ impl<T: Transport> Client<T> {
     /// Return the durable stream sequence for `op`. An unresolved mutation
     /// retains its sequence; callers may retry only byte-identical bytes until
     /// its outcome is observed.
-    fn pending_sequence(&self, partition: u16, op: &DataOp) -> Result<Sequence> {
-        let mut pending = self.pending.lock().unwrap();
+    fn next_mutation_sequence(&self, partition: u16, op: &DataOp) -> Result<Sequence> {
+        let pending = self.pending.lock().unwrap();
         if let Some(existing) = pending.get(&partition) {
             if existing.op == *op {
                 return Ok(existing.sequence);
@@ -561,15 +576,7 @@ impl<T: Transport> Client<T> {
             )));
         }
 
-        let sequence = self.reserve_sequence(partition);
-        pending.insert(
-            partition,
-            PendingMutation {
-                sequence,
-                op: op.clone(),
-            },
-        );
-        Ok(sequence)
+        Ok(self.reserve_sequence(partition))
     }
 
     fn commit_sequence(&self, partition: u16, decided: Sequence) {
@@ -697,14 +704,22 @@ impl<T: Transport> Client<T> {
         partition: u16,
         msg_type: MsgType,
         group: GroupId,
-        request: &ClientRequest,
+        payload: Vec<u8>,
         order: RouteOrder,
     ) -> Result<ClientReply> {
-        let payload = codec::encode(request);
+        // Validate once before any network call, including reads. The payload
+        // is reused unchanged across redirects and retries.
+        msg_type
+            .validate_payload_len(payload.len())
+            .map_err(|error| Error::Config(format!("client request cannot be encoded: {error}")))?;
 
-        for _round in 0..MAX_ROUNDS {
+        let mut rounds = 0usize;
+        let mut no_leader_since = None;
+        loop {
+            rounds += 1;
             let candidates = self.candidate_nodes(partition, order);
             let mut redirected = false;
+            let mut leader_unknown = false;
 
             for node in candidates {
                 let Some(addr) = self.resolve_addr(node) else {
@@ -720,9 +735,12 @@ impl<T: Transport> Client<T> {
                 let transport_call = crate::perf::timer(WriteStage::ClientTransportCall);
                 let reply = self.transport.call(&addr, env).await;
                 drop(transport_call);
-                let Ok(reply_env) = reply else {
-                    // Unreachable/timeout: try the next candidate.
-                    continue;
+                let reply_env = match reply {
+                    Ok(reply_env) => reply_env,
+                    Err(_) => {
+                        // Unreachable/timeout: try the next candidate.
+                        continue;
+                    }
                 };
 
                 // Reject a mismatched-cluster response outright (DESIGN §8.2).
@@ -743,6 +761,10 @@ impl<T: Transport> Client<T> {
                 };
                 match reply {
                     ClientReply::Redirect(r) => {
+                        if r.leader.is_none() {
+                            leader_unknown = true;
+                            no_leader_since.get_or_insert_with(Instant::now);
+                        }
                         if r.cluster_id != self.cluster_id {
                             return Err(Error::Raft(format!(
                                 "redirect from cluster {:#x}, expected {:#x}",
@@ -771,11 +793,20 @@ impl<T: Transport> Client<T> {
             } else {
                 self.refresh_routing().await?;
             }
+            let within_recovery_window = leader_unknown
+                && no_leader_since
+                    .is_some_and(|since: Instant| since.elapsed() < NO_LEADER_RETRY_WINDOW);
+            if rounds >= MAX_ROUNDS && !within_recovery_window {
+                break;
+            }
+            if leader_unknown {
+                tokio::time::sleep(NO_LEADER_RETRY_DELAY).await;
+            }
         }
 
         Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("no candidate served partition {partition} within {MAX_ROUNDS} rounds"),
+            format!("no candidate served partition {partition} after {rounds} rounds"),
         )))
     }
 
@@ -1153,6 +1184,57 @@ mod tests {
         }
     }
 
+    struct RecoveringLeader {
+        available_at: Instant,
+        routing: RoutingInfo,
+        redirects: AtomicU64,
+    }
+
+    impl Server for RecoveringLeader {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            let payload = if request.msg_type == MsgType::MetaQuery {
+                codec::encode(&self.routing)
+            } else if Instant::now() < self.available_at {
+                self.redirects.fetch_add(1, Ordering::Relaxed);
+                codec::encode(&ClientReply::Redirect(Redirect {
+                    cluster_id: 1,
+                    leader: None,
+                    candidates: vec![1],
+                }))
+            } else {
+                codec::encode(&ClientReply::Value(Some((7, b"recovered".to_vec()))))
+            };
+            Envelope::new(
+                1,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                payload,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn a_temporary_no_leader_redirect_outlives_fast_rounds() {
+        let transport = InProcess::new();
+        let server = Arc::new(RecoveringLeader {
+            available_at: Instant::now() + Duration::from_secs(2),
+            routing: routing(vec![1], LogId::new(1, 1)),
+            redirects: AtomicU64::new(0),
+        });
+        transport.register("node-1", server.clone());
+        transport.register("seed", server.clone());
+        let client = Client::new(1, 9, vec!["seed".into()], transport);
+        client.cache.lock().unwrap().routing = Some(server.routing.clone());
+
+        let read = tokio::time::timeout(Duration::from_secs(9), client.get(b"key"))
+            .await
+            .expect("client did not recover")
+            .unwrap();
+        assert_eq!(read, Some((7, b"recovered".to_vec())));
+        assert!(server.redirects.load(Ordering::Relaxed) > MAX_ROUNDS as u64);
+    }
+
     #[tokio::test]
     async fn an_unavailable_candidate_is_skipped_rather_than_failing_the_operation() {
         let transport = InProcess::new();
@@ -1328,7 +1410,7 @@ mod tests {
         client.commit_sequence(0, Sequence::MAX);
 
         let error = client
-            .pending_sequence(
+            .next_mutation_sequence(
                 0,
                 &DataOp::Delete {
                     key: b"key".to_vec(),

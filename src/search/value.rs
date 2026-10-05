@@ -107,7 +107,9 @@ pub fn extract_document(
     definition: &SearchIndexDefinition,
 ) -> Result<Option<ExtractedDocument>> {
     definition.validate()?;
-    if !flatbuffers::buffer_has_identifier(encoded, IDENTIFIER, false) {
+    // FlatBuffers' identifier helper asserts on buffers shorter than the
+    // offset plus four-byte identifier. Ordinary DAL values may be shorter.
+    if encoded.len() < 8 || !flatbuffers::buffer_has_identifier(encoded, IDENTIFIER, false) {
         return Err(Error::Search(
             "value is not a DALV SearchValue FlatBuffer".into(),
         ));
@@ -364,5 +366,6 @@ mod tests {
         let encoded = encode_search_value("article", &payload).unwrap();
         assert!(extract_document(&encoded, &definition()).is_err());
         assert!(extract_document(b"not-flatbuffers", &definition()).is_err());
+        assert!(extract_document(b"ok", &definition()).is_err());
     }
 }

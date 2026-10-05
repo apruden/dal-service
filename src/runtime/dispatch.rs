@@ -594,7 +594,9 @@ impl RootDispatch {
             GroupId::Meta => match self.meta() {
                 Some(meta) => match meta.read_placement(body.group).await {
                     Ok(crate::meta::node::MetaRead::Value(Some(placement))) => {
-                        placement.voters == body.voters && placement.r#move.is_none()
+                        crate::types::voter_set(placement.voters)
+                            == crate::types::voter_set(body.voters)
+                            && placement.r#move.is_none()
                     }
                     Ok(crate::meta::node::MetaRead::Value(None))
                     | Ok(crate::meta::node::MetaRead::NotLeader { .. })

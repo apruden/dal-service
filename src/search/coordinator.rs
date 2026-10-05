@@ -301,9 +301,9 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
         self.release_all(&rejected_sessions, deadline).await;
 
         let global = Arc::new(global);
-        let (replies, failures) = self
+        let (replies, failures, unconsumed) = self
             .fan_out_over(
-                sessions,
+                sessions.clone(),
                 deadline,
                 |(partition, session_id)| {
                     let request = Arc::new(ShardExecuteRequest {
@@ -312,18 +312,33 @@ impl<S: ShardSearchSource> SearchCoordinator<S> {
                     });
                     self.shards.execute(partition, request)
                 },
-                (ReplyAccumulator::new(window), failures),
-                |(replies, failures), outcome| match outcome {
+                (ReplyAccumulator::new(window), failures, BTreeSet::new()),
+                |(replies, failures, unconsumed), outcome| match outcome {
                     Contribution::Value(partition, reply) => {
                         match check_identity(generation, partition, &reply) {
                             Ok(()) => replies.add(reply),
                             Err(failure) => failures.push(failure),
                         }
                     }
-                    Contribution::Failed(failure) => failures.push(failure),
+                    Contribution::Failed(failure) => {
+                        // A phase-two RPC that timed out or errored may never
+                        // have reached the replica, leaving the session — and
+                        // its pinned searcher — held until TTL. Remember it so
+                        // it gets a best-effort release below. (If the replica
+                        // did consume it, releasing again is a no-op.)
+                        unconsumed.insert(failure.partition);
+                        failures.push(failure);
+                    }
                 },
             )
             .await;
+        let leftover: Vec<(u16, SearchSessionId)> = sessions
+            .into_iter()
+            .filter(|(partition, _)| unconsumed.contains(partition))
+            .collect();
+        if !leftover.is_empty() {
+            self.release_all(&leftover, deadline).await;
+        }
         Ok((replies, failures))
     }
 
@@ -525,6 +540,7 @@ mod tests {
     struct MockShards {
         failing: HashSet<u16>,
         invalid_statistics: HashSet<u16>,
+        failing_execute: HashSet<u16>,
         definition_hash: [u8; 32],
         executed: Mutex<Vec<(u16, ShardStatistics)>>,
         released: Mutex<Vec<(u16, SearchSessionId)>>,
@@ -535,6 +551,7 @@ mod tests {
             Self {
                 failing: failing.iter().copied().collect(),
                 invalid_statistics: HashSet::new(),
+                failing_execute: HashSet::new(),
                 definition_hash: generation().definition_hash,
                 executed: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
@@ -543,6 +560,11 @@ mod tests {
 
         fn with_invalid_statistics(mut self, partitions: &[u16]) -> Self {
             self.invalid_statistics = partitions.iter().copied().collect();
+            self
+        }
+
+        fn with_failing_execute(mut self, partitions: &[u16]) -> Self {
+            self.failing_execute = partitions.iter().copied().collect();
             self
         }
     }
@@ -594,6 +616,9 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(request.session_id.incarnation, 7);
                 assert_eq!(request.session_id.sequence, 100 + partition as u64);
+                if self.failing_execute.contains(&partition) {
+                    return Err(Error::Search("phase two timed out".into()));
+                }
                 self.executed
                     .lock()
                     .unwrap()
@@ -752,6 +777,43 @@ mod tests {
         assert_eq!(reply.failed_partitions.len(), 1);
         assert_eq!(reply.failed_partitions[0].partition, 2);
         assert_eq!(reply.hits.len(), 2);
+    }
+
+    /// A phase-two execute that times out or errors may never have reached the
+    /// replica, so its prepared session — and the searcher it pins — must get
+    /// a best-effort release instead of surviving until TTL.
+    #[tokio::test]
+    async fn a_failed_phase_two_execute_releases_its_prepared_session() {
+        let shards = MockShards::new(&[]).with_failing_execute(&[1]);
+        let coordinator = SearchCoordinator::new(3, shards).unwrap();
+        let reply = coordinator
+            .search(&generation(), &request(true))
+            .await
+            .unwrap();
+        assert!(reply.partial);
+        assert_eq!(reply.failed_partitions.len(), 1);
+        assert_eq!(reply.failed_partitions[0].partition, 1);
+        assert_eq!(
+            coordinator.shards.released.lock().unwrap().as_slice(),
+            &[(
+                1,
+                SearchSessionId {
+                    incarnation: 7,
+                    sequence: 101,
+                }
+            )]
+        );
+        // The healthy shards were consumed by their execute, not released.
+        let executed: Vec<u16> = coordinator
+            .shards
+            .executed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(partition, _)| *partition)
+            .collect();
+        assert_eq!(executed.len(), 2);
+        assert!(executed.contains(&0) && executed.contains(&2));
     }
 
     #[tokio::test]

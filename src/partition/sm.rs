@@ -315,8 +315,8 @@ impl RocksStateMachine {
     }
 
     async fn build_snapshot_now(&self) -> Result<Snapshot, StorageError<NodeId>> {
-        let (last_log_id, membership, state) = {
-            let _view = self.state_view.lock().await;
+        let (last_log_id, membership, view) = {
+            let view = self.state_view.clone().lock_owned().await;
             let (last_log_id, membership) = self.read_applied()?;
             if let Some(log_id) = &last_log_id {
                 self.storage
@@ -326,17 +326,28 @@ impl RocksStateMachine {
                         self.write_failure("snapshot durability fence failed", error)
                     })?;
             }
-            let state = self
-                .storage
-                .state_snapshot(self.group)
-                .map_err(|error| self.read_failure("snapshot state capture failed", error))?;
-            (last_log_id, membership, state)
+            (last_log_id, membership, view)
         };
-        let snapshot_file =
-            crate::snapshot::SnapshotFile::build(&self.storage.snapshot_temp_dir(), |writer| {
+        let storage = self.storage.clone();
+        let group = self.group;
+        let snapshot_file = tokio::task::spawn_blocking(move || {
+            // Keep the view lock until both the metadata and RocksDB snapshot
+            // name the same applied prefix. The source then pins its CF while
+            // the blocking worker encodes and syncs the file.
+            let state = storage.state_snapshot(group)?;
+            drop(view);
+            crate::snapshot::SnapshotFile::build(&storage.snapshot_temp_dir(), |writer| {
                 state.write_to(writer)
             })
-            .map_err(|error| self.read_failure("snapshot state stream failed", error))?;
+        })
+        .await
+        .map_err(|error| {
+            self.read_failure(
+                "snapshot build task failed",
+                crate::error::Error::Io(std::io::Error::other(error)),
+            )
+        })?
+        .map_err(|error| self.read_failure("snapshot state stream failed", error))?;
         let snapshot_id = match &last_log_id {
             Some(l) => format!("{l}"),
             None => "empty".to_string(),
@@ -404,24 +415,33 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
         meta: &SnapshotMeta,
         snapshot: Box<SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        let _view = self.state_view.lock().await;
-        self.storage
-            .validate_state_install(self.group, meta.last_log_id.as_ref())
-            .map_err(write_err)?;
-        let mut installer = self
-            .storage
-            .begin_state_install(self.group)
-            .map_err(write_err)?;
         let mut snapshot = *snapshot;
-        crate::snapshot::decode_records(&mut snapshot, |key, value| installer.put(key, value))
+        snapshot
+            .prepare_for_blocking_read()
             .await
             .map_err(|error| self.write_failure("snapshot stream/install failed", error))?;
-        let applied: Applied = (meta.last_log_id, meta.last_membership.clone());
-        installer
-            .finish(&codec::encode(&applied))
-            .map_err(|error| self.write_failure("snapshot state install failed", error))?;
-        self.storage
-            .record_state_installed(self.group, meta.last_log_id);
+        let view = self.state_view.clone().lock_owned().await;
+        let storage = self.storage.clone();
+        let group = self.group;
+        let last_log_id = meta.last_log_id;
+        let applied: Applied = (last_log_id, meta.last_membership.clone());
+        tokio::task::spawn_blocking(move || {
+            let _view = view;
+            storage.validate_state_install(group, last_log_id.as_ref())?;
+            let mut installer = storage.begin_state_install(group)?;
+            snapshot.decode_records_sync(|key, value| installer.put(key, value))?;
+            installer.finish(&codec::encode(&applied))?;
+            storage.record_state_installed(group, last_log_id);
+            Ok::<(), crate::error::Error>(())
+        })
+        .await
+        .map_err(|error| {
+            self.write_failure(
+                "snapshot install task failed",
+                crate::error::Error::Io(std::io::Error::other(error)),
+            )
+        })?
+        .map_err(|error| self.write_failure("snapshot stream/install failed", error))?;
         Ok(())
     }
 

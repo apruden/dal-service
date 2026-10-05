@@ -184,6 +184,10 @@ pub fn serving_key(group: GroupId) -> Vec<u8> {
     format!("local/serving/{}", group.token()).into_bytes()
 }
 
+pub fn serving_prefix() -> &'static [u8] {
+    b"local/serving/"
+}
+
 pub fn admission_key(group: GroupId) -> Vec<u8> {
     format!("local/admission/{}", group.token()).into_bytes()
 }

@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{Error, Result};
-use crate::search::{IndexCheckpoint, LocalSearchIndex, SearchSourceSnapshot};
+use crate::search::{IndexCheckpoint, LocalSearchIndex};
 use crate::storage::Storage;
 use crate::types::GroupId;
 
@@ -14,14 +15,21 @@ pub struct SearchCatchUp {
     pub checkpoint_index: Option<u64>,
 }
 
+fn projection_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+}
+
 /// Drives one local Tantivy generation from a database-wide source snapshot.
 /// Delivery is at-least-once; projection is idempotent delete-then-add.
+#[derive(Clone)]
 pub struct SearchIndexWorker {
     storage: Arc<Storage>,
     group: GroupId,
     name: String,
     index: Arc<LocalSearchIndex>,
-    run: tokio::sync::Mutex<()>,
+    run: Arc<tokio::sync::Mutex<()>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl SearchIndexWorker {
@@ -39,7 +47,8 @@ impl SearchIndexWorker {
             group,
             name,
             index,
-            run: tokio::sync::Mutex::new(()),
+            run: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -65,160 +74,130 @@ impl SearchIndexWorker {
     /// continuity in either case: while no checkpoint was held, pruning was
     /// allowed to discard this consumer's outbox gap.
     pub(crate) async fn catch_up_rebuilding(&self, force_rebuild: bool) -> Result<SearchCatchUp> {
-        let _run = self.run.lock().await;
+        // Acquire before launching so cancelled waiters do not enqueue work.
+        // Once launched, the owned guard stays with the entire job, including
+        // every blocking stage and durable checkpoint publication.
+        let guard = self.run.clone().lock_owned().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Search("search generation is closed".into()));
+        }
+        let worker = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            worker.run_pass(force_rebuild).await
+        })
+        .await
+        .map_err(|error| Error::Search(format!("search projection task failed: {error}")))?
+    }
 
-        // Pick the scan shape before snapshotting: an index whose checkpoint is
-        // already valid for the current epoch only needs the rows its outbox
-        // marks dirty, while an invalid one needs every row. The epoch is
-        // re-read from the snapshot, so a snapshot install racing this read is
-        // caught below and redone as a rebuild.
+    /// Fence future passes and wait for a pass whose caller has gone away.
+    pub(crate) async fn close_and_drain(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _guard = self.run.lock().await;
+    }
+
+    async fn run_pass(&self, force_rebuild: bool) -> Result<SearchCatchUp> {
+        let _slot = projection_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Search("search projection executor is closed".into()))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Search("search generation is closed".into()));
+        }
+        // An invalid checkpoint always starts a full scan. Once a pass has an
+        // owned job guard, every source read and index commit stays serialized.
         let hint = if force_rebuild {
             None
         } else {
             self.incremental_position()?
         };
-        if hint.is_none() {
+        let Some(_after) = hint else {
             self.begin_rebuild()?;
-        }
-        let mut snapshot = self.load_source(hint).await?;
-        let checkpoint = if force_rebuild {
-            None
-        } else {
-            self.usable_checkpoint(&snapshot)?
-        };
-        if checkpoint.is_none() && hint.is_some() {
-            // This index's checkpoint was already rejected above, so it must
-            // not be resumed from. Re-testing it against the wider snapshot
-            // would let it back in: an ahead-of-source checkpoint stops looking
-            // ahead as soon as the authoritative prefix advances past it, which
-            // would silently resume the projection just declared untrustworthy
-            // (§7.2) and leave the diverged prefix's documents in place.
-            self.begin_rebuild()?;
-            snapshot = self.load_source(None).await?;
-        }
-
-        let Some(checkpoint) = checkpoint else {
-            let projected_keys = snapshot.records.len();
-            let checkpoint_index = snapshot.applied.map(|log_id| log_id.index);
-            // Everything at or below the snapshot point is covered by this
-            // pass (its first commit lands exactly there), so publish that
-            // floor before the long projection: the journal below it becomes
-            // prunable and this builder stops looking like the group's
-            // furthest-behind consumer to the lag-budget enforcer.
-            self.storage.record_search_consumer_retention_floor(
-                self.group,
-                &self.name,
-                self.index.generation().id,
-                (snapshot.epoch, checkpoint_index.unwrap_or(0)),
-            )?;
-            let rejected_documents = self
-                .project_in_blocking(move |index| index.rebuild(&snapshot))
-                .await?;
-            self.persist_checkpoint_and_prune().await?;
-            return Ok(SearchCatchUp {
-                rebuilt: true,
-                projected_keys,
-                rejected_documents,
-                checkpoint_index,
-            });
+            return self.rebuild_streaming().await;
         };
 
-        let after = checkpoint
-            .source_log_id
-            .as_ref()
-            .map(|log_id| log_id.index)
-            .unwrap_or(0);
-        let through = snapshot
-            .applied
-            .as_ref()
-            .map(|log_id| log_id.index)
-            .unwrap_or(0);
-        let dirty: HashSet<Vec<u8>> = snapshot
-            .outbox
-            .iter()
-            .filter(|entry| {
-                entry.source_log_id.index > after && entry.source_log_id.index <= through
-            })
-            .map(|entry| entry.user_key.clone())
-            .collect();
-        // Nothing to project and no prefix to advance: skip the commit rather
-        // than fsync a Tantivy segment and reload the reader for a no-op, which
-        // is the common case when a search runs against an idle partition. The
-        // whole log id must match, not just the index, so a term change is
-        // still recorded.
-        if dirty.is_empty() && checkpoint.source_log_id == snapshot.applied {
-            // The Tantivy commit is already correct, but the durable consumer
-            // record may not be: a crash between a commit and the record write
-            // that follows it leaves the retention watermark behind the commit,
-            // and on an idle partition nothing would ever advance it again — so
-            // the outbox stays pinned until the lag budget forces a rebuild.
-            // Re-publishing is cheap; what the early return avoids is the
-            // Tantivy commit and reader reload, not this point read.
-            let durable = self.storage.search_consumer_checkpoint(
-                self.group,
-                &self.name,
-                self.index.generation().id,
-            )?;
-            if durable.as_ref() != Some(&checkpoint) {
-                self.persist_checkpoint_and_prune().await?;
-            }
-            return Ok(SearchCatchUp {
-                rebuilt: false,
-                projected_keys: 0,
-                rejected_documents: 0,
-                checkpoint_index: (through != 0).then_some(through),
-            });
-        }
-
-        let projected_keys = dirty.len();
-        let rejected_documents = self
+        let storage = self.storage.clone();
+        let group = self.group;
+        let name = self.name.clone();
+        let generation = self.index.generation().id;
+        let handle = tokio::runtime::Handle::current();
+        let result = self
             .project_in_blocking(move |index| {
-                let source: HashMap<&[u8], (u64, &[u8])> = snapshot
-                    .records
-                    .iter()
-                    .map(|(key, version, value)| (key.as_slice(), (*version, value.as_slice())))
-                    .collect();
-                let mut rejected_documents = 0u64;
-                for key in &dirty {
-                    rejected_documents +=
-                        index.project(key, source.get(key.as_slice()).copied())? as u64;
-                }
-                // Advance through no-op/rejected Raft commands too: state at A
-                // is unchanged and every actual mutation in (C,A] was covered.
-                index.commit(snapshot.epoch, snapshot.applied)?;
-                Ok(rejected_documents)
+                storage.with_search_source_view(group, |source| {
+                    let Some(checkpoint) = index.validate_checkpoint(source.epoch())? else {
+                        return Ok(None);
+                    };
+                    if checkpoint_ahead_of_source(&checkpoint, source.applied().as_ref()) {
+                        return Ok(None);
+                    }
+                    if let Some(applied) = source.applied() {
+                        handle.block_on(storage.wait_state_durable(group, &applied))?;
+                    }
+                    let after = checkpoint.source_log_id.map(|id| id.index).unwrap_or(0);
+                    let mut rejected_documents = 0u64;
+                    let projected_keys = source.for_each_dirty(after, |key, value| {
+                        rejected_documents += index.project(key, value)? as u64;
+                        #[cfg(test)]
+                        if group == GroupId::Data(u16::MAX - 1) {
+                            fail::fail_point!("search_worker::after_project_for_cancellation_test");
+                        } else if group == GroupId::Data(u16::MAX - 2) {
+                            if let Some((entered, release)) =
+                                cancellation_tests::epoch_gate().lock().unwrap().take()
+                            {
+                                let _ = entered.send(());
+                                let _ = release.recv();
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    let through = source.applied().map(|id| id.index).unwrap_or(0);
+                    if projected_keys == 0 && checkpoint.source_log_id == source.applied() {
+                        let repaired =
+                            storage.with_search_epoch_fence(group, source.epoch(), || {
+                                let durable =
+                                    storage.search_consumer_checkpoint(group, &name, generation)?;
+                                if durable.as_ref() != Some(&checkpoint) {
+                                    storage.record_search_consumer_checkpoint(
+                                        group, &name, generation, checkpoint,
+                                    )?;
+                                    return Ok(true);
+                                }
+                                Ok(false)
+                            })?;
+                        if repaired {
+                            storage.prune_search_outbox(group)?;
+                        }
+                        return Ok(Some(SearchCatchUp {
+                            rebuilt: false,
+                            projected_keys: 0,
+                            rejected_documents: 0,
+                            checkpoint_index: (through != 0).then_some(through),
+                        }));
+                    }
+                    storage.with_search_epoch_fence(group, source.epoch(), || {
+                        index.commit(source.epoch(), source.applied())?;
+                        let committed = index.checkpoint()?.ok_or_else(|| {
+                            Error::Search("Tantivy commit has no checkpoint".into())
+                        })?;
+                        storage
+                            .record_search_consumer_checkpoint(group, &name, generation, committed)
+                    })?;
+                    storage.prune_search_outbox(group)?;
+                    Ok(Some(SearchCatchUp {
+                        rebuilt: false,
+                        projected_keys,
+                        rejected_documents,
+                        checkpoint_index: (through != 0).then_some(through),
+                    }))
+                })
             })
             .await?;
-        self.persist_checkpoint_and_prune().await?;
-        Ok(SearchCatchUp {
-            rebuilt: false,
-            projected_keys,
-            rejected_documents,
-            checkpoint_index: (through != 0).then_some(through),
-        })
-    }
-
-    /// A checkpoint the worker may resume from: identity/epoch-valid and not
-    /// ahead of the authoritative snapshot. An ahead checkpoint cannot be
-    /// trusted — with equal epochs a projection must never move backward — so
-    /// it is discarded and the generation rebuilds from authoritative state
-    /// (design §7.2) instead of failing every catch-up forever.
-    fn usable_checkpoint(
-        &self,
-        snapshot: &SearchSourceSnapshot,
-    ) -> Result<Option<IndexCheckpoint>> {
-        let Some(checkpoint) = self.index.validate_checkpoint(snapshot.epoch)? else {
-            return Ok(None);
-        };
-        if checkpoint_ahead_of_source(&checkpoint, snapshot.applied.as_ref()) {
-            tracing::warn!(
-                group = ?self.group,
-                name = self.name,
-                "search checkpoint is ahead of authoritative state; discarding for rebuild"
-            );
-            return Ok(None);
+        if let Some(result) = result {
+            return Ok(result);
         }
-        Ok(Some(checkpoint))
+        self.begin_rebuild()?;
+        self.rebuild_streaming().await
     }
 
     /// Clear the durable pruning watermark before the authoritative snapshot
@@ -227,6 +206,48 @@ impl SearchIndexWorker {
     fn begin_rebuild(&self) -> Result<()> {
         self.storage
             .begin_search_consumer_rebuild(self.group, &self.name, self.index.generation())
+    }
+
+    async fn rebuild_streaming(&self) -> Result<SearchCatchUp> {
+        let storage = self.storage.clone();
+        let group = self.group;
+        let name = self.name.clone();
+        let handle = tokio::runtime::Handle::current();
+        self.project_in_blocking(move |index| {
+            storage.with_search_source_view(group, |source| {
+                if let Some(applied) = source.applied() {
+                    handle.block_on(storage.wait_state_durable(group, &applied))?;
+                }
+                let checkpoint_index = source.applied().map(|id| id.index);
+                storage.record_search_consumer_retention_floor(
+                    group,
+                    &name,
+                    index.generation().id,
+                    (source.epoch(), checkpoint_index.unwrap_or(0)),
+                )?;
+                let (projected_keys, rejected_documents) = index.rebuild_from_view(source)?;
+                storage.with_search_epoch_fence(group, source.epoch(), || {
+                    index.commit(source.epoch(), source.applied())?;
+                    let checkpoint = index
+                        .checkpoint()?
+                        .ok_or_else(|| Error::Search("Tantivy rebuild has no checkpoint".into()))?;
+                    storage.record_search_consumer_checkpoint(
+                        group,
+                        &name,
+                        index.generation().id,
+                        checkpoint,
+                    )
+                })?;
+                storage.prune_search_outbox(group)?;
+                Ok(SearchCatchUp {
+                    rebuilt: true,
+                    projected_keys,
+                    rejected_documents,
+                    checkpoint_index,
+                })
+            })
+        })
+        .await
     }
 
     /// The source index a valid checkpoint has already projected through, or
@@ -242,18 +263,6 @@ impl SearchIndexWorker {
         }))
     }
 
-    async fn load_source(&self, after: Option<u64>) -> Result<SearchSourceSnapshot> {
-        let storage = self.storage.clone();
-        let group = self.group;
-        let snapshot = self
-            .in_blocking(move || storage.search_source_snapshot(group, after))
-            .await?;
-        if let Some(applied) = snapshot.applied.as_ref() {
-            self.storage.wait_state_durable(self.group, applied).await?;
-        }
-        Ok(snapshot)
-    }
-
     /// Run one projection pass, discarding whatever it buffered if it fails.
     ///
     /// The writer outlives any single pass, so adds left behind by a failed one
@@ -266,12 +275,16 @@ impl SearchIndexWorker {
         F: FnOnce(&LocalSearchIndex) -> Result<T> + Send + 'static,
     {
         let index = self.index.clone();
+        let closed = self.closed.clone();
         self.in_blocking(move || {
             let outcome = work(&index);
-            if outcome.is_err()
-                && let Err(error) = index.rollback_uncommitted()
+            if let Err(error) = &outcome
+                && let Err(rollback) = index.rollback_uncommitted()
             {
-                tracing::error!(%error, "could not discard a failed search projection pass");
+                closed.store(true, Ordering::Release);
+                return Err(Error::Search(format!(
+                    "search projection failed: {error}; writer rollback failed: {rollback}"
+                )));
             }
             outcome
         })
@@ -289,27 +302,6 @@ impl SearchIndexWorker {
             .await
             .map_err(|error| Error::Search(format!("search projection task failed: {error}")))?
     }
-
-    async fn persist_checkpoint_and_prune(&self) -> Result<()> {
-        let storage = self.storage.clone();
-        let index = self.index.clone();
-        let group = self.group;
-        let name = self.name.clone();
-        self.in_blocking(move || {
-            let checkpoint = index
-                .checkpoint()?
-                .ok_or_else(|| Error::Search("Tantivy commit has no checkpoint".into()))?;
-            storage.record_search_consumer_checkpoint(
-                group,
-                &name,
-                index.generation().id,
-                checkpoint,
-            )?;
-            storage.prune_search_outbox(group)?;
-            Ok(())
-        })
-        .await
-    }
 }
 
 fn checkpoint_ahead_of_source(
@@ -320,5 +312,301 @@ fn checkpoint_ahead_of_source(
         (Some(checkpoint), Some(source)) => checkpoint.index > source.index,
         (Some(_), None) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::search::*;
+    use crate::storage::StateMutation;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
+    type EpochPause = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    pub(super) fn epoch_gate() -> &'static Mutex<Option<EpochPause>> {
+        static GATE: OnceLock<Mutex<Option<EpochPause>>> = OnceLock::new();
+        GATE.get_or_init(|| Mutex::new(None))
+    }
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn log_id(index: u64) -> openraft::LogId<u64> {
+        openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index)
+    }
+
+    fn generation() -> SearchIndexGeneration {
+        SearchIndexGeneration::new(
+            9,
+            SearchIndexDefinition {
+                document_type: "article".into(),
+                fields: vec![SearchField {
+                    name: "title".into(),
+                    source_path: vec![PathSegment::Key("title".into())],
+                    kind: FieldKind::Text {
+                        tokenizer: "default".into(),
+                        positions: true,
+                    },
+                    required: true,
+                    multi_valued: false,
+                    indexed: true,
+                    stored: true,
+                    fast: false,
+                }],
+                default_search_fields: vec!["title".into()],
+            },
+        )
+        .unwrap()
+    }
+
+    async fn apply(storage: &Storage, group: GroupId, version: u64) {
+        #[derive(serde::Serialize)]
+        struct Record {
+            version: u64,
+            value: Vec<u8>,
+        }
+        let value = encode_search_value(
+            "article",
+            &flexbuffers::to_vec(serde_json::json!({"title": "term"})).unwrap(),
+        )
+        .unwrap();
+        let mutations: Vec<_> = [b"a", b"b"]
+            .into_iter()
+            .map(|key| StateMutation::Put {
+                key: crate::keyspace::user_key(key),
+                value: crate::codec::encode(&Record {
+                    version,
+                    value: value.clone(),
+                }),
+            })
+            .collect();
+        let applied = crate::codec::encode(&(
+            Some(log_id(version)),
+            openraft::StoredMembership::<u64, openraft::BasicNode>::default(),
+        ));
+        storage
+            .apply_raft(
+                group,
+                &mutations,
+                log_id(version),
+                &applied,
+                &crate::codec::encode(&Some(log_id(version))),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_cannot_interleave_a_newer_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(u16::MAX - 1);
+        storage.ensure_group(group).unwrap();
+        let generation = generation();
+        storage
+            .register_search_consumer(group, "articles", &generation)
+            .unwrap();
+        let index = Arc::new(
+            LocalSearchIndex::open_or_create(&dir.path().join("index"), group, generation).unwrap(),
+        );
+        let worker = Arc::new(
+            SearchIndexWorker::new(storage.clone(), group, "articles".into(), index.clone())
+                .unwrap(),
+        );
+        worker.catch_up().await.unwrap();
+        apply(&storage, group, 2).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+        let release = Arc::new(Mutex::new(release_rx));
+        let fired = Arc::new(AtomicBool::new(false));
+        fail::cfg_callback(
+            "search_worker::after_project_for_cancellation_test",
+            move || {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                }
+            },
+        )
+        .unwrap();
+        let first_worker = worker.clone();
+        let first = tokio::spawn(async move { first_worker.catch_up().await });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        apply(&storage, group, 3).await;
+        let second_worker = worker.clone();
+        let second = tokio::spawn(async move { second_worker.catch_up().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "new projection entered while older job was paused"
+        );
+        release_guard.release();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        fail::remove("search_worker::after_project_for_cancellation_test");
+
+        let checkpoint = index.checkpoint().unwrap().unwrap();
+        assert_eq!(checkpoint.source_log_id, Some(log_id(3)));
+        assert_eq!(storage.search_outbox_usage(group).unwrap().0, 0);
+        let held = index
+            .hold(
+                &SearchQuery::MatchAll,
+                GenerationSelection::Exact(9),
+                10,
+                checkpoint,
+            )
+            .unwrap();
+        let reply = index
+            .execute(u16::MAX - 1, &held, 10, held.local_statistics())
+            .unwrap();
+        assert_eq!(reply.hits.len(), 2);
+        assert!(reply.hits.iter().all(|hit| hit.version == 3));
+    }
+
+    #[tokio::test]
+    async fn repeated_dirty_keys_stream_to_one_final_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(60);
+        storage.ensure_group(group).unwrap();
+        let generation = generation();
+        storage
+            .register_search_consumer(group, "articles", &generation)
+            .unwrap();
+        let index = Arc::new(
+            LocalSearchIndex::open_or_create(&dir.path().join("index"), group, generation).unwrap(),
+        );
+        let worker =
+            SearchIndexWorker::new(storage.clone(), group, "articles".into(), index.clone())
+                .unwrap();
+        worker.catch_up().await.unwrap();
+        apply(&storage, group, 2).await;
+        apply(&storage, group, 3).await;
+        worker.catch_up().await.unwrap();
+        let checkpoint = index.checkpoint().unwrap().unwrap();
+        assert_eq!(checkpoint.source_log_id, Some(log_id(3)));
+        let held = index
+            .hold(
+                &SearchQuery::MatchAll,
+                GenerationSelection::Exact(9),
+                10,
+                checkpoint,
+            )
+            .unwrap();
+        let reply = index
+            .execute(60, &held, 10, held.local_statistics())
+            .unwrap();
+        assert_eq!(reply.hits.len(), 2);
+        assert!(reply.hits.iter().all(|hit| hit.version == 3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_install_fences_a_paused_old_epoch_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let group = GroupId::Data(u16::MAX - 2);
+        storage.ensure_group(group).unwrap();
+        let generation = generation();
+        storage
+            .register_search_consumer(group, "articles", &generation)
+            .unwrap();
+        let index = Arc::new(
+            LocalSearchIndex::open_or_create(&dir.path().join("index"), group, generation).unwrap(),
+        );
+        let worker = Arc::new(
+            SearchIndexWorker::new(storage.clone(), group, "articles".into(), index.clone())
+                .unwrap(),
+        );
+        worker.catch_up().await.unwrap();
+        apply(&storage, group, 2).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+        *epoch_gate().lock().unwrap() = Some((entered_tx, release_rx));
+        let running = worker.clone();
+        let pass = tokio::spawn(async move { running.catch_up().await });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let installed = crate::codec::encode(&(
+            Some(log_id(3)),
+            openraft::StoredMembership::<u64, openraft::BasicNode>::default(),
+        ));
+        let installing_storage = storage.clone();
+        let install = tokio::task::spawn_blocking(move || {
+            installing_storage.install_state(group, &[], &installed)
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if storage.search_projection_epoch(group).unwrap() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        release_guard.release();
+        assert!(
+            pass.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("epoch changed")
+        );
+        install.await.unwrap().unwrap();
+        storage.record_state_installed(group, Some(log_id(3)));
+
+        worker.catch_up().await.unwrap();
+        let checkpoint = index.checkpoint().unwrap().unwrap();
+        assert_eq!(checkpoint.projection_epoch, 2);
+        assert_eq!(checkpoint.source_log_id, Some(log_id(3)));
+        let held = index
+            .hold(
+                &SearchQuery::MatchAll,
+                GenerationSelection::Exact(9),
+                10,
+                checkpoint,
+            )
+            .unwrap();
+        let reply = index
+            .execute(u16::MAX - 2, &held, 10, held.local_statistics())
+            .unwrap();
+        assert!(reply.hits.is_empty());
     }
 }

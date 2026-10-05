@@ -292,6 +292,106 @@ async fn client_put_then_get_round_trips() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_limit_accepts_one_mib_and_rejects_oversize_before_proposal() {
+    let c = Cluster::bootstrap().await;
+    let client = c.client(0xC5, vec![ctrl_addr(1)]);
+    let maximum = vec![b'v'; dal::types::MAX_VALUE_BYTES];
+    assert_eq!(maximum.len(), 1_048_576);
+    let oversized = vec![b'x'; maximum.len() + 1];
+    assert!(matches!(
+        client.put(b"large", &oversized, None).await,
+        Err(dal::Error::Config(_))
+    ));
+
+    // A refused value must leave the client's sequence available for a valid
+    // mutation. Exercise the inclusive boundary through Raft and a read back.
+    let key = vec![b'k'; 4 * 1024];
+    assert!(matches!(
+        client.put(&key, &maximum, None).await.unwrap(),
+        WriteReply::Applied { .. }
+    ));
+    let read = client.get(&key).await.unwrap();
+    assert_eq!(read.as_ref().map(|(_, value)| value), Some(&maximum));
+
+    // The in-process carrier skips framing; check that both boundary-sized
+    // wire bodies fit the tightened client envelope too.
+    let request = ClientRequest::Mutate(DataRequest {
+        client_id: 0xC5,
+        sequence: 1,
+        op: DataOp::Put {
+            key,
+            value: maximum,
+            if_version: Some(IfVersion::Number(u64::MAX)),
+        },
+    });
+    for payload in [
+        codec::encode(&request),
+        codec::encode(&ClientReply::Value(read)),
+    ] {
+        let envelope = Envelope::new(CID, MsgType::ClientOp, GroupId::Data(0), 1, payload);
+        assert_eq!(
+            Envelope::decode(&envelope.encode().unwrap()).unwrap(),
+            envelope
+        );
+    }
+
+    // Direct library callers of PartitionNode must also be refused before
+    // adding an oversized value to the replicated log.
+    let leader = c.leader().unwrap();
+    let node = c
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == leader)
+        .unwrap();
+    let before = node.applied_index();
+    let request = DataRequest {
+        client_id: 0xC6,
+        sequence: 1,
+        op: DataOp::Put {
+            key: b"direct".to_vec(),
+            value: oversized,
+            if_version: None,
+        },
+    };
+    assert!(matches!(
+        node.write(request).await,
+        Err(dal::Error::Config(_))
+    ));
+    assert_eq!(node.applied_index(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_complete_request_does_not_reserve_a_mutation_sequence() {
+    let c = Cluster::bootstrap().await;
+    let client = c.client(0xC7, vec![ctrl_addr(1)]);
+    let value = vec![b'v'; dal::types::MAX_VALUE_BYTES];
+    let large_key = vec![b'k'; 64 * 1024];
+    assert!(matches!(
+        client
+            .put(&large_key, &value, Some(IfVersion::Number(1)))
+            .await,
+        Err(dal::Error::Config(_))
+    ));
+    assert!(matches!(
+        client
+            .put(b"valid-after-local-error", b"ok", None)
+            .await
+            .unwrap(),
+        WriteReply::Applied { .. }
+    ));
+
+    let oversized_key = vec![b'd'; MsgType::ClientOp.max_payload()];
+    assert!(matches!(
+        client.delete(&oversized_key, None).await,
+        Err(dal::Error::Config(_))
+    ));
+    assert!(matches!(
+        client.get(&oversized_key).await,
+        Err(dal::Error::Config(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_client_mutations_use_distinct_sequences() {
     let c = Cluster::bootstrap().await;
     let client = Arc::new(c.client(0xC4, vec![ctrl_addr(1)]));

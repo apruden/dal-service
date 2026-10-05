@@ -131,7 +131,7 @@ through M1's batch helper.
 - Sequence record per `(client_id)` within the partition CF:
   `(highest_sequence, command_digest, stored MutationResult)`, where
   `command_digest` is a 128-bit xxh3 of the canonical command bytes (values
-  reach 16 MiB, so raw bytes are not retained; accidental collision is
+  reach 1 MiB, so raw bytes are not retained; accidental collision is
   negligible under the non-Byzantine model, and M7's oracle still checks true
   byte identity). A retry at `highest_sequence` succeeds only when its digest
   matches; reuse of an idempotency key for another command returns a stable

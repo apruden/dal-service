@@ -370,8 +370,49 @@ impl SearchDriver {
     }
 
     pub async fn run(mut self) {
+        let maintenance_search = self.search.clone();
+        let maintenance_partitions = self.partitions.clone();
+        let mut maintenance_shutdown = self.shutdown.clone();
+        let maintenance_stop = Arc::new(tokio::sync::Notify::new());
+        let stop_waiter = maintenance_stop.clone();
+        let maintenance = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SEARCH_RECONCILE_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop_waiter.notified() => return,
+                    changed = maintenance_shutdown.changed() => {
+                        if changed.is_err() || *maintenance_shutdown.borrow() { return; }
+                        continue;
+                    }
+                }
+                maintenance_search.sweep_expired_sessions();
+                let hosted: Vec<u16> = maintenance_partitions
+                    .read()
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .collect();
+                for partition in hosted {
+                    match maintenance_search.enforce_outbox_bounds(partition).await {
+                        Ok(Some((name, generation))) => tracing::warn!(
+                            partition,
+                            index = name,
+                            generation,
+                            "search index released for rebuild to bound outbox growth"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(partition, %error, "failed to enforce search outbox bounds")
+                        }
+                    }
+                }
+            }
+        });
         loop {
             if *self.shutdown.borrow() || !self.identity_gate.is_open() {
+                maintenance_stop.notify_one();
+                let _ = maintenance.await;
                 return;
             }
             if self.readiness.is_ready() {
@@ -381,6 +422,8 @@ impl SearchDriver {
                 _ = tokio::time::sleep(SEARCH_RECONCILE_INTERVAL) => {}
                 changed = self.shutdown.changed() => {
                     if changed.is_err() || *self.shutdown.borrow() {
+                        maintenance_stop.notify_one();
+                        let _ = maintenance.await;
                         return;
                     }
                 }
@@ -403,24 +446,6 @@ impl SearchDriver {
         }
         self.drop_unlisted(&catalog, &hosted).await;
         self.advance_local_projections().await;
-        // After advancing, whatever journal remains is genuinely blocked by a
-        // lagging consumer rather than by scheduling.
-        for partition in &hosted {
-            match self.search.enforce_outbox_bounds(*partition) {
-                Ok(Some((name, generation))) => {
-                    tracing::warn!(
-                        partition,
-                        index = name,
-                        generation,
-                        "search index released for rebuild to bound outbox growth"
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(partition, %error, "failed to enforce search outbox bounds")
-                }
-            }
-        }
         self.drive_activation(&catalog).await;
     }
 

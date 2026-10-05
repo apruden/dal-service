@@ -113,7 +113,7 @@ pub enum MsgType {
 }
 
 impl MsgType {
-    fn from_u8(v: u8) -> Option<MsgType> {
+    pub(crate) fn from_u8(v: u8) -> Option<MsgType> {
         Some(match v {
             0 => MsgType::ClientOp,
             1 => MsgType::RaftAppend,
@@ -143,13 +143,13 @@ impl MsgType {
         })
     }
 
-    /// The largest payload this message type may carry. Values reach 16 MiB
+    /// The largest payload this message type may carry. Values reach 1 MiB
     /// (§4.2); bulk-lane snapshot/migration frames are larger; control frames
     /// are tiny. The limit is enforced before decode.
     pub fn max_payload(self) -> usize {
         match self {
-            // A client value can be 16 MiB; leave headroom for op framing.
-            MsgType::ClientOp => 16 * MIB + 64 * KIB,
+            // Reserve separate headroom for the key and operation framing.
+            MsgType::ClientOp => crate::types::MAX_VALUE_BYTES + 64 * KIB,
             // A batch of client entries plus Raft framing.
             MsgType::RaftAppend => 64 * MIB,
             MsgType::RaftVote => 4 * KIB,
@@ -181,6 +181,20 @@ impl MsgType {
             MsgType::SearchIndexAdmin => crate::search::SEARCH_MAX_DEFINITION_BYTES + 4 * KIB,
             MsgType::TransferLeadership => 4 * KIB,
         }
+    }
+
+    /// Validate a serialized payload before a caller reserves resources or
+    /// records a mutation sequence. `Envelope::encode` uses the same check.
+    pub fn validate_payload_len(self, len: usize) -> Result<(), FrameError> {
+        let limit = self.max_payload();
+        if len > limit {
+            return Err(FrameError::Oversized {
+                msg_type: self,
+                limit,
+                got: len,
+            });
+        }
+        Ok(())
     }
 
     /// Whether this type rides the bulk lane (`bulk_addr`). Only these may
@@ -295,14 +309,7 @@ impl Envelope {
     /// limit as inbound frames, so an oversized reply can never bypass the
     /// router's memory reservation and fail only after reaching its peer.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let limit = self.msg_type.max_payload();
-        if self.payload.len() > limit {
-            return Err(FrameError::Oversized {
-                msg_type: self.msg_type,
-                limit,
-                got: self.payload.len(),
-            });
-        }
+        self.msg_type.validate_payload_len(self.payload.len())?;
         let profiled = crate::perf::write_path_enabled().then(Instant::now);
         let mut buf = Vec::with_capacity(HEADER_LEN + self.payload.len());
         buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -321,16 +328,6 @@ impl Envelope {
             crate::perf::record_envelope(self.msg_type, true, started.elapsed(), buf.len());
         }
         Ok(buf)
-    }
-
-    /// Read the `request_id` from an already-framed envelope without decoding or
-    /// validating the payload. Returns `None` if the frame is too short to hold
-    /// the header field. Used by the outbound transport to correlate a reply
-    /// with the request that is waiting for it.
-    pub fn peek_request_id(frame: &[u8]) -> Option<u64> {
-        frame
-            .get(24..32)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
 
     /// Parse and validate a frame. Validation order matches DESIGN §10.2:

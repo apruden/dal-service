@@ -284,8 +284,9 @@ pub async fn execute_abort(
     )
 }
 
-/// Commit a directory state transition (DESIGN §9.1). The incarnation must be
-/// at least the recorded one; the meta state machine rejects a stale value.
+/// Commit a directory state transition (DESIGN §9.1). The incarnation must
+/// quote the recorded one exactly: only `RegisterNode` may advance it, so the
+/// meta state machine rejects both a stale and a fabricated-higher value.
 pub async fn set_node_state(
     meta: &[Arc<MetaNode>],
     node_id: NodeId,

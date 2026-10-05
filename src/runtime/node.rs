@@ -444,7 +444,7 @@ impl Node {
         for seed in &cfg.seeds {
             addrs.add_control_seed(seed.clone());
         }
-        let tuning = RaftTuning::default();
+        let tuning = RaftTuning::durable_tcp();
 
         let meta = if is_meta_voter {
             let net = RaftPeerFactory::new(
@@ -819,7 +819,10 @@ impl Node {
                     "data group {partition} has a move before genesis initialization"
                 )));
             }
-            return Ok(placement.is_some_and(|placement| placement.voters == voters));
+            return Ok(placement.is_some_and(|placement| {
+                crate::types::voter_set(placement.voters)
+                    == crate::types::voter_set(voters.iter().copied())
+            }));
         }
 
         let body = BootstrapStatusBody {
@@ -1115,7 +1118,14 @@ impl StatusSource for NodeStatus {
                     let committed = node.committed_voter_set();
                     let leader = node.current_leader();
                     let materialized = node.materialized_state_status();
-                    let last_log_index = node.raft().metrics().borrow().last_log_index;
+                    let (last_log_index, raft_snapshot_index) = {
+                        let metrics = node.raft().metrics();
+                        let metrics = metrics.borrow();
+                        (
+                            metrics.last_log_index,
+                            metrics.snapshot.map(|log_id| log_id.index),
+                        )
+                    };
                     let retained_log_entries = match (
                         last_log_index,
                         materialized.durable.map(|log_id| log_id.index),
@@ -1147,6 +1157,7 @@ impl StatusSource for NodeStatus {
                         role,
                         leader,
                         applied: node.applied_index(),
+                        raft_snapshot_index,
                         materialized_visible: materialized.visible.map(|log_id| log_id.index),
                         materialized_durable: materialized.durable.map(|log_id| log_id.index),
                         materialized_pending_entries: materialized.pending_entries,
@@ -1181,11 +1192,20 @@ impl StatusSource for NodeStatus {
         };
         partitions.sort_by_key(|s| s.partition);
 
+        let rocks = crate::perf::write_path_enabled().then(|| self.storage.rocks_counters());
+        let router = crate::transport::router::counters();
         ClusterStatus {
             node_id: self.node_id,
             cluster_id: cluster_id_hex(self.cluster.cluster_id),
             protocol_version: self.cluster.protocol_version,
             storage_failed: self.storage.database_failure().is_some(),
+            storage_wal_syncs: rocks.map(|counters| counters.wal_syncs),
+            storage_wal_bytes: rocks.map(|counters| counters.wal_bytes),
+            storage_stall_micros: rocks.map(|counters| counters.stall_micros),
+            router_admission_rejections: router.admission_rejections,
+            router_reply_send_eagain: router.reply_send_eagain,
+            router_reply_send_failures: router.reply_send_failures,
+            router_max_active_handlers: router.max_active_handlers,
             meta,
             partitions,
             directory,

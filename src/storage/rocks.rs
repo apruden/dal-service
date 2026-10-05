@@ -73,6 +73,83 @@ pub(crate) struct StateSnapshot<'a> {
     cf: Arc<BoundColumnFamily<'a>>,
 }
 
+/// One consistent source prefix for a search projection. Records are visited
+/// directly from RocksDB so a rebuild does not own every user value at once.
+pub(crate) struct SearchSourceView<'a> {
+    snapshot: rocksdb::SnapshotWithThreadMode<'a, Db>,
+    cf: Arc<BoundColumnFamily<'a>>,
+    group: GroupId,
+    epoch: u64,
+    applied: Option<RaftLogId>,
+}
+
+impl SearchSourceView<'_> {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(crate) fn applied(&self) -> Option<RaftLogId> {
+        self.applied
+    }
+
+    pub(crate) fn for_each_user(
+        &self,
+        mut visit: impl FnMut(&[u8], u64, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let mut count = 0;
+        for item in self.snapshot.iterator_cf(
+            &self.cf,
+            rocksdb::IteratorMode::From(&[keyspace::TAG_USER], rocksdb::Direction::Forward),
+        ) {
+            let (key, value) = item?;
+            let Some(user_key) = key.strip_prefix(&[keyspace::TAG_USER]) else {
+                break;
+            };
+            let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+            visit(user_key, record.version, &record.value)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn for_each_dirty(
+        &self,
+        after: u64,
+        mut visit: impl FnMut(&[u8], Option<(u64, &[u8])>) -> Result<()>,
+    ) -> Result<usize> {
+        let Some(first) = after.checked_add(1) else {
+            return Ok(0);
+        };
+        let prefix = keyspace::search_outbox_epoch_prefix(self.group, self.epoch);
+        let mut start = prefix.clone();
+        start.extend_from_slice(&first.to_be_bytes());
+        let through = self.applied.map(|id| id.index).unwrap_or(0);
+        let mut count = 0;
+        for item in self.snapshot.iterator(rocksdb::IteratorMode::From(
+            &start,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let entry = crate::search::decode_outbox_key(self.group, &key)?;
+            if entry.source_log_id.index > through {
+                break;
+            }
+            let state_key = keyspace::user_key(&entry.user_key);
+            match self.snapshot.get_cf(&self.cf, &state_key)? {
+                Some(value) => {
+                    let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
+                    visit(&entry.user_key, Some((record.version, &record.value)))?;
+                }
+                None => visit(&entry.user_key, None)?,
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
 impl StateSnapshot<'_> {
     pub(crate) fn write_to(&self, writer: &mut impl Write) -> Result<()> {
         let records = self
@@ -276,6 +353,7 @@ impl Storage {
             search_lifecycle: std::sync::Mutex::new(()),
         };
         storage.cleanup_snapshot_cfs(&existing)?;
+        storage.cleanup_reclaimed_groups()?;
         storage.cleanup_snapshot_temp_files();
         Ok(storage)
     }
@@ -499,7 +577,16 @@ impl Storage {
     }
 
     /// Idempotently drop both CFs for a group (reclamation, DESIGN §7.4).
+    ///
+    /// The first step durably records `NonServing`. The runtime never re-hosts
+    /// a `NonServing` group ([`Self::authorize_group_start`]) and
+    /// [`Self::cleanup_reclaimed_groups`] re-runs this drop at open for any
+    /// `NonServing` group with on-disk leftovers, so a crash at any point below
+    /// leaves recoverable — not permanently leaked — partial state. Every step
+    /// tolerates a half-completed prior attempt: already-dropped CFs, a
+    /// missing pointer, and lingering search records are all no-ops to redo.
     pub fn drop_group(&self, group: GroupId) -> Result<()> {
+        self.set_serving_state(group, ServingState::NonServing)?;
         self.apply_durability.begin_close(group);
         self.apply_durability.ensure_drained(group)?;
         let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
@@ -515,8 +602,6 @@ impl Storage {
                 self.db.drop_cf(&name)?;
             }
         }
-        self.delete_local(&keyspace::state_cf_pointer_key(group))?;
-        self.apply_durability.remove(group);
         if matches!(group, GroupId::Data(_)) {
             self.delete_local_prefix(&keyspace::search_prefix(group))?;
             let index_path = self.path.join("search").join(group.token());
@@ -524,6 +609,13 @@ impl Storage {
                 std::fs::remove_dir_all(index_path)?;
             }
         }
+        // The pointer delete comes after the search cleanup so a dangling
+        // pointer additionally marks any crash window past the CF drops
+        // (mirroring `cleanup_snapshot_cfs`); the `NonServing` record above is
+        // the marker that covers every window, including groups that never had
+        // a snapshot install and therefore never had a pointer.
+        self.delete_local(&keyspace::state_cf_pointer_key(group))?;
+        self.apply_durability.remove(group);
         Ok(())
     }
 
@@ -816,6 +908,48 @@ impl Storage {
                 }
             }
             self.delete_local(&keyspace::state_cf_pointer_key(group))?;
+        }
+        Ok(())
+    }
+
+    /// Finish reclamations that crashed part-way through [`Self::drop_group`].
+    ///
+    /// [`Self::cleanup_snapshot_cfs`] already covers groups whose state-CF
+    /// pointer dangles, but a group that never had a snapshot install never had
+    /// a pointer, so nothing marked its crash window. The durable `NonServing`
+    /// record that `drop_group` writes first is the marker that covers *every*
+    /// group: it is written before any destructive step and outlives all of
+    /// them, so any leftover found beside one is an unfinished reclaim.
+    ///
+    /// Safety never depended on this — `authorize_group_start` refuses a
+    /// `NonServing` group regardless, so the leftovers were inert. Without the
+    /// sweep they were merely never reclaimed, leaking column families and the
+    /// group's search index directory for the life of the node.
+    fn cleanup_reclaimed_groups(&self) -> Result<()> {
+        let prefix = keyspace::serving_prefix();
+        let mut reclaimed = Vec::new();
+        for item in self.db.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if codec::decode::<ServingState>(&value)? != ServingState::NonServing {
+                continue;
+            }
+            let token = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|error| Error::Corrupt("serving state".into(), error.to_string()))?;
+            let group = GroupId::from_token(token).ok_or_else(|| {
+                Error::Corrupt("serving state".into(), format!("bad group token {token:?}"))
+            })?;
+            reclaimed.push(group);
+        }
+        for group in reclaimed {
+            // Idempotent: every step tolerates an already-completed prior
+            // attempt, so re-running a fully finished drop is a no-op.
+            self.drop_group(group)?;
         }
         Ok(())
     }
@@ -1565,35 +1699,18 @@ impl Storage {
         Ok(deleted)
     }
 
-    /// Capture the state rows, projection epoch, and applied prefix from one
-    /// database-wide RocksDB snapshot. This prevents a backfill from pairing
-    /// state from one prefix with an outbox/applied marker from another.
-    ///
-    /// `incremental_after` picks the shape. `None` loads every user row, which
-    /// is what a rebuild needs. `Some(index)` loads only the rows the outbox
-    /// marks dirty in `(index, applied]` — a caught-up index needs nothing
-    /// else, and scanning the whole partition per catch-up would make the cost
-    /// of a search scale with the partition rather than with the change set.
-    pub fn search_source_snapshot(
+    /// Run one search projection against a stable state CF, epoch, and applied
+    /// prefix without collecting all user values or outbox rows in memory.
+    pub(crate) fn with_search_source_view<T>(
         &self,
         group: GroupId,
-        incremental_after: Option<u64>,
-    ) -> Result<crate::search::SearchSourceSnapshot> {
+        consume: impl FnOnce(&SearchSourceView<'_>) -> Result<T>,
+    ) -> Result<T> {
         if !matches!(group, GroupId::Data(_)) {
             return Err(Error::Search(
                 "search projection requires a data group".into(),
             ));
         }
-        // The state CF handle and the RocksDB snapshot must describe the same
-        // generation. A snapshot install switches the CF pointer and bumps the
-        // projection epoch in one write, so resolving the handle outside this
-        // lock lets an install land in between: the handle would still name the
-        // pre-install CF while the snapshot already reports the post-install
-        // epoch, and the projection would then commit pre-install documents
-        // under the new epoch — accepted by `validate_checkpoint`, violating
-        // both the exact-prefix (I5) and epoch-fence (I8) invariants.
-        //
-        // `StateInstaller::finish` takes these in the same order.
         let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
         let cf = self.state_cf(group)?;
         let snapshot = self.db.snapshot();
@@ -1609,63 +1726,32 @@ impl Storage {
             }
             None => None,
         };
-        let outbox_prefix = keyspace::search_outbox_epoch_prefix(group, epoch);
-        let mut outbox = Vec::new();
-        for item in snapshot.iterator(rocksdb::IteratorMode::From(
-            &outbox_prefix,
-            rocksdb::Direction::Forward,
-        )) {
-            let (key, _) = item?;
-            if !key.starts_with(&outbox_prefix) {
-                break;
-            }
-            outbox.push(crate::search::decode_outbox_key(group, &key)?);
-        }
-
-        let mut records = Vec::new();
-        match incremental_after {
-            None => {
-                for item in snapshot.iterator_cf(
-                    &cf,
-                    rocksdb::IteratorMode::From(&[keyspace::TAG_USER], rocksdb::Direction::Forward),
-                ) {
-                    let (key, value) = item?;
-                    let Some(user_key) = key.strip_prefix(&[keyspace::TAG_USER]) else {
-                        break;
-                    };
-                    let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
-                    records.push((user_key.to_vec(), record.version, record.value));
-                }
-            }
-            Some(after) => {
-                let through = applied.as_ref().map(|log_id| log_id.index).unwrap_or(0);
-                outbox.retain(|entry| {
-                    entry.source_log_id.index > after && entry.source_log_id.index <= through
-                });
-                let mut loaded = std::collections::HashSet::new();
-                for entry in &outbox {
-                    if !loaded.insert(entry.user_key.clone()) {
-                        continue;
-                    }
-                    let mut state_key = Vec::with_capacity(entry.user_key.len() + 1);
-                    state_key.push(keyspace::TAG_USER);
-                    state_key.extend_from_slice(&entry.user_key);
-                    // A key absent from the snapshot was deleted; the caller
-                    // projects that as a document removal.
-                    let Some(value) = snapshot.get_cf(&cf, &state_key)? else {
-                        continue;
-                    };
-                    let record: crate::partition::state_machine::KeyRecord = codec::decode(&value)?;
-                    records.push((entry.user_key.clone(), record.version, record.value));
-                }
-            }
-        }
-        Ok(crate::search::SearchSourceSnapshot {
+        consume(&SearchSourceView {
+            snapshot,
+            cf,
+            group,
             epoch,
             applied,
-            records,
-            outbox,
         })
+    }
+
+    /// Keep a snapshot install from changing the projection epoch between the
+    /// final check and publishing a Tantivy/consumer checkpoint. Publication
+    /// may acquire `search_lifecycle`, so this always takes the snapshot lock
+    /// first; no caller may take those locks in the opposite order.
+    pub(crate) fn with_search_epoch_fence<T>(
+        &self,
+        group: GroupId,
+        epoch: u64,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
+        if self.search_projection_epoch(group)? != epoch {
+            return Err(Error::Search(
+                "source epoch changed during search projection".into(),
+            ));
+        }
+        publish()
     }
 
     /// Atomically replace a group's replicated state from a snapshot using a
@@ -1879,6 +1965,67 @@ mod tests {
             storage.serving_state(group).unwrap(),
             Some(ServingState::NonServing)
         );
+    }
+
+    /// A reclaim that crashes after the durable `NonServing` record but before
+    /// the CF drops leaves nothing for `cleanup_snapshot_cfs` to notice when
+    /// the group never had a snapshot install — there is no state-CF pointer to
+    /// dangle. The `NonServing` marker itself must get the leftovers reclaimed.
+    #[test]
+    fn open_finishes_a_reclaim_that_crashed_before_the_cf_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = GroupId::Data(5);
+        let index_path = dir.path().join("search").join(group.token());
+        {
+            let storage = Storage::open(dir.path()).unwrap();
+            storage.ensure_group(group).unwrap();
+            assert!(storage.group_exists(group));
+            // No snapshot install ran, so this group has no state-CF pointer:
+            // the pointer-driven sweep is blind to it.
+            assert!(
+                storage
+                    .get_local::<String>(&keyspace::state_cf_pointer_key(group))
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::create_dir_all(&index_path).unwrap();
+            std::fs::write(index_path.join("meta.json"), b"{}").unwrap();
+            // Crash simulation: the durable marker lands, the drops do not.
+            storage
+                .set_serving_state(group, ServingState::NonServing)
+                .unwrap();
+        }
+
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(
+            !storage.group_exists(group),
+            "open must finish the interrupted reclaim"
+        );
+        assert!(
+            !index_path.exists(),
+            "the group's search index directory must be reclaimed too"
+        );
+        assert_eq!(
+            storage.serving_state(group).unwrap(),
+            Some(ServingState::NonServing),
+            "the group must stay fenced after cleanup"
+        );
+    }
+
+    /// The sweep must not touch a group that is still serving.
+    #[test]
+    fn open_leaves_a_serving_group_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = GroupId::Data(6);
+        {
+            let storage = Storage::open(dir.path()).unwrap();
+            storage.ensure_group(group).unwrap();
+            storage
+                .set_serving_state(group, ServingState::Serving)
+                .unwrap();
+        }
+        let storage = Storage::open(dir.path()).unwrap();
+        assert!(storage.group_exists(group));
     }
 
     #[tokio::test]

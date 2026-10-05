@@ -409,25 +409,27 @@ impl MetaStateMachine {
         let Some(mut entry) = self.node(s, node_id)? else {
             return Ok((reject(MetaReject::UnknownNode), vec![]));
         };
-        if incarnation < entry.incarnation {
+        // Only `RegisterNode` may advance the committed incarnation (§9.1):
+        // liveness evidence must quote it exactly. Accepting a fabricated
+        // higher value would let a `SetNodeState` revive a Down node while
+        // bypassing the rejoin fence, and would desynchronize the committed
+        // incarnation from the node's durable RegistrationBinding.
+        if incarnation != entry.incarnation {
             return Ok((reject(MetaReject::StaleIncarnation), vec![]));
         }
         // A node declared Down must not be revived by ordinary liveness
-        // evidence. Leaving Down is an explicit rejoin and therefore needs a
-        // strictly newer incarnation for *any* target state — guarding only
-        // Down -> Active would let a replayed/stale command revive the node
-        // through a Down -> Suspect -> Active two-step.
-        if entry.state == NodeState::Down
-            && state != NodeState::Down
-            && incarnation == entry.incarnation
-        {
+        // evidence. Leaving Down is an explicit rejoin, which only
+        // `RegisterNode` performs (advancing the incarnation) — any state
+        // transition out of Down proposed here is stale or forged. Guarding
+        // only Down -> Active would let a replayed/stale command revive the
+        // node through a Down -> Suspect -> Active two-step.
+        if entry.state == NodeState::Down && state != NodeState::Down {
             return Ok((reject(MetaReject::StaleIncarnation), vec![]));
         }
-        if entry.state == state && entry.incarnation == incarnation {
+        if entry.state == state {
             return Ok((MetaApplyResult::NoOp, vec![]));
         }
         entry.state = state;
-        entry.incarnation = incarnation;
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_node_key(node_id), &entry)],

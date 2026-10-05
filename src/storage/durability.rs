@@ -139,9 +139,14 @@ impl Shared {
     /// Raft RPC handlers whose progress is what frees the budget.
     async fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
         loop {
-            // Subscribe before checking, so a release between the two leaves a
-            // notification for this waiter instead of being lost.
+            // `enable()` registers this waiter with the `Notify` before the
+            // budget check. Releases are signalled with `notify_waiters()`,
+            // which wakes only already-registered waiters and stores no
+            // permit, so a release between the check and the first poll of an
+            // unregistered future would otherwise be lost forever.
             let capacity = self.capacity_available.notified();
+            tokio::pin!(capacity);
+            capacity.as_mut().enable();
             if let Some(reservation) = self.try_reserve(bytes)? {
                 return Ok(reservation);
             }
@@ -502,11 +507,14 @@ where
         }
         Err(error) => {
             let message = format!("database WAL write failed: {error}");
+            // Deliver the error to BOTH callbacks: for the log path
+            // `on_durable` is openraft's flush callback, and dropping it
+            // silently would leave openraft waiting on an I/O that will
+            // never be reported.
             if let Some(callback) = on_written {
                 callback(Err(io::Error::other(message.clone())));
-            } else {
-                on_durable(Err(io::Error::other(message.clone())));
             }
+            on_durable(Err(io::Error::other(message.clone())));
             Err(message)
         }
     }
@@ -530,11 +538,11 @@ fn complete_batch(batch: Vec<PendingFlush>, error: Option<&str>) {
 }
 
 fn fail_unwritten(request: WriteRequest, error: &str) {
+    // Both callbacks must observe the failure; see `write_one`.
     if let Some(callback) = request.on_written {
         callback(Err(io::Error::other(error.to_owned())));
-    } else {
-        (request.on_durable)(Err(io::Error::other(error.to_owned())));
     }
+    (request.on_durable)(Err(io::Error::other(error.to_owned())));
 }
 
 fn fail_remaining(receiver: &Receiver<Command>, shared: &Shared, error: &str) {

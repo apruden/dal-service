@@ -71,6 +71,58 @@ fn node_config(id: NodeId, dir: PathBuf) -> NodeConfig {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotated_genesis_voter_order_bootstraps_every_partition() {
+    let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
+    let mut desc = descriptor();
+    desc.config.p = 2;
+    desc.data_placements.push((1, vec![2, 3, 1]));
+    let ctx = zmq::Context::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for (index, dir) in dirs.iter().enumerate() {
+        nodes.push(Arc::new(
+            Node::start(
+                ctx.clone(),
+                node_config((index + 1) as u64, dir.path().to_path_buf()),
+                desc.clone(),
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    settle();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let handles: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let node = node.clone();
+                tokio::spawn(async move { node.bootstrap().await })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("rotated genesis placement did not bootstrap");
+    for node in &nodes {
+        assert!(node.hosts_partition(1));
+        assert_eq!(
+            node.local_placement_voters(1).unwrap().unwrap().0,
+            vec![1, 2, 3]
+        );
+    }
+    for node in nodes {
+        Arc::try_unwrap(node)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+}
+
 fn search_definition() -> SearchIndexDefinition {
     SearchIndexDefinition {
         document_type: "article".into(),

@@ -24,6 +24,14 @@ pub struct ClusterStatus {
     /// Database-wide fail-stop state. This includes meta-only nodes and remains
     /// true for the rest of the process after any materialization/WAL failure.
     pub storage_failed: bool,
+    /// RocksDB counters when write-path profiling is enabled for this node.
+    pub storage_wal_syncs: Option<u64>,
+    pub storage_wal_bytes: Option<u64>,
+    pub storage_stall_micros: Option<u64>,
+    pub router_admission_rejections: u64,
+    pub router_reply_send_eagain: u64,
+    pub router_reply_send_failures: u64,
+    pub router_max_active_handlers: usize,
     /// Present when this node runs the meta group.
     pub meta: Option<MetaStatus>,
     pub partitions: Vec<PartitionStatus>,
@@ -53,6 +61,8 @@ pub struct PartitionStatus {
     pub role: Role,
     pub leader: Option<NodeId>,
     pub applied: Option<u64>,
+    /// Highest log entry covered by the Raft snapshot on this node.
+    pub raft_snapshot_index: Option<u64>,
     /// Highest state-machine entry visible to reads in this process.
     pub materialized_visible: Option<u64>,
     /// Highest state-machine entry covered by a completed RocksDB WAL flush.
@@ -171,6 +181,13 @@ mod tests {
                 cluster_id: "0xda1".into(),
                 protocol_version: 1,
                 storage_failed: false,
+                storage_wal_syncs: None,
+                storage_wal_bytes: None,
+                storage_stall_micros: None,
+                router_admission_rejections: 0,
+                router_reply_send_eagain: 0,
+                router_reply_send_failures: 0,
+                router_max_active_handlers: 0,
                 meta: Some(MetaStatus {
                     is_leader: true,
                     leader: Some(7),
@@ -182,6 +199,7 @@ mod tests {
                     role: Role::Leader,
                     leader: Some(7),
                     applied: Some(10),
+                    raft_snapshot_index: None,
                     materialized_visible: Some(10),
                     materialized_durable: Some(9),
                     materialized_pending_entries: 1,

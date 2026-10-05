@@ -372,7 +372,7 @@ Epoch, `LogId`, and raw-key components use a canonical length-delimited,
 big-endian encoding so range scans preserve source order without delimiter
 ambiguity.
 
-The outbox stores keys, not values. Values can reach 16 MiB and already exist in
+The outbox stores keys, not values. Values can reach 1 MiB and already exist in
 the authoritative state CF.
 
 One outbox entry is emitted for each final user-key mutation in a coalesced

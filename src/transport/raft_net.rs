@@ -280,7 +280,7 @@ where
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<C>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         let _profile = matches!(self.group, GroupId::Data(_))
             .then(|| crate::perf::timer(WriteStage::RaftAppendTransportCall));
@@ -298,9 +298,12 @@ where
             0,
             codec::encode(&rpc),
         );
+        // Honor openraft's own deadline: it abandons the RPC at `hard_ttl`
+        // regardless, so expiring the transport waiter on the same clock frees
+        // the pending slot instead of holding it for the transport default.
         let reply = self
             .control
-            .call(&addr, env)
+            .call_with_timeout(&addr, env, Some(option.hard_ttl()))
             .await
             .map_err(|e| transport_err(self.target, e))?;
         validate_reply_envelope(
@@ -319,7 +322,7 @@ where
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         if !self.identity_gate.is_open() {
             return Err(unreachable(self.target, "local process identity is fenced"));
@@ -337,7 +340,7 @@ where
         );
         let reply = self
             .control
-            .call(&addr, env)
+            .call_with_timeout(&addr, env, Some(option.hard_ttl()))
             .await
             .map_err(|e| transport_err(self.target, e))?;
         validate_reply_envelope(
@@ -356,7 +359,7 @@ where
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<C>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, Node, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
@@ -375,9 +378,13 @@ where
             0,
             codec::encode(&rpc),
         );
+        // The motivating case for a per-call deadline: `install_snapshot_timeout`
+        // is far longer than a control-lane round-trip, and a chunk judged by
+        // the transport default would be failed while still legitimately in
+        // flight.
         let reply = self
             .bulk
-            .call(&addr, env)
+            .call_with_timeout(&addr, env, Some(option.hard_ttl()))
             .await
             .map_err(|e| transport_err(self.target, e))?;
         validate_reply_envelope(

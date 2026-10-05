@@ -14,6 +14,7 @@
 //!   DAL_BENCH_READS       (default 1000) sequential single-client reads
 //!   DAL_BENCH_CLIENTS     (default 16)   concurrent clients
 //!   DAL_BENCH_OPS         (default 6000) total ops in each concurrent phase
+//!   DAL_BENCH_VALUE_BYTES (default 128) value size, at most 1 MiB
 //!   DAL_BENCH_DIR          (default OS temp directory) parent for RocksDB dirs;
 //!                          set this explicitly to a durable filesystem
 //!   DAL_BENCH_TRANSPORT_PER_CLIENT=1 creates one ZMQ transport per concurrent
@@ -54,7 +55,6 @@ use dal::types::{ClusterConfig, ClusterId, HashSpec, NodeId, PROTOCOL_VERSION};
 
 const CID: ClusterId = 0x0000_0000_0000_0000_0000_0000_0000_0DA1;
 const VOTERS: [NodeId; 3] = [1, 2, 3];
-const VALUE_BYTES: usize = 128;
 const PREFIX: &str = "bench";
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -224,10 +224,10 @@ impl Stats {
     }
 }
 
-fn value(i: usize) -> Vec<u8> {
-    let mut v = vec![b'x'; VALUE_BYTES];
+fn value(i: usize, value_bytes: usize) -> Vec<u8> {
+    let mut v = vec![b'x'; value_bytes];
     let tag = format!("v{i}");
-    v[..tag.len().min(VALUE_BYTES)].copy_from_slice(&tag.as_bytes()[..tag.len().min(VALUE_BYTES)]);
+    v[..tag.len().min(value_bytes)].copy_from_slice(&tag.as_bytes()[..tag.len().min(value_bytes)]);
     v
 }
 
@@ -260,7 +260,7 @@ async fn start_cluster(
 /// Force a leader election on every partition and confirm the cluster serves,
 /// so the measured phases don't pay election latency. Writes one key per
 /// partition, retrying until each applies.
-async fn warm_up(c: &Client<ZmqTransport>, p: u16) {
+async fn warm_up(c: &Client<ZmqTransport>, p: u16, value_bytes: usize) {
     let spec = HashSpec::CANONICAL;
     for part in 0..p {
         // Find a key that hashes to this partition so every group is touched.
@@ -274,7 +274,8 @@ async fn warm_up(c: &Client<ZmqTransport>, p: u16) {
         };
         let mut ok = false;
         for _ in 0..50 {
-            if let Ok(WriteReply::Applied { .. }) = c.put(&key, &value(0), None).await {
+            if let Ok(WriteReply::Applied { .. }) = c.put(&key, &value(0, value_bytes), None).await
+            {
                 ok = true;
                 break;
             }
@@ -292,6 +293,11 @@ async fn end_to_end_benchmark_three_nodes() {
     let reads = env_usize("DAL_BENCH_READS", 1000);
     let clients = env_usize("DAL_BENCH_CLIENTS", 16).max(1);
     let concurrent_ops = env_usize("DAL_BENCH_OPS", 6000);
+    let value_bytes = env_usize("DAL_BENCH_VALUE_BYTES", 128);
+    assert!(
+        (1..=dal::types::MAX_VALUE_BYTES).contains(&value_bytes),
+        "benchmark value size must be between 1 byte and 1 MiB"
+    );
 
     let ctx = zmq::Context::new();
     let shared_transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(5), Lane::Control);
@@ -305,7 +311,7 @@ async fn end_to_end_benchmark_three_nodes() {
 
     let writer = client(shared_transport.clone(), 1);
     let warm = Instant::now();
-    warm_up(&writer, partitions).await;
+    warm_up(&writer, partitions, value_bytes).await;
     let warm_elapsed = warm.elapsed();
     let mut rocks_before = rocks_counters(&nodes);
     dal::perf::reset_write_path();
@@ -334,7 +340,7 @@ async fn end_to_end_benchmark_three_nodes() {
         std::env::var("DAL_BENCH_TRIAL_ID").unwrap_or_else(|_| "unset".into()),
     );
     println!(
-        "  cluster: 3 nodes, R=3, {partitions} partitions, value={VALUE_BYTES}B | boot {:.2}s, warm-up {:.2}s",
+        "  cluster: 3 nodes, R=3, {partitions} partitions, value={value_bytes}B | boot {:.2}s, warm-up {:.2}s",
         boot_elapsed.as_secs_f64(),
         warm_elapsed.as_secs_f64(),
     );
@@ -377,7 +383,10 @@ async fn end_to_end_benchmark_three_nodes() {
     for i in 0..writes {
         let key = format!("{PREFIX}-seq-{i}").into_bytes();
         let start = Instant::now();
-        let reply = writer.put(&key, &value(i), None).await.unwrap();
+        let reply = writer
+            .put(&key, &value(i, value_bytes), None)
+            .await
+            .unwrap();
         assert!(matches!(reply, WriteReply::Applied { .. }));
         wl.push(start.elapsed());
     }
@@ -422,6 +431,7 @@ async fn end_to_end_benchmark_three_nodes() {
         per_client,
         Workload::Write,
         1_000,
+        value_bytes,
     )
     .await;
     Stats::from(&format!("conc write ({clients} clients)"), cw.0, cw.1).print();
@@ -437,6 +447,7 @@ async fn end_to_end_benchmark_three_nodes() {
         per_client,
         Workload::Mixed,
         1_000_000,
+        value_bytes,
     )
     .await;
     Stats::from(&format!("conc mixed ({clients} clients)"), cm.0, cm.1).print();
@@ -532,6 +543,7 @@ async fn run_concurrent(
     per_client: usize,
     workload: Workload,
     id_base: u128,
+    value_bytes: usize,
 ) -> (Vec<Duration>, Duration) {
     let mut clients_to_run = Vec::with_capacity(clients);
     for c in 0..clients {
@@ -560,12 +572,12 @@ async fn run_concurrent(
                 let start = Instant::now();
                 match workload {
                     Workload::Write => {
-                        let r = retry_put(&cl, &key, &value(i)).await;
+                        let r = retry_put(&cl, &key, &value(i, value_bytes)).await;
                         assert!(matches!(r, WriteReply::Applied { .. }));
                     }
                     Workload::Mixed => {
                         if i % 2 == 0 {
-                            let r = retry_put(&cl, &key, &value(i)).await;
+                            let r = retry_put(&cl, &key, &value(i, value_bytes)).await;
                             assert!(matches!(r, WriteReply::Applied { .. }));
                         } else {
                             // Read a key this client already wrote.
