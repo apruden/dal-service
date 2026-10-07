@@ -117,7 +117,7 @@ fn is_z85_public_key(key: &str) -> bool {
     if key.len() != 40 || !key.bytes().all(|byte| Z85.as_bytes().contains(&byte)) {
         return false;
     }
-    key.as_bytes().as_chunks::<5>().0.iter().all(|chunk| {
+    key.as_bytes().chunks(5).all(|chunk| {
         chunk
             .iter()
             .try_fold(0u64, |value, byte| {
