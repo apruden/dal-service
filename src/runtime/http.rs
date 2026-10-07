@@ -302,6 +302,7 @@ impl StatusSource for StatusCache {
 pub fn router(src: Arc<dyn StatusSource>) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/health", get(health))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -310,6 +311,104 @@ pub fn router(src: Arc<dyn StatusSource>) -> Router {
 
 async fn status(State(src): State<Arc<dyn StatusSource>>) -> Json<ClusterStatus> {
     Json(src.status())
+}
+
+async fn metrics(State(src): State<Arc<dyn StatusSource>>) -> axum::http::Response<String> {
+    let body = render_metrics(&src.status());
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(body)
+        .expect("static metrics response is valid")
+}
+
+/// Render a deliberately small set of cached operational metrics. Labels are
+/// restricted to the numeric partition id; user-controlled index names,
+/// client ids, and request data never become metric dimensions.
+fn render_metrics(status: &ClusterStatus) -> String {
+    let mut out = String::with_capacity(2048);
+    metric(
+        &mut out,
+        "dal_storage_failed",
+        u64::from(status.storage_failed),
+    );
+    metric(
+        &mut out,
+        "dal_storage_wal_pending_requests",
+        status.storage_wal_pending_requests as u64,
+    );
+    metric(
+        &mut out,
+        "dal_storage_wal_pending_bytes",
+        status.storage_wal_pending_bytes as u64,
+    );
+    metric(
+        &mut out,
+        "dal_snapshot_builds_total",
+        status.snapshot_builds,
+    );
+    metric(
+        &mut out,
+        "dal_snapshot_installs_total",
+        status.snapshot_installs,
+    );
+    metric(
+        &mut out,
+        "dal_router_admission_rejections_total",
+        status.router_admission_rejections,
+    );
+    metric(
+        &mut out,
+        "dal_diagnostic_sample_stale",
+        u64::from(status.diagnostic_sample_stale),
+    );
+    if let Some(meta) = &status.meta {
+        metric(&mut out, "dal_meta_is_leader", u64::from(meta.is_leader));
+        if let Some(applied) = meta.applied {
+            metric(&mut out, "dal_meta_applied_index", applied);
+        }
+    }
+    for partition in &status.partitions {
+        let id = partition.partition;
+        if let Some(applied) = partition.applied {
+            partition_metric(&mut out, "dal_partition_applied_index", id, applied);
+        }
+        if let Some(durable) = partition.materialized_durable {
+            partition_metric(&mut out, "dal_partition_durable_index", id, durable);
+        }
+        partition_metric(
+            &mut out,
+            "dal_partition_recovery_ready",
+            id,
+            u64::from(partition.materialized_recovery_ready),
+        );
+        partition_metric(
+            &mut out,
+            "dal_search_outbox_entries",
+            id,
+            partition.search_outbox_entries,
+        );
+        partition_metric(
+            &mut out,
+            "dal_search_outbox_bytes",
+            id,
+            partition.search_outbox_bytes,
+        );
+    }
+    out
+}
+
+fn metric(out: &mut String, name: &str, value: u64) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "{name} {value}");
+}
+
+fn partition_metric(out: &mut String, name: &str, partition: u16, value: u64) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "{name}{{partition=\"{partition}\"}} {value}");
 }
 
 async fn health(
@@ -539,6 +638,27 @@ pub(crate) mod tests {
         assert_eq!(got.partitions[0].role, Role::Leader);
         assert_eq!(got.partitions[0].search[0].name, "articles");
         assert_eq!(got.partitions[0].search_outbox_entries, 3);
+    }
+
+    #[tokio::test]
+    async fn metrics_export_uses_only_bounded_partition_labels() {
+        let app = router(Arc::new(StubStatus));
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("dal_storage_failed 0\n"));
+        assert!(body.contains("dal_partition_durable_index{partition=\"0\"} 9\n"));
+        assert!(!body.contains("articles"));
+        assert!(!body.contains("ab".repeat(32).as_str()));
+        assert!(!body.contains("node_id"));
     }
 
     #[test]
