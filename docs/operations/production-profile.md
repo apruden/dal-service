@@ -61,17 +61,20 @@ payload before keys and metadata. All mutations select from that fixed keyspace.
 
 Budget each 3 TiB host conservatively: at most 150 GiB for authoritative RocksDB
 state plus compaction headroom, 17 GiB for the 1 GiB retained-log limit across
-16 data groups plus meta, 900 GiB for eight active search projections, at most
-one quarantine per index, and one concurrent full-index rebuild, 150 GiB for
-backup/checkpoint staging, and 50 GiB for service logs and temporary files.
+16 data groups plus meta, and 900 GiB for search: 400 GiB for eight active
+projections capped at 50 GiB each, 400 GiB for at most one same-size quarantine
+per index, 50 GiB for one concurrent full-index rebuild, and 50 GiB of search
+headroom. Also reserve 150 GiB for backup/checkpoint staging and 50 GiB for
+service logs and temporary files.
 Phase 6 adds a node-wide rebuild coordinator and disk preflight. An existing
 quarantine blocks silent replacement and raises an operator alert; the runbook
 archives or removes it before another quarantine for that index. Restore rebuilds
 run through the same coordinator. Keep at least 40% (about 1.2 TiB) free
 throughout qualification. Measure actual projection, quarantine, and rebuild
 size rather than assuming each equals source size, plus physical write volume
-and disk amplification; reduce the operating envelope if any component exceeds
-its budget.
+and disk amplification. Admission refuses a generation that cannot fit its
+50 GiB allocation and the free-space floor; reduce the index count or dataset
+before qualifying a workload whose projections exceed that allocation.
 
 The 17 GiB whole-node retained-log budget takes about 2.4 minutes to transfer
 over an ideal 1 Gbit/s link. The 10-minute catch-up target leaves room for
