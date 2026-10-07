@@ -240,7 +240,9 @@ async fn start_cluster(
     for (i, &id) in VOTERS.iter().enumerate() {
         let cfg = node_config(id, dirs[i].path().to_path_buf());
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();

@@ -375,10 +375,10 @@ struct SecureTransport {
 }
 
 impl Node {
-    /// Assemble and start the node: open storage, start every group this node is
-    /// a voter of over the ZMQ network, and bind the control and bulk servers.
+    /// Start a node with unauthenticated transports for isolated tests only.
+    /// Production callers must use [`Node::start_secure`].
     /// Does not drive genesis — call [`Node::bootstrap`] once the peers are up.
-    pub async fn start(
+    pub async fn start_insecure_for_tests(
         ctx: zmq::Context,
         cfg: NodeConfig,
         desc: BootstrapDescriptor,
@@ -2445,7 +2445,8 @@ mod tests {
         cfg.data_dir = data_dir.clone();
         cfg.http_addr = Some("not-a-socket-address".into());
 
-        let err = match Node::start(zmq::Context::new(), cfg, descriptor()).await {
+        let err = match Node::start_insecure_for_tests(zmq::Context::new(), cfg, descriptor()).await
+        {
             Ok(_) => panic!("invalid HTTP address unexpectedly started a node"),
             Err(err) => err,
         };

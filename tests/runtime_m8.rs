@@ -82,7 +82,7 @@ async fn rotated_genesis_voter_order_bootstraps_every_partition() {
     let mut nodes = Vec::new();
     for (index, dir) in dirs.iter().enumerate() {
         nodes.push(Arc::new(
-            Node::start(
+            Node::start_insecure_for_tests(
                 ctx.clone(),
                 node_config((index + 1) as u64, dir.path().to_path_buf()),
                 desc.clone(),
@@ -190,7 +190,9 @@ async fn draining_a_node_migrates_its_partition() {
             timeouts: Timeouts::default(),
         };
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -340,7 +342,9 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
             timeouts: timeouts.clone(),
         };
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -462,7 +466,11 @@ async fn become_learner_requires_a_live_plan() {
     };
 
     // Without a live, linearly-read plan an arbitrary admission must be refused.
-    let node = Arc::new(Node::start(ctx.clone(), cfg, desc).await.unwrap());
+    let node = Arc::new(
+        Node::start_insecure_for_tests(ctx.clone(), cfg, desc)
+            .await
+            .unwrap(),
+    );
     node.bootstrap().await.unwrap();
     settle();
     assert!(!node.hosts_partition(0), "node 4 should host nothing yet");
@@ -538,7 +546,9 @@ async fn non_meta_voter_data_leader_drives_a_move() {
             timeouts: Timeouts::default(),
         };
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -638,7 +648,9 @@ async fn http_status_reports_node_local_view() {
             cfg.http_addr = Some(http_addr.clone());
         }
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -730,7 +742,9 @@ async fn start_and_bootstrap(
         let mut cfg = node_config(id, dirs[i].path().to_path_buf());
         cfg.timeouts = timeouts.clone();
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -766,7 +780,9 @@ async fn failure_detector_marks_a_silent_node_down() {
         let mut cfg = node_config(id, dirs[i].path().to_path_buf());
         cfg.timeouts = short_timeouts();
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -842,7 +858,9 @@ async fn three_node_cluster_serves_a_client_op() {
     for (i, &id) in VOTERS.iter().enumerate() {
         let cfg = node_config(id, dirs[i].path().to_path_buf());
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg, desc.clone()).await.unwrap(),
+            Node::start_insecure_for_tests(ctx.clone(), cfg, desc.clone())
+                .await
+                .unwrap(),
         ));
     }
     settle();
@@ -1056,7 +1074,7 @@ async fn joined_node_discovers_live_members_and_receives_rebalanced_data() {
     let mut nodes = Vec::new();
     for (index, &id) in voters.iter().enumerate() {
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), config(id, index), desc.clone())
+            Node::start_insecure_for_tests(ctx.clone(), config(id, index), desc.clone())
                 .await
                 .unwrap(),
         ));
@@ -1092,7 +1110,7 @@ async fn joined_node_discovers_live_members_and_receives_rebalanced_data() {
         entry.bulk_addr = format!("inproc://m8join-stale-bulk-{}", entry.node_id);
     }
     let joined_node = Arc::new(
-        Node::start(ctx.clone(), joined_cfg, stale_desc)
+        Node::start_insecure_for_tests(ctx.clone(), joined_cfg, stale_desc)
             .await
             .unwrap(),
     );
@@ -1177,7 +1195,7 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
     let mut nodes = Vec::new();
     for (i, &id) in all.iter().enumerate() {
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg(id, i), desc.clone())
+            Node::start_insecure_for_tests(ctx.clone(), cfg(id, i), desc.clone())
                 .await
                 .unwrap(),
         ));
@@ -1244,7 +1262,7 @@ async fn a_restarted_node_rehosts_a_partition_gained_by_rebalance() {
         .await
         .unwrap();
     settle();
-    let restarted = Node::start(ctx.clone(), cfg(4, 3), desc.clone())
+    let restarted = Node::start_insecure_for_tests(ctx.clone(), cfg(4, 3), desc.clone())
         .await
         .unwrap();
     assert!(
@@ -1306,7 +1324,7 @@ async fn draining_the_meta_leader_hands_off_and_swaps_in_the_spare() {
     let mut nodes = Vec::new();
     for (i, &id) in all.iter().enumerate() {
         nodes.push(Arc::new(
-            Node::start(ctx.clone(), cfg(id, i), desc.clone())
+            Node::start_insecure_for_tests(ctx.clone(), cfg(id, i), desc.clone())
                 .await
                 .unwrap(),
         ));
