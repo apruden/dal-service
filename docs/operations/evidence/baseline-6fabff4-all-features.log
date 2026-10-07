@@ -1,0 +1,459 @@
+   Compiling dal-service v0.1.0 (/home/alex/workspace/dal-service)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.15s
+     Running unittests src/lib.rs (target/debug/deps/dal-1f92519c34a37429)
+
+running 206 tests
+test api::client::tests::redirect_candidates_extend_a_stale_placement ... ok
+test api::client::tests::leader_first_prepends_hint_and_dedupes ... ok
+test api::client::tests::deciding_the_last_sequence_exhausts_the_stream_without_overflow ... ok
+test api::client::tests::spread_omits_hint_and_rotates_over_all_voters ... ok
+test api::client::tests::spread_with_min_version_leads_with_hint_then_rotates ... ok
+test api::client::tests::an_unavailable_candidate_is_skipped_rather_than_failing_the_operation ... ok
+test api::client::tests::a_newer_placement_snapshot_retires_redirect_candidates ... ok
+test api::client::tests::a_redirect_newer_than_the_refreshed_snapshot_is_kept ... ok
+test config::tests::down_before_suspect_rejected ... ok
+test api::ops::tests::routing_validation_rejects_cache_poisoning_shapes ... ok
+test config::tests::duplicate_bootstrap_nodes_rejected ... ok
+test api::client::tests::redirect_to_an_unknown_node_refreshes_its_address ... ok
+test config::tests::meta_voter_not_in_bootstrap_rejected ... ok
+test config::tests::even_meta_voter_set_rejected ... ok
+test config::tests::node_config_validation ... ok
+test config::tests::odd_five_meta_voters_ok ... ok
+test config::tests::partition_count_bounds ... ok
+test config::tests::r_below_three_rejected ... ok
+test config::tests::p_zero_rejected ... ok
+test config::tests::raft_replication_batch_is_safe_for_maximum_client_frames ... ok
+test config::tests::routing_shape_must_fit_the_protocol_frame ... ok
+test config::tests::too_few_bootstrap_nodes_rejected ... ok
+test config::tests::too_small_meta_voter_set_rejected ... ok
+test config::tests::zero_node_id_rejected ... ok
+test keyspace::tests::tags_are_distinct ... ok
+test config::tests::valid_init_passes ... ok
+test keyspace::tests::user_keys_never_collide_with_internal ... ok
+test meta::failure::tests::active_to_suspect_to_down_and_back ... ok
+test meta::failure::tests::classify_thresholds ... ok
+test meta::failure::tests::down_is_never_reactivated_by_heartbeat ... ok
+test meta::failure::tests::evaluate_never_reactivates_down_from_silence_or_beat ... ok
+test meta::failure::tests::evaluate_proposes_suspect_then_down ... ok
+test meta::failure::tests::old_incarnation_cannot_refresh_current_liveness ... ok
+test meta::failure::tests::stable_states_are_noops ... ok
+test meta::failure::tests::tracker_ignores_stale_and_replayed_heartbeats ... ok
+test meta::reconcile::tests::gate_accepts_healthy_single_voter_plan ... ok
+test meta::reconcile::tests::gate_no_plan ... ok
+test meta::failure::tests::unobserved_node_gets_a_full_grace_period ... ok
+test meta::reconcile::tests::gate_rejects_aborting ... ok
+test meta::reconcile::tests::gate_rejects_config_mismatch ... ok
+test meta::reconcile::tests::reconcile_covers_all_phases ... ok
+test meta::reconcile::tests::reconcile_no_plan_is_noop ... ok
+test meta::failure::tests::tracker_refuses_unknown_nodes_past_the_cap ... ok
+test meta::failure::tests::evaluate_prunes_nodes_absent_from_the_directory ... ok
+test api::client::tests::coordinated_seed_retries_share_one_deadline ... ok
+test partition::log_store::tests::database_failure_fences_vote_and_log_io ... ok
+test partition::log_store::tests::flush_failure_while_purge_waits_preserves_marker_and_logs ... ok
+test partition::log_store::tests::purge_crash_boundaries_are_safe_and_retryable ... ok
+test partition::log_store::tests::raft_storage_error_poisons_sibling_groups ... ok
+test partition::node::tests::database_failure_stops_raft_participation ... ok
+test partition::log_store::tests::purge_waits_for_the_same_materialized_prefix_to_be_durable ... ok
+test partition::sm::tests::apply_observer_records_fresh_and_replayed_entries_at_the_apply_boundary ... ok
+test partition::sm::tests::coalesced_apply_chunks_input_larger_than_the_dirty_entry_budget ... ok
+test partition::sm::tests::coalesced_batch_observes_same_client_and_same_key_predecessors ... ok
+test partition::sm::tests::snapshot_transfer_from_a_dirty_source_installs_a_durable_fenced_prefix ... ok
+test partition::sm::tests::snapshot_waits_until_its_visible_applied_prefix_is_durable ... ok
+test placement::tests::aborting_move_blocks_new_balance_work ... ok
+test placement::tests::balanced_cluster_proposes_nothing ... ok
+test placement::tests::drains_an_ineligible_voter ... ok
+test placement::tests::in_flight_target_reserves_destination_load ... ok
+test placement::tests::is_deterministic ... ok
+test placement::tests::proposal_differs_by_exactly_one_voter ... ok
+test placement::tests::skips_partition_with_move_in_flight ... ok
+test placement::tests::suspect_voter_is_not_drained ... ok
+test placement::tests::too_few_eligible_nodes_proposes_nothing ... ok
+test placement::tests::voter_missing_from_the_directory_is_drained ... ok
+test runtime::config_file::tests::cluster_id_hex_round_trips ... ok
+test runtime::config_file::tests::init_descriptor_is_deterministic_and_sorted ... ok
+test runtime::config_file::tests::init_rejects_duplicate_addr ... ok
+test runtime::config_file::tests::init_rejects_invalid_init_config ... ok
+test runtime::config_file::tests::node_file_defaults ... ok
+test runtime::config_file::tests::node_file_rejects_invalid ... ok
+test runtime::config_file::tests::node_file_round_trip ... ok
+test runtime::config_file::tests::placements_cover_all_partitions_with_r_distinct_voters ... ok
+test runtime::config_file::tests::placements_deterministic ... ok
+test runtime::directory::tests::follower_data_only_resolves_the_authoritative_leader ... ok
+test runtime::directory::tests::follower_hint_is_never_returned_as_authority ... ok
+test runtime::dispatch::tests::foreign_peer_control_is_rejected_before_dispatch ... ok
+test runtime::http::tests::a_failed_search_index_does_not_change_health ... ok
+test runtime::http::tests::health_fails_closed_with_materialization_failure ... ok
+test runtime::http::tests::health_returns_ok ... ok
+test runtime::http::tests::status_returns_the_snapshot_as_json ... ok
+test runtime::node::tests::allows_config_for_a_dynamically_joined_node ... ok
+test runtime::node::tests::defers_descriptor_address_change_to_live_registration_check ... ok
+test runtime::node::tests::invalid_http_address_fails_before_opening_storage_or_starting_tasks ... ok
+test runtime::node::tests::rejects_an_incompatible_protocol_descriptor ... ok
+test runtime::node::tests::rejects_incomplete_or_malformed_placement_descriptors ... ok
+test runtime::readiness::tests::readiness_is_closed_until_bootstrap_completes ... ok
+test search::coordinator::tests::a_failed_phase_two_execute_releases_its_prepared_session ... ok
+test search::coordinator::tests::a_partial_search_names_every_omitted_partition ... ok
+test search::coordinator::tests::a_strict_search_fails_closed_before_executing_any_shard ... ok
+test search::coordinator::tests::every_shard_is_scored_against_the_same_summed_statistics ... ok
+test search::coordinator::tests::fan_out_never_polls_more_than_the_configured_bound ... ok
+test search::coordinator::tests::global_search_rejects_unimplemented_field_sorting ... ok
+test search::coordinator::tests::invalid_prepared_statistics_release_their_session ... ok
+test search::coordinator::tests::score_order_is_total_even_with_nan_and_none ... ok
+test search::definition::tests::aggregate_statistics_must_fit_the_prepare_frame ... ok
+test search::definition::tests::hash_is_stable_and_identity_is_checked ... ok
+test search::definition::tests::oversized_search_reply_is_refused_before_transport_encoding ... ok
+test search::definition::tests::query_shape_is_bounded_before_fan_out ... ok
+test search::definition::tests::rejects_reserved_and_duplicate_fields ... ok
+test search::outbox::tests::key_encoding_round_trips_opaque_keys_and_orders_by_log_index ... ok
+test search::outbox::tests::rejects_truncated_and_wrong_group_keys ... ok
+test search::service::tests::phase_two_result_is_fenced_when_an_install_lands_during_scoring ... ok
+test search::service::tests::session_ids_do_not_alias_across_service_restarts ... ok
+test search::service::tests::sweep_reaps_expired_sessions_without_a_new_prepare ... ok
+test search::value::tests::different_type_is_not_a_document ... ok
+test search::value::tests::rejects_scalar_coercion_and_unverified_envelopes ... ok
+test search::value::tests::verifies_envelope_and_extracts_exact_types ... ok
+test search::worker::cancellation_tests::cancelled_waiter_cannot_interleave_a_newer_projection ... ok
+test search::worker::cancellation_tests::repeated_dirty_keys_stream_to_one_final_version ... ok
+test partition::node::tests::eventual_search_remains_leader_authorized ... ok
+test search::worker::cancellation_tests::snapshot_install_fences_a_paused_old_epoch_projection ... ok
+test snapshot::tests::checksum_rejects_a_corrupted_snapshot ... ok
+test snapshot::tests::file_backed_stream_round_trips_records ... ok
+test snapshot::tests::maximum_value_snapshot_stream_measurement ... ignored, release snapshot stream measurement; set DAL_BENCH_DIR to a durable filesystem
+test storage::apply_durability::tests::a_backwards_snapshot_install_fails_the_whole_database ... ok
+test storage::apply_durability::tests::a_single_batch_cannot_bypass_group_limits ... ok
+test storage::apply_durability::tests::capd_crash_model_preserves_prefix_and_replay_invariants ... ok
+test storage::apply_durability::tests::closing_rejects_new_applies_and_allows_existing_ones_to_drain ... ok
+test storage::apply_durability::tests::global_failure_poison_applies_to_groups_registered_later ... ok
+test storage::apply_durability::tests::mismatch_at_same_index_is_corruption ... ok
+test storage::apply_durability::tests::per_group_byte_limit_blocks_until_the_oldest_batch_is_durable ... ok
+test storage::apply_durability::tests::snapshot_install_invalidates_an_inflight_recovery_epoch ... ok
+test storage::apply_durability::tests::snapshot_install_may_advance_but_never_replace_with_an_older_prefix ... ok
+test storage::apply_durability::tests::visible_and_durable_are_independent_and_monotonic ... ok
+test storage::batch::tests::coalesced_applies_trigger_when_they_cross_a_prune_boundary ... ok
+test storage::durability::tests::adaptive_batching_flushes_a_lone_writer_without_the_collection_delay ... ok
+test snapshot::tests::buffered_install_reads_records_across_buffer_boundaries ... ok
+test storage::durability::tests::external_database_failure_fails_an_already_written_request ... ok
+test storage::durability::tests::flush_failure_fails_mixed_log_and_state_waiters ... ok
+test storage::durability::tests::oversized_batch_is_rejected_instead_of_undercharged ... ok
+test storage::rocks::tests::abrupt_exit_child_writes_visible_batch ... ok
+
+running 1 test
+test storage::rocks::tests::abrupt_process_exit_reopens_to_an_atomic_state_prefix ... ok
+test api::client::tests::a_temporary_no_leader_redirect_outlives_fast_rounds ... ok
+test storage::rocks::tests::async_reclamation_closes_admission_and_waits_for_state_durability ... ok
+test storage::rocks::tests::dirty_age_watchdog_fails_storage_closed ... ok
+test storage::durability::tests::groups_active_writers_into_one_flush ... ok
+test storage::rocks::tests::dropping_storage_durably_drains_pending_log_callbacks ... ok
+test storage::rocks::tests::maximum_value_snapshot_install_measurement ... ignored, release snapshot install measurement; set DAL_BENCH_DIR to a durable filesystem
+test storage::rocks::tests::data_state_returns_visible_before_wal_durability ... ok
+test storage::rocks::tests::open_finishes_a_reclaim_that_crashed_before_the_cf_drops ... ok
+test storage::rocks::tests::meta_state_stays_synchronous ... ok
+test storage::rocks::tests::open_leaves_a_serving_group_intact ... ok
+test storage::rocks::tests::log_batch_is_readable_before_its_durable_callback ... ok
+test transport::codec::tests::bad_group_tag_rejected ... ok
+test transport::codec::tests::bad_msg_type_rejected ... ok
+test transport::codec::tests::empty_payload_round_trips ... ok
+test transport::codec::tests::lane_limits_cover_every_msg_type ... ok
+test transport::codec::tests::operator_frames_round_trip ... ok
+test transport::codec::tests::oversized_outbound_payload_is_never_encoded ... ok
+test transport::codec::tests::oversized_payload_rejected_before_read ... ok
+test transport::codec::tests::peer_control_classification ... ok
+test transport::codec::tests::round_trip_meta_and_data ... ok
+test transport::codec::tests::trailing_bytes_rejected ... ok
+test transport::codec::tests::truncated_header_rejected ... ok
+test transport::codec::tests::unsupported_version_rejected ... ok
+test transport::dealer::tests::a_per_call_timeout_overrides_the_transport_default ... ok
+test storage::rocks::tests::per_group_dirty_limit_backpressures_until_flush ... ok
+test transport::dealer::tests::clone_shares_the_peer_connection_directory ... ok
+test transport::dealer::tests::a_reply_is_decoded_and_correlated_on_the_io_thread ... ok
+test transport::raft_net::tests::control_seeds_remain_discovery_candidates ... ok
+test transport::raft_net::tests::directory_merge_never_regresses_or_rebinds_an_incarnation ... ok
+test transport::raft_net::tests::fenced_factory_refuses_outbound_raft ... ok
+test transport::raft_net::tests::missing_address_is_unreachable ... ok
+test transport::dealer::tests::idle_peers_are_evicted_while_in_flight_ones_are_kept ... ok
+test transport::raft_net::tests::raft_reply_from_the_wrong_cluster_is_rejected_before_payload_decode ... ok
+test transport::raft_net::tests::vote_round_trips_over_transport ... ok
+test transport::raft_wire::tests::append_entries_round_trips_for_meta_group ... ok
+test transport::raft_wire::tests::append_entries_round_trips_for_data_group ... ok
+test transport::raft_wire::tests::append_reply_round_trips ... ok
+test transport::raft_wire::tests::control_bodies_round_trip ... ok
+test transport::raft_wire::tests::install_snapshot_round_trips ... ok
+test transport::raft_wire::tests::vote_round_trips ... ok
+test transport::router::tests::client_byte_saturation_preserves_maximum_peer_request_and_reply ... ok
+test transport::router::tests::peer_control_uses_capacity_reserved_from_clients ... ok
+test transport::router::tests::reply_byte_reservation_is_held_until_admission_drops ... ok
+test transport::router::tests::request_byte_reservation_bounds_large_inflight_frames ... ok
+test transport::raft_wire::tests::one_maximum_value_entry_fits_the_production_raft_frame ... ok
+test types::tests::group_cf_names_are_stable ... ok
+test types::tests::group_ordering_meta_before_data ... ok
+test types::tests::partition_of_is_in_range_and_deterministic ... ok
+test types::tests::voter_set_dedups_and_sorts ... ok
+test verify::linearizability::tests::cas_success_and_failure ... ok
+test verify::linearizability::tests::concurrent_reads_can_pick_either_side_of_a_write ... ok
+test verify::linearizability::tests::create_only_second_attempt_fails ... ok
+test verify::linearizability::tests::empty_history_is_linearizable ... ok
+test verify::linearizability::tests::non_monotonic_reads_violate ... ok
+test verify::linearizability::tests::read_of_stale_value_after_write_returns_is_not_linearizable ... ok
+test verify::linearizability::tests::sequential_write_then_read_is_linearizable ... ok
+test verify::linearizability::tests::versions_must_be_monotonic ... ok
+test verify::oracles::tests::converged_detects_divergence_and_stale_plans ... ok
+test verify::oracles::tests::exactly_once_accepts_identical_replays ... ok
+test verify::oracles::tests::exactly_once_rejects_reused_sequence_for_different_command ... ok
+test verify::oracles::tests::exactly_once_rejects_two_fresh_decisions ... ok
+test verify::oracles::tests::no_lost_write_flags_disappearance_and_regression ... ok
+test verify::rng::tests::below_is_in_range ... ok
+test verify::rng::tests::different_seeds_diverge ... ok
+test verify::rng::tests::same_seed_same_sequence ... ok
+test storage::rocks::tests::reclaim_refuses_to_drop_a_group_with_an_unflushed_state_apply ... ok
+test transport::router::tests::zmq_peer_append_progresses_with_client_byte_budgets_saturated ... ok
+test partition::node::tests::recovery_fence_rejects_leadership_and_membership_races ... ok
+test partition::node::tests::async_state_converges_with_delay_reorder_and_duplicate_delivery ... ok
+test partition::log_store::tests::passes_openraft_storage_conformance_suite ... ok
+test partition::node::tests::async_state_cluster_operations_are_visible_ordered_replayed_and_recovered ... ok
+test partition::node::tests::acknowledged_async_suffix_replays_after_simulated_power_loss_matrix ... ok
+
+test result: ok. 204 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 12.14s
+
+     Running unittests src/main.rs (target/debug/deps/dal-df26b7d40f2459a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/benchmark_e2e.rs (target/debug/deps/benchmark_e2e-71c4bc67ee9f400b)
+
+running 1 test
+test end_to_end_benchmark_three_nodes ... ignored, benchmark: run `cargo test --release --test benchmark_e2e end_to_end_benchmark_three_nodes -- --ignored --nocapture`
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/benchmark_multiprocess.rs (target/debug/deps/benchmark_multiprocess-4d39a24724d57050)
+
+running 1 test
+test three_process_tcp_mixed_workload ... ignored, release benchmark: run with --ignored --nocapture and DAL_BENCH_DIR on a durable filesystem
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bootstrap_m5.rs (target/debug/deps/bootstrap_m5-3305d91afccfb919)
+
+running 6 tests
+test bootstrap_records_accept_identical_reject_conflict ... ok
+test full_bootstrap_serves_meta_and_data ... ok
+test meta_quorum_loss_data_still_serves ... ok
+test bootstrap_is_resumable ... ok
+test full_cluster_restart_recovers_meta_and_data ... ok
+test meta_membership_grows_and_survives_restart ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s
+
+     Running tests/meta_group_m5.rs (target/debug/deps/meta_group_m5-ed03a542c4d6b651)
+
+running 4 tests
+test commands_replicate_and_converge ... ok
+test bootstrap_init_and_linearizable_read ... ok
+test follower_restarts_from_log ... ok
+test leader_failover_preserves_committed_meta ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+
+     Running tests/meta_m5.rs (target/debug/deps/meta_m5-42391b9c9c8355b7)
+
+running 16 tests
+test commands_before_init_are_rejected ... ok
+test abort_only_clears_an_aborting_plan_rolled_back ... ok
+test create_plan_requires_single_voter_change ... ok
+test finalize_commits_target_voters ... ok
+test abort_report_with_target_finalizes_a_completed_move ... ok
+test explicit_registration_revives_a_down_node_at_the_same_addresses ... ok
+test create_plan_rejects_bad_targets ... ok
+test cluster_init_is_immutable_but_idempotent ... ok
+test finalize_rejects_mismatched_observation ... ok
+test init_validates_config_and_meta_voters ... ok
+test meta_membership_change_rules ... ok
+test meta_removal_cannot_drop_below_three ... ok
+test meta_replacement_is_not_blocked_by_data_replication_factor ... ok
+test set_node_state_guards_incarnation ... ok
+test seed_placement_rules ... ok
+test registration_rejects_addresses_owned_by_another_node ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/placement_m5.rs (target/debug/deps/placement_m5-af5b1b2bdc1f30fe)
+
+running 3 tests
+test proposals_change_exactly_one_voter ... ok
+test is_deterministic ... ok
+test converges_to_near_even ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/raft_group_m3.rs (target/debug/deps/raft_group_m3-bedfc8e5ad64d6bf)
+
+running 8 tests
+test bootstrap_write_and_linearizable_read ... ok
+test stale_read_below_min_version_redirects ... ok
+test isolated_old_leader_cannot_serve_stale_read ... ok
+test follower_serves_stale_read ... ok
+test followers_converge ... ok
+test follower_restarts_from_log ... ok
+test isolated_replica_refuses_stale_read ... ok
+test leader_failover_preserves_acknowledged_write ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+
+     Running tests/rebalance_m6.rs (target/debug/deps/rebalance_m6-2a285deaeb47d0b1)
+
+running 14 tests
+test interrupted_move_resumes_from_committed_config ... ok
+test cleared_plan_cannot_be_resurrected ... ok
+test abort_after_add_learner_removes_it_once ... ok
+test abort_racing_a_completed_move_finalizes_benignly ... ok
+test drain_removes_the_current_leader ... ok
+test duplicate_finalize_is_benign ... ok
+test drain_replaces_a_follower ... ok
+test grow_to_four_then_shrink_back_converges ... ok
+test meta_learner_removal_is_safe_and_idempotent ... ok
+test resume_after_add_learner ... ok
+test move_adds_node_and_finalizes ... ok
+test planned_learner_never_joins_then_abort_and_replace ... ok
+test resume_after_change_membership ... ok
+test resume_after_create_plan ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests/runtime_m8.rs (target/debug/deps/runtime_m8-133d059c4c99c1fa)
+
+running 12 tests
+test draining_a_node_migrates_its_partition ... ok
+test abort_driver_rolls_back_a_plan_whose_target_dies ... ok
+test failure_detector_marks_a_silent_node_down ... ok
+test a_restarted_node_rehosts_a_partition_gained_by_rebalance ... ok
+test draining_the_meta_leader_hands_off_and_swaps_in_the_spare ... ok
+test http_status_reports_node_local_view ... ok
+test joined_node_discovers_live_members_and_receives_rebalanced_data ... ok
+test non_meta_voter_data_leader_drives_a_move ... ok
+test operator_cli_commands_query_and_mutate_the_cluster ... ok
+test rotated_genesis_voter_order_bootstraps_every_partition ... ok
+test three_node_cluster_serves_a_client_op ... ok
+test become_learner_requires_a_live_plan ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.62s
+
+     Running tests/search.rs (target/debug/deps/search-fb5852dd9d3359c1)
+
+running 22 tests
+test catalog_frames_fit_two_maximum_definitions ... ok
+test catalog_records_bound_the_retiring_generation_list ... ok
+test dot_only_index_names_are_rejected ... ok
+test a_backfilling_generation_is_not_victimized_by_the_lag_budget ... ok
+test a_lagging_index_is_released_so_the_outbox_cannot_grow_without_bound ... ok
+test global_statistics_missing_a_term_fail_closed ... ok
+test coalesced_apply_crossing_a_boundary_prunes_without_consumers ... ok
+test corrupt_index_directory_is_quarantined_and_recreated ... ok
+test forgotten_partitions_reject_installs_until_readmitted ... ok
+test outbox_pruning_retains_everything_for_a_consumer_that_has_projected_nothing ... ok
+test prune_failure_fences_storage_without_failing_the_applied_entry ... ok
+test raft_apply_publishes_user_mutation_and_outbox_atomically ... ok
+test outbox_pruning_waits_for_the_slowest_registered_generation ... ok
+test rebuild_clears_an_ahead_watermark_before_snapshotting ... ok
+test large_stored_hits_are_refused_before_building_an_oversized_reply ... ok
+test rebuild_discards_documents_buffered_by_a_failed_pass ... ok
+test a_new_consumer_rebuilds_when_an_old_index_has_an_outbox_gap ... ok
+test snapshot_install_advances_projection_epoch ... ok
+test tantivy_projection_persists_checkpoint_and_searches_stored_identity ... ok
+test reload_failure_keeps_the_serving_checkpoint_paired_with_its_reader ... ok
+test reinstall_after_registration_crash_rebuilds_over_the_pruned_gap ... ok
+test global_bm25_matches_a_single_index_reference_corpus ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/search_catalog.rs (target/debug/deps/search_catalog-8ea05c7558f59799)
+
+running 4 tests
+test legacy_search_command_encoding_remains_decodable ... ok
+test engine_revision_is_part_of_search_command_idempotency ... ok
+test activation_requires_every_current_partition_voter ... ok
+test catalog_count_is_bounded_to_fit_full_catalog_frames ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/state_machine_m2.rs (target/debug/deps/state_machine_m2-c621450a1382514d)
+
+running 14 tests
+test crash_between_applies_recovers_to_prefix ... ok
+test basic_put_get_delete ... ok
+test delete_recreate_keeps_versions_strictly_increasing ... ok
+test failed_cas_advances_highest_avoiding_wedge ... ok
+test delete_with_absent_sentinel_is_malformed ... ok
+test every_committed_entry_advances_last_applied ... ok
+test gapped_and_stale_sequences_are_rejected ... ok
+test independent_clients_have_independent_sequences ... ok
+test numeric_cas_against_absent_fails ... ok
+test put_absent_is_create_only ... ok
+test retry_returns_stored_result_without_reapplying ... ok
+test same_sequence_different_command_is_rejected ... ok
+test unconditional_delete_of_absent_is_applied ... ok
+test value_limit_rejects_an_oversized_committed_entry_without_consuming_sequence ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/storage_m1.rs (target/debug/deps/storage_m1-e43128126cf5318c)
+
+running 16 tests
+test fresh_open_persists_identity_and_matches_on_reopen ... ok
+test heartbeat_incarnation_advances_across_restarts ... ok
+test group_start_requires_durable_admission_and_never_revives_non_serving ... ok
+test group_cf_lifecycle ... ok
+test crash_after_write_is_durable ... ok
+test a_new_verified_plan_can_readmit_a_reclaimed_group ... ok
+test registration_binding_is_durable_and_monotonic ... ok
+test wrong_cluster_id_is_rejected ... ok
+test wrong_node_id_is_rejected ... ok
+test cfs_survive_reopen ... ok
+test interrupted_reclaim_with_dangling_pointer_is_completed_at_open ... ok
+test crash_before_write_leaves_previous_state ... ok
+test multi_mutation_batch_is_all_or_nothing ... ok
+test reclaim_records_non_serving_before_dropping_cfs ... ok
+test sequential_applies_recover_to_last_prefix ... ok
+test snapshot_replace_is_atomic_at_both_crash_boundaries ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/transport_m4.rs (target/debug/deps/transport_m4-bdfc5b2c0b49d440)
+
+running 15 tests
+test mispartitioned_key_is_rejected ... ok
+test oversize_prefix_rejected ... ok
+test decode_never_panics ... ok
+test client_put_then_get_round_trips ... ok
+test envelope_round_trips ... ok
+test cold_client_with_one_live_seed ... ok
+test concurrent_client_mutations_use_distinct_sequences ... ok
+test peer_control_on_client_path_is_rejected ... ok
+test refused_mutation_does_not_wedge_the_stream ... ok
+test stale_route_redirects_and_converges ... ok
+test wrong_cluster_reply_is_rejected ... ok
+test decoded_values_cannot_consume_client_frame_headroom ... ok
+test oversized_complete_request_does_not_reserve_a_mutation_sequence ... ok
+test value_limit_accepts_one_mib_and_rejects_oversize_before_proposal ... ok
+test retry_across_leader_change_applies_exactly_once ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+
+     Running tests/verify_m7.rs (target/debug/deps/verify_m7-bb14c3b2222a4841)
+
+running 1 test
+test oracles_hold_under_leader_crash_multiple_seeds has been running for over 60 seconds
+test oracles_hold_under_leader_crash_multiple_seeds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 307.47s
+
+     Running tests/zmq_smoke_m4.rs (target/debug/deps/zmq_smoke_m4-30fd8f53ceb95ac9)
+
+running 3 tests
+test zmq_dealer_router_round_trip ... ok
+test shutdown_yields_while_an_inflight_handler_finishes ... ok
+test tcp_router_refuses_frames_over_maxmsgsize ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
