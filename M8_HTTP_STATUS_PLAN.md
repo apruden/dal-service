@@ -102,6 +102,8 @@ in-flight blocking diagnostic collection, then drives axum's graceful-shutdown
 future after the data plane has drained. Probes therefore remain available
 during the drain. The HTTP join has a five-second ceiling; a stalled admin
 client is aborted and makes shutdown return an error instead of hanging.
+The whole node drain is independently bounded by the configured
+`timeouts.shutdown_ms` (60 seconds by default).
 
 ## Step 3 — CLI / runtime wiring (built)
 

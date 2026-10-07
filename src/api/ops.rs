@@ -128,6 +128,10 @@ pub enum ClientReply {
     /// reached the replicated log (e.g. a Raft error after proposal). A client
     /// must not abandon an in-flight mutation sequence on this reply.
     Error(String),
+    /// Process-local admission is closed (startup, drain, or fatal failure).
+    /// A prior attempt may already have committed, so mutation clients retain
+    /// the pending command and sequence for resolution after service returns.
+    Unavailable(String),
 }
 
 /// Public per-shard search reply used by the client-side scatter/gather

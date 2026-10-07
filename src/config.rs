@@ -21,6 +21,7 @@ pub struct Timeouts {
     pub suspect: Duration,
     pub down: Duration,
     pub request: Duration,
+    pub shutdown: Duration,
 }
 
 impl Default for Timeouts {
@@ -29,6 +30,7 @@ impl Default for Timeouts {
             suspect: Duration::from_secs(3),
             down: Duration::from_secs(15),
             request: Duration::from_secs(5),
+            shutdown: Duration::from_secs(60),
         }
     }
 }
@@ -47,6 +49,9 @@ impl Timeouts {
         }
         if self.request.is_zero() {
             return Err(Error::Config("request_timeout must be > 0".into()));
+        }
+        if self.shutdown.is_zero() {
+            return Err(Error::Config("shutdown_timeout must be > 0".into()));
         }
         Ok(())
     }
@@ -421,6 +426,7 @@ mod tests {
             suspect: Duration::from_secs(10),
             down: Duration::from_secs(5),
             request: Duration::from_secs(5),
+            shutdown: Duration::from_secs(60),
         };
         assert!(t.validate().is_err());
     }

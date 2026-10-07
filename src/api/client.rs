@@ -445,6 +445,7 @@ impl<T: Transport> Client<T> {
             ClientReply::Value(v) => Ok(v),
             ClientReply::Refused(e) => Err(Error::Raft(format!("read refused: {e}"))),
             ClientReply::Error(e) => Err(Error::Raft(format!("read rejected: {e}"))),
+            ClientReply::Unavailable(e) => Err(Error::Raft(format!("read unavailable: {e}"))),
             other => Err(Error::Raft(format!("unexpected read reply: {other:?}"))),
         }
     }
@@ -510,6 +511,7 @@ impl<T: Transport> Client<T> {
                 Err(Error::Raft(format!("write refused: {e}")))
             }
             ClientReply::Error(e) => Err(Error::Raft(format!("write rejected: {e}"))),
+            ClientReply::Unavailable(e) => Err(Error::Raft(format!("write unavailable: {e}"))),
             other => Err(Error::Raft(format!("unexpected write reply: {other:?}"))),
         }
     }
@@ -1126,6 +1128,7 @@ mod tests {
         /// A node that cannot serve — identity-fenced, or shedding load at the
         /// router — answers with an empty body carrying no client outcome.
         Unavailable,
+        AdmissionClosed,
     }
 
     struct ScriptedServer(ScriptedReply);
@@ -1134,6 +1137,9 @@ mod tests {
         async fn serve(&self, request: Envelope) -> Envelope {
             let payload = match &self.0 {
                 ScriptedReply::Unavailable => Vec::new(),
+                ScriptedReply::AdmissionClosed => codec::encode(&ClientReply::Unavailable(
+                    "node is not accepting client work".into(),
+                )),
                 ScriptedReply::Redirect => codec::encode(&ClientReply::Redirect(Redirect {
                     cluster_id: 1,
                     leader: Some(4),
@@ -1253,6 +1259,34 @@ mod tests {
             client.get(b"key").await.unwrap(),
             Some((7, b"new".to_vec()))
         );
+    }
+
+    #[tokio::test]
+    async fn admission_unavailable_preserves_pending_mutation_identity() {
+        let transport = InProcess::new();
+        transport.register(
+            "node-1",
+            Arc::new(ScriptedServer(ScriptedReply::AdmissionClosed)),
+        );
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(routing(vec![1], LogId::new(1, 1)));
+
+        let error = client.put(b"key", b"value", None).await.unwrap_err();
+        assert!(error.to_string().contains("write unavailable"));
+        let pending = client.pending.lock().unwrap();
+        let mutation = pending
+            .get(&0)
+            .expect("ambiguous mutation must remain pending");
+        assert_eq!(mutation.sequence, 1);
+        assert!(matches!(
+            &mutation.op,
+            DataOp::Put { key, value, .. } if key == b"key" && value == b"value"
+        ));
+        drop(pending);
+
+        let error = client.put(b"other", b"value", None).await.unwrap_err();
+        assert!(error.to_string().contains("is unresolved"));
+        assert_eq!(client.pending.lock().unwrap().get(&0).unwrap().sequence, 1);
     }
 
     #[tokio::test]

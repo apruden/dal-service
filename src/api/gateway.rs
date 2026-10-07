@@ -19,6 +19,7 @@ use crate::api::ops::{
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use crate::perf::WriteStage;
+use crate::runtime::readiness::RuntimeReadiness;
 use crate::search::ShardSearchOutcome;
 use crate::transport::Server;
 
@@ -79,6 +80,7 @@ pub struct ClientGateway {
     search: RwLock<Option<Arc<crate::search::SearchService>>>,
     search_catalog: RwLock<Option<Arc<dyn SearchCatalogSource>>>,
     shard_source: RwLock<Option<Arc<dyn ShardSourceFactory>>>,
+    readiness: Option<RuntimeReadiness>,
 }
 
 impl ClientGateway {
@@ -98,7 +100,21 @@ impl ClientGateway {
             search: RwLock::new(None),
             search_catalog: RwLock::new(None),
             shard_source: RwLock::new(None),
+            readiness: None,
         }
+    }
+
+    /// Attach the process lifecycle admission gate. Standalone gateways used by
+    /// lower-level tests omit it and retain their historical always-open mode.
+    pub fn with_readiness(mut self, readiness: RuntimeReadiness) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
+    fn accepts_client_work(&self) -> bool {
+        self.readiness
+            .as_ref()
+            .is_none_or(RuntimeReadiness::is_ready)
     }
 
     pub fn set_search_service(&self, search: Arc<crate::search::SearchService>) {
@@ -145,6 +161,9 @@ impl ClientGateway {
 
     async fn handle_client_op(&self, env: &Envelope) -> ClientReply {
         let _profile = crate::perf::timer(WriteStage::ClientGatewayHandle);
+        if !self.accepts_client_work() {
+            return ClientReply::Unavailable("node is not accepting client work".into());
+        }
         let req: ClientRequest = match codec::decode(&env.payload) {
             Ok(r) => r,
             Err(e) => return ClientReply::Refused(format!("malformed ClientOp: {e}")),
@@ -242,6 +261,9 @@ impl ClientGateway {
     /// the catalog generation, scatters to every partition leader, and merges
     /// one deterministic result; the client makes a single round trip.
     async fn handle_coordinated_search(&self, env: &Envelope) -> SearchShardReply {
+        if !self.accepts_client_work() {
+            return SearchShardReply::Error("node is not accepting client work".into());
+        }
         let request: crate::search::SearchRequest = match codec::decode(&env.payload) {
             Ok(request) => request,
             Err(error) => return SearchShardReply::Refused(format!("malformed SearchOp: {error}")),
@@ -328,6 +350,9 @@ impl ClientGateway {
     }
 
     async fn handle_search_op(&self, env: &Envelope) -> SearchShardReply {
+        if !self.accepts_client_work() {
+            return SearchShardReply::Error("node is not accepting client work".into());
+        }
         let request: crate::search::SearchRequest = match codec::decode(&env.payload) {
             Ok(request) => request,
             Err(error) => return SearchShardReply::Refused(format!("malformed SearchOp: {error}")),
@@ -474,5 +499,50 @@ impl Server for ClientGateway {
                 ClientReply::Error(format!("unsupported client msg_type {other:?}")),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoRouting;
+
+    impl RoutingSource for NoRouting {
+        fn routing(
+            &self,
+            _local_only: bool,
+        ) -> Pin<Box<dyn Future<Output = Option<RoutingInfo>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_gateway_returns_pending_preserving_unavailable() {
+        let readiness = RuntimeReadiness::default();
+        assert!(readiness.mark_ready());
+        let gateway = ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoRouting),
+        )
+        .with_readiness(readiness.clone());
+        assert!(readiness.begin_draining());
+
+        let reply = gateway
+            .serve(Envelope::new(
+                7,
+                MsgType::ClientOp,
+                GroupId::Data(0),
+                1,
+                Vec::new(),
+            ))
+            .await;
+        assert_eq!(
+            codec::decode::<ClientReply>(&reply.payload).unwrap(),
+            ClientReply::Unavailable("node is not accepting client work".into())
+        );
     }
 }

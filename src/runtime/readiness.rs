@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-/// Observable process lifecycle. Transitions are monotonic except that
-/// `Failed` and `Draining` both converge on `Stopped` during teardown.
+/// Observable process lifecycle. Transitions are monotonic; clean teardown
+/// moves `Draining` to `Stopped`, while failures remain `Failed` for diagnosis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]

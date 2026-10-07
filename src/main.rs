@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use dal::api::ops::RoutingInfo;
 use dal::meta::state_machine::MetaApplyResult;
@@ -149,27 +150,125 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
     }
 
     with_runtime(async move {
-        let ctx = zmq::Context::new();
-        let node = match Node::start(ctx, node_cfg, desc).await {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("run: start: {e}");
+        let mut signals = match ShutdownSignals::register() {
+            Ok(signals) => signals,
+            Err(error) => {
+                eprintln!("run: signal registration: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        if let Err(e) = node.bootstrap().await {
-            eprintln!("run: bootstrap: {e}");
-            return ExitCode::FAILURE;
+        let shutdown_timeout = node_cfg.timeouts.shutdown;
+        let ctx = zmq::Context::new();
+        let mut start = Box::pin(Node::start(ctx, node_cfg, desc));
+        let node = tokio::select! {
+            result = &mut start => match result {
+                Ok(node) => node,
+                Err(error) => {
+                    eprintln!("run: start: {error}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            signal = signals.recv() => {
+                eprintln!("dal received {signal} during startup; stopping");
+                return match tokio::time::timeout(shutdown_timeout, &mut start).await {
+                    Ok(Ok(node)) => shutdown_node(node).await,
+                    Ok(Err(error)) => {
+                        eprintln!("run: start while stopping: {error}");
+                        ExitCode::FAILURE
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "run: forced stop after startup exceeded {} ms",
+                            shutdown_timeout.as_millis()
+                        );
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+        };
+
+        enum BootstrapEvent {
+            Complete(dal::error::Result<()>),
+            Signal(&'static str),
+            Fatal,
         }
+        let event = {
+            let bootstrap = node.bootstrap();
+            tokio::pin!(bootstrap);
+            tokio::select! {
+                result = &mut bootstrap => BootstrapEvent::Complete(result),
+                signal = signals.recv() => BootstrapEvent::Signal(signal),
+                () = node.wait_for_failure() => BootstrapEvent::Fatal,
+            }
+        };
+        match event {
+            BootstrapEvent::Complete(Ok(())) => {}
+            BootstrapEvent::Complete(Err(error)) => {
+                eprintln!("run: bootstrap: {error}");
+                node.mark_failed();
+                let _ = shutdown_node(node).await;
+                return ExitCode::FAILURE;
+            }
+            BootstrapEvent::Signal(signal) => {
+                eprintln!(
+                    "dal node {} received {signal} during bootstrap",
+                    node.node_id()
+                );
+                return shutdown_node(node).await;
+            }
+            BootstrapEvent::Fatal => {
+                eprintln!("dal node {} failed during bootstrap", node.node_id());
+                let _ = shutdown_node(node).await;
+                return ExitCode::FAILURE;
+            }
+        }
+
         eprintln!("dal node {} running; Ctrl-C to stop", node.node_id());
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("dal node {} shutting down", node.node_id());
-        if let Err(e) = node.shutdown().await {
-            eprintln!("run: shutdown: {e}");
-            return ExitCode::FAILURE;
-        }
-        ExitCode::SUCCESS
+        let failed = tokio::select! {
+            signal = signals.recv() => {
+                eprintln!("dal node {} received {signal}; shutting down", node.node_id());
+                false
+            }
+            () = node.wait_for_failure() => {
+                eprintln!("dal node {} has a fatal background failure; shutting down", node.node_id());
+                true
+            }
+        };
+        let result = shutdown_node(node).await;
+        if failed { ExitCode::FAILURE } else { result }
     })
+}
+
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+async fn shutdown_node(node: Node) -> ExitCode {
+    match node.shutdown().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("run: shutdown: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn join(config: &str) -> ExitCode {
@@ -390,7 +489,14 @@ fn with_runtime<F: Future<Output = ExitCode>>(fut: F) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => rt.block_on(fut),
+        Ok(rt) => {
+            let result = rt.block_on(fut);
+            // A timed-out graceful stop may leave non-cancellable blocking work
+            // in Tokio's pool. Bound runtime destruction so the executable can
+            // still exit through its explicit forced-stop path.
+            rt.shutdown_timeout(Duration::from_secs(5));
+            result
+        }
         Err(e) => {
             eprintln!("runtime: {e}");
             ExitCode::FAILURE

@@ -691,6 +691,15 @@ impl Storage {
         self.apply_durability.wait_for_failure().await
     }
 
+    /// Close new materialized-state submissions for `group` and wait until
+    /// every visible batch is covered by a successful WAL flush. Node shutdown
+    /// calls this only after the group's Raft runtime has stopped producing
+    /// applies.
+    pub(crate) async fn drain_group_state(&self, group: GroupId) -> Result<()> {
+        self.apply_durability.begin_close(group);
+        self.apply_durability.drain(group).await
+    }
+
     /// Reclaim a removed group's local data (DESIGN §7.4): record `NonServing`
     /// *before* dropping the CFs, so a crash mid-reclaim can never leave
     /// servable-looking state behind. After the drop, the absence of local Raft

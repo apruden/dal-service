@@ -46,7 +46,7 @@ reclamation are assembled; remaining items are listed under "Status".
   (config enforces `control_addr != bulk_addr`).
 - **HTTP lane** (`http_addr`): read-only `/status`, `/health`, `/livez`, and `/readyz`, built
   (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`). Listener bound before storage
-  opens; serving task aborted on shutdown.
+  opens; serving task receives bounded graceful shutdown after data-plane drain.
 
 ### 5. Dispatch / envelope routing (§10.2)
 Inbound frame → decode `Envelope` → split by `MsgType::is_peer_control()`:
@@ -193,17 +193,26 @@ impl Server for RootDispatch {
     `run` awaits the shutdown signal.
 
 ## Shutdown (`Node::shutdown`)
-Change lifecycle to `Draining` (closing readiness) → abort background loops → stop both ZMQ pollers (no new frames) →
-`raft.shutdown()` on meta + every partition → asynchronously drain already
-dispatched handlers → drop `Storage` (flush/close). Poller stopping is
+SIGINT, SIGTERM, and fatal required-task exit share one coordinator, including
+while bootstrap is pending. Change lifecycle to `Draining` (closing client
+admission) → attempt bounded best-effort meta leadership handoff → abort
+background producers → stop both ZMQ pollers (no new frames) → allow accepted
+handlers one request timeout to finish → `raft.shutdown()` on meta + every
+partition → wait until every visible materialized batch is WAL-durable → drain
+handlers released by Raft shutdown → drop `Storage`. Poller stopping is
 synchronous, but handler draining yields to Tokio so an in-flight request can
 finish on a single-worker runtime. Successful teardown records `Stopped`; a
-Raft shutdown or owned-task error records `Failed`. The diagnostic sampler is
+Raft shutdown, durability failure, or owned-task error records `Failed`.
+`ClientReply::Unavailable` preserves an ambiguous mutation's pending sequence
+when lifecycle admission is closed; `Refused` remains reserved for requests
+that certainly were never proposed. The diagnostic sampler is
 signalled and joined, including any in-flight blocking collection, before the
 final storage owner is released. The HTTP task remains available throughout
 the drain and receives graceful shutdown last. Its connection drain is bounded
 to five seconds; timeout or serve failure records `Failed` and is returned by
-`Node::shutdown`.
+`Node::shutdown`. The complete shutdown has a configurable 60-second default
+deadline. Expiry is an explicit failed forced stop, followed by a bounded
+five-second Tokio runtime teardown in the executable.
 
 ## Example: client write path (once assembled)
 `Client` (DEALER) → target `control_addr` ROUTER → `ClientGateway` →

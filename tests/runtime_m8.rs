@@ -323,6 +323,7 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
         suspect: Duration::from_millis(800),
         down: Duration::from_millis(1600),
         request: Duration::from_millis(500),
+        shutdown: Duration::from_secs(10),
     };
 
     let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -714,6 +715,7 @@ fn short_timeouts() -> Timeouts {
         suspect: Duration::from_millis(400),
         down: Duration::from_millis(1200),
         request: Duration::from_millis(1000),
+        shutdown: Duration::from_secs(10),
     }
 }
 
@@ -1033,6 +1035,7 @@ async fn joined_node_discovers_live_members_and_receives_rebalanced_data() {
         suspect: Duration::from_secs(2),
         down: Duration::from_secs(6),
         request: Duration::from_secs(1),
+        shutdown: Duration::from_secs(10),
     };
     let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
     let config = |id: NodeId, index: usize| NodeConfig {

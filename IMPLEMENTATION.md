@@ -98,7 +98,8 @@ layers, async-trait sugar beyond what openraft requires.
   Placement records retain the last confirmed data config `LogId`. All are
   serde-derived; envelope byte layout is deferred to M4.
 - Config: `cluster_id`, `node_id`, control/bulk listen addrs, seed addrs,
-  data dir, timeouts; `P` and `R` appear only in `init` input. Validation:
+  data dir, failure/request timeouts, and `shutdown_ms` (default 60,000); `P`
+  and `R` appear only in `init` input. Validation:
   `P > 0`, `P <= u16::MAX`, `R >= 3`, ≥ `R` distinct bootstrap nodes, an
   odd meta-voter set of ≥ 3 distinct nodes, and a worst-case `P`/`R` routing
   snapshot that fits the 4 MiB `MetaQuery` frame. The directory is bounded to
@@ -416,8 +417,13 @@ config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
   `RootDispatch` → bind control and bulk `ZmqServer`s → spawn background drivers.
   `Node::bootstrap` drives resumable genesis from the descriptor, querying the
   shared live address book rather than retaining descriptor-only meta endpoints.
-  `Node::shutdown` first stops inbound acceptance, shuts down every Raft, then
-  asynchronously drains already-dispatched handlers before storage is released.
+  `Node::shutdown` closes lifecycle admission, attempts a bounded meta-leader
+  handoff, stops inbound acceptance, gives accepted work one request timeout to
+  finish, shuts down every Raft, drains visible state through its durable WAL
+  prefix, then asynchronously drains released handlers before storage is
+  released. Required background task exit or panic changes lifecycle to
+  `Failed`; the executable coordinates those failures with both SIGINT and
+  SIGTERM, including during bootstrap.
 - **`RootDispatch` — the peer/operator-control dispatcher** (`runtime/dispatch.rs`):
   the inbound `Server` that splits on `MsgType::is_peer_control()`. Client frames
   (`ClientOp`, `MetaQuery`) go to the `ClientGateway`; peer/operator frames are
@@ -459,7 +465,10 @@ config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
 - **Config + binary** (`runtime/config_file.rs`, `main.rs`): JSON node config
   (`http_addr`, initial placements) and immutable init descriptor; `dal run
   --config <node> --cluster <init>` starts a node, drives genesis, and serves
-  until SIGINT.
+  until SIGINT, SIGTERM, or a fatal owned-task failure. Signals are registered
+  before startup waits. Shutdown is bounded by `shutdown_ms` (60 seconds by
+  default); expiry returns failure and the Tokio runtime waits at most five
+  more seconds for non-cancellable blocking work before process exit.
 
 **Gate:** the `runtime_m8` suite on a real ZeroMQ `inproc://` three-node cluster
 (production `RaftPeerFactory`, not `ChannelNetwork`): serves a client op end to
@@ -469,7 +478,10 @@ idempotently; a non-meta-voter data leader drives its own move; the failure
 detector progresses a silenced node to `Down`; `/status` reports the node-local
 view. Plus: heartbeat incarnation persists and advances across restarts
 (`storage_m1`); lifecycle probes never collect full status; and an invalid
-`http_addr` fails before storage is opened (`runtime::node` unit test).
+`http_addr` fails before storage is opened (`runtime::node` unit test). The
+`process_lifecycle` suite sends SIGTERM during bootstrap, reopens the same data
+directory, signals a running meta leader after an acknowledged write, verifies
+failover and restart, then stops the cluster with SIGINT.
 
 **Operator CLI** (`runtime/admin.rs`, `main.rs`): `join`, `leave`, `abort-plan`,
 `index-create`, `index-rebuild`, `index-drop`, and `status` are wired as thin ZMQ

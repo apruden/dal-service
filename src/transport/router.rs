@@ -610,6 +610,15 @@ impl ZmqServer {
         self.wait_for_handlers().await;
     }
 
+    /// Give already-dispatched handlers a bounded opportunity to complete
+    /// while their Raft services are still running. A false result tells the
+    /// caller to proceed with Raft shutdown, which releases blocked handlers.
+    pub async fn drain_handlers_for(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.wait_for_handlers())
+            .await
+            .is_ok()
+    }
+
     async fn wait_for_handlers(&self) {
         loop {
             // Subscribe before checking the count so a completion between the

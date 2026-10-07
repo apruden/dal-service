@@ -12,10 +12,12 @@
 //! keep the running membership synchronized with committed meta state.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{FutureExt, stream::FuturesUnordered, stream::StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -44,8 +46,8 @@ use crate::transport::{
     Transport,
     codec::{Envelope, Lane, MsgType},
     raft_wire::{
-        BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, PlacementQueryBody,
-        PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
+        BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, LeadershipTransferReply,
+        PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
     },
 };
 use crate::types::{
@@ -335,6 +337,9 @@ pub struct Node {
     readiness: RuntimeReadiness,
     identity_gate: ProcessIdentityGate,
     search: Arc<crate::search::SearchService>,
+    storage: Arc<Storage>,
+    shutdown_timeout: Duration,
+    request_timeout: Duration,
     // Background control loops (heartbeat emitter, failure detector); aborted on
     // shutdown.
     tasks: Vec<JoinHandle<()>>,
@@ -507,13 +512,16 @@ impl Node {
             addrs.clone(),
             cfg.control_addr.clone(),
         ));
-        let gateway = Arc::new(ClientGateway::new(
-            cfg.cluster_id,
-            cluster.p,
-            cluster.hash_spec,
-            partitions.clone(),
-            routing.clone(),
-        ));
+        let gateway = Arc::new(
+            ClientGateway::new(
+                cfg.cluster_id,
+                cluster.p,
+                cluster.hash_spec,
+                partitions.clone(),
+                routing.clone(),
+            )
+            .with_readiness(readiness.clone()),
+        );
         let search = Arc::new(crate::search::SearchService::new(storage.clone())?);
         gateway.set_search_service(search.clone());
         let catalog: Arc<dyn SearchCatalogSource> = Arc::new(LiveSearchCatalog {
@@ -620,23 +628,31 @@ impl Node {
         let directory_timeout = cfg.timeouts.request;
         let hb_control = ZmqTransport::new(ctx.clone(), hb_interval, Lane::Control);
         let mut tasks = Vec::new();
-        tasks.push(tokio::spawn(heartbeat_emitter(
-            registration.clone(),
-            heartbeat_incarnation,
-            hb_control,
-            addrs.clone(),
-            hb_interval,
-            identity_gate.clone(),
+        tasks.push(tokio::spawn(required_background_task(
+            "heartbeat emitter",
+            readiness.clone(),
+            heartbeat_emitter(
+                registration.clone(),
+                heartbeat_incarnation,
+                hb_control,
+                addrs.clone(),
+                hb_interval,
+                identity_gate.clone(),
+            ),
         )));
         // Spawn on every node. The shared handle becomes populated if this node
         // is promoted to a meta voter later, at which point it can immediately
         // participate in failure detection and assume the leader role.
-        tasks.push(tokio::spawn(failure_detector(
-            meta_handle.clone(),
-            heartbeats.clone(),
-            cfg.timeouts,
-            hb_interval,
-            identity_gate.clone(),
+        tasks.push(tokio::spawn(required_background_task(
+            "failure detector",
+            readiness.clone(),
+            failure_detector(
+                meta_handle.clone(),
+                heartbeats.clone(),
+                cfg.timeouts.clone(),
+                hb_interval,
+                identity_gate.clone(),
+            ),
         )));
         // The rebalance driver runs on every node: its data-leader role must run
         // wherever a partition is led, including on non-meta-voter nodes (which
@@ -659,11 +675,17 @@ impl Node {
             readiness.clone(),
         )
         .with_search_catalog(catalog.clone());
-        tasks.push(tokio::spawn(driver.run()));
+        tasks.push(tokio::spawn(required_background_task(
+            "rebalance driver",
+            readiness.clone(),
+            driver.run(),
+        )));
         // Search-index lifecycle: build the generations this node's partitions
         // owe the catalog, report readiness, and (as meta leader) activate.
         let (search_shutdown, search_shutdown_rx) = watch::channel(false);
-        let search_task = tokio::spawn(
+        let search_task = tokio::spawn(required_background_task(
+            "search driver",
+            readiness.clone(),
             crate::runtime::search::SearchDriver::new(
                 cfg.node_id,
                 cfg.cluster_id,
@@ -678,15 +700,19 @@ impl Node {
                 search_shutdown_rx,
             )
             .run(),
-        );
-        tasks.push(tokio::spawn(recovery_fence_driver(
-            cfg.node_id,
-            cfg.cluster_id,
-            partitions.clone(),
-            control.clone(),
-            addrs.clone(),
-            directory_timeout,
-            identity_gate.clone(),
+        ));
+        tasks.push(tokio::spawn(required_background_task(
+            "recovery fence driver",
+            readiness.clone(),
+            recovery_fence_driver(
+                cfg.node_id,
+                cfg.cluster_id,
+                partitions.clone(),
+                control.clone(),
+                addrs.clone(),
+                directory_timeout,
+                identity_gate.clone(),
+            ),
         )));
 
         // Read-only HTTP admin plane. Its listener was bound before runtime
@@ -716,12 +742,16 @@ impl Node {
             ));
             let (sampler_tx, sampler_rx) = watch::channel(false);
             let sampler_source: Arc<dyn StatusSource> = live_status;
-            status_task = Some(tokio::spawn(status_sampler(
-                sampler_source,
-                cache.clone(),
+            status_task = Some(tokio::spawn(required_background_task(
+                "status sampler",
                 readiness.clone(),
-                STATUS_SAMPLE_INTERVAL,
-                sampler_rx,
+                status_sampler(
+                    sampler_source,
+                    cache.clone(),
+                    readiness.clone(),
+                    STATUS_SAMPLE_INTERVAL,
+                    sampler_rx,
+                ),
             )));
             status_shutdown = Some(sampler_tx);
 
@@ -770,6 +800,9 @@ impl Node {
             readiness,
             identity_gate,
             search,
+            storage,
+            shutdown_timeout: cfg.timeouts.shutdown,
+            request_timeout: cfg.timeouts.request,
             tasks,
             search_shutdown,
             search_task: Some(search_task),
@@ -1014,6 +1047,21 @@ impl Node {
         &self.cluster
     }
 
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
+    }
+
+    pub fn mark_failed(&self) {
+        self.readiness.mark_failed();
+    }
+
+    /// Resolve when any required process-local task records a fatal failure.
+    pub async fn wait_for_failure(&self) {
+        while self.readiness.lifecycle() != RuntimeLifecycle::Failed {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Cumulative RocksDB counters used by the opt-in write-path benchmark.
     pub fn rocks_counters(&self) -> crate::perf::RocksCounters {
         // Every Raft group on this runtime shares this one node-local DB.
@@ -1029,8 +1077,15 @@ impl Node {
 
     /// Gracefully stop inbound work and background loops, then shut down every
     /// Raft group and release all storage owners before returning.
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(self) -> Result<()> {
+        let timeout = self.shutdown_timeout;
+        let readiness = self.readiness.clone();
+        enforce_shutdown_deadline(readiness, timeout, self.shutdown_inner()).await
+    }
+
+    async fn shutdown_inner(mut self) -> Result<()> {
         self.readiness.begin_draining();
+        self.handoff_meta_leadership().await;
         // Unlike the other loops, search reconciliation can own non-abortable
         // blocking work. Ask it to stop and let the current pass drain before
         // releasing storage.
@@ -1056,6 +1111,16 @@ impl Node {
             server.stop_accepting();
         }
 
+        // Let requests that crossed admission before Draining finish while
+        // Raft still runs. The second-stage drain below remains necessary:
+        // quorum-blocked handlers are released only by Raft shutdown.
+        if let Some(server) = self._control_srv.as_ref() {
+            let _ = server.drain_handlers_for(self.request_timeout).await;
+        }
+        if let Some(server) = self._bulk_srv.as_ref() {
+            let _ = server.drain_handlers_for(self.request_timeout).await;
+        }
+
         let mut first_error = None;
         let meta = self.meta();
         if let Some(node) = &meta
@@ -1067,6 +1132,24 @@ impl Node {
             self.partitions.read().unwrap().values().cloned().collect();
         for node in &partitions {
             if let Err(error) = node.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        let mut groups: Vec<GroupId> = self
+            .partitions
+            .read()
+            .unwrap()
+            .keys()
+            .copied()
+            .map(GroupId::Data)
+            .collect();
+        if meta.is_some() {
+            groups.push(GroupId::Meta);
+        }
+        for group in groups {
+            if let Err(error) = self.storage.drain_group_state(group).await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1113,6 +1196,11 @@ impl Node {
             }
         }
 
+        if first_error.is_none() && self.readiness.lifecycle() == RuntimeLifecycle::Failed {
+            first_error = Some(Error::Raft(
+                "runtime entered Failed before shutdown completed".into(),
+            ));
+        }
         if first_error.is_some() {
             self.readiness.mark_failed();
         } else if self.readiness.lifecycle() != RuntimeLifecycle::Failed {
@@ -1124,6 +1212,93 @@ impl Node {
         } else {
             Ok(())
         }
+    }
+
+    async fn handoff_meta_leadership(&self) {
+        let Some(meta) = self.meta() else {
+            return;
+        };
+        if meta.current_leader() != Some(self.node_id) {
+            return;
+        }
+
+        let handoff_budget = self
+            .request_timeout
+            .max(Duration::from_secs(2))
+            .min(Duration::from_secs(5));
+        let deadline = Instant::now() + handoff_budget;
+        let candidates: Vec<NodeId> = meta
+            .voters()
+            .into_iter()
+            .filter(|node| *node != self.node_id)
+            .collect();
+        while Instant::now() < deadline && meta.current_leader() == Some(self.node_id) {
+            let Some(target) = meta.leadership_transfer_target(&candidates) else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let Some(address) = self.addrs.control(target) else {
+                return;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let request = Envelope::new(
+                self.cluster.cluster_id,
+                MsgType::TransferLeadership,
+                GroupId::Meta,
+                0,
+                Vec::new(),
+            );
+            let triggered = self
+                .control
+                .call_with_timeout(&address, request, Some(remaining))
+                .await
+                .ok()
+                .and_then(|reply| {
+                    crate::codec::decode::<LeadershipTransferReply>(&reply.payload).ok()
+                })
+                == Some(LeadershipTransferReply::Triggered);
+            if !triggered {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+async fn enforce_shutdown_deadline<F>(
+    readiness: RuntimeReadiness,
+    timeout: Duration,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(timeout, shutdown).await {
+        Ok(result) => result,
+        Err(_) => {
+            readiness.mark_failed();
+            Err(Error::Raft(format!(
+                "forced stop after shutdown exceeded {} ms",
+                timeout.as_millis()
+            )))
+        }
+    }
+}
+
+async fn required_background_task<F>(name: &'static str, readiness: RuntimeReadiness, future: F)
+where
+    F: Future<Output = ()>,
+{
+    let outcome = AssertUnwindSafe(future).catch_unwind().await;
+    if matches!(
+        readiness.lifecycle(),
+        RuntimeLifecycle::Starting | RuntimeLifecycle::Running
+    ) {
+        match outcome {
+            Ok(()) => eprintln!("required background task exited: {name}"),
+            Err(_) => eprintln!("required background task panicked: {name}"),
+        }
+        readiness.mark_failed();
     }
 }
 
@@ -2278,5 +2453,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("synthetic listener failure"));
+    }
+
+    #[tokio::test]
+    async fn required_background_exit_and_panic_fail_the_runtime() {
+        let exited = RuntimeReadiness::default();
+        assert!(exited.mark_ready());
+        required_background_task("test exit", exited.clone(), async {}).await;
+        assert_eq!(exited.lifecycle(), RuntimeLifecycle::Failed);
+
+        let panicked = RuntimeReadiness::default();
+        assert!(panicked.mark_ready());
+        required_background_task("test panic", panicked.clone(), async {
+            panic!("synthetic task panic")
+        })
+        .await;
+        assert_eq!(panicked.lifecycle(), RuntimeLifecycle::Failed);
+    }
+
+    #[tokio::test]
+    async fn expected_background_exit_while_draining_is_not_a_failure() {
+        let readiness = RuntimeReadiness::default();
+        assert!(readiness.mark_ready());
+        assert!(readiness.begin_draining());
+        required_background_task("test drain", readiness.clone(), async {}).await;
+        assert_eq!(readiness.lifecycle(), RuntimeLifecycle::Draining);
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_expiry_is_a_failed_forced_stop() {
+        let readiness = RuntimeReadiness::default();
+        assert!(readiness.mark_ready());
+        let error = enforce_shutdown_deadline(
+            readiness.clone(),
+            Duration::from_millis(10),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("forced stop"));
+        assert_eq!(readiness.lifecycle(), RuntimeLifecycle::Failed);
     }
 }

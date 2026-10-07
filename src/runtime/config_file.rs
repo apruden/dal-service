@@ -35,6 +35,12 @@ struct TimeoutsFile {
     suspect_ms: u64,
     down_ms: u64,
     request_ms: u64,
+    #[serde(default = "default_shutdown_ms")]
+    shutdown_ms: u64,
+}
+
+fn default_shutdown_ms() -> u64 {
+    Timeouts::default().shutdown.as_millis() as u64
 }
 
 impl Default for TimeoutsFile {
@@ -44,6 +50,7 @@ impl Default for TimeoutsFile {
             suspect_ms: t.suspect.as_millis() as u64,
             down_ms: t.down.as_millis() as u64,
             request_ms: t.request.as_millis() as u64,
+            shutdown_ms: t.shutdown.as_millis() as u64,
         }
     }
 }
@@ -54,6 +61,7 @@ impl From<TimeoutsFile> for Timeouts {
             suspect: std::time::Duration::from_millis(f.suspect_ms),
             down: std::time::Duration::from_millis(f.down_ms),
             request: std::time::Duration::from_millis(f.request_ms),
+            shutdown: std::time::Duration::from_millis(f.shutdown_ms),
         }
     }
 }
@@ -229,6 +237,7 @@ mod tests {
         assert_eq!(cfg.http_addr.as_deref(), Some("127.0.0.1:7001"));
         assert_eq!(cfg.timeouts.suspect.as_millis(), 1000);
         assert_eq!(cfg.timeouts.down.as_millis(), 5000);
+        assert_eq!(cfg.timeouts.shutdown, Timeouts::default().shutdown);
     }
 
     #[test]
