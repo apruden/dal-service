@@ -182,22 +182,35 @@ impl ZapAuthenticator {
                             Err(zmq::Error::EAGAIN | zmq::Error::EINTR) => continue,
                             Err(error) => {
                                 if worker_running.load(Ordering::Acquire) {
-                                    *worker_failure.lock().unwrap() =
-                                        Some(format!("ZAP receive failed: {error}"));
+                                    fail_closed_until_stopped(
+                                        &socket,
+                                        &worker_running,
+                                        &worker_failure,
+                                        format!("ZAP receive failed: {error}"),
+                                    );
                                 }
                                 break;
                             }
                         };
                         let response = zap_response(&request, &worker_domain, &policy);
-                        if let Err(error) = socket.send_multipart(response, 0) {
-                            *worker_failure.lock().unwrap() =
-                                Some(format!("ZAP reply failed: {error}"));
+                        if let Err(error) = send_zap_response(&socket, &response) {
+                            fail_closed_until_stopped(
+                                &socket,
+                                &worker_running,
+                                &worker_failure,
+                                format!("ZAP reply failed: {error}"),
+                            );
                             break;
                         }
                     }
                 }));
                 if result.is_err() && worker_running.load(Ordering::Acquire) {
-                    *worker_failure.lock().unwrap() = Some("ZAP worker panicked".into());
+                    fail_closed_until_stopped(
+                        &socket,
+                        &worker_running,
+                        &worker_failure,
+                        "ZAP worker panicked".into(),
+                    );
                 }
             })
             .map_err(crate::Error::Io)?;
@@ -236,6 +249,44 @@ impl Drop for ZapAuthenticator {
             let _ = worker.join();
         }
     }
+}
+
+/// Keep the ZAP endpoint registered while the authenticator is unhealthy.
+/// libzmq builds without ZAP domain enforcement can otherwise accept CURVE
+/// connections after the handler socket is dropped.
+fn fail_closed_until_stopped(
+    socket: &zmq::Socket,
+    running: &AtomicBool,
+    failure: &Mutex<Option<String>>,
+    reason: String,
+) {
+    *failure.lock().unwrap() = Some(reason);
+    while running.load(Ordering::Acquire) {
+        // Borrowing the socket here pins its lifetime: unanswered ZAP requests
+        // stall instead of reaching a context where the handler is absent.
+        let _ = socket.get_socket_type();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn send_zap_response(socket: &zmq::Socket, response: &[Vec<u8>]) -> zmq::Result<()> {
+    for (index, frame) in response.iter().enumerate() {
+        let flags = if index + 1 < response.len() {
+            zmq::SNDMORE
+        } else {
+            0
+        };
+        loop {
+            match socket.send(frame, flags) {
+                Err(zmq::Error::EINTR) => continue,
+                result => {
+                    result?;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn zap_domain(cluster_id: u128) -> String {
@@ -399,6 +450,32 @@ mod tests {
         let mut unknown_key = request;
         unknown_key[6] = zmq::z85_decode(&"B".repeat(40)).unwrap();
         assert_eq!(zap_response(&unknown_key, &domain, &policy)[2], b"400");
+    }
+
+    #[test]
+    fn failed_authenticator_keeps_its_zap_endpoint_bound_until_shutdown() {
+        let ctx = zmq::Context::new();
+        let endpoint = "inproc://dal-zap-fail-closed-test";
+        let socket = ctx.socket(zmq::REP).unwrap();
+        socket.bind(endpoint).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let worker_failure = failure.clone();
+        let worker = std::thread::spawn(move || {
+            fail_closed_until_stopped(
+                &socket,
+                &worker_running,
+                &worker_failure,
+                "injected failure".into(),
+            );
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let probe = ctx.socket(zmq::REP).unwrap();
+        assert!(probe.bind(endpoint).is_err());
+        running.store(false, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(failure.lock().unwrap().as_deref(), Some("injected failure"));
     }
 
     #[test]
