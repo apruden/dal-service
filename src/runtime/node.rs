@@ -1222,10 +1222,10 @@ impl Node {
             return;
         }
 
-        let handoff_budget = self
-            .request_timeout
-            .max(Duration::from_secs(2))
-            .min(Duration::from_secs(5));
+        // Keep the best-effort wait within the configured per-request budget;
+        // a shutdown configured for a shorter deadline must not inherit a
+        // hidden two-second floor from leadership handoff.
+        let handoff_budget = self.request_timeout.min(Duration::from_secs(5));
         let deadline = Instant::now() + handoff_budget;
         let candidates: Vec<NodeId> = meta
             .voters()
