@@ -310,6 +310,13 @@ fn join(config: &str, auth: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let candidate = match load_node_security(Path::new(config), &cfg) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("join: node security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let security = match load_operator_security(Path::new(auth), cfg.cluster_id) {
         Ok(value) => value,
         Err(e) => {
@@ -317,6 +324,10 @@ fn join(config: &str, auth: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = security.validate_joining_node(&candidate, cfg.node_id) {
+        eprintln!("join: enrollment: {e}");
+        return ExitCode::FAILURE;
+    }
     if cfg
         .seeds
         .iter()

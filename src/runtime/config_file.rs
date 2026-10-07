@@ -129,6 +129,7 @@ pub struct LoadedNodeSecurity {
 /// Operator credentials and out-of-band node pins loaded from a dedicated
 /// operator auth file. This deliberately contains no node service identity.
 pub struct LoadedOperatorSecurity {
+    pub policy: TrustPolicy,
     pub user_id: String,
     pub public_key: [u8; 32],
     pub secret_key: [u8; 32],
@@ -137,6 +138,35 @@ pub struct LoadedOperatorSecurity {
 }
 
 impl LoadedOperatorSecurity {
+    /// Require the operator and joining node to use the same installed policy
+    /// generation, and confirm that the policy binds the candidate key to the
+    /// declared node identity before the registration RPC is sent.
+    pub fn validate_joining_node(
+        &self,
+        candidate: &LoadedNodeSecurity,
+        node_id: NodeId,
+    ) -> Result<()> {
+        if self.policy.generation() != candidate.policy.generation() {
+            return Err(Error::Config(
+                "operator and candidate node trust-policy generations differ".into(),
+            ));
+        }
+        let encoded = zmq::z85_encode(&candidate.public_key)
+            .map_err(|_| Error::Config("candidate CURVE public key cannot be encoded".into()))?;
+        let expected = format!("node:{node_id}");
+        match self.policy.principal_for_curve_key(&encoded) {
+            Some(principal)
+                if principal.user_id == expected
+                    && principal.permissions.contains(&Permission::PeerRpc) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Config(format!(
+                "operator trust policy must bind the candidate key to {expected} with peer_rpc permission"
+            ))),
+        }
+    }
+
     pub fn validate_descriptor(&self, desc: &BootstrapDescriptor) -> Result<()> {
         for entry in &desc.directory {
             let expected = format!("node:{}", entry.node_id);
@@ -225,6 +255,7 @@ pub fn load_operator_security(
         server_key_principals.insert(endpoint, principal_id);
     }
     Ok(LoadedOperatorSecurity {
+        policy,
         user_id,
         public_key,
         secret_key,
@@ -747,6 +778,50 @@ mod tests {
         assert_eq!(loaded.user_id, "ops:deploy");
         assert_eq!(loaded.server_keys.len(), 1);
         assert!(load_operator_security(&auth_path, 8).is_err());
+    }
+
+    #[test]
+    fn operator_enrollment_requires_candidate_key_in_the_same_policy_generation() {
+        let node_key = "C".repeat(40);
+        let policy = TrustPolicy::new(
+            7,
+            4,
+            vec![crate::transport::security::Principal {
+                user_id: "node:9".into(),
+                curve_public_key: node_key.clone(),
+                permissions: vec![Permission::PeerRpc],
+                client_ids: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let operator = LoadedOperatorSecurity {
+            policy: policy.clone(),
+            user_id: "ops:test".into(),
+            public_key: [0; 32],
+            secret_key: [0; 32],
+            server_keys: BTreeMap::new(),
+            server_key_principals: BTreeMap::new(),
+        };
+        let candidate = LoadedNodeSecurity {
+            policy: Arc::new(policy),
+            user_id: "node:9".into(),
+            public_key: zmq::z85_decode(&node_key).unwrap().try_into().unwrap(),
+            secret_key: [0; 32],
+            server_keys: BTreeMap::new(),
+            server_key_principals: BTreeMap::new(),
+        };
+        operator.validate_joining_node(&candidate, 9).unwrap();
+        assert!(operator.validate_joining_node(&candidate, 8).is_err());
+        let stale_policy = TrustPolicy::new(7, 3, vec![]).unwrap();
+        let stale_operator = LoadedOperatorSecurity {
+            policy: stale_policy,
+            user_id: "ops:test".into(),
+            public_key: [0; 32],
+            secret_key: [0; 32],
+            server_keys: BTreeMap::new(),
+            server_key_principals: BTreeMap::new(),
+        };
+        assert!(stale_operator.validate_joining_node(&candidate, 9).is_err());
     }
 
     #[test]
