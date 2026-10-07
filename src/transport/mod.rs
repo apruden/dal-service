@@ -11,6 +11,7 @@ pub mod dealer;
 pub mod raft_net;
 pub mod raft_wire;
 pub mod router;
+pub mod security;
 
 use std::collections::HashMap;
 use std::future::Future;
