@@ -30,7 +30,7 @@ use crate::transport::raft_wire::{
     SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
-use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
+use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use std::sync::{Arc, Mutex};
@@ -96,6 +96,22 @@ impl RootDispatch {
         self.meta.read().unwrap().clone()
     }
 
+    fn authenticated_as_node(
+        &self,
+        context: &crate::transport::RequestContext,
+        node_id: NodeId,
+    ) -> bool {
+        if self.trust_policy.is_none() {
+            return true;
+        }
+        context
+            .authenticated_user_id
+            .as_deref()
+            .and_then(|identity| identity.strip_prefix("node:"))
+            .and_then(|id| id.parse::<NodeId>().ok())
+            == Some(node_id)
+    }
+
     fn reply(&self, req: &Envelope, payload: Vec<u8>) -> Envelope {
         Envelope::new(
             self.cluster_id,
@@ -116,11 +132,11 @@ impl RootDispatch {
     async fn serve_control(
         &self,
         req: Envelope,
-        _context: crate::transport::RequestContext,
+        context: crate::transport::RequestContext,
     ) -> Envelope {
         match req.msg_type {
             MsgType::RaftAppend | MsgType::RaftVote | MsgType::RaftSnapshot => {
-                self.serve_raft(req).await
+                self.serve_raft(req, &context).await
             }
             MsgType::DataConfigObservation => self.serve_observation(req).await,
             MsgType::JoinRequest => self.serve_join(req).await,
@@ -129,12 +145,12 @@ impl RootDispatch {
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
             MsgType::PlacementQuery => self.serve_placement_query(req).await,
             MsgType::DirectoryQuery => self.serve_directory_query(req).await,
-            MsgType::DataRecoveryFence => self.serve_recovery_fence(req).await,
-            MsgType::Heartbeat => self.serve_heartbeat(req),
+            MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
+            MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
             MsgType::SearchPrepare => self.serve_search_prepare(req).await,
             MsgType::SearchExecute => self.serve_search_execute(req).await,
-            MsgType::SearchIndexStatus => self.serve_search_index_status(req).await,
+            MsgType::SearchIndexStatus => self.serve_search_index_status(req, &context).await,
             MsgType::SearchIndexAdmin => self.serve_search_index_admin(req).await,
             MsgType::TransferLeadership => self.serve_transfer_leadership(req).await,
             // Client/reply types are handled before reaching serve_control (or
@@ -143,7 +159,11 @@ impl RootDispatch {
         }
     }
 
-    async fn serve_raft(&self, req: Envelope) -> Envelope {
+    async fn serve_raft(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
         match req.group_id {
             GroupId::Meta => {
                 let Some(meta) = self.meta() else {
@@ -160,12 +180,28 @@ impl RootDispatch {
                         else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.append_entries(rpc).await))
                     }
                     MsgType::RaftVote => {
                         let Ok(rpc) = codec::decode::<VoteRequest<u64>>(&req.payload) else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.vote(rpc).await))
                     }
                     _ => {
@@ -174,6 +210,14 @@ impl RootDispatch {
                         else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.install_snapshot(rpc).await))
                     }
                 }
@@ -194,12 +238,28 @@ impl RootDispatch {
                         else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.append_entries(rpc).await))
                     }
                     MsgType::RaftVote => {
                         let Ok(rpc) = codec::decode::<VoteRequest<u64>>(&req.payload) else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.vote(rpc).await))
                     }
                     _ => {
@@ -208,6 +268,14 @@ impl RootDispatch {
                         else {
                             return self.raft_unavailable(&req);
                         };
+                        if !rpc
+                            .vote
+                            .leader_id
+                            .voted_for()
+                            .is_some_and(|id| self.authenticated_as_node(context, id))
+                        {
+                            return self.raft_unavailable(&req);
+                        }
                         self.reply(&req, codec::encode(&raft.install_snapshot(rpc).await))
                     }
                 }
@@ -422,7 +490,11 @@ impl RootDispatch {
     /// Either relay a replica's readiness observation to the meta group, or
     /// answer whether this node has built the generations a move driver needs
     /// before it promotes this node to voter (design §5.2, §11.1).
-    async fn serve_search_index_status(&self, req: Envelope) -> Envelope {
+    async fn serve_search_index_status(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
         let Ok(body) = codec::decode::<SearchIndexStatusBody>(&req.payload) else {
             return self.reply(
                 &req,
@@ -433,6 +505,14 @@ impl RootDispatch {
         };
         match body {
             SearchIndexStatusBody::Report { name, observation } => {
+                if !self.authenticated_as_node(context, observation.node_id) {
+                    return self.reply(
+                        &req,
+                        codec::encode(&SearchIndexStatusReply::Submitted(SubmitReply::Error(
+                            "authenticated node does not match observation node_id".into(),
+                        ))),
+                    );
+                }
                 let cmd = MetaCommand::ReportSearchIndexReady { name, observation };
                 let outcome = match self.meta() {
                     None => SubmitReply::Error("node does not run the meta group".into()),
@@ -521,12 +601,24 @@ impl RootDispatch {
         self.reply(&req, codec::encode(&PlacementQueryReply { placement }))
     }
 
-    async fn serve_recovery_fence(&self, req: Envelope) -> Envelope {
+    async fn serve_recovery_fence(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
         let reply = match (
             req.group_id,
             codec::decode::<RecoveryFenceRequest>(&req.payload),
         ) {
             (GroupId::Data(partition), Ok(body)) => {
+                if !self.authenticated_as_node(context, body.requester) {
+                    return self.reply(
+                        &req,
+                        codec::encode(&RecoveryFenceReply::Rejected(
+                            "authenticated node does not match requester".into(),
+                        )),
+                    );
+                }
                 let node = self.partitions.read().unwrap().get(&partition).cloned();
                 match node {
                     Some(node) => node.issue_recovery_fence(body.requester).await,
@@ -572,7 +664,11 @@ impl RootDispatch {
     /// only needs to know the frame was delivered. A stale/replayed sequence is
     /// dropped by the tracker; the meta leader's detector loop turns accepted
     /// evidence into `SetNodeState` transitions.
-    fn serve_heartbeat(&self, req: Envelope) -> Envelope {
+    fn serve_heartbeat(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
         // Only the meta leader's detector ever reads this evidence, and it is
         // reachable only from a node hosting meta. Recording it elsewhere would
         // accumulate state from unauthenticated frames that nothing consumes.
@@ -580,6 +676,9 @@ impl RootDispatch {
             return self.reply(&req, Vec::new());
         }
         if let Ok(body) = codec::decode::<HeartbeatBody>(&req.payload) {
+            if !self.authenticated_as_node(context, body.node_id) {
+                return self.reply(&req, Vec::new());
+            }
             self.heartbeats.lock().unwrap().observe(
                 body.node_id,
                 body.incarnation,
@@ -808,5 +907,46 @@ mod tests {
             .await;
         assert!(matches!(codec::decode::<SubmitReply>(&reply.payload),
             Ok(SubmitReply::Error(error)) if error == "authorization denied"));
+    }
+
+    #[test]
+    fn peer_sender_identity_must_match_raft_node_id() {
+        use crate::transport::security::{Permission, Principal, TrustPolicy};
+        let partitions = Arc::new(RwLock::new(HashMap::new()));
+        let gateway = Arc::new(ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            partitions.clone(),
+            Arc::new(EmptyRouting),
+        ));
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                1,
+                vec![Principal {
+                    user_id: "node:1".into(),
+                    curve_public_key: "A".repeat(40),
+                    permissions: vec![Permission::PeerRpc],
+                }],
+            )
+            .unwrap(),
+        );
+        let dispatch = RootDispatch::new(
+            7,
+            gateway,
+            Arc::new(RwLock::new(None)),
+            partitions,
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+            None,
+        )
+        .with_trust_policy(policy);
+        let context = crate::transport::RequestContext {
+            authenticated_user_id: Some("node:1".into()),
+        };
+        assert!(dispatch.authenticated_as_node(&context, 1));
+        assert!(!dispatch.authenticated_as_node(&context, 2));
+        assert!(!dispatch.authenticated_as_node(&crate::transport::RequestContext::default(), 1));
     }
 }
