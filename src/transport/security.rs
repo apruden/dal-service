@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
@@ -134,10 +135,11 @@ fn is_z85_public_key(key: &str) -> bool {
     })
 }
 
-/// Owns the process-wide ZeroMQ Authentication Protocol handler. libzmq
-/// consults this REP socket for every CURVE connection using this domain.
+/// Owns the ZeroMQ Authentication Protocol handler for one ZeroMQ context.
+/// libzmq consults this REP socket for CURVE connections in this context.
 pub struct ZapAuthenticator {
     running: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
     domain: String,
 }
@@ -167,23 +169,41 @@ impl ZapAuthenticator {
 
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = running.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let worker_failure = failure.clone();
         let worker_domain = domain.clone();
         let worker = std::thread::Builder::new()
             .name("zmq-zap-authenticator".into())
             .spawn(move || {
-                while worker_running.load(Ordering::Acquire) {
-                    let request = match socket.recv_multipart(0) {
-                        Ok(request) => request,
-                        Err(zmq::Error::EAGAIN) => continue,
-                        Err(_) => break,
-                    };
-                    let response = zap_response(&request, &worker_domain, &policy);
-                    let _ = socket.send_multipart(response, 0);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while worker_running.load(Ordering::Acquire) {
+                        let request = match socket.recv_multipart(0) {
+                            Ok(request) => request,
+                            Err(zmq::Error::EAGAIN | zmq::Error::EINTR) => continue,
+                            Err(error) => {
+                                if worker_running.load(Ordering::Acquire) {
+                                    *worker_failure.lock().unwrap() =
+                                        Some(format!("ZAP receive failed: {error}"));
+                                }
+                                break;
+                            }
+                        };
+                        let response = zap_response(&request, &worker_domain, &policy);
+                        if let Err(error) = socket.send_multipart(response, 0) {
+                            *worker_failure.lock().unwrap() =
+                                Some(format!("ZAP reply failed: {error}"));
+                            break;
+                        }
+                    }
+                }));
+                if result.is_err() && worker_running.load(Ordering::Acquire) {
+                    *worker_failure.lock().unwrap() = Some("ZAP worker panicked".into());
                 }
             })
             .map_err(crate::Error::Io)?;
         Ok(Self {
             running,
+            failure,
             worker: Some(worker),
             domain,
         })
@@ -191,6 +211,21 @@ impl ZapAuthenticator {
 
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Return an error after any fatal worker failure. Runtime supervision
+    /// must use this to fail closed instead of continuing without ZAP.
+    pub fn ensure_healthy(&self) -> crate::Result<()> {
+        match self.failure.lock().unwrap().as_ref() {
+            Some(reason) => Err(crate::Error::Config(format!(
+                "CURVE ZAP authenticator failed: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.failure.lock().unwrap().is_none()
     }
 }
 
