@@ -20,6 +20,7 @@ rocksdb = "0.22"
 thiserror = "1"
 bytes = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 fail = "0.5"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 serde_json = "1"
