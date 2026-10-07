@@ -105,7 +105,11 @@ impl RootDispatch {
         self.reply(req, Vec::new())
     }
 
-    async fn serve_control(&self, req: Envelope) -> Envelope {
+    async fn serve_control(
+        &self,
+        req: Envelope,
+        _context: crate::transport::RequestContext,
+    ) -> Envelope {
         match req.msg_type {
             MsgType::RaftAppend | MsgType::RaftVote | MsgType::RaftSnapshot => {
                 self.serve_raft(req).await
@@ -637,7 +641,7 @@ impl Server for RootDispatch {
             return self.raft_unavailable(&request);
         }
         if request.msg_type.is_peer_control() {
-            self.serve_control(request).await
+            self.serve_control(request, context).await
         } else {
             self.gateway.serve_with_context(request, context).await
         }
