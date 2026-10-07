@@ -100,7 +100,8 @@ without leaking background tasks. The node owns the HTTP server and diagnostic
 sampler separately. Shutdown first changes lifecycle to `Draining`, joins any
 in-flight blocking diagnostic collection, then drives axum's graceful-shutdown
 future after the data plane has drained. Probes therefore remain available
-during the drain.
+during the drain. The HTTP join has a five-second ceiling; a stalled admin
+client is aborted and makes shutdown return an error instead of hanging.
 
 ## Step 3 — CLI / runtime wiring (built)
 

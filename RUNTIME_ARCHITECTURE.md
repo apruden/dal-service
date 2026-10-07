@@ -201,7 +201,9 @@ finish on a single-worker runtime. Successful teardown records `Stopped`; a
 Raft shutdown or owned-task error records `Failed`. The diagnostic sampler is
 signalled and joined, including any in-flight blocking collection, before the
 final storage owner is released. The HTTP task remains available throughout
-the drain and receives graceful shutdown last.
+the drain and receives graceful shutdown last. Its connection drain is bounded
+to five seconds; timeout or serve failure records `Failed` and is returned by
+`Node::shutdown`.
 
 ## Example: client write path (once assembled)
 `Client` (DEALER) → target `control_addr` ROUTER → `ClientGateway` →

@@ -62,6 +62,9 @@ const BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 /// Expensive local diagnostics are sampled away from HTTP request handlers.
 const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_SAMPLE_MAX_AGE: Duration = Duration::from_secs(3);
+/// HTTP responses are small and local. Bound graceful connection draining so a
+/// stalled admin client cannot prevent process shutdown indefinitely.
+const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The node's meta-group runtime, shared and mutable so a node can start hosting
 /// the meta group at runtime or stop after a drain.
@@ -348,7 +351,7 @@ pub struct Node {
     // The HTTP listener remains available while lifecycle is Draining and is
     // stopped only after owned work and probes have reached a terminal state.
     http_shutdown: Option<watch::Sender<bool>>,
-    http_task: Option<JoinHandle<()>>,
+    http_task: Option<JoinHandle<Result<()>>>,
     // Converts database fail-stop into process lifecycle immediately.
     storage_failure_task: Option<JoinHandle<()>>,
     // Dropping these stops the poller threads and closes the sockets.
@@ -733,13 +736,15 @@ impl Node {
                         }
                     }
                 };
-                if let Err(error) = axum::serve(listener, crate::runtime::http::router(src))
+                let result = axum::serve(listener, crate::runtime::http::router(src))
                     .with_graceful_shutdown(shutdown)
                     .await
-                {
+                    .map_err(Error::from);
+                if let Err(error) = &result {
                     eprintln!("HTTP admin task failed: {error}");
                     http_readiness.mark_failed();
                 }
+                result
             }));
             http_shutdown = Some(http_tx);
         }
@@ -1096,27 +1101,43 @@ impl Node {
             let _ = task.await;
         }
 
+        if let Some(shutdown) = self.http_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(task) = self.http_task.take() {
+            let result = join_http_task(task, HTTP_SHUTDOWN_TIMEOUT).await;
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+
         if first_error.is_some() {
             self.readiness.mark_failed();
         } else if self.readiness.lifecycle() != RuntimeLifecycle::Failed {
             self.readiness.mark_stopped();
         }
 
-        if let Some(shutdown) = self.http_shutdown.take() {
-            let _ = shutdown.send(true);
-        }
-        if let Some(task) = self.http_task.take()
-            && let Err(error) = task.await
-            && first_error.is_none()
-        {
-            self.readiness.mark_failed();
-            first_error = Some(Error::Raft(format!("HTTP admin task failed: {error}")));
-        }
-
         if let Some(error) = first_error {
             Err(error)
         } else {
             Ok(())
+        }
+    }
+}
+
+async fn join_http_task(mut task: JoinHandle<Result<()>>, timeout: Duration) -> Result<()> {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(Error::Raft(format!("HTTP admin task failed: {error}"))),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(Error::Raft(format!(
+                "HTTP admin shutdown exceeded {} ms",
+                timeout.as_millis()
+            )))
         }
     }
 }
@@ -2235,5 +2256,27 @@ mod tests {
         .await;
 
         assert_eq!(readiness.lifecycle(), RuntimeLifecycle::Failed);
+    }
+
+    #[tokio::test]
+    async fn http_shutdown_is_bounded_and_propagates_task_errors() {
+        let pending = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let error = join_http_task(pending, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown exceeded"));
+
+        let failed = tokio::spawn(async {
+            Err(Error::Io(std::io::Error::other(
+                "synthetic listener failure",
+            )))
+        });
+        let error = join_http_task(failed, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("synthetic listener failure"));
     }
 }

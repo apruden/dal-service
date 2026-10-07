@@ -451,10 +451,11 @@ config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
   liveness closed. Readiness gates hosted voters but ignores learner catch-up.
   The sampler and HTTP server are separately owned: shutdown joins an in-flight
   blocking sample and keeps probes available through `Draining`, then stops
-  HTTP gracefully after the data plane. A storage fail-stop watcher changes
-  lifecycle to `Failed` immediately. The listener is bound before storage
-  opens or any task spawns, so a bad `http_addr` fails startup without leaking
-  work.
+  HTTP gracefully after the data plane. HTTP connection draining is capped at
+  five seconds; timeout or serve failure fails shutdown. A storage fail-stop
+  watcher changes lifecycle to `Failed` immediately. The listener is bound
+  before storage opens or any task spawns, so a bad `http_addr` fails startup
+  without leaking work.
 - **Config + binary** (`runtime/config_file.rs`, `main.rs`): JSON node config
   (`http_addr`, initial placements) and immutable init descriptor; `dal run
   --config <node> --cluster <init>` starts a node, drives genesis, and serves
