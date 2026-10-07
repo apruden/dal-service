@@ -21,6 +21,14 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use codec::Envelope;
 
+/// Transport-authenticated identity attached to an inbound request. A missing
+/// identity means the connection did not provide ZeroMQ User-Id metadata;
+/// callers must never substitute a field from the request payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestContext {
+    pub authenticated_user_id: Option<String>,
+}
+
 /// A request/reply RPC channel keyed by node control address. The client and
 /// peer paths depend only on this trait; the concrete carrier (in-process or
 /// ZeroMQ) is chosen at construction.
@@ -58,6 +66,17 @@ pub trait Transport: Send + Sync {
 /// reply. Implemented by the client gateway and the peer-control dispatcher.
 pub trait Server: Send + Sync {
     fn serve(&self, request: Envelope) -> impl Future<Output = Envelope> + Send;
+
+    /// Receive the carrier's authenticated context with the request. Existing
+    /// in-process and test servers retain their old behavior until they opt in.
+    fn serve_with_context(
+        &self,
+        request: Envelope,
+        context: RequestContext,
+    ) -> impl Future<Output = Envelope> + Send {
+        let _ = context;
+        self.serve(request)
+    }
 }
 
 /// A deterministic in-process transport: a shared directory of address →

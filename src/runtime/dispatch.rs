@@ -621,6 +621,15 @@ impl RootDispatch {
 
 impl Server for RootDispatch {
     async fn serve(&self, request: Envelope) -> Envelope {
+        self.serve_with_context(request, crate::transport::RequestContext::default())
+            .await
+    }
+
+    async fn serve_with_context(
+        &self,
+        request: Envelope,
+        context: crate::transport::RequestContext,
+    ) -> Envelope {
         // The gateway applies this check for client traffic. Peer-control
         // frames bypass the gateway, so enforce the same cluster boundary here
         // before a foreign Raft or operator request reaches a local group.
@@ -630,7 +639,7 @@ impl Server for RootDispatch {
         if request.msg_type.is_peer_control() {
             self.serve_control(request).await
         } else {
-            self.gateway.serve(request).await
+            self.gateway.serve_with_context(request, context).await
         }
     }
 }

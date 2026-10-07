@@ -388,6 +388,15 @@ impl ClientGateway {
 
 impl Server for ClientGateway {
     async fn serve(&self, request: Envelope) -> Envelope {
+        self.serve_with_context(request, crate::transport::RequestContext::default())
+            .await
+    }
+
+    async fn serve_with_context(
+        &self,
+        request: Envelope,
+        _context: crate::transport::RequestContext,
+    ) -> Envelope {
         // Wrong cluster: reply stamped with our real cluster id so the client's
         // per-reply cluster check rejects it (DESIGN §8.2).
         if request.cluster_id != self.cluster_id {

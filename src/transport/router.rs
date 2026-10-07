@@ -414,17 +414,44 @@ impl ZmqServer {
     {
         while running.load(Ordering::Relaxed) {
             Self::flush_replies(&socket, &reply_rx);
-            if let Ok(parts) = socket.recv_multipart(0) {
+            if let Ok((parts, authenticated_user_id)) = Self::recv_request(&socket) {
                 Self::dispatch(
-                    parts, &server, &handle, &active, &reply_tx, &admission, lane,
+                    parts,
+                    authenticated_user_id,
+                    &server,
+                    &handle,
+                    &active,
+                    &reply_tx,
+                    &admission,
+                    lane,
                 );
             }
         }
     }
 
+    /// Read the ROUTER multipart without discarding ZeroMQ's authenticated
+    /// User-Id metadata. The application payload is the final frame.
+    fn recv_request(socket: &zmq::Socket) -> zmq::Result<(Vec<Vec<u8>>, Option<String>)> {
+        let mut parts = Vec::new();
+        let mut authenticated_user_id = None;
+        loop {
+            let mut message = socket.recv_msg(0)?;
+            let more = socket.get_rcvmore()?;
+            if !parts.is_empty() && !more {
+                authenticated_user_id = message.gets("User-Id").map(str::to_owned);
+            }
+            parts.push(message.to_vec());
+            if !more {
+                break;
+            }
+        }
+        Ok((parts, authenticated_user_id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch<S>(
         mut parts: Vec<Vec<u8>>,
+        authenticated_user_id: Option<String>,
         server: &Arc<S>,
         handle: &Handle,
         active: &Arc<ActiveHandlers>,
@@ -527,7 +554,14 @@ impl ZmqServer {
                 crate::perf::record_duration(stage, started.elapsed());
             }
             let handler_started = handler_stage.map(|_| Instant::now());
-            let reply = server.serve(env).await;
+            let reply = server
+                .serve_with_context(
+                    env,
+                    crate::transport::RequestContext {
+                        authenticated_user_id,
+                    },
+                )
+                .await;
             if let (Some(stage), Some(started)) = (handler_stage, handler_started) {
                 crate::perf::record_duration(stage, started.elapsed());
             }
