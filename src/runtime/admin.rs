@@ -210,12 +210,23 @@ pub async fn status_secure(
     seed: Option<&str>,
     curve: CurveClientConfig,
 ) -> Result<RoutingInfo> {
-    status_with_transport(
-        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
-        desc,
-        seed,
-    )
-    .await
+    status_with_transport(secure_transport(ctx, curve, seed)?, desc, seed).await
+}
+
+fn secure_transport(
+    ctx: zmq::Context,
+    curve: CurveClientConfig,
+    seed: Option<&str>,
+) -> Result<ZmqTransport> {
+    if let Some(seed) = seed {
+        curve.server_key(seed)?;
+    }
+    Ok(ZmqTransport::new_curve(
+        ctx,
+        ADMIN_TIMEOUT,
+        Lane::Control,
+        curve,
+    ))
 }
 
 async fn status_with_transport(
@@ -269,11 +280,10 @@ pub async fn join_secure(
     cfg: &NodeConfig,
     curve: CurveClientConfig,
 ) -> Result<MetaApplyResult> {
-    join_with_transport(
-        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
-        cfg,
-    )
-    .await
+    for seed in &cfg.seeds {
+        curve.server_key(seed)?;
+    }
+    join_with_transport(secure_transport(ctx, curve, None)?, cfg).await
 }
 
 async fn join_with_transport(transport: ZmqTransport, cfg: &NodeConfig) -> Result<MetaApplyResult> {
@@ -327,13 +337,7 @@ pub async fn leave_secure(
     seed: Option<&str>,
     curve: CurveClientConfig,
 ) -> Result<MetaApplyResult> {
-    leave_with_transport(
-        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
-        desc,
-        node_id,
-        seed,
-    )
-    .await
+    leave_with_transport(secure_transport(ctx, curve, seed)?, desc, node_id, seed).await
 }
 
 async fn leave_with_transport(
@@ -384,7 +388,7 @@ pub async fn abort_plan_secure(
     curve: CurveClientConfig,
 ) -> Result<MetaApplyResult> {
     abort_plan_with_transport(
-        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        secure_transport(ctx, curve, seed)?,
         desc,
         group,
         plan_id,
@@ -438,13 +442,8 @@ pub async fn search_index_admin_secure(
     seed: Option<&str>,
     curve: CurveClientConfig,
 ) -> Result<MetaApplyResult> {
-    search_index_admin_with_transport(
-        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
-        desc,
-        command,
-        seed,
-    )
-    .await
+    search_index_admin_with_transport(secure_transport(ctx, curve, seed)?, desc, command, seed)
+        .await
 }
 
 async fn search_index_admin_with_transport(

@@ -98,6 +98,18 @@ struct NodeSecurityFile {
     server_key_pins: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorSecurityFile {
+    cluster_id: String,
+    trust_policy_file: PathBuf,
+    user_id: String,
+    curve_public_key_file: PathBuf,
+    curve_secret_key_file: PathBuf,
+    /// Endpoint to trusted node principal; redirects never create pins.
+    server_key_pins: BTreeMap<String, String>,
+}
+
 /// Validated node credentials loaded from protected files and an operator
 /// policy. This value intentionally has no `Debug` implementation because it
 /// contains the private CURVE secret key.
@@ -108,6 +120,112 @@ pub struct LoadedNodeSecurity {
     pub secret_key: [u8; 32],
     pub server_keys: BTreeMap<String, [u8; 32]>,
     server_key_principals: BTreeMap<String, String>,
+}
+
+/// Operator credentials and out-of-band node pins loaded from a dedicated
+/// operator auth file. This deliberately contains no node service identity.
+pub struct LoadedOperatorSecurity {
+    pub user_id: String,
+    pub public_key: [u8; 32],
+    pub secret_key: [u8; 32],
+    pub server_keys: BTreeMap<String, [u8; 32]>,
+    server_key_principals: BTreeMap<String, String>,
+}
+
+impl LoadedOperatorSecurity {
+    pub fn validate_descriptor(&self, desc: &BootstrapDescriptor) -> Result<()> {
+        for entry in &desc.directory {
+            let expected = format!("node:{}", entry.node_id);
+            for endpoint in [&entry.control_addr, &entry.bulk_addr] {
+                if !self.server_keys.contains_key(endpoint)
+                    || self.server_key_principals.get(endpoint) != Some(&expected)
+                {
+                    return Err(Error::Config(format!(
+                        "operator server_key_pins must bind {endpoint} to {expected}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load a dedicated operator credential file. Its public key must resolve to
+/// an explicit `operator` principal in the cluster trust policy.
+pub fn load_operator_security(
+    path: &Path,
+    cluster_id: ClusterId,
+) -> Result<LoadedOperatorSecurity> {
+    let text = std::fs::read_to_string(path)?;
+    let file: OperatorSecurityFile = serde_json::from_str(&text)
+        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    let configured_cluster_id = parse_cluster_id(&file.cluster_id)?;
+    if configured_cluster_id != cluster_id {
+        return Err(Error::Config(
+            "operator auth file cluster_id does not match target cluster".into(),
+        ));
+    }
+    let resolve = |referenced: PathBuf| {
+        if referenced.is_absolute() {
+            referenced
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(referenced)
+        }
+    };
+    let policy = TrustPolicy::load(&resolve(file.trust_policy_file))?;
+    if policy.cluster_id() != cluster_id {
+        return Err(Error::Config(
+            "trust policy cluster_id does not match target cluster".into(),
+        ));
+    }
+    let public_key = load_curve_key(&resolve(file.curve_public_key_file))?;
+    let secret_key = load_curve_key(&resolve(file.curve_secret_key_file))?;
+    let encoded = zmq::z85_encode(&public_key)
+        .map_err(|_| Error::Config("operator CURVE public key cannot be encoded".into()))?;
+    let principal = policy
+        .principal_for_curve_key(&encoded)
+        .filter(|principal| {
+            principal.user_id == file.user_id
+                && principal.permissions.contains(&Permission::Operator)
+        })
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "operator CURVE key is not bound to {} with operator permission",
+                file.user_id
+            ))
+        })?;
+    let user_id = principal.user_id.clone();
+    let mut server_keys = BTreeMap::new();
+    let mut server_key_principals = BTreeMap::new();
+    for (endpoint, principal_id) in file.server_key_pins {
+        if endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES {
+            return Err(Error::Config(
+                "operator server_key_pins contains an invalid endpoint".into(),
+            ));
+        }
+        let principal = policy
+            .authorize(&principal_id, Permission::PeerRpc)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "server key pin {endpoint} references unknown or untrusted node {principal_id}"
+                ))
+            })?;
+        let key = zmq::z85_decode(&principal.curve_public_key)
+            .map_err(|_| Error::Config("trust policy contains an invalid CURVE public key".into()))?
+            .try_into()
+            .map_err(|_| Error::Config("trust policy CURVE public key has wrong length".into()))?;
+        server_keys.insert(endpoint.clone(), key);
+        server_key_principals.insert(endpoint, principal_id);
+    }
+    Ok(LoadedOperatorSecurity {
+        user_id,
+        public_key,
+        secret_key,
+        server_keys,
+        server_key_principals,
+    })
 }
 
 impl LoadedNodeSecurity {
@@ -485,6 +603,35 @@ mod tests {
         let mut swapped = descriptor.clone();
         swapped.directory[1].node_id = 4;
         assert!(security.validate_descriptor(&swapped, 2).is_err());
+    }
+
+    #[test]
+    fn operator_security_requires_operator_principal_and_loads_node_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let operator_public = "C".repeat(40);
+        let node_public = "D".repeat(40);
+        let policy_path = dir.path().join("policy.json");
+        std::fs::write(&policy_path, format!(
+            r#"{{"cluster_id":"7","generation":1,"principals":[{{"user_id":"ops:deploy","curve_public_key":"{operator_public}","permissions":["operator"]}},{{"user_id":"node:1","curve_public_key":"{node_public}","permissions":["peer_rpc"]}}]}}"#
+        )).unwrap();
+        let public_path = dir.path().join("operator-public.key");
+        let secret_path = dir.path().join("operator-secret.key");
+        std::fs::write(&public_path, &operator_public).unwrap();
+        std::fs::write(&secret_path, &operator_public).unwrap();
+        #[cfg(unix)]
+        for file in [&policy_path, &public_path, &secret_path] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let auth_path = dir.path().join("operator.json");
+        std::fs::write(&auth_path, format!(
+            r#"{{"cluster_id":"7","trust_policy_file":"{}","user_id":"ops:deploy","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5101":"node:1"}}}}"#,
+            policy_path.display(), public_path.display(), secret_path.display()
+        )).unwrap();
+        let loaded = load_operator_security(&auth_path, 7).unwrap();
+        assert_eq!(loaded.user_id, "ops:deploy");
+        assert_eq!(loaded.server_keys.len(), 1);
+        assert!(load_operator_security(&auth_path, 8).is_err());
     }
 
     #[test]
