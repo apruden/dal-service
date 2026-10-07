@@ -290,6 +290,9 @@ pub struct ZmqServer {
     running: Arc<AtomicBool>,
     poller: Option<JoinHandle<()>>,
     active: Arc<ActiveHandlers>,
+    // Retain ZAP until this listener's socket is closed. `Drop` joins the
+    // poller before fields are dropped, so CURVE cannot outlive its handler.
+    _zap: Option<Arc<crate::transport::security::ZapAuthenticator>>,
 }
 
 struct ActiveHandlers {
@@ -334,6 +337,23 @@ impl ZmqServer {
         Self::bind_with_limits(ctx, addr, server, lane, limits)
     }
 
+    /// Bind a CURVE-protected ROUTER socket using the ZAP domain and lifetime
+    /// of `zap`. The private server key is binary 32-byte CURVE material.
+    pub fn bind_curve<S>(
+        ctx: zmq::Context,
+        addr: &str,
+        server: Arc<S>,
+        lane: Lane,
+        secret_key: [u8; 32],
+        zap: Arc<crate::transport::security::ZapAuthenticator>,
+    ) -> Result<ZmqServer>
+    where
+        S: Server + 'static,
+    {
+        let limits = RouterLimits::from_env(lane)?;
+        Self::bind_with_limits_and_curve(ctx, addr, server, lane, limits, Some((secret_key, zap)))
+    }
+
     fn bind_with_limits<S>(
         ctx: zmq::Context,
         addr: &str,
@@ -344,9 +364,34 @@ impl ZmqServer {
     where
         S: Server + 'static,
     {
+        Self::bind_with_limits_and_curve(ctx, addr, server, lane, limits, None)
+    }
+
+    fn bind_with_limits_and_curve<S>(
+        ctx: zmq::Context,
+        addr: &str,
+        server: Arc<S>,
+        lane: Lane,
+        limits: RouterLimits,
+        curve: Option<([u8; 32], Arc<crate::transport::security::ZapAuthenticator>)>,
+    ) -> Result<ZmqServer>
+    where
+        S: Server + 'static,
+    {
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
         socket.set_rcvtimeo(1).map_err(zmq_io)?;
+        if let Some((secret_key, zap)) = &curve {
+            zap.ensure_healthy()?;
+            if zmq::has("curve") != Some(true) {
+                return Err(Error::Config(
+                    "libzmq was built without CURVE support".into(),
+                ));
+            }
+            socket.set_curve_server(true).map_err(zmq_io)?;
+            socket.set_curve_secretkey(secret_key).map_err(zmq_io)?;
+            socket.set_zap_domain(zap.domain()).map_err(zmq_io)?;
+        }
         // Refuse oversized frames during assembly. `Envelope::decode` enforces
         // the same bound, but only once libzmq has already materialized the
         // whole message on the heap — far too late to bound memory.
@@ -395,6 +440,7 @@ impl ZmqServer {
             running,
             poller: Some(poller),
             active,
+            _zap: curve.map(|(_, zap)| zap),
         })
     }
 
