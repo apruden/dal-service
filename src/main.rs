@@ -16,6 +16,7 @@ use dal::meta::state_machine::MetaApplyResult;
 use dal::runtime::admin;
 use dal::runtime::config_file::{
     load_init_descriptor, load_node_config, load_node_security, load_operator_security,
+    validate_node_security,
 };
 use dal::runtime::node::Node;
 use dal::search::SearchIndexDefinition;
@@ -27,6 +28,7 @@ fn usage() -> &'static str {
     "usage: dal <command> [args]\n\
      \n\
      commands:\n\
+       check-config --config <node.json> --cluster <init.json>   validate configuration without starting\n\
        run         --config <node.json> --cluster <init.json>   run a node (drives genesis)\n\
        join        --config <node.json> --auth <operator.json>   register this node with its cluster\n\
        leave       --auth <operator.json> --cluster <init.json> --node <id> [--seed <addr>]   gracefully drain a node\n\
@@ -55,6 +57,13 @@ fn main() -> ExitCode {
     let rest = &args[1..];
 
     match command.as_str() {
+        "check-config" => match (flag(rest, "--config"), flag(rest, "--cluster")) {
+            (Some(config), Some(cluster)) => check_config(config, cluster),
+            _ => {
+                eprintln!("check-config: --config <node.json> and --cluster <init.json> required");
+                ExitCode::FAILURE
+            }
+        },
         "run" => match (flag(rest, "--config"), flag(rest, "--cluster")) {
             (Some(config), Some(cluster)) => run_node(config, cluster),
             _ => {
@@ -151,6 +160,35 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Validate the node, cluster descriptor, credentials, trust policy, and pins
+/// without opening storage, binding sockets, or advancing trust generations.
+fn check_config(config: &str, cluster: &str) -> ExitCode {
+    let cfg = match load_node_config(Path::new(config)) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("check-config: config: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let descriptor = match load_init_descriptor(Path::new(cluster)) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            eprintln!("check-config: cluster: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = dal::runtime::node::validate_node_descriptor(&cfg, &descriptor) {
+        eprintln!("check-config: descriptor: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = validate_node_security(Path::new(config), &cfg) {
+        eprintln!("check-config: security: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("configuration valid");
+    ExitCode::SUCCESS
 }
 
 /// Install bounded, structured logs before parsing configuration so startup

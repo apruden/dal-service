@@ -116,6 +116,10 @@ dal status --auth operator.json --cluster init.json
 dal leave --auth operator.json --cluster init.json --node 3
 ```
 
+Before installation or a restart, `dal check-config --config node.json
+--cluster init.json` validates the descriptor, keys, policy, endpoint pins, and
+trust-generation marker without opening storage or changing the marker.
+
 `dal join` takes both the joining node config and the operator auth file. All
 explicit `--seed` addresses must already have pins. Administrative RPCs require
 the operator permission at the receiving node. Client reads, writes, and search

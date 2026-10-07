@@ -420,6 +420,20 @@ pub fn load_node_config(path: &Path) -> Result<NodeConfig> {
 /// relative to the node config file unless absolute. Every peer pin resolves
 /// through the trust policy rather than accepting self-reported keys.
 pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSecurity> {
+    load_node_security_inner(path, cfg, true)
+}
+
+/// Validate node credentials and pins without advancing the durable trust
+/// generation marker. Used by the non-mutating `check-config` command.
+pub fn validate_node_security(path: &Path, cfg: &NodeConfig) -> Result<()> {
+    load_node_security_inner(path, cfg, false).map(drop)
+}
+
+fn load_node_security_inner(
+    path: &Path,
+    cfg: &NodeConfig,
+    persist_generation: bool,
+) -> Result<LoadedNodeSecurity> {
     let text = std::fs::read_to_string(path)?;
     let file: NodeFile = serde_json::from_str(&text)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
@@ -448,7 +462,6 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
             "security.trust_generation_file must be an absolute path outside data_dir and its backups".into(),
         ));
     }
-    ensure_policy_generation(&security.trust_generation_file, policy.generation())?;
     let public_key = load_curve_key(&resolve(security.curve_public_key_file))?;
     let secret_key = load_curve_key(&resolve(security.curve_secret_key_file))?;
     let encoded_public_key = zmq::z85_encode(&public_key)
@@ -508,6 +521,11 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
             )));
         }
     }
+    if persist_generation {
+        ensure_policy_generation(&security.trust_generation_file, policy.generation())?;
+    } else {
+        validate_policy_generation_marker(&security.trust_generation_file, policy.generation())?;
+    }
     Ok(LoadedNodeSecurity {
         policy,
         user_id,
@@ -516,6 +534,47 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
         server_keys,
         server_key_principals,
     })
+}
+
+fn validate_policy_generation_marker(path: &Path, generation: u64) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::Config(
+            "trust_generation_file must be an absolute path outside data backups".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Config("trust_generation_file has no parent directory".into()))?;
+    if !parent.is_dir() {
+        return Err(Error::Config(format!(
+            "trust generation directory {} must already exist",
+            parent.display()
+        )));
+    }
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(Error::Config(
+                    "trust_generation_file must be a regular file".into(),
+                ));
+            }
+            validate_private_mode(path, &metadata)?;
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| {
+                    Error::Config(format!("trust generation marker is invalid: {error}"))
+                })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if current > generation {
+        return Err(Error::Config(format!(
+            "trust policy generation {generation} is older than the persisted generation {current}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,7 +770,10 @@ mod tests {
         )
         .unwrap();
         let cfg = load_node_config(&node_config).unwrap();
+        validate_node_security(&node_config, &cfg).unwrap();
+        assert!(!generation_path.exists());
         let security = load_node_security(&node_config, &cfg).unwrap();
+        assert!(generation_path.exists());
         let expected_peer_key: [u8; 32] =
             zmq::z85_decode(&peer_public).unwrap().try_into().unwrap();
         assert_eq!(security.user_id, "node:2");

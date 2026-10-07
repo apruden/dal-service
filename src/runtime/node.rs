@@ -2283,7 +2283,7 @@ fn bind_authoritative_registration(
     Ok(binding)
 }
 
-fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Result<()> {
+pub fn validate_node_descriptor(cfg: &NodeConfig, desc: &BootstrapDescriptor) -> Result<()> {
     cfg.validate()?;
     validate_routing_shape(desc.config.p, desc.config.r)?;
     if cfg.cluster_id != desc.cluster_id || desc.config.cluster_id != desc.cluster_id {
