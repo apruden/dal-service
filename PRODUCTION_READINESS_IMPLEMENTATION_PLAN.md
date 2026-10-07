@@ -21,7 +21,10 @@ windows for upgrades and coordinated backups. This is an assumption, not an
 established product requirement. Phase 0 must validate it against availability
 and recovery objectives. Rolling upgrades and online backups become launch
 requirements if maintenance windows cannot meet those objectives; their extra
-gates are specified below.
+gates are specified below. The provisional
+[operating profile](docs/operations/production-profile.md) combines 99% time
+availability with a 24-hour RPO at 50 GiB; daily offline backups cannot meet
+both, so its online-backup gate applies unless those targets are changed.
 
 This plan extends the current-binary, new-cluster scope in
 [the materialization plan](ASYNC_MATERIALIZED_STATE_IMPLEMENTATION_PLAN.md).
@@ -33,11 +36,18 @@ subsequent releases; Phase 4 defines the initial versioned upgrade exercise.
 
 ## Existing implementation and evidence
 
-The baseline is commit `6fabff4`. On 2026-10-06,
-`cargo test --locked --all-targets --all-features` completed with **342 passed,
-zero failed, and four ignored measurement tests**. The 100-seed leader-crash
-campaign passed in 307.47 seconds. Preserve future results as CI artifacts tied
-to the exact revision, binary digest, toolchain, configuration, and seed list.
+The implementation baseline is commit `6fabff4`. An earlier captured test log
+reports **342 passed, zero failed, and four ignored measurement tests**, with a
+leader-crash campaign taking 307.47 seconds. The original log lacks a revision
+header and captured seed list, so those outcomes are diagnostic until reproduced
+with provenance. Preserve future results as CI artifacts tied to the exact
+revision, binary digest, toolchain, configuration, and seed list.
+
+Phase 0 commit `57e7c3e` reproduced the full suite with an explicit clean
+revision, Rust/Cargo versions, command, and seeds 0 through 99: **342 passed,
+zero failed, and four ignored measurement tests**. Its leader-crash campaign
+completed in 302.93 seconds. The archived log remains single-host regression
+evidence; it does not satisfy independent-host qualification.
 
 Retain the existing majority-durable Raft log, asynchronous data-state
 materialization, recovery fencing, deterministic idempotency, streamed
@@ -741,7 +751,7 @@ resources.
 
 | Dimension | Required coverage |
 | --- | --- |
-| Topology | At least three independent hosts/failure domains; the production replica policy; spare-node admission and replacement; partition counts 1, 16, and the intended production maximum, including 128 if supported |
+| Topology | At least three independent hosts/failure domains; the production replica policy; spare-node admission and replacement; partition counts 1, 16, and the intended supported maximum. A 128-partition exploratory case does not expand the supported envelope until aggregate memory and all release gates pass. |
 | Data | 128 B, 4 KiB, 64 KiB, and 1 MiB values; opaque and indexable values; hot-key skew and broad keys; datasets larger than cache and several compaction cycles |
 | Load | Sequential and concurrent writes, CAS, linearizable/stale reads, search, index rebuild, snapshots, and rebalancing; 1, 16, 64 clients plus intended peak concurrency |
 | Process failures | SIGTERM, SIGKILL, reboot, repeated leader loss, planned stops longer than failure timeouts, full-cluster cold start using deployment assets, rolling restart where supported, and failed migration/restore boundaries |
