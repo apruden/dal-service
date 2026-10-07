@@ -114,7 +114,21 @@ impl TrustPolicy {
 fn is_z85_public_key(key: &str) -> bool {
     const Z85: &str =
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
-    key.len() == 40 && key.bytes().all(|byte| Z85.as_bytes().contains(&byte))
+    if key.len() != 40 || !key.bytes().all(|byte| Z85.as_bytes().contains(&byte)) {
+        return false;
+    }
+    key.as_bytes().as_chunks::<5>().0.iter().all(|chunk| {
+        chunk
+            .iter()
+            .try_fold(0u64, |value, byte| {
+                let digit = Z85
+                    .as_bytes()
+                    .iter()
+                    .position(|candidate| candidate == byte)? as u64;
+                Some(value * 85 + digit)
+            })
+            .is_some_and(|value| value <= u32::MAX as u64)
+    })
 }
 
 #[cfg(test)]
@@ -197,5 +211,11 @@ mod tests {
             permissions: vec![Permission::ClientRead],
         };
         assert!(TrustPolicy::new(7, 1, vec![invalid_z85]).is_err());
+        let out_of_range = Principal {
+            user_id: "out-of-range".into(),
+            curve_public_key: "#".repeat(40),
+            permissions: vec![Permission::ClientRead],
+        };
+        assert!(TrustPolicy::new(7, 1, vec![out_of_range]).is_err());
     }
 }
