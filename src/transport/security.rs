@@ -58,9 +58,9 @@ impl TrustPolicy {
                     principal.user_id
                 ));
             }
-            if principal.curve_public_key.len() != 40 || !principal.curve_public_key.is_ascii() {
+            if !is_z85_public_key(&principal.curve_public_key) {
                 return Err(format!(
-                    "principal {} CURVE public key must be 40 ASCII bytes",
+                    "principal {} CURVE public key must be 40 valid Z85 bytes",
                     principal.user_id
                 ));
             }
@@ -103,18 +103,18 @@ impl TrustPolicy {
             .filter(|p| p.permissions.contains(&permission))
     }
 
-    /// Check whether a ZAP identity is present. This does not validate the
-    /// cluster ID; callers must compare [`Self::cluster_id`] with local config.
-    pub fn admits(&self, user_id: &str) -> bool {
-        self.principals.contains_key(user_id)
-    }
-
     /// Resolve the trusted principal bound to a presented CURVE public key.
     pub fn principal_for_curve_key(&self, key: &str) -> Option<&Principal> {
         self.curve_keys
             .get(key)
             .and_then(|user_id| self.principals.get(user_id))
     }
+}
+
+fn is_z85_public_key(key: &str) -> bool {
+    const Z85: &str =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+    key.len() == 40 && key.bytes().all(|byte| Z85.as_bytes().contains(&byte))
 }
 
 #[cfg(test)]
@@ -137,7 +137,6 @@ mod tests {
     #[test]
     fn policy_denies_unknown_principals_and_unlisted_permissions() {
         let policy = policy();
-        assert!(policy.admits("app:orders"));
         assert_eq!(
             policy
                 .principal_for_curve_key(&"A".repeat(40))
@@ -145,7 +144,6 @@ mod tests {
                 .user_id,
             "app:orders"
         );
-        assert!(!policy.admits("node:2"));
         assert!(
             policy
                 .authorize("app:orders", Permission::ClientWrite)
@@ -193,5 +191,11 @@ mod tests {
             permissions: vec![Permission::ClientRead],
         };
         assert!(TrustPolicy::new(7, 1, vec![malformed_key]).is_err());
+        let invalid_z85 = Principal {
+            user_id: "invalid-z85".into(),
+            curve_public_key: "~".repeat(40),
+            permissions: vec![Permission::ClientRead],
+        };
+        assert!(TrustPolicy::new(7, 1, vec![invalid_z85]).is_err());
     }
 }
