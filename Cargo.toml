@@ -21,6 +21,7 @@ thiserror = "1"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.5"
 fail = "0.5"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 serde_json = "1"

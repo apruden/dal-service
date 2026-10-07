@@ -12,6 +12,7 @@ use crate::transport::codec::MsgType;
 use crate::types::GroupId;
 
 static AUTHORIZATION_DENIALS: AtomicU64 = AtomicU64::new(0);
+static LOG_DROP_COUNTER: OnceLock<tracing_appender::non_blocking::ErrorCounter> = OnceLock::new();
 
 /// Count rejected authenticated requests without recording principal identity.
 pub(crate) fn record_authorization_denial() {
@@ -20,6 +21,18 @@ pub(crate) fn record_authorization_denial() {
 
 pub(crate) fn authorization_denials() -> u64 {
     AUTHORIZATION_DENIALS.load(Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn install_log_drop_counter(counter: tracing_appender::non_blocking::ErrorCounter) {
+    let _ = LOG_DROP_COUNTER.set(counter);
+}
+
+pub(crate) fn dropped_log_lines() -> u64 {
+    LOG_DROP_COUNTER
+        .get()
+        .map(|counter| counter.dropped_lines().min(u64::MAX as usize) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]

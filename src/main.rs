@@ -47,7 +47,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 fn main() -> ExitCode {
-    init_tracing();
+    let _tracing_guard = init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "process started");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first() else {
@@ -201,16 +201,32 @@ fn check_config(config: &str, cluster: &str) -> ExitCode {
 
 /// Install bounded, structured logs before parsing configuration so startup
 /// failures are visible through the same production logging path.
-fn init_tracing() {
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(1024)
+        .lossy(true)
+        .finish(std::io::stderr());
+    let drop_counter = writer.error_counter();
+    match tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)
         .with_current_span(false)
         .with_span_list(false)
-        .try_init();
+        .with_writer(writer)
+        .try_init()
+    {
+        Ok(()) => {
+            dal::perf::install_log_drop_counter(drop_counter);
+            Some(guard)
+        }
+        Err(error) => {
+            eprintln!("failed to install structured logger: {error}");
+            None
+        }
+    }
 }
 
 /// Load config + genesis descriptor, start the node, drive genesis, then serve

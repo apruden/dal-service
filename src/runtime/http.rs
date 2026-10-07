@@ -67,6 +67,8 @@ pub struct ClusterStatus {
     pub router_admission_rejections: u64,
     #[serde(default)]
     pub authorization_denials: u64,
+    #[serde(default)]
+    pub log_dropped_lines: u64,
     pub router_reply_send_eagain: u64,
     pub router_reply_send_failures: u64,
     pub router_max_active_handlers: usize,
@@ -389,6 +391,11 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     metric(
         &mut out,
+        "dal_log_dropped_lines_total",
+        status.log_dropped_lines,
+    );
+    metric(
+        &mut out,
         "dal_router_reply_send_eagain_total",
         status.router_reply_send_eagain,
     );
@@ -569,6 +576,7 @@ pub(crate) mod tests {
                 snapshot_record_peak_bytes: 0,
                 router_admission_rejections: 0,
                 authorization_denials: 0,
+                log_dropped_lines: 0,
                 router_reply_send_eagain: 0,
                 router_reply_send_failures: 0,
                 router_max_active_handlers: 0,
@@ -746,6 +754,7 @@ pub(crate) mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("dal_storage_failed 0\n"));
         assert!(body.contains("dal_authorization_denials_total 0\n"));
+        assert!(body.contains("dal_log_dropped_lines_total 0\n"));
         assert!(body.contains("dal_partition_visible_index{partition=\"0\"} 10\n"));
         assert!(body.contains("dal_partition_durable_index{partition=\"0\"} 9\n"));
         assert!(body.contains("dal_partition_materialized_pending_bytes{partition=\"0\"} 128\n"));
@@ -763,12 +772,14 @@ pub(crate) mod tests {
         object.remove("diagnostic_sample_age_ms");
         object.remove("diagnostic_sample_stale");
         object.remove("authorization_denials");
+        object.remove("log_dropped_lines");
         let decoded: ClusterStatus = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.lifecycle, RuntimeLifecycle::Running);
         assert!(decoded.identity_valid);
         assert_eq!(decoded.diagnostic_sample_age_ms, 0);
         assert!(!decoded.diagnostic_sample_stale);
         assert_eq!(decoded.authorization_denials, 0);
+        assert_eq!(decoded.log_dropped_lines, 0);
     }
 
     /// Design §14: an unusable derived index degrades search only. It must not
