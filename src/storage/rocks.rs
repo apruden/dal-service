@@ -118,6 +118,39 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read-only storage-format validation for `dal check-config`.
+pub fn check_storage_format(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let marker = path.join(STORAGE_FORMAT_FILE);
+    if marker.exists() {
+        let manifest: StorageFormatManifest =
+            serde_json::from_slice(&fs::read(&marker)?).map_err(|error| {
+                Error::Corrupt(
+                    marker.display().to_string(),
+                    format!("invalid storage format manifest: {error}"),
+                )
+            })?;
+        if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
+            return Err(Error::Config(format!(
+                "data directory {} uses storage format {}; this binary supports format {}. Use a supported upgrade/import procedure",
+                path.display(),
+                manifest.storage_format_version,
+                STORAGE_FORMAT_VERSION
+            )));
+        }
+        return Ok(());
+    }
+    if fs::read_dir(path)?.next().transpose()?.is_none() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a supported upgrade/import procedure",
+        path.display()
+    )))
+}
+
 /// The node identity record persisted in the default CF. Opening a data dir
 /// whose identity mismatches the config is a hard error (DESIGN §12.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1911,6 +1944,8 @@ mod tests {
     fn fresh_storage_gets_durable_format_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
+        check_storage_format(&db).unwrap();
+        assert!(!db.exists());
         preflight_storage_format(&db).unwrap();
         let manifest: StorageFormatManifest =
             serde_json::from_slice(&fs::read(db.join(STORAGE_FORMAT_FILE)).unwrap()).unwrap();
@@ -1926,6 +1961,7 @@ mod tests {
         options.create_if_missing(true);
         let db = Db::open(&options, &path).unwrap();
         drop(db);
+        assert!(check_storage_format(&path).is_err());
         let error = preflight_storage_format(&path).unwrap_err().to_string();
         assert!(error.contains("no DAL_FORMAT.json"));
         assert!(path.join("CURRENT").exists());

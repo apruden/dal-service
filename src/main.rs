@@ -165,6 +165,10 @@ fn main() -> ExitCode {
 /// Validate the node, cluster descriptor, credentials, trust policy, and pins
 /// without opening storage, binding sockets, or advancing trust generations.
 fn check_config(config: &str, cluster: &str) -> ExitCode {
+    if zmq::has("curve") != Some(true) {
+        eprintln!("check-config: this libzmq build does not support CURVE security");
+        return ExitCode::FAILURE;
+    }
     let cfg = match load_node_config(Path::new(config)) {
         Ok(cfg) => cfg,
         Err(error) => {
@@ -185,6 +189,10 @@ fn check_config(config: &str, cluster: &str) -> ExitCode {
     }
     if let Err(error) = validate_node_security(Path::new(config), &cfg) {
         eprintln!("check-config: security: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = dal::storage::rocks::check_storage_format(&cfg.data_dir) {
+        eprintln!("check-config: storage: {error}");
         return ExitCode::FAILURE;
     }
     println!("configuration valid");
