@@ -145,6 +145,16 @@ impl NodeConfig {
                     "http_addr must differ from control_addr and bulk_addr".into(),
                 ));
             }
+            let address: std::net::SocketAddr = http.parse().map_err(|error| {
+                Error::Config(format!(
+                    "http_addr must be a numeric socket address: {error}"
+                ))
+            })?;
+            if !address.ip().is_loopback() {
+                return Err(Error::Config(
+                    "http_addr must bind to loopback; expose remote diagnostics through an authenticated TLS proxy".into(),
+                ));
+            }
         }
         if self.data_dir.as_os_str().is_empty() {
             return Err(Error::Config("data_dir must be set".into()));
@@ -418,6 +428,10 @@ mod tests {
         assert!(nc.validate().is_err());
         nc.http_addr = Some(String::new());
         assert!(nc.validate().is_err());
+        nc.http_addr = Some("0.0.0.0:7001".into());
+        assert!(nc.validate().is_err());
+        nc.http_addr = Some("[::1]:7001".into());
+        nc.validate().unwrap();
     }
 
     #[test]
