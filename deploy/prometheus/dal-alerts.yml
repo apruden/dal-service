@@ -1,0 +1,47 @@
+groups:
+  - name: dal-node
+    rules:
+      - alert: DALStorageFailed
+        expr: dal_storage_failed == 1
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "DAL storage has failed on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalstoragefailed"
+
+      - alert: DALPartitionNotRecovering
+        expr: dal_partition_recovery_ready == 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL partition {{ $labels.partition }} is not ready on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalpartitionnotrecovering"
+
+      - alert: DALMaterializationLagGrowing
+        expr: dal_partition_oldest_pending_milliseconds > 60000
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL partition {{ $labels.partition }} materialization is over one minute behind"
+          runbook: "docs/operations/alerts.md#dalmaterializationlaggrowing"
+
+      - alert: DALLogDrops
+        expr: increase(dal_log_dropped_lines_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL diagnostic logs are being dropped on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dallogdrops"
+
+      - alert: DALAuthorizationDenialsSpike
+        expr: increase(dal_authorization_denials_total[5m]) >= 20
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL is rejecting many authenticated requests on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalauthorizationdenialsspike"
