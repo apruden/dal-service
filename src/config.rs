@@ -257,7 +257,7 @@ impl InitConfig {
                 "meta voter set must have >= {MIN_META_VOTERS} distinct nodes"
             )));
         }
-        if meta.len() % 2 == 0 {
+        if meta.len().is_multiple_of(2) {
             return Err(Error::Config("meta voter set must be odd".into()));
         }
         if !meta.is_subset(&bootstrap) {

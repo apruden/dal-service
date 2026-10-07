@@ -278,7 +278,7 @@ impl MetaStateMachine {
         if mv.len() != meta_voters.len() {
             return Ok((invalid("duplicate meta voter"), vec![]));
         }
-        if mv.len() < MIN_META_VOTERS || mv.len() % 2 == 0 {
+        if mv.len() < MIN_META_VOTERS || mv.len().is_multiple_of(2) {
             return Ok((invalid("meta voters must be an odd set of >= 3"), vec![]));
         }
         if mv.len() > MAX_CLUSTER_NODES {
