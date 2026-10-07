@@ -6,6 +6,7 @@
 //! node-local authority state that must survive snapshot install and reclamation.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +41,82 @@ type RaftApplied = (
     Option<RaftLogId>,
     openraft::StoredMembership<u64, openraft::BasicNode>,
 );
+
+const STORAGE_FORMAT_FILE: &str = "DAL_FORMAT.json";
+const STORAGE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StorageFormatManifest {
+    storage_format_version: u32,
+}
+
+/// Establish the format marker only for a genuinely empty directory. Existing
+/// RocksDB databases without a marker require an explicit import/migration
+/// path; inferring compatibility from their contents is unsafe.
+fn preflight_storage_format(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let marker = path.join(STORAGE_FORMAT_FILE);
+    if marker.exists() {
+        let bytes = fs::read(&marker)?;
+        let manifest: StorageFormatManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::Corrupt(
+                marker.display().to_string(),
+                format!("invalid storage format manifest: {error}"),
+            )
+        })?;
+        if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
+            return Err(Error::Config(format!(
+                "data directory {} uses storage format {}; this binary supports format {}. Use a supported upgrade/import procedure",
+                path.display(),
+                manifest.storage_format_version,
+                STORAGE_FORMAT_VERSION
+            )));
+        }
+        return Ok(());
+    }
+
+    let temporary_prefix = format!(".{STORAGE_FORMAT_FILE}.tmp-");
+    let entries = fs::read_dir(path)?;
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&temporary_prefix)
+            && entry.file_type()?.is_file()
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    if fs::read_dir(path)?.next().transpose()?.is_some() {
+        return Err(Error::Config(format!(
+            "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a supported upgrade/import procedure",
+            path.display()
+        )));
+    }
+
+    let temporary = path.join(format!("{temporary_prefix}{}", std::process::id()));
+    let bytes = serde_json::to_vec(&StorageFormatManifest {
+        storage_format_version: STORAGE_FORMAT_VERSION,
+    })
+    .map_err(Error::codec)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&temporary, &marker) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
 
 /// The node identity record persisted in the default CF. Opening a data dir
 /// whose identity mismatches the config is a hard error (DESIGN §12.1).
@@ -312,6 +389,7 @@ impl Storage {
         apply_limits: ApplyDurabilityLimits,
     ) -> Result<Storage> {
         let path = path.as_ref().to_path_buf();
+        preflight_storage_format(&path)?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -1828,6 +1906,43 @@ mod tests {
     use openraft::CommittedLeaderId;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn fresh_storage_gets_durable_format_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        preflight_storage_format(&db).unwrap();
+        let manifest: StorageFormatManifest =
+            serde_json::from_slice(&fs::read(db.join(STORAGE_FORMAT_FILE)).unwrap()).unwrap();
+        assert_eq!(manifest.storage_format_version, STORAGE_FORMAT_VERSION);
+        preflight_storage_format(&db).unwrap();
+    }
+
+    #[test]
+    fn unmarked_existing_database_is_rejected_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy");
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let db = Db::open(&options, &path).unwrap();
+        drop(db);
+        let error = preflight_storage_format(&path).unwrap_err().to_string();
+        assert!(error.contains("no DAL_FORMAT.json"));
+        assert!(path.join("CURRENT").exists());
+        assert!(!path.join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    #[test]
+    fn unknown_storage_format_is_rejected_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future");
+        fs::create_dir(&path).unwrap();
+        let marker = path.join(STORAGE_FORMAT_FILE);
+        fs::write(&marker, br#"{"storage_format_version":999}"#).unwrap();
+        let before = fs::read(&marker).unwrap();
+        assert!(preflight_storage_format(&path).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), before);
+    }
 
     #[test]
     #[ignore = "release snapshot install measurement; set DAL_BENCH_DIR to a durable filesystem"]
