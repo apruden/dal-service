@@ -107,6 +107,7 @@ pub struct LoadedNodeSecurity {
     pub public_key: [u8; 32],
     pub secret_key: [u8; 32],
     pub server_keys: BTreeMap<String, [u8; 32]>,
+    server_key_principals: BTreeMap<String, String>,
 }
 
 impl LoadedNodeSecurity {
@@ -117,9 +118,7 @@ impl LoadedNodeSecurity {
         local_node_id: NodeId,
     ) -> Result<()> {
         for entry in &desc.directory {
-            if entry.node_id == local_node_id {
-                continue;
-            }
+            let expected_principal = format!("node:{}", entry.node_id);
             for endpoint in [&entry.control_addr, &entry.bulk_addr] {
                 if !self.server_keys.contains_key(endpoint) {
                     return Err(Error::Config(format!(
@@ -127,7 +126,19 @@ impl LoadedNodeSecurity {
                         entry.node_id
                     )));
                 }
+                if self.server_key_principals.get(endpoint) != Some(&expected_principal) {
+                    return Err(Error::Config(format!(
+                        "security.server_key_pins endpoint {endpoint} is not bound to node {}",
+                        entry.node_id
+                    )));
+                }
             }
+        }
+        let local_principal = format!("node:{local_node_id}");
+        if self.user_id != local_principal {
+            return Err(Error::Config(
+                "local node identity differs from the configured node id".into(),
+            ));
         }
         Ok(())
     }
@@ -194,6 +205,7 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
     }
     let user_id = principal.user_id.clone();
     let mut server_keys = BTreeMap::new();
+    let mut server_key_principals = BTreeMap::new();
     for (endpoint, principal_id) in security.server_key_pins {
         if endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES {
             return Err(Error::Config(
@@ -211,7 +223,22 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
             .map_err(|_| Error::Config("trust policy contains an invalid CURVE public key".into()))?
             .try_into()
             .map_err(|_| Error::Config("trust policy CURVE public key has wrong length".into()))?;
-        server_keys.insert(endpoint, key);
+        server_keys.insert(endpoint.clone(), key);
+        server_key_principals.insert(endpoint.clone(), principal_id);
+    }
+    for endpoint in [&cfg.control_addr, &cfg.bulk_addr] {
+        match server_key_principals.get(endpoint) {
+            Some(principal_id) if principal_id != &user_id => {
+                return Err(Error::Config(format!(
+                    "local endpoint {endpoint} is pinned to {principal_id}, expected {user_id}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                server_key_principals.insert(endpoint.clone(), user_id.clone());
+                server_keys.insert(endpoint.clone(), public_key);
+            }
+        }
     }
     for endpoint in &cfg.seeds {
         if !server_keys.contains_key(endpoint) {
@@ -226,6 +253,7 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
         public_key,
         secret_key,
         server_keys,
+        server_key_principals,
     })
 }
 
@@ -424,11 +452,39 @@ mod tests {
         let expected_peer_key: [u8; 32] =
             zmq::z85_decode(&peer_public).unwrap().try_into().unwrap();
         assert_eq!(security.user_id, "node:2");
-        assert_eq!(security.server_keys.len(), 2);
+        assert_eq!(security.server_keys.len(), 4);
         assert_eq!(
             security.server_keys["tcp://127.0.0.1:5003"],
             expected_peer_key
         );
+        let descriptor = BootstrapDescriptor {
+            cluster_id: 7,
+            config: ClusterConfig {
+                cluster_id: 7,
+                protocol_version: PROTOCOL_VERSION,
+                p: 1,
+                r: 3,
+                hash_spec: HashSpec::CANONICAL,
+            },
+            meta_voters: vec![2, 3, 4],
+            directory: vec![
+                DirEntry {
+                    node_id: 2,
+                    control_addr: "tcp://127.0.0.1:5001".into(),
+                    bulk_addr: "tcp://127.0.0.1:5002".into(),
+                },
+                DirEntry {
+                    node_id: 3,
+                    control_addr: "tcp://127.0.0.1:5003".into(),
+                    bulk_addr: "tcp://127.0.0.1:5004".into(),
+                },
+            ],
+            data_placements: Vec::new(),
+        };
+        security.validate_descriptor(&descriptor, 2).unwrap();
+        let mut swapped = descriptor.clone();
+        swapped.directory[1].node_id = 4;
+        assert!(security.validate_descriptor(&swapped, 2).is_err());
     }
 
     #[test]
