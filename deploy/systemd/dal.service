@@ -1,0 +1,27 @@
+[Unit]
+Description=DAL replicated data service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=dal
+Group=dal
+Environment=RUST_LOG=info
+ExecStartPre=/usr/local/bin/dal check-config --config /etc/dal/node.json --cluster /etc/dal/cluster.json
+ExecStart=/usr/local/bin/dal run --config /etc/dal/node.json --cluster /etc/dal/cluster.json
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStartSec=infinity
+TimeoutStopSec=75s
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dal/node-1 /var/lib/dal-security
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
