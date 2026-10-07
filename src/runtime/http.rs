@@ -1,18 +1,20 @@
 //! Read-only HTTP admin plane (DESIGN §10; `M8_HTTP_STATUS_PLAN.md`).
 //!
 //! A third inbound plane alongside the ZMQ control and bulk lanes, bound on
-//! `http_addr`. It exposes `GET /status` and `GET /health` and nothing else:
+//! `http_addr`. It exposes cached diagnostics and cheap lifecycle probes:
 //! observability only, off the correctness path, so it can never be a side door
-//! to consensus or operator commands (ground rule 9). `/status` is built from
-//! node-local Raft metrics and cached reads — never a linearizable round trip —
-//! so it answers cheaply even during an election.
+//! to consensus or operator commands (ground rule 9). The runtime samples
+//! expensive local diagnostics away from the request path; no probe performs a
+//! network round trip, RocksDB scan, or search-outbox scan.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::{Json, Router, extract::State, routing::get};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeDirectoryEntry, NodeId};
+use crate::runtime::readiness::{RuntimeLifecycle, RuntimeReadiness};
+use crate::types::{NodeDirectoryEntry, NodeId, ProcessIdentityGate};
 
 /// A node's self-reported status. All fields come from node-local state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,10 @@ pub struct ClusterStatus {
     /// Cluster id as a hex string (JSON cannot carry a u128 reliably).
     pub cluster_id: String,
     pub protocol_version: u32,
+    pub lifecycle: RuntimeLifecycle,
+    pub identity_valid: bool,
+    /// Age of the cached diagnostic sample returned by `/status`.
+    pub diagnostic_sample_age_ms: u64,
     /// Database-wide fail-stop state. This includes meta-only nodes and remains
     /// true for the rest of the process after any materialization/WAL failure.
     pub storage_failed: bool,
@@ -157,17 +163,130 @@ pub struct PlanStatus {
     pub aborting: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeStatus {
+    pub lifecycle: RuntimeLifecycle,
+    pub live: bool,
+    pub ready: bool,
+}
+
+impl ProbeStatus {
+    fn from_status(status: &ClusterStatus) -> Self {
+        let storage_healthy = !status.storage_failed
+            && status
+                .partitions
+                .iter()
+                .all(|partition| !partition.materialized_failed);
+        let local_groups_ready = status
+            .partitions
+            .iter()
+            .all(|partition| partition.serving && partition.materialized_recovery_ready);
+        let live = status.lifecycle.is_live() && status.identity_valid && storage_healthy;
+        Self {
+            lifecycle: status.lifecycle,
+            live,
+            ready: live && status.lifecycle.is_ready() && local_groups_ready,
+        }
+    }
+}
+
 /// Supplies a node-local status snapshot. Implemented by the runtime node;
 /// the HTTP layer depends only on this so it stays decoupled and testable.
 pub trait StatusSource: Send + Sync {
     fn status(&self) -> ClusterStatus;
+
+    fn probe(&self) -> ProbeStatus {
+        ProbeStatus::from_status(&self.status())
+    }
 }
 
-/// The admin router: `GET /status` and `GET /health`.
+struct CachedSample {
+    status: ClusterStatus,
+    sampled_at: Instant,
+    storage_healthy: bool,
+    local_groups_ready: bool,
+}
+
+/// Shared bounded-cost source for the HTTP plane. Only the background sampler
+/// calls the live status collector; requests clone the latest cached snapshot.
+pub struct StatusCache {
+    sample: RwLock<CachedSample>,
+    lifecycle: RuntimeReadiness,
+    identity_gate: ProcessIdentityGate,
+}
+
+impl StatusCache {
+    pub fn new(
+        status: ClusterStatus,
+        lifecycle: RuntimeReadiness,
+        identity_gate: ProcessIdentityGate,
+    ) -> Self {
+        let (storage_healthy, local_groups_ready) = sample_health(&status);
+        Self {
+            sample: RwLock::new(CachedSample {
+                status,
+                sampled_at: Instant::now(),
+                storage_healthy,
+                local_groups_ready,
+            }),
+            lifecycle,
+            identity_gate,
+        }
+    }
+
+    pub fn publish(&self, status: ClusterStatus) {
+        let (storage_healthy, local_groups_ready) = sample_health(&status);
+        *self.sample.write().unwrap() = CachedSample {
+            status,
+            sampled_at: Instant::now(),
+            storage_healthy,
+            local_groups_ready,
+        };
+    }
+}
+
+fn sample_health(status: &ClusterStatus) -> (bool, bool) {
+    let storage_healthy = !status.storage_failed
+        && status
+            .partitions
+            .iter()
+            .all(|partition| !partition.materialized_failed);
+    let local_groups_ready = status
+        .partitions
+        .iter()
+        .all(|partition| partition.serving && partition.materialized_recovery_ready);
+    (storage_healthy, local_groups_ready)
+}
+
+impl StatusSource for StatusCache {
+    fn status(&self) -> ClusterStatus {
+        let sample = self.sample.read().unwrap();
+        let mut status = sample.status.clone();
+        status.lifecycle = self.lifecycle.lifecycle();
+        status.identity_valid = self.identity_gate.is_open();
+        status.diagnostic_sample_age_ms = sample.sampled_at.elapsed().as_millis() as u64;
+        status
+    }
+
+    fn probe(&self) -> ProbeStatus {
+        let sample = self.sample.read().unwrap();
+        let lifecycle = self.lifecycle.lifecycle();
+        let live = lifecycle.is_live() && self.identity_gate.is_open() && sample.storage_healthy;
+        ProbeStatus {
+            lifecycle,
+            live,
+            ready: live && lifecycle.is_ready() && sample.local_groups_ready,
+        }
+    }
+}
+
+/// The admin router. `/health` remains a compatibility alias for liveness.
 pub fn router(src: Arc<dyn StatusSource>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .with_state(src)
 }
 
@@ -178,16 +297,28 @@ async fn status(State(src): State<Arc<dyn StatusSource>>) -> Json<ClusterStatus>
 async fn health(
     State(src): State<Arc<dyn StatusSource>>,
 ) -> (axum::http::StatusCode, &'static str) {
-    let status = src.status();
-    if status.storage_failed
-        || status
-            .partitions
-            .iter()
-            .any(|partition| partition.materialized_failed)
-    {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "failed")
+    probe_response(src.probe().live, "ok", "failed")
+}
+
+async fn livez(State(src): State<Arc<dyn StatusSource>>) -> (axum::http::StatusCode, &'static str) {
+    probe_response(src.probe().live, "live", "failed")
+}
+
+async fn readyz(
+    State(src): State<Arc<dyn StatusSource>>,
+) -> (axum::http::StatusCode, &'static str) {
+    probe_response(src.probe().ready, "ready", "not ready")
+}
+
+fn probe_response(
+    healthy: bool,
+    success: &'static str,
+    failure: &'static str,
+) -> (axum::http::StatusCode, &'static str) {
+    if healthy {
+        (axum::http::StatusCode::OK, success)
     } else {
-        (axum::http::StatusCode::OK, "ok")
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, failure)
     }
 }
 
@@ -205,6 +336,9 @@ mod tests {
                 node_id: 7,
                 cluster_id: "0xda1".into(),
                 protocol_version: 1,
+                lifecycle: RuntimeLifecycle::Running,
+                identity_valid: true,
+                diagnostic_sample_age_ms: 0,
                 storage_failed: false,
                 storage_wal_syncs: None,
                 storage_wal_bytes: None,
@@ -305,6 +439,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_probes_do_not_collect_status() {
+        struct ProbeOnly;
+        impl StatusSource for ProbeOnly {
+            fn status(&self) -> ClusterStatus {
+                panic!("probe request must not collect status")
+            }
+
+            fn probe(&self) -> ProbeStatus {
+                ProbeStatus {
+                    lifecycle: RuntimeLifecycle::Running,
+                    live: true,
+                    ready: true,
+                }
+            }
+        }
+
+        let app = router(Arc::new(ProbeOnly));
+        for path in ["/health", "/livez", "/readyz"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_is_live_but_not_ready() {
+        struct Draining;
+        impl StatusSource for Draining {
+            fn status(&self) -> ClusterStatus {
+                let mut status = StubStatus.status();
+                status.lifecycle = RuntimeLifecycle::Draining;
+                status
+            }
+        }
+
+        let app = router(Arc::new(Draining));
+        let live = app
+            .clone()
+            .oneshot(Request::get("/livez").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let ready = app
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn health_fails_closed_with_materialization_failure() {
         let app = router(Arc::new(FailedStatus));
         let resp = app
@@ -351,5 +538,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn cache_updates_age_without_recollecting_status() {
+        let lifecycle = RuntimeReadiness::default();
+        assert!(lifecycle.mark_ready());
+        let identity = ProcessIdentityGate::default();
+        let cache = StatusCache::new(StubStatus.status(), lifecycle, identity);
+        let first = cache.status();
+        assert_eq!(first.lifecycle, RuntimeLifecycle::Running);
+        assert!(cache.probe().ready);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(cache.status().diagnostic_sample_age_ms >= 1);
     }
 }

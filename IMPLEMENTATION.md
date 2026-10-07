@@ -442,11 +442,13 @@ config_file}.rs`, `main.rs`, plus the durable heartbeat incarnation in
   detector tracks both with the sequence, so restart may reset sequence to one
   while an old process or pre-rejoin identity cannot refresh current liveness.
 - **Read-only HTTP admin plane** (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`):
-  `GET /status` + `GET /health`, node-local and best-effort (never
-  `ensure_linearizable`), a third inbound plane off the correctness path. Its
-  listener is bound before storage opens or any task spawns, so a bad `http_addr`
-  fails startup without leaking detached work; the serving task is aborted on
-  shutdown with the other loops.
+  `GET /status`, `/health`, `/livez`, and `/readyz`, node-local and best-effort
+  (never `ensure_linearizable`), form a third inbound plane off the correctness
+  path. Lifecycle is explicit (`Starting`, `Running`, `Draining`, `Failed`,
+  `Stopped`). A background sampler collects detailed status once per second;
+  HTTP requests clone that snapshot and report its age, while probes read only
+  lifecycle and cached health flags. The listener is bound before storage opens
+  or any task spawns, so a bad `http_addr` fails startup without leaking work.
 - **Config + binary** (`runtime/config_file.rs`, `main.rs`): JSON node config
   (`http_addr`, initial placements) and immutable init descriptor; `dal run
   --config <node> --cluster <init>` starts a node, drives genesis, and serves
@@ -459,8 +461,8 @@ dies rolls back to the original voters; `BecomeLearner` starts a hosted partitio
 idempotently; a non-meta-voter data leader drives its own move; the failure
 detector progresses a silenced node to `Down`; `/status` reports the node-local
 view. Plus: heartbeat incarnation persists and advances across restarts
-(`storage_m1`), and an invalid `http_addr` fails before storage is opened
-(`runtime::node` unit test).
+(`storage_m1`); lifecycle probes never collect full status; and an invalid
+`http_addr` fails before storage is opened (`runtime::node` unit test).
 
 **Operator CLI** (`runtime/admin.rs`, `main.rs`): `join`, `leave`, `abort-plan`,
 `index-create`, `index-rebuild`, `index-drop`, and `status` are wired as thin ZMQ

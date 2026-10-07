@@ -44,7 +44,7 @@ reclamation are assembled; remaining items are listed under "Status".
   (`transport/dealer.rs`). Single `Envelope` codec; `MsgType` discriminates.
 - **Bulk lane** (`bulk_addr`): snapshot install traffic, off the control lane
   (config enforces `control_addr != bulk_addr`).
-- **HTTP lane** (`http_addr`): read-only `/status` + `/health`, built
+- **HTTP lane** (`http_addr`): read-only `/status`, `/health`, `/livez`, and `/readyz`, built
   (`runtime/http.rs`, `M8_HTTP_STATUS_PLAN.md`). Listener bound before storage
   opens; serving task aborted on shutdown.
 
@@ -176,24 +176,28 @@ impl Server for RootDispatch {
 8. **Assemble `RootDispatch`** (gateway + meta + partitions + storage).
 9. **Bind inbound planes** — `ZmqServer::bind(ctx, control_addr, root_dispatch)`
    and a bulk `ZmqServer` on `bulk_addr`.
-10. **Spawn HTTP** —
-    `if let Some(a) = cfg.http_addr { spawn http::serve(a.parse()?, status_source, shutdown_rx) }`.
-    `None` → skip.
+10. **Spawn HTTP and diagnostic sampling** — initialize lifecycle as `Starting`,
+    collect one local status snapshot, then sample detailed diagnostics once per
+    second on a blocking worker. `/status` returns the cached snapshot with its
+    age; `/livez`, `/readyz`, and compatibility `/health` read only lifecycle
+    and cached health flags. `None` → skip the HTTP and sampling tasks.
 11. **Spawn background drivers** — heartbeat emitter (liveness → meta voters), the
     reconcile loop (reacts to placement changes: start/stop partitions, honor
     `BecomeLearner`), and — active only while meta leader — the rebalancer/plan
     driver. Address refresh and recovery run immediately; new plans and reclaim
     work wait for successful `Node::bootstrap` plus confirmation that every
     designated genesis data voter has initialized.
-12. **Return `Node`**; `run` awaits the shutdown signal.
+12. **Return `Node`**; successful bootstrap changes lifecycle to `Running`, and
+    `run` awaits the shutdown signal.
 
 ## Shutdown (`Node::shutdown`)
-Abort background loops → stop both ZMQ pollers (no new frames) →
+Change lifecycle to `Draining` (closing readiness) → abort background loops → stop both ZMQ pollers (no new frames) →
 `raft.shutdown()` on meta + every partition → asynchronously drain already
 dispatched handlers → drop `Storage` (flush/close). Poller stopping is
 synchronous, but handler draining yields to Tokio so an in-flight request can
-finish on a single-worker runtime. Graceful HTTP shutdown is wired to the same
-signal.
+finish on a single-worker runtime. Successful teardown records `Stopped`; a
+Raft shutdown error records `Failed`. Signal coordination and keeping probes
+available throughout the drain are the next lifecycle milestone.
 
 ## Example: client write path (once assembled)
 `Client` (DEALER) → target `control_addr` ROUTER → `ClientGateway` →

@@ -32,7 +32,7 @@ use crate::runtime::config_file::cluster_id_hex;
 use crate::runtime::directory::fetch_authoritative_directory;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
-    ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusSource,
+    ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusCache, StatusSource,
 };
 use crate::runtime::readiness::RuntimeReadiness;
 use crate::runtime::rebalance::RebalanceDriver;
@@ -59,6 +59,8 @@ use crate::types::{
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll cadence while waiting for genesis to complete.
 const BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
+/// Expensive local diagnostics are sampled away from HTTP request handlers.
+const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The node's meta-group runtime, shared and mutable so a node can start hosting
 /// the meta group at runtime or stop after a drain.
@@ -676,14 +678,35 @@ impl Node {
         // assembly; the serving task is aborted on shutdown with the other
         // loops.
         if let Some(listener) = http_listener {
-            let src: Arc<dyn StatusSource> = Arc::new(NodeStatus {
+            let live_status = Arc::new(NodeStatus {
                 node_id: cfg.node_id,
                 cluster: cluster.clone(),
                 storage: storage.clone(),
                 meta: meta_handle.clone(),
                 partitions: partitions.clone(),
                 search: search.clone(),
+                readiness: readiness.clone(),
+                identity_gate: identity_gate.clone(),
             });
+            let cache = Arc::new(StatusCache::new(
+                live_status.status(),
+                readiness.clone(),
+                identity_gate.clone(),
+            ));
+            let sampler_source = live_status.clone();
+            let sampler_cache = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(STATUS_SAMPLE_INTERVAL).await;
+                    let source = sampler_source.clone();
+                    let Ok(status) = tokio::task::spawn_blocking(move || source.status()).await
+                    else {
+                        return;
+                    };
+                    sampler_cache.publish(status);
+                }
+            }));
+            let src: Arc<dyn StatusSource> = cache;
             tasks.push(tokio::spawn(async move {
                 let _ = axum::serve(listener, crate::runtime::http::router(src)).await;
             }));
@@ -774,8 +797,13 @@ impl Node {
             }
             node.initialize(voters).await?;
         }
-        self.readiness.mark_ready();
-        Ok(())
+        if self.readiness.mark_ready() {
+            Ok(())
+        } else {
+            Err(Error::Raft(
+                "bootstrap completed after runtime readiness closed".into(),
+            ))
+        }
     }
 
     fn require_identity_open(&self) -> Result<()> {
@@ -952,6 +980,7 @@ impl Node {
     /// Gracefully stop inbound work and background loops, then shut down every
     /// Raft group and release all storage owners before returning.
     pub async fn shutdown(mut self) -> Result<()> {
+        self.readiness.begin_draining();
         // Unlike the other loops, search reconciliation can own non-abortable
         // blocking work. Ask it to stop and let the current pass drain before
         // releasing storage.
@@ -1009,8 +1038,10 @@ impl Node {
         }
 
         if let Some(error) = first_error {
+            self.readiness.mark_failed();
             return Err(error);
         }
+        self.readiness.mark_stopped();
         Ok(())
     }
 }
@@ -1095,6 +1126,8 @@ struct NodeStatus {
     meta: MetaHandle,
     partitions: PartitionMap,
     search: Arc<crate::search::SearchService>,
+    readiness: RuntimeReadiness,
+    identity_gate: ProcessIdentityGate,
 }
 
 impl StatusSource for NodeStatus {
@@ -1207,6 +1240,9 @@ impl StatusSource for NodeStatus {
             node_id: self.node_id,
             cluster_id: cluster_id_hex(self.cluster.cluster_id),
             protocol_version: self.cluster.protocol_version,
+            lifecycle: self.readiness.lifecycle(),
+            identity_valid: self.identity_gate.is_open(),
+            diagnostic_sample_age_ms: 0,
             storage_failed: self.storage.database_failure().is_some(),
             storage_wal_syncs: rocks.map(|counters| counters.wal_syncs),
             storage_wal_bytes: rocks.map(|counters| counters.wal_bytes),

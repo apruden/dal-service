@@ -1,7 +1,9 @@
 # M8 — HTTP status plane (implementation plan)
 
 Read-only HTTP observability plane for a running node, exposing `/status` and
-`/health`. Operator mutations stay on the typed ZMQ control frames (ground rule
+`/health`; production lifecycle work later added `/livez` and `/readyz` while
+retaining `/health` as a compatibility liveness alias. Operator mutations stay
+on the typed ZMQ control frames (ground rule
 9); HTTP is observability only.
 
 ## Locked decisions
@@ -13,7 +15,8 @@ Read-only HTTP observability plane for a running node, exposing `/status` and
   CLI does *not* call HTTP. `/status` is the machine/ops-facing surface only.
 - **Plan reporting: id + state only** — no `plan.age` in v1 (avoids adding a
   timestamp to the placement record).
-- **HTTP is read-only** — routes are `GET /status` and `GET /health`. No
+- **HTTP is read-only** — routes are `GET /status`, `GET /health`, `GET /livez`,
+  and `GET /readyz`. No
   mutation routes.
 - The HTTP layer is built and tested against a narrow `StatusSource` trait so it
   did not block on the runtime. (The full `runtime::Node` assembly has since

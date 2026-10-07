@@ -760,7 +760,8 @@ single-partition implementation.
    a runnable process: the production ZeroMQ `RaftNetwork`, the `runtime::Node`
    startup/shutdown lifecycle, the peer/operator-control dispatcher, the
    background drivers (heartbeat, failure detection, rebalance/abort), a
-   directory-fenced durable heartbeat incarnation, a read-only HTTP `/status` plane, and the
+   directory-fenced durable heartbeat incarnation, a read-only HTTP plane with
+   cached `/status` plus lifecycle `/livez` and `/readyz` probes, and the
    `dal run` binary. Adds no protocol; gated on the phase-6 behaviors holding
    over real sockets (a ZeroMQ three-node cluster serves ops, migrates on
    drain, rolls back a doomed plan, and marks a silent node `Down`).

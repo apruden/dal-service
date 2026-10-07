@@ -616,6 +616,7 @@ fn http_get(addr: &str, path: &str) -> String {
 async fn http_status_reports_node_local_view() {
     let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::runtime::http::{ClusterStatus, Role};
+    use dal::runtime::readiness::RuntimeLifecycle;
 
     let ctx = zmq::Context::new();
     let desc = descriptor();
@@ -640,6 +641,18 @@ async fn http_status_reports_node_local_view() {
         ));
     }
     settle();
+
+    let starting_live = http_get(&http_addr, "/livez");
+    let starting_ready = http_get(&http_addr, "/readyz");
+    assert!(
+        starting_live.starts_with("HTTP/1.1 200"),
+        "starting livez: {starting_live}"
+    );
+    assert!(
+        starting_ready.starts_with("HTTP/1.1 503"),
+        "starting readyz: {starting_ready}"
+    );
+
     let handles: Vec<_> = nodes
         .iter()
         .map(|n| {
@@ -660,14 +673,16 @@ async fn http_status_reports_node_local_view() {
     // obtain a leader-issued quorum target for this process epoch even when no
     // user mutation is needed to make progress.
     let mut ready_status = None;
-    for _ in 0..40 {
+    for _ in 0..60 {
         let raw = http_get(&http_addr, "/status");
         let body = raw.split_once("\r\n\r\n").expect("http body").1;
         let status: ClusterStatus = serde_json::from_str(body).unwrap();
-        if status
-            .partitions
-            .iter()
-            .any(|partition| partition.partition == 0 && partition.materialized_recovery_ready)
+        let ready = http_get(&http_addr, "/readyz");
+        if ready.starts_with("HTTP/1.1 200")
+            && status
+                .partitions
+                .iter()
+                .any(|partition| partition.partition == 0 && partition.materialized_recovery_ready)
         {
             ready_status = Some(status);
             break;
@@ -676,6 +691,9 @@ async fn http_status_reports_node_local_view() {
     }
     let status = ready_status.expect("recovery-fence driver did not open partition 0");
     assert_eq!(status.node_id, 1);
+    assert_eq!(status.lifecycle, RuntimeLifecycle::Running);
+    assert!(status.identity_valid);
+    assert!(status.diagnostic_sample_age_ms <= 2_000);
     assert!(status.meta.is_some(), "node 1 runs the meta group");
     let p0 = status
         .partitions
