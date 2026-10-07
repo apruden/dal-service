@@ -44,11 +44,11 @@ and error counts separately, including while maintenance closes client ingress.
 | Mixed KV load | At least 500 successful operations/s for 72 hours with 16 clients: 60% linearizable reads, 10% stale reads, 20% writes, and 10% CAS. Use 70% 4 KiB, 15% 128 B, 10% 64 KiB, and 5% 1 MiB values by operation count. Use the fixed mixed keyspace below so mutations overwrite existing keys. Measure per-operation p95/p99; proposed limits are 100/500 ms for reads and 150/750 ms for writes and CAS. |
 | Search | At least 50 queries/s for one hour, 50% single-term strict text, 25% multi-term strict text, and 25% `MatchAll`, across the eight indexes. p95 below 500 ms; p99 index freshness lag below 60 s after normal writes. Report rebuild and concurrent search separately. |
 | Value classes and concurrency | Also run isolated 128 B, 4 KiB, 64 KiB, and 1 MiB values; hot and broad keys; opaque and indexable values; and 1, 16, and 64 clients. Record all latency percentiles by operation and value class. Peak supported concurrency is provisionally 64 clients. |
-| Failover | Over at least 100 independent node-crash trials, p99 time to resume successful writes at most 15 s where every affected group retains quorum. Report the maximum, ambiguous write outcomes, and quorum-loss intervals separately. |
+| Failover | Run at least 300 independent node-crash trials where every affected group retains quorum. Every trial must resume successful writes within 15 s; also report empirical p99 and maximum, ambiguous write outcomes, and quorum-loss intervals. Zero failures in 300 trials gives about 95% confidence that the within-15-second rate exceeds 99%. |
 | Shutdown | Under normal load, close readiness before admission, drain, and stop within the proposed 60 s application deadline and 90 s supervisor grace period in every qualification trial. Report p99 and maximum drain time and classify forced stops as crashes. |
 | Availability and error rate | At least 99% time availability in each 30-day window, including planned maintenance. Send rate-limited valid read/write canaries to every partition and count the cluster unavailable if any required partition fails; report per-partition results too. Measure meta-dependent search separately. A failed or timed-out canary counts unavailable, while deterministically invalid input is excluded. Separately, below 0.1% errors/timeouts on valid operations during normal load with quorum. Safety requires zero lost acknowledged writes after any failure that leaves a durable quorum. |
-| Backlog and resources | Under the supported workload, zero forced search-consumer releases or rebuilds due to the compiled-in outbox bounds of 2,000,000 entries and 512 MiB per group. Keep retained Raft logs below 4 GiB per data group and catch a follower up from that backlog within 10 minutes. Measure DAL RSS below 24 GiB and at least 40% free disk on each trial host. Implement aggregate bounds or reduce the envelope if these targets fail. |
-| Client identities | Applications reuse stable client identities; ephemeral per-request identities are unsupported. Until safe record expiry exists, admit at most 100,000 application client identities per cluster and qualify one year at the expected identity creation rate. Enforce the limit before release and include identity records in disk accounting. |
+| Backlog and resources | Under the supported workload, zero forced search-consumer releases or rebuilds due to the compiled-in outbox bounds of 2,000,000 entries and 512 MiB per group. Keep retained Raft logs below 1 GiB per data group and catch one node up from the resulting 16 GiB maximum across 16 groups within 10 minutes. Add retained-byte accounting before enforcing this gate. Measure DAL RSS below 24 GiB and at least 40% free disk on each trial host. Implement aggregate bounds or reduce the envelope if these targets fail. |
+| Client identities | Applications reuse stable client identities; ephemeral per-request identities are unsupported. The operator trust policy explicitly binds permitted IDs to application principals and contains at most 100,000 IDs cluster-wide. Provision no more than 200 new IDs/day: one year × that rate × a 1.25 safety factor is at most 91,250. Alert at 80% and reject policy additions over the cap without affecting existing streams. Before one year or exhaustion, implement safe expiry or qualify a larger cap. Include the resulting per-partition sequence records in disk accounting. |
 | Disaster recovery | Provisional RPO at most 24 hours, measured from the last verified off-host backup, and RTO at most 4 hours for the 50 GiB dataset. Backup cadence must be shorter than 24 hours by the worst-case backup completion delay; report both actual recovered point and timed restore. |
 
 Run each isolated value-size trial on a fresh 50 GiB dataset rather than adding
@@ -59,12 +59,21 @@ with equivalent sizing for the other classes. For the mixed soak, use about
 payload before keys and metadata. All mutations select from that fixed keyspace.
 
 Budget each 2 TiB host conservatively: at most 150 GiB for authoritative RocksDB
-state plus compaction headroom, 64 GiB for the 4 GiB retained-log limit across
-16 data groups, 400 GiB for eight worst-case full-corpus search projections,
-150 GiB for backup/checkpoint staging, and 50 GiB for service logs and temporary
-files. Keep at least 40% (about 819 GiB) free throughout qualification. Measure
-each category, physical write volume, and disk amplification; reduce the
-operating envelope if any component exceeds its budget.
+state plus compaction headroom, 16 GiB for the 1 GiB retained-log limit across
+16 data groups, 600 GiB for eight active search projections plus one full-size
+rebuild generation and one quarantined generation, 150 GiB for backup/checkpoint
+staging, and 50 GiB for service logs and temporary files. Permit only one index
+rebuild at a time. A verified unused quarantine must be removed through the
+runbook before another rebuild; admission preflight refuses work that would
+cross the disk budget. Keep at least 40% (about 819 GiB) free throughout
+qualification. Measure actual projection and rebuild size rather than assuming
+it equals source size, plus physical write volume and disk amplification; reduce
+the operating envelope if any component exceeds its budget.
+
+The 16 GiB whole-node retained-log budget takes about 2.3 minutes to transfer
+over an ideal 1 Gbit/s link. The 10-minute catch-up target leaves room for
+protocol overhead and concurrent foreground traffic; qualification must measure
+that contention rather than relying on the ideal calculation.
 
 The provisional 99% time-availability target permits about 7.2 hours of total
 unavailability in 30 days. A 50 GiB transfer over an ideal 1 Gbit/s link alone
