@@ -288,11 +288,23 @@ fn protected_write(path: &Path, bytes: &[u8]) {
     }
 }
 
+fn require_curve_support_or_skip() -> bool {
+    if zmq::has("curve") == Some(true) {
+        return true;
+    }
+    assert_ne!(
+        std::env::var("DAL_REQUIRE_CURVE_TESTS").as_deref(),
+        Ok("1"),
+        "CI requires a libzmq build with CURVE support"
+    );
+    eprintln!("skipping: libzmq has no CURVE support");
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_during_bootstrap_drains_and_reopens_the_data_directory() {
     let root = tempfile::tempdir().unwrap();
-    if zmq::has("curve") != Some(true) {
-        eprintln!("skipping: libzmq has no CURVE support");
+    if !require_curve_support_or_skip() {
         return;
     }
     let (cluster, configs, _controls, _http, data_dirs, _client_curve) = write_cluster(root.path());
@@ -322,8 +334,7 @@ async fn sigterm_during_bootstrap_drains_and_reopens_the_data_directory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigterm_and_sigint_stop_and_restart_a_running_cluster() {
     let root = tempfile::tempdir().unwrap();
-    if zmq::has("curve") != Some(true) {
-        eprintln!("skipping: libzmq has no CURVE support");
+    if !require_curve_support_or_skip() {
         return;
     }
     let (cluster, configs, controls, http, _data_dirs, client_curve) = write_cluster(root.path());

@@ -1,0 +1,82 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (Rust ${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.88.0", "1.98.1"]
+    env:
+      DAL_REQUIRE_CURVE_TESTS: "1"
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake libclang-dev libzmq3-dev libsodium-dev pkg-config
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Compile all targets
+        run: cargo check --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --lib --bin dal -- -D warnings
+      - name: Test all targets
+        run: cargo test --locked --all-targets
+      - name: Test fault-injection feature
+        if: matrix.toolchain == '1.98.1'
+        run: cargo test --locked --all-targets --all-features
+
+  release-artifact:
+    name: Build and inspect release artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake libclang-dev libzmq3-dev libsodium-dev pkg-config
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Install dependency audit tool
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Audit Rust dependencies
+        run: cargo audit
+      - name: Build production binary without failpoints
+        run: cargo build --locked --release --bin dal
+      - name: Record dependency inventory and digest
+        run: |
+          mkdir -p target/release/release-evidence
+          cargo cyclonedx --format json --describe binaries
+          mv dal_bin.cdx.json target/release/release-evidence/dal-linux-x86_64.cdx.json
+          cargo metadata --locked --format-version 1 > target/release/release-evidence/cargo-metadata.json
+          dpkg-query --show libzmq3-dev libsodium-dev libclang-dev cmake > target/release/release-evidence/native-packages.txt
+          ldd target/release/dal > target/release/release-evidence/shared-libraries.txt
+          sha256sum target/release/dal > target/release/release-evidence/SHA256SUMS
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dal-linux-x86_64
+          path: |
+            target/release/dal
+            target/release/release-evidence/
