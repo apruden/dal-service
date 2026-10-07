@@ -14,6 +14,7 @@ use dal::api::client::Client;
 use dal::api::ops::WriteReply;
 use dal::transport::codec::Lane;
 use dal::transport::dealer::ZmqTransport;
+use dal::transport::security::CurveClientConfig;
 
 const CID: u128 = 0xDA1_51A1;
 
@@ -139,6 +140,7 @@ fn write_cluster(
     Vec<String>,
     Vec<String>,
     Vec<PathBuf>,
+    CurveClientConfig,
 ) {
     let addrs = tcp_addrs(9);
     let controls = addrs[0..3].to_vec();
@@ -147,6 +149,8 @@ fn write_cluster(
         .iter()
         .map(|address| address.trim_start_matches("tcp://").to_string())
         .collect();
+    let node_keys: Vec<_> = (0..3).map(|_| zmq::CurveKeyPair::new().unwrap()).collect();
+    let client_keys = zmq::CurveKeyPair::new().unwrap();
     let nodes: Vec<_> = (0..3)
         .map(|index| {
             serde_json::json!({
@@ -172,9 +176,61 @@ fn write_cluster(
 
     let mut configs = Vec::new();
     let mut data_dirs = Vec::new();
+    let policy_path = root.join("trust-policy.json");
+    let mut principals: Vec<_> = node_keys
+        .iter()
+        .enumerate()
+        .map(|(index, keys)| {
+            serde_json::json!({
+                "user_id": format!("node:{}", index + 1),
+                "curve_public_key": zmq::z85_encode(&keys.public_key).unwrap(),
+                "permissions": ["peer_rpc"]
+            })
+        })
+        .collect();
+    principals.push(serde_json::json!({
+        "user_id": "app:lifecycle",
+        "curve_public_key": zmq::z85_encode(&client_keys.public_key).unwrap(),
+        "permissions": ["client_read", "client_write"]
+    }));
+    protected_write(
+        &policy_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "cluster_id": format!("{CID:#x}"), "generation": 1, "principals": principals
+        }))
+        .unwrap(),
+    );
+    let server_pins: serde_json::Map<String, serde_json::Value> = (0..3)
+        .flat_map(|index| {
+            [
+                (controls[index].clone(), index),
+                (bulks[index].clone(), index),
+            ]
+        })
+        .map(|(endpoint, index)| {
+            (
+                endpoint,
+                serde_json::Value::String(format!("node:{}", index + 1)),
+            )
+        })
+        .collect();
     for index in 0..3 {
         let data_dir = root.join(format!("node-{}-data", index + 1));
         let config = root.join(format!("node-{}.json", index + 1));
+        let public_key_path = root.join(format!("node-{}-public.key", index + 1));
+        let secret_key_path = root.join(format!("node-{}-secret.key", index + 1));
+        protected_write(
+            &public_key_path,
+            zmq::z85_encode(&node_keys[index].public_key)
+                .unwrap()
+                .as_bytes(),
+        );
+        protected_write(
+            &secret_key_path,
+            zmq::z85_encode(&node_keys[index].secret_key)
+                .unwrap()
+                .as_bytes(),
+        );
         std::fs::write(
             &config,
             serde_json::to_vec(&serde_json::json!({
@@ -187,6 +243,12 @@ fn write_cluster(
                     (peer != index).then_some(address)
                 }).collect::<Vec<_>>(),
                 "data_dir": data_dir,
+                "security": {
+                    "trust_policy_file": policy_path,
+                    "curve_public_key_file": public_key_path,
+                    "curve_secret_key_file": secret_key_path,
+                    "server_key_pins": server_pins
+                },
                 "timeouts": {
                     "suspect_ms": 3000,
                     "down_ms": 15000,
@@ -200,13 +262,38 @@ fn write_cluster(
         configs.push(config);
         data_dirs.push(data_dir);
     }
-    (cluster, configs, controls, http, data_dirs)
+    let server_keys = controls
+        .iter()
+        .chain(bulks.iter())
+        .enumerate()
+        .map(|(index, addr)| {
+            let node = if index < 3 { index } else { index - 3 };
+            (addr.clone(), node_keys[node].public_key)
+        })
+        .collect();
+    let client_curve =
+        CurveClientConfig::new(client_keys.public_key, client_keys.secret_key, server_keys)
+            .unwrap();
+    (cluster, configs, controls, http, data_dirs, client_curve)
+}
+
+fn protected_write(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_during_bootstrap_drains_and_reopens_the_data_directory() {
     let root = tempfile::tempdir().unwrap();
-    let (cluster, configs, _controls, _http, data_dirs) = write_cluster(root.path());
+    if zmq::has("curve") != Some(true) {
+        eprintln!("skipping: libzmq has no CURVE support");
+        return;
+    }
+    let (cluster, configs, _controls, _http, data_dirs, _client_curve) = write_cluster(root.path());
     let log = root.path().join("bootstrap.log");
 
     for _ in 0..2 {
@@ -233,7 +320,11 @@ async fn sigterm_during_bootstrap_drains_and_reopens_the_data_directory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigterm_and_sigint_stop_and_restart_a_running_cluster() {
     let root = tempfile::tempdir().unwrap();
-    let (cluster, configs, controls, http, _data_dirs) = write_cluster(root.path());
+    if zmq::has("curve") != Some(true) {
+        eprintln!("skipping: libzmq has no CURVE support");
+        return;
+    }
+    let (cluster, configs, controls, http, _data_dirs, client_curve) = write_cluster(root.path());
     let logs: Vec<_> = (0..3)
         .map(|index| root.path().join(format!("node-{}.log", index + 1)))
         .collect();
@@ -248,7 +339,12 @@ async fn sigterm_and_sigint_stop_and_restart_a_running_cluster() {
         CID,
         91,
         controls.clone(),
-        ZmqTransport::new(zmq::Context::new(), Duration::from_secs(2), Lane::Control),
+        ZmqTransport::new_curve(
+            zmq::Context::new(),
+            Duration::from_secs(2),
+            Lane::Control,
+            client_curve,
+        ),
     );
     let version = match client
         .put(b"survives-signal", b"value", None)
@@ -282,9 +378,9 @@ async fn sigterm_and_sigint_stop_and_restart_a_running_cluster() {
     assert!(status.success());
     let failover = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
-            for index in 0..3 {
+            for (index, address) in http.iter().enumerate() {
                 if index != leader
-                    && status_json(&http[index]).await.is_some_and(|status| {
+                    && status_json(address).await.is_some_and(|status| {
                         status
                             .pointer("/meta/is_leader")
                             .and_then(|value| value.as_bool())

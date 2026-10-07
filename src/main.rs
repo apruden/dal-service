@@ -14,7 +14,7 @@ use std::time::Duration;
 use dal::api::ops::RoutingInfo;
 use dal::meta::state_machine::MetaApplyResult;
 use dal::runtime::admin;
-use dal::runtime::config_file::{load_init_descriptor, load_node_config};
+use dal::runtime::config_file::{load_init_descriptor, load_node_config, load_node_security};
 use dal::runtime::node::Node;
 use dal::search::SearchIndexDefinition;
 use dal::transport::raft_wire::SearchIndexAdminBody;
@@ -144,6 +144,13 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let security = match load_node_security(Path::new(config), &node_cfg) {
+        Ok(security) => security,
+        Err(e) => {
+            eprintln!("run: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if node_cfg.cluster_id != desc.cluster_id {
         eprintln!("run: node config and cluster descriptor disagree on cluster_id");
         return ExitCode::FAILURE;
@@ -159,7 +166,7 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
         };
         let shutdown_timeout = node_cfg.timeouts.shutdown;
         let ctx = zmq::Context::new();
-        let mut start = Box::pin(Node::start(ctx, node_cfg, desc));
+        let mut start = Box::pin(Node::start_secure(ctx, node_cfg, desc, security));
         let node = tokio::select! {
             result = &mut start => match result {
                 Ok(node) => node,

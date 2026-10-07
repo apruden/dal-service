@@ -30,7 +30,7 @@ use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
 use crate::meta::node::{MetaNode, MetaRead};
 use crate::partition::node::PartitionNode;
-use crate::runtime::config_file::cluster_id_hex;
+use crate::runtime::config_file::{LoadedNodeSecurity, cluster_id_hex};
 use crate::runtime::directory::fetch_authoritative_directory;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
@@ -42,6 +42,7 @@ use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_net::{AddrBook, RaftPeerFactory};
 use crate::transport::router::ZmqServer;
+use crate::transport::security::{CurveClientConfig, ZapAuthenticator};
 use crate::transport::{
     Transport,
     codec::{Envelope, Lane, MsgType},
@@ -362,6 +363,14 @@ pub struct Node {
     // Dropping these stops the poller threads and closes the sockets.
     _control_srv: Option<ZmqServer>,
     _bulk_srv: Option<ZmqServer>,
+    _zap: Option<Arc<ZapAuthenticator>>,
+}
+
+struct SecureTransport {
+    zap: Arc<ZapAuthenticator>,
+    public_key: [u8; 32],
+    secret_key: [u8; 32],
+    server_keys: std::collections::BTreeMap<String, [u8; 32]>,
 }
 
 impl Node {
@@ -372,6 +381,38 @@ impl Node {
         ctx: zmq::Context,
         cfg: NodeConfig,
         desc: BootstrapDescriptor,
+    ) -> Result<Node> {
+        Self::start_inner(ctx, cfg, desc, None).await
+    }
+
+    /// Start a production node with mandatory CURVE authentication and pinned
+    /// peer keys. ZAP is started before any sockets can bind.
+    pub async fn start_secure(
+        ctx: zmq::Context,
+        cfg: NodeConfig,
+        desc: BootstrapDescriptor,
+        security: LoadedNodeSecurity,
+    ) -> Result<Node> {
+        security.validate_descriptor(&desc, cfg.node_id)?;
+        let zap = Arc::new(ZapAuthenticator::start(
+            ctx.clone(),
+            security.policy,
+            cfg.cluster_id,
+        )?);
+        let secure = SecureTransport {
+            zap,
+            public_key: security.public_key,
+            secret_key: security.secret_key,
+            server_keys: security.server_keys,
+        };
+        Self::start_inner(ctx, cfg, desc, Some(secure)).await
+    }
+
+    async fn start_inner(
+        ctx: zmq::Context,
+        cfg: NodeConfig,
+        desc: BootstrapDescriptor,
+        secure: Option<SecureTransport>,
     ) -> Result<Node> {
         validate_node_descriptor(&cfg, &desc)?;
 
@@ -396,8 +437,23 @@ impl Node {
             cfg.cluster_id,
             cfg.node_id,
         )?);
-        let control = ZmqTransport::new(ctx.clone(), cfg.timeouts.request, Lane::Control);
-        let bulk = ZmqTransport::new(ctx.clone(), cfg.timeouts.request, Lane::Bulk);
+        let make_transport = |lane| -> Result<ZmqTransport> {
+            match &secure {
+                Some(security) => Ok(ZmqTransport::new_curve(
+                    ctx.clone(),
+                    cfg.timeouts.request,
+                    lane,
+                    CurveClientConfig::new(
+                        security.public_key,
+                        security.secret_key,
+                        security.server_keys.clone(),
+                    )?,
+                )),
+                None => Ok(ZmqTransport::new(ctx.clone(), cfg.timeouts.request, lane)),
+            }
+        };
+        let control = make_transport(Lane::Control)?;
+        let bulk = make_transport(Lane::Bulk)?;
         let registration = resolve_registration_binding(&cfg, &desc, &storage, &control).await?;
         let identity_gate = ProcessIdentityGate::default();
         let readiness = RuntimeReadiness::default();
@@ -612,13 +668,33 @@ impl Node {
             .with_identity_gate(identity_gate.clone()),
         );
 
-        let control_srv = ZmqServer::bind(
-            ctx.clone(),
-            &cfg.control_addr,
-            dispatch.clone(),
-            Lane::Control,
-        )?;
-        let bulk_srv = ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone(), Lane::Bulk)?;
+        let (control_srv, bulk_srv) = match &secure {
+            Some(security) => (
+                ZmqServer::bind_curve(
+                    &cfg.control_addr,
+                    dispatch.clone(),
+                    Lane::Control,
+                    security.secret_key,
+                    security.zap.clone(),
+                )?,
+                ZmqServer::bind_curve(
+                    &cfg.bulk_addr,
+                    dispatch.clone(),
+                    Lane::Bulk,
+                    security.secret_key,
+                    security.zap.clone(),
+                )?,
+            ),
+            None => (
+                ZmqServer::bind(
+                    ctx.clone(),
+                    &cfg.control_addr,
+                    dispatch.clone(),
+                    Lane::Control,
+                )?,
+                ZmqServer::bind(ctx.clone(), &cfg.bulk_addr, dispatch.clone(), Lane::Bulk)?,
+            ),
+        };
 
         // Control loops: every node beats to every node it knows, so a node
         // promoted to meta voter later already holds liveness evidence; the
@@ -626,8 +702,34 @@ impl Node {
         // is O(N) frames per node per interval — revisit if clusters outgrow it.
         let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
         let directory_timeout = cfg.timeouts.request;
-        let hb_control = ZmqTransport::new(ctx.clone(), hb_interval, Lane::Control);
+        let hb_control = match &secure {
+            Some(security) => ZmqTransport::new_curve(
+                ctx.clone(),
+                hb_interval,
+                Lane::Control,
+                CurveClientConfig::new(
+                    security.public_key,
+                    security.secret_key,
+                    security.server_keys.clone(),
+                )?,
+            ),
+            None => ZmqTransport::new(ctx.clone(), hb_interval, Lane::Control),
+        };
         let mut tasks = Vec::new();
+        if let Some(security) = &secure {
+            let zap = security.zap.clone();
+            let failure_readiness = readiness.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    if let Err(error) = zap.ensure_healthy() {
+                        eprintln!("CURVE authenticator failed: {error}");
+                        failure_readiness.mark_failed();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }));
+        }
         tasks.push(tokio::spawn(required_background_task(
             "heartbeat emitter",
             readiness.clone(),
@@ -813,6 +915,7 @@ impl Node {
             storage_failure_task: Some(storage_failure_task),
             _control_srv: Some(control_srv),
             _bulk_srv: Some(bulk_srv),
+            _zap: secure.map(|security| security.zap),
         })
     }
 
