@@ -23,6 +23,7 @@ use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
     AbortPlanBody, JoinBody, LeaveBody, SearchIndexAdminBody, SubmitReply,
 };
+use crate::transport::security::CurveClientConfig;
 use crate::types::{ClusterId, GroupId, NodeId};
 
 /// Per-call request timeout for an operator command. Operator commands are
@@ -195,7 +196,33 @@ pub async fn status(
     desc: &BootstrapDescriptor,
     seed: Option<&str>,
 ) -> Result<RoutingInfo> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
+    status_with_transport(
+        ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control),
+        desc,
+        seed,
+    )
+    .await
+}
+
+pub async fn status_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<RoutingInfo> {
+    status_with_transport(
+        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        desc,
+        seed,
+    )
+    .await
+}
+
+async fn status_with_transport(
+    transport: ZmqTransport,
+    desc: &BootstrapDescriptor,
+    seed: Option<&str>,
+) -> Result<RoutingInfo> {
     let contact_ids: Vec<NodeId> = desc.directory.iter().map(|e| e.node_id).collect();
     let targets = Targets::from_descriptor(desc, seed, &contact_ids)
         .discover_live(&transport, desc.cluster_id)
@@ -234,12 +261,27 @@ pub async fn status(
 /// `dal join`: register this node with the cluster it is configured for, using
 /// its own config for identity and its seeds as the contact list.
 pub async fn join(ctx: zmq::Context, cfg: &NodeConfig) -> Result<MetaApplyResult> {
+    join_with_transport(ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control), cfg).await
+}
+
+pub async fn join_secure(
+    ctx: zmq::Context,
+    cfg: &NodeConfig,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    join_with_transport(
+        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        cfg,
+    )
+    .await
+}
+
+async fn join_with_transport(transport: ZmqTransport, cfg: &NodeConfig) -> Result<MetaApplyResult> {
     if cfg.seeds.is_empty() {
         return Err(Error::Config(
             "join needs at least one seed in the node config".into(),
         ));
     }
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
     let targets = Targets {
         candidates: cfg.seeds.clone(),
         directory: HashMap::new(),
@@ -269,7 +311,37 @@ pub async fn leave(
     node_id: NodeId,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
+    leave_with_transport(
+        ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control),
+        desc,
+        node_id,
+        seed,
+    )
+    .await
+}
+
+pub async fn leave_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    node_id: NodeId,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    leave_with_transport(
+        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        desc,
+        node_id,
+        seed,
+    )
+    .await
+}
+
+async fn leave_with_transport(
+    transport: ZmqTransport,
+    desc: &BootstrapDescriptor,
+    node_id: NodeId,
+    seed: Option<&str>,
+) -> Result<MetaApplyResult> {
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;
@@ -293,7 +365,41 @@ pub async fn abort_plan(
     plan_id: u64,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
+    abort_plan_with_transport(
+        ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control),
+        desc,
+        group,
+        plan_id,
+        seed,
+    )
+    .await
+}
+
+pub async fn abort_plan_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    group: GroupId,
+    plan_id: u64,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    abort_plan_with_transport(
+        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        desc,
+        group,
+        plan_id,
+        seed,
+    )
+    .await
+}
+
+async fn abort_plan_with_transport(
+    transport: ZmqTransport,
+    desc: &BootstrapDescriptor,
+    group: GroupId,
+    plan_id: u64,
+    seed: Option<&str>,
+) -> Result<MetaApplyResult> {
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;
@@ -316,7 +422,37 @@ pub async fn search_index_admin(
     command: SearchIndexAdminBody,
     seed: Option<&str>,
 ) -> Result<MetaApplyResult> {
-    let transport = ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control);
+    search_index_admin_with_transport(
+        ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control),
+        desc,
+        command,
+        seed,
+    )
+    .await
+}
+
+pub async fn search_index_admin_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    command: SearchIndexAdminBody,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    search_index_admin_with_transport(
+        ZmqTransport::new_curve(ctx, ADMIN_TIMEOUT, Lane::Control, curve),
+        desc,
+        command,
+        seed,
+    )
+    .await
+}
+
+async fn search_index_admin_with_transport(
+    transport: ZmqTransport,
+    desc: &BootstrapDescriptor,
+    command: SearchIndexAdminBody,
+    seed: Option<&str>,
+) -> Result<MetaApplyResult> {
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
         .discover_live(&transport, desc.cluster_id)
         .await;

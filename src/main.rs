@@ -14,10 +14,13 @@ use std::time::Duration;
 use dal::api::ops::RoutingInfo;
 use dal::meta::state_machine::MetaApplyResult;
 use dal::runtime::admin;
-use dal::runtime::config_file::{load_init_descriptor, load_node_config, load_node_security};
+use dal::runtime::config_file::{
+    LoadedNodeSecurity, load_init_descriptor, load_node_config, load_node_security,
+};
 use dal::runtime::node::Node;
 use dal::search::SearchIndexDefinition;
 use dal::transport::raft_wire::SearchIndexAdminBody;
+use dal::transport::security::CurveClientConfig;
 use dal::types::GroupId;
 
 fn usage() -> &'static str {
@@ -26,12 +29,12 @@ fn usage() -> &'static str {
      commands:\n\
        run         --config <node.json> --cluster <init.json>   run a node (drives genesis)\n\
        join        --config <node.json>                         register this node with its cluster\n\
-       leave       --cluster <init.json> --node <id> [--seed <addr>]   gracefully drain a node\n\
-       abort-plan  --cluster <init.json> --group <meta|N> --plan <id> [--seed <addr>]   abort a stuck plan\n\
-       index-create  --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
-       index-rebuild --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
-       index-drop    --cluster <init.json> --name <name> [--seed <addr>]\n\
-       status      --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n"
+       leave       --config <node.json> --cluster <init.json> --node <id> [--seed <addr>]   gracefully drain a node\n\
+       abort-plan  --config <node.json> --cluster <init.json> --group <meta|N> --plan <id> [--seed <addr>]   abort a stuck plan\n\
+       index-create  --config <node.json> --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
+       index-rebuild --config <node.json> --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
+       index-drop    --config <node.json> --cluster <init.json> --name <name> [--seed <addr>]\n\
+       status      --config <node.json> --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -64,20 +67,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        "leave" => match (flag(rest, "--cluster"), flag(rest, "--node")) {
-            (Some(cluster), Some(node)) => leave(cluster, node, flag(rest, "--seed")),
+        "leave" => match (
+            flag(rest, "--config"),
+            flag(rest, "--cluster"),
+            flag(rest, "--node"),
+        ) {
+            (Some(config), Some(cluster), Some(node)) => {
+                leave(config, cluster, node, flag(rest, "--seed"))
+            }
             _ => {
                 eprintln!("leave: --cluster <init.json> and --node <id> required");
                 ExitCode::FAILURE
             }
         },
         "abort-plan" => match (
+            flag(rest, "--config"),
             flag(rest, "--cluster"),
             flag(rest, "--group"),
             flag(rest, "--plan"),
         ) {
-            (Some(cluster), Some(group), Some(plan)) => {
-                abort_plan(cluster, group, plan, flag(rest, "--seed"))
+            (Some(config), Some(cluster), Some(group), Some(plan)) => {
+                abort_plan(config, cluster, group, plan, flag(rest, "--seed"))
             }
             _ => {
                 eprintln!(
@@ -87,17 +97,21 @@ fn main() -> ExitCode {
             }
         },
         "index-create" | "index-rebuild" => match (
+            flag(rest, "--config"),
             flag(rest, "--cluster"),
             flag(rest, "--name"),
             flag(rest, "--definition"),
         ) {
-            (Some(cluster), Some(name), Some(definition)) => search_index_definition_command(
-                command,
-                cluster,
-                name,
-                definition,
-                flag(rest, "--seed"),
-            ),
+            (Some(config), Some(cluster), Some(name), Some(definition)) => {
+                search_index_definition_command(
+                    command,
+                    config,
+                    cluster,
+                    name,
+                    definition,
+                    flag(rest, "--seed"),
+                )
+            }
             _ => {
                 eprintln!(
                     "{command}: --cluster <init.json>, --name <name>, and --definition <json> required"
@@ -105,17 +119,23 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        "index-drop" => match (flag(rest, "--cluster"), flag(rest, "--name")) {
-            (Some(cluster), Some(name)) => search_index_drop(cluster, name, flag(rest, "--seed")),
+        "index-drop" => match (
+            flag(rest, "--config"),
+            flag(rest, "--cluster"),
+            flag(rest, "--name"),
+        ) {
+            (Some(config), Some(cluster), Some(name)) => {
+                search_index_drop(config, cluster, name, flag(rest, "--seed"))
+            }
             _ => {
                 eprintln!("index-drop: --cluster <init.json> and --name <name> required");
                 ExitCode::FAILURE
             }
         },
-        "status" => match flag(rest, "--cluster") {
-            Some(cluster) => status(cluster, flag(rest, "--seed")),
-            None => {
-                eprintln!("status: --cluster <init.json> required");
+        "status" => match (flag(rest, "--config"), flag(rest, "--cluster")) {
+            (Some(config), Some(cluster)) => status(config, cluster, flag(rest, "--seed")),
+            _ => {
+                eprintln!("status: --config <node.json> and --cluster <init.json> required");
                 ExitCode::FAILURE
             }
         },
@@ -286,10 +306,29 @@ fn join(config: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    with_runtime(async move { report("join", admin::join(zmq::Context::new(), &cfg).await) })
+    let security = match load_node_security(Path::new(config), &cfg) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("join: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let curve = match curve_client_config(security) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("join: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    with_runtime(async move {
+        report(
+            "join",
+            admin::join_secure(zmq::Context::new(), &cfg, curve).await,
+        )
+    })
 }
 
-fn leave(cluster: &str, node: &str, seed: Option<&str>) -> ExitCode {
+fn leave(config: &str, cluster: &str, node: &str, seed: Option<&str>) -> ExitCode {
     let desc = match load_init_descriptor(Path::new(cluster)) {
         Ok(d) => d,
         Err(e) => {
@@ -301,16 +340,29 @@ fn leave(cluster: &str, node: &str, seed: Option<&str>) -> ExitCode {
         eprintln!("leave: --node must be a node id (u64)");
         return ExitCode::FAILURE;
     };
+    let curve = match load_cli_curve(config, &desc) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("leave: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let seed = seed.map(str::to_string);
     with_runtime(async move {
         report(
             "leave",
-            admin::leave(zmq::Context::new(), &desc, node_id, seed.as_deref()).await,
+            admin::leave_secure(zmq::Context::new(), &desc, node_id, seed.as_deref(), curve).await,
         )
     })
 }
 
-fn abort_plan(cluster: &str, group: &str, plan: &str, seed: Option<&str>) -> ExitCode {
+fn abort_plan(
+    config: &str,
+    cluster: &str,
+    group: &str,
+    plan: &str,
+    seed: Option<&str>,
+) -> ExitCode {
     let desc = match load_init_descriptor(Path::new(cluster)) {
         Ok(d) => d,
         Err(e) => {
@@ -329,17 +381,33 @@ fn abort_plan(cluster: &str, group: &str, plan: &str, seed: Option<&str>) -> Exi
         eprintln!("abort-plan: --plan must be a plan id (u64)");
         return ExitCode::FAILURE;
     };
+    let curve = match load_cli_curve(config, &desc) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("abort-plan: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let seed = seed.map(str::to_string);
     with_runtime(async move {
         report(
             "abort-plan",
-            admin::abort_plan(zmq::Context::new(), &desc, group, plan_id, seed.as_deref()).await,
+            admin::abort_plan_secure(
+                zmq::Context::new(),
+                &desc,
+                group,
+                plan_id,
+                seed.as_deref(),
+                curve,
+            )
+            .await,
         )
     })
 }
 
 fn search_index_definition_command(
     command: &str,
+    config: &str,
     cluster: &str,
     name: &str,
     definition_path: &str,
@@ -378,17 +446,31 @@ fn search_index_definition_command(
             definition,
         }
     };
+    let curve = match load_cli_curve(config, &desc) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("{command}: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let label = command.to_string();
     let seed = seed.map(str::to_string);
     with_runtime(async move {
         report(
             &label,
-            admin::search_index_admin(zmq::Context::new(), &desc, body, seed.as_deref()).await,
+            admin::search_index_admin_secure(
+                zmq::Context::new(),
+                &desc,
+                body,
+                seed.as_deref(),
+                curve,
+            )
+            .await,
         )
     })
 }
 
-fn search_index_drop(cluster: &str, name: &str, seed: Option<&str>) -> ExitCode {
+fn search_index_drop(config: &str, cluster: &str, name: &str, seed: Option<&str>) -> ExitCode {
     let desc = match load_init_descriptor(Path::new(cluster)) {
         Ok(d) => d,
         Err(e) => {
@@ -403,16 +485,30 @@ fn search_index_drop(cluster: &str, name: &str, seed: Option<&str>) -> ExitCode 
     let body = SearchIndexAdminBody::Drop {
         name: name.to_string(),
     };
+    let curve = match load_cli_curve(config, &desc) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("index-drop: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let seed = seed.map(str::to_string);
     with_runtime(async move {
         report(
             "index-drop",
-            admin::search_index_admin(zmq::Context::new(), &desc, body, seed.as_deref()).await,
+            admin::search_index_admin_secure(
+                zmq::Context::new(),
+                &desc,
+                body,
+                seed.as_deref(),
+                curve,
+            )
+            .await,
         )
     })
 }
 
-fn status(cluster: &str, seed: Option<&str>) -> ExitCode {
+fn status(config: &str, cluster: &str, seed: Option<&str>) -> ExitCode {
     let desc = match load_init_descriptor(Path::new(cluster)) {
         Ok(d) => d,
         Err(e) => {
@@ -420,9 +516,16 @@ fn status(cluster: &str, seed: Option<&str>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let curve = match load_cli_curve(config, &desc) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("status: security: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let seed = seed.map(str::to_string);
     with_runtime(async move {
-        match admin::status(zmq::Context::new(), &desc, seed.as_deref()).await {
+        match admin::status_secure(zmq::Context::new(), &desc, seed.as_deref(), curve).await {
             Ok(info) => {
                 print_routing(&info);
                 ExitCode::SUCCESS
@@ -433,6 +536,30 @@ fn status(cluster: &str, seed: Option<&str>) -> ExitCode {
             }
         }
     })
+}
+
+fn load_cli_curve(
+    config: &str,
+    desc: &dal::meta::bootstrap::BootstrapDescriptor,
+) -> Result<CurveClientConfig, String> {
+    let node_config = load_node_config(Path::new(config)).map_err(|error| error.to_string())?;
+    if node_config.cluster_id != desc.cluster_id {
+        return Err("operator config and cluster descriptor disagree on cluster_id".into());
+    }
+    let security =
+        load_node_security(Path::new(config), &node_config).map_err(|error| error.to_string())?;
+    security
+        .validate_descriptor(desc, node_config.node_id)
+        .map_err(|error| error.to_string())?;
+    curve_client_config(security).map_err(|error| error.to_string())
+}
+
+fn curve_client_config(security: LoadedNodeSecurity) -> dal::error::Result<CurveClientConfig> {
+    CurveClientConfig::new(
+        security.public_key,
+        security.secret_key,
+        security.server_keys,
+    )
 }
 
 /// A partition group is `meta` or a partition number.
