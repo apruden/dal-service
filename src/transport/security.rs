@@ -137,6 +137,9 @@ fn is_z85_public_key(key: &str) -> bool {
 
 /// Owns the ZeroMQ Authentication Protocol handler for one ZeroMQ context.
 /// libzmq consults this REP socket for CURVE connections in this context.
+/// Keep it alive until every CURVE server socket in the context is closed;
+/// libzmq builds without ZAP domain enforcement may admit clients if this
+/// endpoint is removed while those servers remain active.
 pub struct ZapAuthenticator {
     running: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
@@ -187,18 +190,20 @@ impl ZapAuthenticator {
                                         &worker_running,
                                         &worker_failure,
                                         format!("ZAP receive failed: {error}"),
+                                        None,
                                     );
                                 }
                                 break;
                             }
                         };
                         let response = zap_response(&request, &worker_domain, &policy);
-                        if let Err(error) = send_zap_response(&socket, &response) {
+                        if let Err(error) = send_zap_response(&socket, &response, &worker_running) {
                             fail_closed_until_stopped(
                                 &socket,
                                 &worker_running,
                                 &worker_failure,
                                 format!("ZAP reply failed: {error}"),
+                                Some(&response),
                             );
                             break;
                         }
@@ -210,6 +215,7 @@ impl ZapAuthenticator {
                         &worker_running,
                         &worker_failure,
                         "ZAP worker panicked".into(),
+                        None,
                     );
                 }
             })
@@ -259,17 +265,58 @@ fn fail_closed_until_stopped(
     running: &AtomicBool,
     failure: &Mutex<Option<String>>,
     reason: String,
+    pending_response: Option<&[Vec<u8>]>,
 ) {
     *failure.lock().unwrap() = Some(reason);
+    if let Some(response) = pending_response
+        && !send_until_stopped(socket, response, running)
+    {
+        return;
+    }
     while running.load(Ordering::Acquire) {
-        // Borrowing the socket here pins its lifetime: unanswered ZAP requests
-        // stall instead of reaching a context where the handler is absent.
-        let _ = socket.get_socket_type();
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        match socket.recv_multipart(0) {
+            Ok(request) => {
+                let denial = zap_denial(&request);
+                if !send_until_stopped(socket, &denial, running) {
+                    return;
+                }
+            }
+            Err(zmq::Error::EAGAIN | zmq::Error::EINTR) => {}
+            // A terminating context is already taking all its sockets down;
+            // return so context destruction cannot deadlock on this worker.
+            Err(zmq::Error::ETERM) => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
     }
 }
 
-fn send_zap_response(socket: &zmq::Socket, response: &[Vec<u8>]) -> zmq::Result<()> {
+fn send_until_stopped(socket: &zmq::Socket, response: &[Vec<u8>], running: &AtomicBool) -> bool {
+    while running.load(Ordering::Acquire) {
+        match send_zap_response(socket, response, running) {
+            Ok(()) => return true,
+            Err(zmq::Error::ETERM) => return false,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    false
+}
+
+fn zap_denial(request: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    vec![
+        request.first().cloned().unwrap_or_default(),
+        request.get(1).cloned().unwrap_or_default(),
+        b"400".to_vec(),
+        b"DENIED".to_vec(),
+        Vec::new(),
+        Vec::new(),
+    ]
+}
+
+fn send_zap_response(
+    socket: &zmq::Socket,
+    response: &[Vec<u8>],
+    running: &AtomicBool,
+) -> zmq::Result<()> {
     for (index, frame) in response.iter().enumerate() {
         let flags = if index + 1 < response.len() {
             zmq::SNDMORE
@@ -278,7 +325,13 @@ fn send_zap_response(socket: &zmq::Socket, response: &[Vec<u8>]) -> zmq::Result<
         };
         loop {
             match socket.send(frame, flags) {
-                Err(zmq::Error::EINTR) => continue,
+                Err(zmq::Error::EINTR | zmq::Error::EAGAIN) => {
+                    if !running.load(Ordering::Acquire) {
+                        return Err(zmq::Error::ETERM);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
                 result => {
                     result?;
                     break;
@@ -457,6 +510,8 @@ mod tests {
         let ctx = zmq::Context::new();
         let endpoint = "inproc://dal-zap-fail-closed-test";
         let socket = ctx.socket(zmq::REP).unwrap();
+        socket.set_rcvtimeo(100).unwrap();
+        socket.set_sndtimeo(100).unwrap();
         socket.bind(endpoint).unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = running.clone();
@@ -468,9 +523,28 @@ mod tests {
                 &worker_running,
                 &worker_failure,
                 "injected failure".into(),
+                None,
             );
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let client = ctx.socket(zmq::REQ).unwrap();
+        client.set_rcvtimeo(1_000).unwrap();
+        client.connect(endpoint).unwrap();
+        client
+            .send_multipart(
+                [
+                    b"1.0".as_slice(),
+                    b"42",
+                    b"domain",
+                    b"127.0.0.1",
+                    b"id",
+                    b"CURVE",
+                    b"credential",
+                ],
+                0,
+            )
+            .unwrap();
+        let denial = client.recv_multipart(0).unwrap();
+        assert_eq!(denial[2], b"400");
         let probe = ctx.socket(zmq::REP).unwrap();
         assert!(probe.bind(endpoint).is_err());
         running.store(false, Ordering::Release);
