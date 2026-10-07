@@ -69,7 +69,10 @@ service logs and temporary files.
 Phase 6 adds a node-wide rebuild coordinator and disk preflight. An existing
 quarantine blocks silent replacement and raises an operator alert; the runbook
 archives or removes it before another quarantine for that index. Restore rebuilds
-run through the same coordinator. Keep at least 40% (about 1.2 TiB) free
+run through the same coordinator. The 50 GiB rebuild allocation remains reserved
+after activation until the retiring generation is fully reclaimed; another
+rebuild cannot begin while either the building or retiring generation owns it.
+Keep at least 40% (about 1.2 TiB) free
 throughout qualification. Measure actual projection, quarantine, and rebuild
 size rather than assuming each equals source size, plus physical write volume
 and disk amplification. Admission refuses a generation that cannot fit its

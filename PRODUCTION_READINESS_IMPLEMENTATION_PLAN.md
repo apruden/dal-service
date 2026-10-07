@@ -711,8 +711,10 @@ online backups to meet the recovery objective.
   quarantine bounds. Never silently delete an existing quarantine to make room:
   stop that index, alert, and require the documented archive/removal procedure.
   Include active, building, retiring, and quarantined generations in disk and
-  writer-memory accounting. Serialize restore rebuilds through the same path and
-  prove the complete rebuild fits the restore-time objective.
+  writer-memory accounting. Hold the single rebuild reservation through retiring
+  generation reclamation, so activation cannot admit a second rebuild against
+  space still owned by the first. Serialize restore rebuilds through the same
+  path and prove the complete rebuild fits the restore-time objective.
 - Provide an initial Linux service unit running as a dedicated unprivileged
   user, persistent data directories, protected secret paths, SIGTERM handling,
   and the validated termination grace period. Start peers without inter-node
