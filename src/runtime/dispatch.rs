@@ -878,10 +878,41 @@ impl Server for RootDispatch {
                     };
                 }
             }
-            self.serve_control(request, context).await
+            let operation = request.msg_type;
+            let principal = context.authenticated_user_id.clone();
+            let reply = self.serve_control(request, context).await;
+            if matches!(
+                operation,
+                MsgType::JoinRequest
+                    | MsgType::LeaveRequest
+                    | MsgType::AbortPlanRequest
+                    | MsgType::SearchIndexAdmin
+            ) {
+                tracing::info!(
+                    principal = principal.as_deref().unwrap_or("unknown"),
+                    operation = ?operation,
+                    result = audit_result(&reply),
+                    "authenticated admin request completed"
+                );
+            }
+            reply
         } else {
             self.gateway.serve_with_context(request, context).await
         }
+    }
+}
+
+fn audit_result(reply: &Envelope) -> &'static str {
+    match codec::decode::<SubmitReply>(&reply.payload) {
+        Ok(SubmitReply::Outcome(crate::meta::state_machine::MetaApplyResult::Applied)) => "applied",
+        Ok(SubmitReply::Outcome(crate::meta::state_machine::MetaApplyResult::NoOp)) => "no_op",
+        Ok(SubmitReply::Outcome(crate::meta::state_machine::MetaApplyResult::Rejected(_))) => {
+            "rejected"
+        }
+        Ok(SubmitReply::JoinPreflightReady) => "preflight_ready",
+        Ok(SubmitReply::NotLeader { .. }) => "redirected",
+        Ok(SubmitReply::Error(_)) => "error",
+        Err(_) => "unavailable",
     }
 }
 
@@ -913,6 +944,18 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn admin_audit_result_uses_only_coarse_outcomes() {
+        let reply = Envelope::new(
+            7,
+            MsgType::JoinRequest,
+            GroupId::Meta,
+            1,
+            codec::encode(&SubmitReply::Error("sensitive request detail".into())),
+        );
+        assert_eq!(audit_result(&reply), "error");
     }
 
     #[tokio::test]
