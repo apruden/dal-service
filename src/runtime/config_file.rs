@@ -91,6 +91,8 @@ struct NodeFile {
 #[serde(deny_unknown_fields)]
 struct NodeSecurityFile {
     trust_policy_file: PathBuf,
+    /// Absolute, durable marker kept outside data_dir/backups.
+    trust_generation_file: PathBuf,
     curve_public_key_file: PathBuf,
     curve_secret_key_file: PathBuf,
     /// Endpoint to trusted policy principal. Endpoints are provisioned out of
@@ -103,6 +105,8 @@ struct NodeSecurityFile {
 struct OperatorSecurityFile {
     cluster_id: String,
     trust_policy_file: PathBuf,
+    /// Absolute, durable marker kept outside data backups.
+    trust_generation_file: PathBuf,
     user_id: String,
     curve_public_key_file: PathBuf,
     curve_secret_key_file: PathBuf,
@@ -180,6 +184,7 @@ pub fn load_operator_security(
             "trust policy cluster_id does not match target cluster".into(),
         ));
     }
+    ensure_policy_generation(&resolve(file.trust_generation_file), policy.generation())?;
     let public_key = load_curve_key(&resolve(file.curve_public_key_file))?;
     let secret_key = load_curve_key(&resolve(file.curve_secret_key_file))?;
     let encoded = zmq::z85_encode(&public_key)
@@ -226,6 +231,105 @@ pub fn load_operator_security(
         server_keys,
         server_key_principals,
     })
+}
+
+/// Persist the highest trust-policy generation observed by this deployment
+/// outside the database directory. The lock and atomic replace prevent two
+/// concurrent starts from racing a newer generation back to an older one.
+fn ensure_policy_generation(path: &Path, generation: u64) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(Error::Config(
+            "trust_generation_file must be an absolute path outside data backups".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Config("trust_generation_file has no parent directory".into()))?;
+    if !parent.is_dir() {
+        return Err(Error::Config(format!(
+            "trust generation directory {} must already exist",
+            parent.display()
+        )));
+    }
+    let lock_path = path.with_extension("lock");
+    let lock = open_private_file(&lock_path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        // POSIX LOCK_EX; lock is released when the descriptor is dropped.
+        if unsafe { flock(lock.as_raw_fd(), 2) } != 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+    }
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(Error::Config(
+                    "trust_generation_file must be a regular file".into(),
+                ));
+            }
+            validate_private_mode(path, &metadata)?;
+            let value = std::fs::read_to_string(path)?;
+            value.trim().parse::<u64>().map_err(|error| {
+                Error::Config(format!("trust generation marker is invalid: {error}"))
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if current > generation {
+        return Err(Error::Config(format!(
+            "trust policy generation {generation} is older than the persisted generation {current}"
+        )));
+    }
+    if generation > current {
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = open_private_file(&temporary, false)?;
+        use std::io::Write;
+        writeln!(file, "{generation}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    drop(lock);
+    Ok(())
+}
+
+fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if create {
+        options.create(true);
+    } else {
+        options.create_new(true);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    validate_private_mode(path, &metadata)?;
+    Ok(file)
+}
+
+fn validate_private_mode(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Config(format!(
+                "{} must not be accessible by group or other users",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl LoadedNodeSecurity {
@@ -306,6 +410,14 @@ pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSec
             "trust policy cluster_id does not match node cluster_id".into(),
         ));
     }
+    if !security.trust_generation_file.is_absolute()
+        || (cfg.data_dir.is_absolute() && security.trust_generation_file.starts_with(&cfg.data_dir))
+    {
+        return Err(Error::Config(
+            "security.trust_generation_file must be an absolute path outside data_dir and its backups".into(),
+        ));
+    }
+    ensure_policy_generation(&security.trust_generation_file, policy.generation())?;
     let public_key = load_curve_key(&resolve(security.curve_public_key_file))?;
     let secret_key = load_curve_key(&resolve(security.curve_secret_key_file))?;
     let encoded_public_key = zmq::z85_encode(&public_key)
@@ -547,6 +659,7 @@ mod tests {
         .unwrap();
         let node_public_path = dir.path().join("node-public.key");
         let node_secret_path = dir.path().join("node-secret.key");
+        let generation_path = dir.path().join("node-policy-generation");
         std::fs::write(&node_public_path, &node_public).unwrap();
         std::fs::write(&node_secret_path, &node_public).unwrap();
         #[cfg(unix)]
@@ -558,8 +671,9 @@ mod tests {
         std::fs::write(
             &node_config,
             format!(
-                r#"{{"cluster_id":"7","node_id":2,"control_addr":"tcp://127.0.0.1:5001","bulk_addr":"tcp://127.0.0.1:5002","seeds":["tcp://127.0.0.1:5003"],"data_dir":"/tmp/dal-node-2","security":{{"trust_policy_file":"{}","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5003":"node:3","tcp://127.0.0.1:5004":"node:3"}}}}}}"#,
+                r#"{{"cluster_id":"7","node_id":2,"control_addr":"tcp://127.0.0.1:5001","bulk_addr":"tcp://127.0.0.1:5002","seeds":["tcp://127.0.0.1:5003"],"data_dir":"/tmp/dal-node-2","security":{{"trust_policy_file":"{}","trust_generation_file":"{}","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5003":"node:3","tcp://127.0.0.1:5004":"node:3"}}}}}}"#,
                 policy_path.display(),
+                generation_path.display(),
                 node_public_path.display(),
                 node_secret_path.display(),
             ),
@@ -616,6 +730,7 @@ mod tests {
         )).unwrap();
         let public_path = dir.path().join("operator-public.key");
         let secret_path = dir.path().join("operator-secret.key");
+        let generation_path = dir.path().join("operator-policy-generation");
         std::fs::write(&public_path, &operator_public).unwrap();
         std::fs::write(&secret_path, &operator_public).unwrap();
         #[cfg(unix)]
@@ -625,13 +740,38 @@ mod tests {
         }
         let auth_path = dir.path().join("operator.json");
         std::fs::write(&auth_path, format!(
-            r#"{{"cluster_id":"7","trust_policy_file":"{}","user_id":"ops:deploy","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5101":"node:1"}}}}"#,
-            policy_path.display(), public_path.display(), secret_path.display()
+            r#"{{"cluster_id":"7","trust_policy_file":"{}","trust_generation_file":"{}","user_id":"ops:deploy","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5101":"node:1"}}}}"#,
+            policy_path.display(), generation_path.display(), public_path.display(), secret_path.display()
         )).unwrap();
         let loaded = load_operator_security(&auth_path, 7).unwrap();
         assert_eq!(loaded.user_id, "ops:deploy");
         assert_eq!(loaded.server_keys.len(), 1);
         assert!(load_operator_security(&auth_path, 8).is_err());
+    }
+
+    #[test]
+    fn trust_policy_generation_marker_rejects_rollback_and_advances_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("trust-generation");
+        ensure_policy_generation(&marker, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "2");
+        assert!(ensure_policy_generation(&marker, 1).is_err());
+        ensure_policy_generation(&marker, 3).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "3");
+        let older_marker = dir.path().join("concurrent-generation");
+        let path_a = older_marker.clone();
+        let path_b = older_marker.clone();
+        let a = std::thread::spawn(move || ensure_policy_generation(&path_a, 4));
+        let b = std::thread::spawn(move || ensure_policy_generation(&path_b, 5));
+        let _ = a.join().unwrap();
+        let _ = b.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&older_marker).unwrap().trim(), "5");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(ensure_policy_generation(&marker, 4).is_err());
+        }
     }
 
     #[test]

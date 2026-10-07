@@ -40,6 +40,10 @@ Use a unique CURVE key for each principal. Every `node:<id>` must have
 `peer_rpc`; operators need `operator`; application permissions are granted
 individually. A key with no permission is rejected. The generation must be
 nonzero and cluster IDs must match the node and descriptor.
+Create the generation-marker directory before starting the service. Keep its
+marker and lock files outside the database directory and every backup/restore
+set; protect that directory from deletion by the service account or restore
+automation. Startup atomically advances the marker and rejects an older policy.
 
 ## Node config
 
@@ -58,6 +62,7 @@ seeds. The principal name in each pin must match the node that owns the address.
   "seeds": ["tcp://10.0.0.12:7001"],
   "security": {
     "trust_policy_file": "trust-policy.json",
+    "trust_generation_file": "/var/lib/dal-security/node-1-generation",
     "curve_public_key_file": "node-1-public.key",
     "curve_secret_key_file": "node-1-secret.key",
     "server_key_pins": {
@@ -86,6 +91,7 @@ control and bulk endpoint in the cluster descriptor to its `node:<id>`.
 {
   "cluster_id": "0x1234",
   "trust_policy_file": "trust-policy.json",
+  "trust_generation_file": "/var/lib/dal-security/operator-generation",
   "user_id": "ops:production",
   "curve_public_key_file": "operator-public.key",
   "curve_secret_key_file": "operator-secret.key",

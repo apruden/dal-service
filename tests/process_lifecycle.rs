@@ -219,6 +219,7 @@ fn write_cluster(
         let config = root.join(format!("node-{}.json", index + 1));
         let public_key_path = root.join(format!("node-{}-public.key", index + 1));
         let secret_key_path = root.join(format!("node-{}-secret.key", index + 1));
+        let generation_path = root.join(format!("node-{}-trust-generation", index + 1));
         protected_write(
             &public_key_path,
             zmq::z85_encode(&node_keys[index].public_key)
@@ -245,6 +246,7 @@ fn write_cluster(
                 "data_dir": data_dir,
                 "security": {
                     "trust_policy_file": policy_path,
+                    "trust_generation_file": generation_path,
                     "curve_public_key_file": public_key_path,
                     "curve_secret_key_file": secret_key_path,
                     "server_key_pins": server_pins
