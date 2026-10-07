@@ -19,6 +19,8 @@ pub enum Permission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub user_id: String,
+    /// Z85-encoded CURVE public key (40 ASCII bytes), provisioned out of band.
+    pub curve_public_key: String,
     pub permissions: Vec<Permission>,
 }
 
@@ -29,6 +31,7 @@ pub struct TrustPolicy {
     cluster_id: u128,
     generation: u64,
     principals: BTreeMap<String, Principal>,
+    curve_keys: BTreeMap<String, String>,
 }
 
 impl TrustPolicy {
@@ -40,7 +43,11 @@ impl TrustPolicy {
         if generation == 0 {
             return Err("trust policy generation must be non-zero".into());
         }
+        if principals.len() > 100_000 {
+            return Err("trust policy exceeds the 100000 principal cluster limit".into());
+        }
         let mut indexed = BTreeMap::new();
+        let mut curve_keys = BTreeMap::new();
         for principal in principals {
             if principal.user_id.is_empty() || principal.user_id.len() > 255 {
                 return Err("principal user_id must be 1..=255 bytes".into());
@@ -50,6 +57,21 @@ impl TrustPolicy {
                     "principal {} has no permissions",
                     principal.user_id
                 ));
+            }
+            if principal.curve_public_key.len() != 40 || !principal.curve_public_key.is_ascii() {
+                return Err(format!(
+                    "principal {} CURVE public key must be 40 ASCII bytes",
+                    principal.user_id
+                ));
+            }
+            if curve_keys
+                .insert(
+                    principal.curve_public_key.clone(),
+                    principal.user_id.clone(),
+                )
+                .is_some()
+            {
+                return Err("duplicate CURVE public key".into());
             }
             if indexed
                 .insert(principal.user_id.clone(), principal)
@@ -62,6 +84,7 @@ impl TrustPolicy {
             cluster_id,
             generation,
             principals: indexed,
+            curve_keys,
         })
     }
 
@@ -80,10 +103,17 @@ impl TrustPolicy {
             .filter(|p| p.permissions.contains(&permission))
     }
 
-    /// ZAP admission is scoped to the expected cluster; callers should also
-    /// compare the presented CURVE key against their configured key binding.
+    /// Check whether a ZAP identity is present. This does not validate the
+    /// cluster ID; callers must compare [`Self::cluster_id`] with local config.
     pub fn admits(&self, user_id: &str) -> bool {
         self.principals.contains_key(user_id)
+    }
+
+    /// Resolve the trusted principal bound to a presented CURVE public key.
+    pub fn principal_for_curve_key(&self, key: &str) -> Option<&Principal> {
+        self.curve_keys
+            .get(key)
+            .and_then(|user_id| self.principals.get(user_id))
     }
 }
 
@@ -97,6 +127,7 @@ mod tests {
             1,
             vec![Principal {
                 user_id: "app:orders".into(),
+                curve_public_key: "A".repeat(40),
                 permissions: vec![Permission::ClientRead, Permission::ClientWrite],
             }],
         )
@@ -107,6 +138,13 @@ mod tests {
     fn policy_denies_unknown_principals_and_unlisted_permissions() {
         let policy = policy();
         assert!(policy.admits("app:orders"));
+        assert_eq!(
+            policy
+                .principal_for_curve_key(&"A".repeat(40))
+                .unwrap()
+                .user_id,
+            "app:orders"
+        );
         assert!(!policy.admits("node:2"));
         assert!(
             policy
@@ -127,19 +165,33 @@ mod tests {
         assert!(TrustPolicy::new(7, 0, vec![]).is_err());
         let p = Principal {
             user_id: "same".into(),
+            curve_public_key: "A".repeat(40),
             permissions: vec![Permission::ClientRead],
         };
-        assert!(TrustPolicy::new(7, 1, vec![p.clone(), p]).is_err());
+        assert!(TrustPolicy::new(7, 1, vec![p.clone(), p.clone()]).is_err());
         assert!(
             TrustPolicy::new(
                 7,
                 1,
                 vec![Principal {
                     user_id: "empty".into(),
+                    curve_public_key: "B".repeat(40),
                     permissions: vec![]
                 }]
             )
             .is_err()
         );
+        let duplicate_key = Principal {
+            user_id: "other".into(),
+            curve_public_key: "A".repeat(40),
+            permissions: vec![Permission::ClientRead],
+        };
+        assert!(TrustPolicy::new(7, 1, vec![p.clone(), duplicate_key]).is_err());
+        let malformed_key = Principal {
+            user_id: "bad-key".into(),
+            curve_public_key: "short".into(),
+            permissions: vec![Permission::ClientRead],
+        };
+        assert!(TrustPolicy::new(7, 1, vec![malformed_key]).is_err());
     }
 }
