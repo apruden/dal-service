@@ -126,6 +126,12 @@ pub struct LoadedNodeSecurity {
     server_key_principals: BTreeMap<String, String>,
 }
 
+impl LoadedNodeSecurity {
+    pub fn server_key_principals(&self) -> &BTreeMap<String, String> {
+        &self.server_key_principals
+    }
+}
+
 /// Operator credentials and out-of-band node pins loaded from a dedicated
 /// operator auth file. This deliberately contains no node service identity.
 pub struct LoadedOperatorSecurity {

@@ -372,6 +372,7 @@ struct SecureTransport {
     public_key: [u8; 32],
     secret_key: [u8; 32],
     server_keys: std::collections::BTreeMap<String, [u8; 32]>,
+    server_key_principals: std::collections::BTreeMap<String, String>,
 }
 
 impl Node {
@@ -396,6 +397,7 @@ impl Node {
     ) -> Result<Node> {
         security.validate_descriptor(&desc, cfg.node_id)?;
         let policy = security.policy.clone();
+        let server_key_principals = security.server_key_principals().clone();
         let zap = Arc::new(ZapAuthenticator::start(
             ctx.clone(),
             security.policy,
@@ -407,6 +409,7 @@ impl Node {
             public_key: security.public_key,
             secret_key: security.secret_key,
             server_keys: security.server_keys,
+            server_key_principals,
         };
         Self::start_inner(ctx, cfg, desc, Some(secure)).await
     }
@@ -672,7 +675,9 @@ impl Node {
         )
         .with_identity_gate(identity_gate.clone());
         let dispatch = match &secure {
-            Some(security) => dispatch.with_trust_policy(security.policy.clone()),
+            Some(security) => dispatch
+                .with_trust_policy(security.policy.clone())
+                .with_server_key_principals(security.server_key_principals.clone()),
             None => dispatch,
         };
         let dispatch = Arc::new(dispatch);

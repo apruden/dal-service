@@ -409,6 +409,9 @@ impl<T: Transport> Client<T> {
                     }
                 }
                 Ok(SubmitReply::NotLeader { leader: None }) => {}
+                Ok(SubmitReply::JoinPreflightReady) => {
+                    last_error = Some("unexpected join-preflight reply to search admin".into())
+                }
                 Ok(SubmitReply::Error(error)) => last_error = Some(error),
                 Err(error) => last_error = Some(format!("malformed search admin reply: {error}")),
             }

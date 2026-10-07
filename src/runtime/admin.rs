@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use futures::StreamExt;
+
 use crate::api::ops::RoutingInfo;
 use crate::codec;
 use crate::config::NodeConfig;
@@ -176,6 +178,9 @@ async fn submit(
                     queue.push_front(hint.clone());
                 }
             }
+            Ok(SubmitReply::JoinPreflightReady) => {
+                last_error = Some("unexpected join-preflight reply to an admin command".into());
+            }
             // Only the leader (or a non-meta node) answers with an error; record
             // it and keep walking, since followers reply `NotLeader`.
             Ok(SubmitReply::Error(e)) => last_error = Some(e),
@@ -272,36 +277,109 @@ async fn status_with_transport(
 /// `dal join`: register this node with the cluster it is configured for, using
 /// its own config for identity and its seeds as the contact list.
 pub async fn join(ctx: zmq::Context, cfg: &NodeConfig) -> Result<MetaApplyResult> {
-    join_with_transport(ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control), cfg).await
+    join_with_transport(
+        ZmqTransport::new(ctx, ADMIN_TIMEOUT, Lane::Control),
+        cfg,
+        0,
+        [0; 32],
+        false,
+    )
+    .await
 }
 
 pub async fn join_secure(
     ctx: zmq::Context,
     cfg: &NodeConfig,
     curve: CurveClientConfig,
+    policy_generation: u64,
+    candidate_public_key: [u8; 32],
 ) -> Result<MetaApplyResult> {
     for seed in &cfg.seeds {
         curve.server_key(seed)?;
     }
-    join_with_transport(secure_transport(ctx, curve, None)?, cfg).await
+    join_with_transport(
+        secure_transport(ctx, curve, None)?,
+        cfg,
+        policy_generation,
+        candidate_public_key,
+        true,
+    )
+    .await
 }
 
-async fn join_with_transport(transport: ZmqTransport, cfg: &NodeConfig) -> Result<MetaApplyResult> {
+async fn join_with_transport(
+    transport: ZmqTransport,
+    cfg: &NodeConfig,
+    policy_generation: u64,
+    candidate_public_key: [u8; 32],
+    require_peer_preflight: bool,
+) -> Result<MetaApplyResult> {
     if cfg.seeds.is_empty() {
         return Err(Error::Config(
             "join needs at least one seed in the node config".into(),
         ));
     }
-    let targets = Targets {
-        candidates: cfg.seeds.clone(),
-        directory: HashMap::new(),
+    let targets = if require_peer_preflight {
+        let directory = fetch_authoritative_directory(
+            &transport,
+            cfg.cluster_id,
+            cfg.seeds.clone(),
+            ADMIN_TIMEOUT,
+        )
+        .await
+        .map_err(|error| {
+            Error::Raft(format!(
+                "join requires an authoritative live directory for enrollment preflight: {error}"
+            ))
+        })?;
+        let mut targets = Targets {
+            candidates: cfg.seeds.clone(),
+            directory: directory
+                .iter()
+                .map(|entry| (entry.node_id, entry.control_addr.clone()))
+                .collect(),
+        };
+        for entry in directory {
+            if !targets.candidates.contains(&entry.control_addr) {
+                targets.candidates.push(entry.control_addr);
+            }
+        }
+        targets
+    } else {
+        Targets {
+            candidates: cfg.seeds.clone(),
+            directory: HashMap::new(),
+        }
+        .discover_live(&transport, cfg.cluster_id)
+        .await
+    };
+    if targets.directory.is_empty() {
+        return Err(Error::Raft(
+            "join could not discover the current node directory for enrollment preflight".into(),
+        ));
     }
-    .discover_live(&transport, cfg.cluster_id)
-    .await;
+    if targets.directory.len() > crate::types::MAX_CLUSTER_NODES {
+        return Err(Error::Config(
+            "join directory exceeds the node limit".into(),
+        ));
+    }
+    if require_peer_preflight {
+        preflight_join_peers(
+            &transport,
+            cfg,
+            &targets,
+            policy_generation,
+            candidate_public_key,
+        )
+        .await?;
+    }
     let body = codec::encode(&JoinBody {
         node_id: cfg.node_id,
         control_addr: cfg.control_addr.clone(),
         bulk_addr: cfg.bulk_addr.clone(),
+        policy_generation,
+        curve_public_key: candidate_public_key,
+        preflight: false,
     });
     submit(
         &transport,
@@ -311,6 +389,70 @@ async fn join_with_transport(transport: ZmqTransport, cfg: &NodeConfig) -> Resul
         body,
     )
     .await
+}
+
+async fn preflight_join_peers(
+    transport: &ZmqTransport,
+    cfg: &NodeConfig,
+    targets: &Targets,
+    policy_generation: u64,
+    candidate_public_key: [u8; 32],
+) -> Result<()> {
+    let expected = targets.directory.len();
+    let mut addresses: Vec<_> = targets.directory.values().cloned().collect();
+    addresses.sort();
+    addresses.dedup();
+    if addresses.len() != expected {
+        return Err(Error::Config(
+            "join directory contains duplicate node endpoints".into(),
+        ));
+    }
+    let replies = futures::stream::iter(addresses.into_iter().map(|address| async move {
+        let request = Envelope::new(
+            cfg.cluster_id,
+            MsgType::JoinRequest,
+            GroupId::Meta,
+            0,
+            codec::encode(&JoinBody {
+                node_id: cfg.node_id,
+                control_addr: cfg.control_addr.clone(),
+                bulk_addr: cfg.bulk_addr.clone(),
+                policy_generation,
+                curve_public_key: candidate_public_key,
+                preflight: true,
+            }),
+        );
+        (address.clone(), transport.call(&address, request).await)
+    }))
+    .buffer_unordered(32)
+    .collect::<Vec<_>>()
+    .await;
+    for (address, reply) in replies {
+        let reply = reply.map_err(|error| {
+            Error::Raft(format!(
+                "join preflight could not contact peer {address}: {error}"
+            ))
+        })?;
+        if reply.cluster_id != cfg.cluster_id || reply.msg_type != MsgType::JoinRequest {
+            return Err(Error::Raft(format!(
+                "join preflight received an invalid reply from peer {address}"
+            )));
+        }
+        match codec::decode::<SubmitReply>(&reply.payload) {
+            Ok(SubmitReply::JoinPreflightReady) => {}
+            Ok(SubmitReply::Error(error)) => {
+                return Err(Error::Config(format!(
+                    "peer {address} rejected join preflight: {error}"
+                )));
+            }
+            _ => {
+                return Err(Error::Raft(format!(
+                    "peer {address} did not confirm join preflight"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `dal leave`: mark a node `Draining` so the cluster migrates its partitions

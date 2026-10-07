@@ -97,6 +97,10 @@ pub struct JoinBody {
     pub node_id: NodeId,
     pub control_addr: String,
     pub bulk_addr: String,
+    pub policy_generation: u64,
+    pub curve_public_key: [u8; 32],
+    /// When true, validate this candidate locally without registering it.
+    pub preflight: bool,
 }
 
 /// `MsgType::LeaveRequest` — operator drain of a node (§9.2).
@@ -141,7 +145,11 @@ pub enum LeadershipTransferReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubmitReply {
     Outcome(MetaApplyResult),
-    NotLeader { leader: Option<NodeId> },
+    NotLeader {
+        leader: Option<NodeId>,
+    },
+    /// This node's trust policy and endpoint pins are ready for enrollment.
+    JoinPreflightReady,
     Error(String),
 }
 
@@ -433,6 +441,9 @@ mod tests {
             node_id: 9,
             control_addr: "tcp://h:1".into(),
             bulk_addr: "tcp://h:2".into(),
+            policy_generation: 1,
+            curve_public_key: [7; 32],
+            preflight: true,
         };
         assert_eq!(
             join,
@@ -440,6 +451,11 @@ mod tests {
         );
 
         let reply = SubmitReply::NotLeader { leader: Some(2) };
+        assert_eq!(
+            reply,
+            codec::decode::<SubmitReply>(&codec::encode(&reply)).unwrap()
+        );
+        let reply = SubmitReply::JoinPreflightReady;
         assert_eq!(
             reply,
             codec::decode::<SubmitReply>(&codec::encode(&reply)).unwrap()

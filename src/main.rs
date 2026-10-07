@@ -448,10 +448,19 @@ fn join(config: &str, auth: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let policy_generation = candidate.policy.generation();
+    let candidate_public_key = candidate.public_key;
     with_runtime(async move {
         report(
             "join",
-            admin::join_secure(zmq::Context::new(), &cfg, curve).await,
+            admin::join_secure(
+                zmq::Context::new(),
+                &cfg,
+                curve,
+                policy_generation,
+                candidate_public_key,
+            )
+            .await,
         )
     })
 }

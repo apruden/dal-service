@@ -55,6 +55,7 @@ pub struct RootDispatch {
     meta_starter: Option<Arc<MetaStarter>>,
     identity_gate: ProcessIdentityGate,
     trust_policy: Option<Arc<TrustPolicy>>,
+    server_key_principals: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl RootDispatch {
@@ -78,6 +79,7 @@ impl RootDispatch {
             meta_starter,
             identity_gate: ProcessIdentityGate::default(),
             trust_policy: None,
+            server_key_principals: None,
         }
     }
 
@@ -88,6 +90,14 @@ impl RootDispatch {
 
     pub fn with_trust_policy(mut self, policy: Arc<TrustPolicy>) -> Self {
         self.trust_policy = Some(policy);
+        self
+    }
+
+    pub fn with_server_key_principals(
+        mut self,
+        principals: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.server_key_principals = Some(principals);
         self
     }
 
@@ -323,6 +333,79 @@ impl RootDispatch {
         let Ok(body) = codec::decode::<JoinBody>(&req.payload) else {
             return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
         };
+        if body.node_id == 0
+            || body.control_addr.is_empty()
+            || body.bulk_addr.is_empty()
+            || body.control_addr.len() > crate::types::MAX_ENDPOINT_BYTES
+            || body.bulk_addr.len() > crate::types::MAX_ENDPOINT_BYTES
+            || body.control_addr == body.bulk_addr
+        {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error(
+                    "invalid joining node identity or endpoints".into(),
+                )),
+            );
+        }
+        if let Some(policy) = &self.trust_policy {
+            if body.policy_generation != policy.generation() {
+                return self.reply(
+                    &req,
+                    codec::encode(&SubmitReply::Error(
+                        "joining node trust-policy generation does not match this peer".into(),
+                    )),
+                );
+            }
+            let encoded_key = match zmq::z85_encode(&body.curve_public_key) {
+                Ok(encoded) => encoded,
+                Err(_) => {
+                    return self.reply(
+                        &req,
+                        codec::encode(&SubmitReply::Error(
+                            "joining node CURVE public key is invalid".into(),
+                        )),
+                    );
+                }
+            };
+            let expected_principal = format!("node:{}", body.node_id);
+            let candidate_trusted =
+                policy
+                    .principal_for_curve_key(&encoded_key)
+                    .is_some_and(|principal| {
+                        principal.user_id == expected_principal
+                            && principal.permissions.contains(&Permission::PeerRpc)
+                    });
+            if !candidate_trusted {
+                return self.reply(
+                    &req,
+                    codec::encode(&SubmitReply::Error(format!(
+                        "trust policy does not bind the joining key to {expected_principal}"
+                    ))),
+                );
+            }
+            let pins_candidate = self.server_key_principals.as_ref().is_some_and(|pins| {
+                pins.get(&body.control_addr) == Some(&expected_principal)
+                    && pins.get(&body.bulk_addr) == Some(&expected_principal)
+            });
+            if !pins_candidate {
+                return self.reply(
+                    &req,
+                    codec::encode(&SubmitReply::Error(format!(
+                        "this peer has no control and bulk pins for {expected_principal}"
+                    ))),
+                );
+            }
+        } else if body.preflight {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error(
+                    "join preflight requires authenticated transport".into(),
+                )),
+            );
+        }
+        if body.preflight {
+            return self.reply(&req, codec::encode(&SubmitReply::JoinPreflightReady));
+        }
         let cmd = MetaCommand::RegisterNode {
             node_id: body.node_id,
             control_addr: body.control_addr,
@@ -844,9 +927,9 @@ mod tests {
         ));
         let dispatch = RootDispatch::new(
             7,
-            gateway,
+            gateway.clone(),
             Arc::new(RwLock::new(None)),
-            partitions,
+            partitions.clone(),
             Arc::new(Mutex::new(HeartbeatTracker::new())),
             None,
             None,
@@ -860,6 +943,9 @@ mod tests {
                 node_id: 9,
                 control_addr: "tcp://foreign-control".into(),
                 bulk_addr: "tcp://foreign-bulk".into(),
+                policy_generation: 0,
+                curve_public_key: [0; 32],
+                preflight: false,
             }),
         );
 
@@ -896,9 +982,9 @@ mod tests {
         );
         let dispatch = RootDispatch::new(
             7,
-            gateway,
+            gateway.clone(),
             Arc::new(RwLock::new(None)),
-            partitions,
+            partitions.clone(),
             Arc::new(Mutex::new(HeartbeatTracker::new())),
             None,
             None,
@@ -913,6 +999,9 @@ mod tests {
                 node_id: 9,
                 control_addr: "tcp://new-control".into(),
                 bulk_addr: "tcp://new-bulk".into(),
+                policy_generation: 0,
+                curve_public_key: [0; 32],
+                preflight: false,
             }),
         );
         let reply = dispatch
@@ -925,6 +1014,112 @@ mod tests {
             .await;
         assert!(matches!(codec::decode::<SubmitReply>(&reply.payload),
             Ok(SubmitReply::Error(error)) if error == "authorization denied"));
+    }
+
+    #[tokio::test]
+    async fn join_preflight_requires_current_policy_and_local_candidate_pins() {
+        use crate::transport::security::{Permission, Principal, TrustPolicy};
+        let partitions = Arc::new(RwLock::new(HashMap::new()));
+        let gateway = Arc::new(ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            partitions.clone(),
+            Arc::new(EmptyRouting),
+        ));
+        let candidate_public_key = [17; 32];
+        let candidate_key_z85 = zmq::z85_encode(&candidate_public_key).unwrap();
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                4,
+                vec![
+                    Principal {
+                        user_id: "ops:join".into(),
+                        curve_public_key: "C".repeat(40),
+                        permissions: vec![Permission::Operator],
+                        client_ids: Vec::new(),
+                    },
+                    Principal {
+                        user_id: "node:9".into(),
+                        curve_public_key: candidate_key_z85,
+                        permissions: vec![Permission::PeerRpc],
+                        client_ids: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let pins = std::collections::BTreeMap::from([
+            ("tcp://new-control".into(), "node:9".into()),
+            ("tcp://new-bulk".into(), "node:9".into()),
+        ]);
+        let dispatch = RootDispatch::new(
+            7,
+            gateway.clone(),
+            Arc::new(RwLock::new(None)),
+            partitions.clone(),
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+            None,
+        )
+        .with_trust_policy(policy.clone())
+        .with_server_key_principals(pins);
+
+        let preflight = |policy_generation| {
+            Envelope::new(
+                7,
+                MsgType::JoinRequest,
+                GroupId::Meta,
+                12,
+                codec::encode(&JoinBody {
+                    node_id: 9,
+                    control_addr: "tcp://new-control".into(),
+                    bulk_addr: "tcp://new-bulk".into(),
+                    policy_generation,
+                    curve_public_key: candidate_public_key,
+                    preflight: true,
+                }),
+            )
+        };
+        let context = crate::transport::RequestContext {
+            authenticated_user_id: Some("ops:join".into()),
+        };
+        let ready = dispatch
+            .serve_with_context(preflight(4), context.clone())
+            .await;
+        assert!(matches!(
+            codec::decode::<SubmitReply>(&ready.payload),
+            Ok(SubmitReply::JoinPreflightReady)
+        ));
+        let stale = dispatch.serve_with_context(preflight(3), context).await;
+        assert!(matches!(
+            codec::decode::<SubmitReply>(&stale.payload),
+            Ok(SubmitReply::Error(error)) if error.contains("generation")
+        ));
+        let missing_pins = RootDispatch::new(
+            7,
+            gateway,
+            Arc::new(RwLock::new(None)),
+            partitions,
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+            None,
+        )
+        .with_trust_policy(policy)
+        .with_server_key_principals(std::collections::BTreeMap::new());
+        let rejected = missing_pins
+            .serve_with_context(
+                preflight(4),
+                crate::transport::RequestContext {
+                    authenticated_user_id: Some("ops:join".into()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            codec::decode::<SubmitReply>(&rejected.payload),
+            Ok(SubmitReply::Error(error)) if error.contains("pins")
+        ));
     }
 
     #[tokio::test]

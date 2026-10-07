@@ -128,3 +128,9 @@ rejected; remote diagnostics require a separately authenticated TLS proxy.
 The local listener exposes `/health`, `/livez`, `/readyz`, detailed cached
 `/status`, and bounded Prometheus text at `/metrics`; keep all of these on the
 loopback-only admin plane.
+
+Before registration, `dal join` preflights every node in the live directory.
+Each peer must run the same trust-policy generation, trust the joining node's
+key, and have control and bulk endpoint pins for that node. Distribute the
+updated policy and pins to every peer before attempting enrollment; otherwise
+the join is rejected before the cluster directory changes.
