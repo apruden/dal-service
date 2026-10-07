@@ -121,3 +121,6 @@ explicit `--seed` addresses must already have pins. Administrative RPCs require
 the operator permission at the receiving node. Client reads, writes, and search
 are checked against their respective permissions. A non-loopback `http_addr` is
 rejected; remote diagnostics require a separately authenticated TLS proxy.
+The local listener exposes `/health`, `/livez`, `/readyz`, detailed cached
+`/status`, and bounded Prometheus text at `/metrics`; keep all of these on the
+loopback-only admin plane.
