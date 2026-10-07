@@ -148,6 +148,53 @@ pub struct ZapAuthenticator {
     domain: String,
 }
 
+/// Outbound CURVE identity and the pinned server public keys for destination
+/// endpoints. Missing pins are configuration errors; secure transports never
+/// fall back to plaintext for an unknown address.
+pub struct CurveClientConfig {
+    public_key: [u8; 32],
+    secret_key: [u8; 32],
+    server_keys: BTreeMap<String, [u8; 32]>,
+}
+
+impl CurveClientConfig {
+    pub fn new(
+        public_key: [u8; 32],
+        secret_key: [u8; 32],
+        server_keys: BTreeMap<String, [u8; 32]>,
+    ) -> crate::Result<Self> {
+        if zmq::has("curve") != Some(true) {
+            return Err(crate::Error::Config(
+                "libzmq was built without CURVE support".into(),
+            ));
+        }
+        if server_keys.is_empty() || server_keys.keys().any(String::is_empty) {
+            return Err(crate::Error::Config(
+                "CURVE client requires pinned server keys for its destinations".into(),
+            ));
+        }
+        Ok(Self {
+            public_key,
+            secret_key,
+            server_keys,
+        })
+    }
+
+    pub(crate) fn client_public_key(&self) -> &[u8; 32] {
+        &self.public_key
+    }
+
+    pub(crate) fn client_secret_key(&self) -> &[u8; 32] {
+        &self.secret_key
+    }
+
+    pub(crate) fn server_key(&self, addr: &str) -> crate::Result<&[u8; 32]> {
+        self.server_keys.get(addr).ok_or_else(|| {
+            crate::Error::Config(format!("no pinned CURVE server key for endpoint {addr}"))
+        })
+    }
+}
+
 impl ZapAuthenticator {
     pub fn start(
         ctx: zmq::Context,
@@ -436,46 +483,89 @@ mod tests {
         assert!(policy.authorize("forged", Permission::ClientRead).is_none());
     }
 
-    #[test]
-    fn zap_authenticates_curve_keys_and_returns_the_policy_identity() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn curve_router_and_dealer_preserve_the_zap_identity() {
         if zmq::has("curve") != Some(true) {
             return;
         }
         let ctx = zmq::Context::new();
         let server_keys = zmq::CurveKeyPair::new().unwrap();
         let client_keys = zmq::CurveKeyPair::new().unwrap();
+        let (identity_tx, identity_rx) = std::sync::mpsc::channel();
+        struct IdentityEcho(std::sync::mpsc::Sender<Option<String>>);
+        impl crate::transport::Server for IdentityEcho {
+            async fn serve(
+                &self,
+                request: crate::transport::codec::Envelope,
+            ) -> crate::transport::codec::Envelope {
+                crate::transport::codec::Envelope::new(
+                    request.cluster_id,
+                    request.msg_type,
+                    request.group_id,
+                    request.request_id,
+                    b"pong".to_vec(),
+                )
+            }
+
+            async fn serve_with_context(
+                &self,
+                request: crate::transport::codec::Envelope,
+                context: crate::transport::RequestContext,
+            ) -> crate::transport::codec::Envelope {
+                let _ = self.0.send(context.authenticated_user_id);
+                self.serve(request).await
+            }
+        }
         let principal = Principal {
             user_id: "app:orders".into(),
             curve_public_key: zmq::z85_encode(&client_keys.public_key).unwrap(),
             permissions: vec![Permission::ClientRead],
         };
         let policy = Arc::new(TrustPolicy::new(7, 1, vec![principal]).unwrap());
-        let zap = ZapAuthenticator::start(ctx.clone(), policy, 7).unwrap();
-
-        let server = ctx.socket(zmq::ROUTER).unwrap();
-        server.set_linger(0).unwrap();
-        server.set_curve_server(true).unwrap();
-        server.set_curve_secretkey(&server_keys.secret_key).unwrap();
-        server.set_zap_domain(zap.domain()).unwrap();
-        server.bind("tcp://127.0.0.1:0").unwrap();
-        let endpoint = server.get_last_endpoint().unwrap().unwrap();
-
-        let client = ctx.socket(zmq::DEALER).unwrap();
-        client.set_linger(0).unwrap();
-        client.set_rcvtimeo(2_000).unwrap();
-        client.set_curve_publickey(&client_keys.public_key).unwrap();
-        client.set_curve_secretkey(&client_keys.secret_key).unwrap();
-        client.set_curve_serverkey(&server_keys.public_key).unwrap();
-        client.connect(&endpoint).unwrap();
-        client.send(b"ping".as_slice(), 0).unwrap();
-        let identity = server.recv_msg(0).unwrap().to_vec();
-        let mut payload = server.recv_msg(0).unwrap();
-        assert_eq!(payload.gets("User-Id"), Some("app:orders"));
-        server
-            .send_multipart([identity, b"pong".to_vec()], 0)
+        let zap = Arc::new(ZapAuthenticator::start(ctx, policy, 7).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint = format!("tcp://127.0.0.1:{port}");
+        let server = crate::transport::router::ZmqServer::bind_curve(
+            &endpoint,
+            Arc::new(IdentityEcho(identity_tx)),
+            crate::transport::codec::Lane::Control,
+            server_keys.secret_key,
+            zap,
+        )
+        .unwrap();
+        let client_config = CurveClientConfig::new(
+            client_keys.public_key,
+            client_keys.secret_key,
+            BTreeMap::from([(endpoint.clone(), server_keys.public_key)]),
+        )
+        .unwrap();
+        let transport = crate::transport::dealer::ZmqTransport::new_curve(
+            zmq::Context::new(),
+            std::time::Duration::from_secs(2),
+            crate::transport::codec::Lane::Control,
+            client_config,
+        );
+        let request = crate::transport::codec::Envelope::new(
+            7,
+            crate::transport::codec::MsgType::MetaQuery,
+            crate::types::GroupId::Meta,
+            17,
+            b"ping".to_vec(),
+        );
+        let reply = crate::transport::Transport::call(&transport, &endpoint, request)
+            .await
             .unwrap();
-        assert_eq!(client.recv_bytes(0).unwrap(), b"pong");
-        drop(zap);
+        assert_eq!(reply.payload, b"pong");
+        assert_eq!(
+            identity_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            Some("app:orders".into())
+        );
+        drop(transport);
+        drop(server);
     }
 
     #[test]

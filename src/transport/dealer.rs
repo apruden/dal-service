@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::Envelope;
 use crate::transport::codec::{Lane, MsgType};
+use crate::transport::security::CurveClientConfig;
 use crate::types::GroupId;
 
 /// Bounds the burst of not-yet-dispatched requests held for one peer. The I/O
@@ -119,7 +120,15 @@ impl PeerConn {
     /// Fallible because every step here consumes a process-wide resource (file
     /// descriptors, threads). Exhausting those is a transient operational
     /// condition the caller can retry, not a reason to abort the process.
-    fn new(ctx: zmq::Context, addr: String, lane: Lane) -> Result<PeerConn> {
+    fn new(
+        ctx: zmq::Context,
+        addr: String,
+        lane: Lane,
+        curve: Option<Arc<CurveClientConfig>>,
+    ) -> Result<PeerConn> {
+        if let Some(curve) = &curve {
+            curve.server_key(&addr)?;
+        }
         let wake_id = WAKE_SEQ.fetch_add(1, Ordering::Relaxed);
         let wake_addr = format!("inproc://dal-dealer-wake-{wake_id}");
         // Bind before connect (inproc requires it) so there is no startup race.
@@ -131,7 +140,7 @@ impl PeerConn {
         let (tx, rx) = mpsc::sync_channel(OUTBOUND_QUEUE_DEPTH);
         std::thread::Builder::new()
             .name("zmq-dealer".into())
-            .spawn(move || conn_loop(ctx, addr, lane, signal, rx))
+            .spawn(move || conn_loop(ctx, addr, lane, signal, rx, curve))
             .map_err(Error::Io)?;
         Ok(PeerConn {
             tx,
@@ -177,6 +186,7 @@ struct TransportInner {
     ctx: zmq::Context,
     timeout: Duration,
     lane: Lane,
+    curve: Option<Arc<CurveClientConfig>>,
     next_id: AtomicU64,
     peers: Mutex<HashMap<String, Arc<PeerConn>>>,
 }
@@ -206,6 +216,7 @@ impl TransportInner {
                     self.ctx.clone(),
                     addr.to_string(),
                     self.lane,
+                    self.curve.clone(),
                 )?);
                 peers.insert(addr.to_string(), conn.clone());
                 conn
@@ -235,6 +246,28 @@ impl ZmqTransport {
                 ctx,
                 timeout,
                 lane,
+                curve: None,
+                next_id: AtomicU64::new(1),
+                peers: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Create an outbound transport that always uses CURVE and pins the server
+    /// key for every destination. Addresses without an out-of-band pin fail
+    /// before a DEALER thread is created.
+    pub fn new_curve(
+        ctx: zmq::Context,
+        timeout: Duration,
+        lane: Lane,
+        curve: CurveClientConfig,
+    ) -> ZmqTransport {
+        ZmqTransport {
+            inner: Arc::new(TransportInner {
+                ctx,
+                timeout,
+                lane,
+                curve: Some(Arc::new(curve)),
                 next_id: AtomicU64::new(1),
                 peers: Mutex::new(HashMap::new()),
             }),
@@ -246,7 +279,12 @@ fn zmq_io(e: zmq::Error) -> Error {
     Error::Io(std::io::Error::other(format!("zmq: {e}")))
 }
 
-fn open_socket(ctx: &zmq::Context, addr: &str, lane: Lane) -> Result<zmq::Socket> {
+fn open_socket(
+    ctx: &zmq::Context,
+    addr: &str,
+    lane: Lane,
+    curve: Option<&CurveClientConfig>,
+) -> Result<zmq::Socket> {
     let socket = ctx.socket(zmq::DEALER).map_err(zmq_io)?;
     socket.set_linger(0).map_err(zmq_io)?;
     // A peer's reply is remote input too: cap it during assembly rather than
@@ -256,6 +294,17 @@ fn open_socket(ctx: &zmq::Context, addr: &str, lane: Lane) -> Result<zmq::Socket
         .map_err(zmq_io)?;
     socket.set_rcvhwm(INBOUND_REPLY_HWM).map_err(zmq_io)?;
     socket.set_sndhwm(OUTBOUND_SEND_HWM).map_err(zmq_io)?;
+    if let Some(curve) = curve {
+        socket
+            .set_curve_publickey(curve.client_public_key())
+            .map_err(zmq_io)?;
+        socket
+            .set_curve_secretkey(curve.client_secret_key())
+            .map_err(zmq_io)?;
+        socket
+            .set_curve_serverkey(curve.server_key(addr)?)
+            .map_err(zmq_io)?;
+    }
     socket.connect(addr).map_err(zmq_io)?;
     Ok(socket)
 }
@@ -270,14 +319,15 @@ fn conn_loop(
     lane: Lane,
     signal: zmq::Socket,
     rx: mpsc::Receiver<Outbound>,
+    curve: Option<Arc<CurveClientConfig>>,
 ) {
-    let mut dealer = open_socket(&ctx, &addr, lane).ok();
+    let mut dealer = open_socket(&ctx, &addr, lane, curve.as_deref()).ok();
     let mut pending: HashMap<u64, PendingCall> = HashMap::new();
     let poll_timeout = SWEEP_INTERVAL.as_millis() as i64;
 
     loop {
         if dealer.is_none() {
-            dealer = open_socket(&ctx, &addr, lane).ok();
+            dealer = open_socket(&ctx, &addr, lane, curve.as_deref()).ok();
         }
 
         // Block until a reply or a wake arrives, or the sweep interval elapses.
