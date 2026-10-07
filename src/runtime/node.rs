@@ -1681,6 +1681,7 @@ impl StatusSource for NodeStatus {
             search_source_row_peak_bytes,
             snapshot_record_peak_bytes,
             router_admission_rejections: router.admission_rejections,
+            authorization_denials: crate::perf::authorization_denials(),
             router_reply_send_eagain: router.reply_send_eagain,
             router_reply_send_failures: router.reply_send_failures,
             router_max_active_handlers: router.max_active_handlers,

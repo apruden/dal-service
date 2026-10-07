@@ -479,6 +479,7 @@ impl Server for ClientGateway {
                     Err(_) => self.has_permission(&context, &[Permission::ClientRead]),
                 };
                 if !authorized {
+                    crate::perf::record_authorization_denial();
                     return self.client_reply(
                         request.group_id,
                         request.request_id,
@@ -495,6 +496,7 @@ impl Server for ClientGateway {
                     &[Permission::Search][..]
                 };
                 if !self.has_permission(&context, required) {
+                    crate::perf::record_authorization_denial();
                     return self.reply(
                         MsgType::SearchOp,
                         request.group_id,
@@ -515,6 +517,7 @@ impl Server for ClientGateway {
                     ],
                 ) =>
             {
+                crate::perf::record_authorization_denial();
                 return self.reply(
                     MsgType::MetaQuery,
                     GroupId::Meta,
@@ -532,6 +535,7 @@ impl Server for ClientGateway {
                     ],
                 ) =>
             {
+                crate::perf::record_authorization_denial();
                 return self.reply(
                     MsgType::SearchCatalogQuery,
                     GroupId::Meta,

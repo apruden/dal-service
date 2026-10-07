@@ -778,6 +778,7 @@ impl Server for RootDispatch {
                     .and_then(|user_id| policy.authorize(user_id, required))
                     .is_some();
                 if !authorized {
+                    crate::perf::record_authorization_denial();
                     return if matches!(
                         request.msg_type,
                         MsgType::JoinRequest

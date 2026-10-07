@@ -11,6 +11,17 @@ use std::time::{Duration, Instant};
 use crate::transport::codec::MsgType;
 use crate::types::GroupId;
 
+static AUTHORIZATION_DENIALS: AtomicU64 = AtomicU64::new(0);
+
+/// Count rejected authenticated requests without recording principal identity.
+pub(crate) fn record_authorization_denial() {
+    AUTHORIZATION_DENIALS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn authorization_denials() -> u64 {
+    AUTHORIZATION_DENIALS.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(usize)]
 pub enum WriteStage {
