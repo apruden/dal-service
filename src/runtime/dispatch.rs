@@ -29,6 +29,7 @@ use crate::transport::raft_wire::{
     RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply,
     SubmitReply,
 };
+use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeState, ProcessIdentityGate};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
@@ -53,6 +54,7 @@ pub struct RootDispatch {
     starter: Option<Arc<PartitionStarter>>,
     meta_starter: Option<Arc<MetaStarter>>,
     identity_gate: ProcessIdentityGate,
+    trust_policy: Option<Arc<TrustPolicy>>,
 }
 
 impl RootDispatch {
@@ -75,11 +77,17 @@ impl RootDispatch {
             starter,
             meta_starter,
             identity_gate: ProcessIdentityGate::default(),
+            trust_policy: None,
         }
     }
 
     pub fn with_identity_gate(mut self, identity_gate: ProcessIdentityGate) -> Self {
         self.identity_gate = identity_gate;
+        self
+    }
+
+    pub fn with_trust_policy(mut self, policy: Arc<TrustPolicy>) -> Self {
+        self.trust_policy = Some(policy);
         self
     }
 
@@ -641,6 +649,36 @@ impl Server for RootDispatch {
             return self.raft_unavailable(&request);
         }
         if request.msg_type.is_peer_control() {
+            if let Some(policy) = &self.trust_policy {
+                let required = match request.msg_type {
+                    MsgType::JoinRequest
+                    | MsgType::LeaveRequest
+                    | MsgType::AbortPlanRequest
+                    | MsgType::SearchIndexAdmin => Permission::Operator,
+                    _ => Permission::PeerRpc,
+                };
+                let authorized = context
+                    .authenticated_user_id
+                    .as_deref()
+                    .and_then(|user_id| policy.authorize(user_id, required))
+                    .is_some();
+                if !authorized {
+                    return if matches!(
+                        request.msg_type,
+                        MsgType::JoinRequest
+                            | MsgType::LeaveRequest
+                            | MsgType::AbortPlanRequest
+                            | MsgType::SearchIndexAdmin
+                    ) {
+                        self.reply(
+                            &request,
+                            codec::encode(&SubmitReply::Error("authorization denied".into())),
+                        )
+                    } else {
+                        self.raft_unavailable(&request)
+                    };
+                }
+            }
             self.serve_control(request, context).await
         } else {
             self.gateway.serve_with_context(request, context).await
@@ -714,5 +752,61 @@ mod tests {
         assert_eq!(reply.msg_type, MsgType::JoinRequest);
         assert_eq!(reply.request_id, 42);
         assert!(reply.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_identity_without_operator_permission_cannot_register_nodes() {
+        use crate::transport::security::{Permission, Principal, TrustPolicy};
+        let partitions = Arc::new(RwLock::new(HashMap::new()));
+        let gateway = Arc::new(ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            partitions.clone(),
+            Arc::new(EmptyRouting),
+        ));
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                1,
+                vec![Principal {
+                    user_id: "node:1".into(),
+                    curve_public_key: "A".repeat(40),
+                    permissions: vec![Permission::PeerRpc],
+                }],
+            )
+            .unwrap(),
+        );
+        let dispatch = RootDispatch::new(
+            7,
+            gateway,
+            Arc::new(RwLock::new(None)),
+            partitions,
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+            None,
+        )
+        .with_trust_policy(policy);
+        let request = Envelope::new(
+            7,
+            MsgType::JoinRequest,
+            GroupId::Meta,
+            1,
+            codec::encode(&JoinBody {
+                node_id: 9,
+                control_addr: "tcp://new-control".into(),
+                bulk_addr: "tcp://new-bulk".into(),
+            }),
+        );
+        let reply = dispatch
+            .serve_with_context(
+                request,
+                crate::transport::RequestContext {
+                    authenticated_user_id: Some("node:1".into()),
+                },
+            )
+            .await;
+        assert!(matches!(codec::decode::<SubmitReply>(&reply.payload),
+            Ok(SubmitReply::Error(error)) if error == "authorization denied"));
     }
 }

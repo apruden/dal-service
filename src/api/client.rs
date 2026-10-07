@@ -265,6 +265,9 @@ impl<T: Transport> Client<T> {
                 // node would repeat it; an error may be local to this node, so
                 // keep it and try the next seed.
                 Ok(SearchShardReply::Refused(error)) => return Err(Error::Search(error)),
+                Ok(SearchShardReply::Denied(error)) => {
+                    return Err(Error::Search(format!("denied: {error}")));
+                }
                 Ok(SearchShardReply::Error(error)) => last = Some(error),
                 Ok(SearchShardReply::Redirect(_)) | Err(_) => continue,
             }
@@ -306,6 +309,9 @@ impl<T: Transport> Client<T> {
             match codec::decode::<SearchCatalogReply>(&reply.payload) {
                 Ok(SearchCatalogReply::Record(record)) => return Ok(record),
                 Ok(SearchCatalogReply::Error(error)) => return Err(Error::Search(error)),
+                Ok(SearchCatalogReply::Denied(error)) => {
+                    return Err(Error::Search(format!("denied: {error}")));
+                }
                 _ => continue,
             }
         }
@@ -446,6 +452,7 @@ impl<T: Transport> Client<T> {
             ClientReply::Refused(e) => Err(Error::Raft(format!("read refused: {e}"))),
             ClientReply::Error(e) => Err(Error::Raft(format!("read rejected: {e}"))),
             ClientReply::Unavailable(e) => Err(Error::Raft(format!("read unavailable: {e}"))),
+            ClientReply::Denied(e) => Err(Error::Raft(format!("read denied: {e}"))),
             other => Err(Error::Raft(format!("unexpected read reply: {other:?}"))),
         }
     }
@@ -512,6 +519,7 @@ impl<T: Transport> Client<T> {
             }
             ClientReply::Error(e) => Err(Error::Raft(format!("write rejected: {e}"))),
             ClientReply::Unavailable(e) => Err(Error::Raft(format!("write unavailable: {e}"))),
+            ClientReply::Denied(e) => Err(Error::Raft(format!("write denied: {e}"))),
             other => Err(Error::Raft(format!("unexpected write reply: {other:?}"))),
         }
     }
@@ -860,6 +868,9 @@ impl<T: Transport> Client<T> {
                     }
                     SearchShardReply::Refused(error) | SearchShardReply::Error(error) => {
                         return Err(Error::Search(error));
+                    }
+                    SearchShardReply::Denied(error) => {
+                        return Err(Error::Search(format!("denied: {error}")));
                     }
                 }
             }

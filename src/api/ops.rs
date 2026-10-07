@@ -51,6 +51,7 @@ pub enum SearchCatalogReply {
     Catalog(Vec<crate::search::SearchIndexRecord>),
     Unavailable,
     Error(String),
+    Denied(String),
 }
 
 impl ClientRequest {
@@ -132,6 +133,9 @@ pub enum ClientReply {
     /// A prior attempt may already have committed, so mutation clients retain
     /// the pending command and sequence for resolution after service returns.
     Unavailable(String),
+    /// Authorization failed before the request reached a handler. Unlike a
+    /// refusal this does not resolve or release a pending mutation sequence.
+    Denied(String),
 }
 
 /// Public per-shard search reply used by the client-side scatter/gather
@@ -142,6 +146,7 @@ pub enum SearchShardReply {
     Redirect(Redirect),
     Refused(String),
     Error(String),
+    Denied(String),
 }
 
 impl ClientReply {

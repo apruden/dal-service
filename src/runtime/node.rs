@@ -368,6 +368,7 @@ pub struct Node {
 
 struct SecureTransport {
     zap: Arc<ZapAuthenticator>,
+    policy: Arc<crate::transport::security::TrustPolicy>,
     public_key: [u8; 32],
     secret_key: [u8; 32],
     server_keys: std::collections::BTreeMap<String, [u8; 32]>,
@@ -394,6 +395,7 @@ impl Node {
         security: LoadedNodeSecurity,
     ) -> Result<Node> {
         security.validate_descriptor(&desc, cfg.node_id)?;
+        let policy = security.policy.clone();
         let zap = Arc::new(ZapAuthenticator::start(
             ctx.clone(),
             security.policy,
@@ -401,6 +403,7 @@ impl Node {
         )?);
         let secure = SecureTransport {
             zap,
+            policy,
             public_key: security.public_key,
             secret_key: security.secret_key,
             server_keys: security.server_keys,
@@ -568,16 +571,19 @@ impl Node {
             addrs.clone(),
             cfg.control_addr.clone(),
         ));
-        let gateway = Arc::new(
-            ClientGateway::new(
-                cfg.cluster_id,
-                cluster.p,
-                cluster.hash_spec,
-                partitions.clone(),
-                routing.clone(),
-            )
-            .with_readiness(readiness.clone()),
-        );
+        let gateway = ClientGateway::new(
+            cfg.cluster_id,
+            cluster.p,
+            cluster.hash_spec,
+            partitions.clone(),
+            routing.clone(),
+        )
+        .with_readiness(readiness.clone());
+        let gateway = match &secure {
+            Some(security) => gateway.with_trust_policy(security.policy.clone()),
+            None => gateway,
+        };
+        let gateway = Arc::new(gateway);
         let search = Arc::new(crate::search::SearchService::new(storage.clone())?);
         gateway.set_search_service(search.clone());
         let catalog: Arc<dyn SearchCatalogSource> = Arc::new(LiveSearchCatalog {
@@ -655,18 +661,21 @@ impl Node {
             meta_starter.resume_meta().await?;
         }
 
-        let dispatch = Arc::new(
-            RootDispatch::new(
-                cfg.cluster_id,
-                gateway,
-                meta_handle.clone(),
-                partitions.clone(),
-                heartbeats.clone(),
-                Some(starter.clone()),
-                Some(meta_starter.clone()),
-            )
-            .with_identity_gate(identity_gate.clone()),
-        );
+        let dispatch = RootDispatch::new(
+            cfg.cluster_id,
+            gateway,
+            meta_handle.clone(),
+            partitions.clone(),
+            heartbeats.clone(),
+            Some(starter.clone()),
+            Some(meta_starter.clone()),
+        )
+        .with_identity_gate(identity_gate.clone());
+        let dispatch = match &secure {
+            Some(security) => dispatch.with_trust_policy(security.policy.clone()),
+            None => dispatch,
+        };
+        let dispatch = Arc::new(dispatch);
 
         let (control_srv, bulk_srv) = match &secure {
             Some(security) => (

@@ -300,6 +300,9 @@ impl NodeShardSource {
                     | Ok(crate::api::ops::SearchShardReply::Error(error)) => {
                         return Err(Error::Search(error));
                     }
+                    Ok(crate::api::ops::SearchShardReply::Denied(error)) => {
+                        return Err(Error::Search(format!("denied: {error}")));
+                    }
                     Err(_) => continue,
                 }
             }

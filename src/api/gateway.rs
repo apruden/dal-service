@@ -22,6 +22,7 @@ use crate::perf::WriteStage;
 use crate::runtime::readiness::RuntimeReadiness;
 use crate::search::ShardSearchOutcome;
 use crate::transport::Server;
+use crate::transport::security::{Permission, TrustPolicy};
 
 /// The set of data partitions a node currently hosts, shared between the gateway
 /// and the control dispatcher and mutated as rebalancing adds/removes partitions.
@@ -81,6 +82,7 @@ pub struct ClientGateway {
     search_catalog: RwLock<Option<Arc<dyn SearchCatalogSource>>>,
     shard_source: RwLock<Option<Arc<dyn ShardSourceFactory>>>,
     readiness: Option<RuntimeReadiness>,
+    trust_policy: Option<Arc<TrustPolicy>>,
 }
 
 impl ClientGateway {
@@ -101,6 +103,7 @@ impl ClientGateway {
             search_catalog: RwLock::new(None),
             shard_source: RwLock::new(None),
             readiness: None,
+            trust_policy: None,
         }
     }
 
@@ -109,6 +112,27 @@ impl ClientGateway {
     pub fn with_readiness(mut self, readiness: RuntimeReadiness) -> Self {
         self.readiness = Some(readiness);
         self
+    }
+
+    pub fn with_trust_policy(mut self, policy: Arc<TrustPolicy>) -> Self {
+        self.trust_policy = Some(policy);
+        self
+    }
+
+    fn has_permission(
+        &self,
+        context: &crate::transport::RequestContext,
+        permissions: &[Permission],
+    ) -> bool {
+        let Some(policy) = &self.trust_policy else {
+            return true;
+        };
+        let Some(user_id) = context.authenticated_user_id.as_deref() else {
+            return false;
+        };
+        permissions
+            .iter()
+            .any(|permission| policy.authorize(user_id, *permission).is_some())
     }
 
     fn accepts_client_work(&self) -> bool {
@@ -395,7 +419,7 @@ impl Server for ClientGateway {
     async fn serve_with_context(
         &self,
         request: Envelope,
-        _context: crate::transport::RequestContext,
+        context: crate::transport::RequestContext,
     ) -> Envelope {
         // Wrong cluster: reply stamped with our real cluster id so the client's
         // per-reply cluster check rejects it (DESIGN §8.2).
@@ -430,6 +454,77 @@ impl Server for ClientGateway {
                 request.request_id,
                 ClientReply::Error(RejectFrame::PeerControlOnClientPath.to_string()),
             );
+        }
+
+        match request.msg_type {
+            MsgType::ClientOp => {
+                let permission = match codec::decode::<ClientRequest>(&request.payload) {
+                    Ok(ClientRequest::Read { .. }) => Permission::ClientRead,
+                    Ok(ClientRequest::Mutate(_)) => Permission::ClientWrite,
+                    Err(_) => Permission::ClientRead,
+                };
+                if !self.has_permission(&context, &[permission]) {
+                    return self.client_reply(
+                        request.group_id,
+                        request.request_id,
+                        ClientReply::Denied("principal lacks permission for ClientOp".into()),
+                    );
+                }
+            }
+            MsgType::SearchOp => {
+                let required = if matches!(request.group_id, GroupId::Data(_)) {
+                    &[Permission::Search, Permission::PeerRpc][..]
+                } else {
+                    &[Permission::Search][..]
+                };
+                if !self.has_permission(&context, required) {
+                    return self.reply(
+                        MsgType::SearchOp,
+                        request.group_id,
+                        request.request_id,
+                        codec::encode(&SearchShardReply::Denied(
+                            "principal lacks search permission".into(),
+                        )),
+                    );
+                }
+            }
+            MsgType::MetaQuery
+                if !self.has_permission(
+                    &context,
+                    &[
+                        Permission::ClientRead,
+                        Permission::PeerRpc,
+                        Permission::Operator,
+                    ],
+                ) =>
+            {
+                return self.reply(
+                    MsgType::MetaQuery,
+                    GroupId::Meta,
+                    request.request_id,
+                    Vec::new(),
+                );
+            }
+            MsgType::SearchCatalogQuery
+                if !self.has_permission(
+                    &context,
+                    &[
+                        Permission::Search,
+                        Permission::PeerRpc,
+                        Permission::Operator,
+                    ],
+                ) =>
+            {
+                return self.reply(
+                    MsgType::SearchCatalogQuery,
+                    GroupId::Meta,
+                    request.request_id,
+                    codec::encode(&SearchCatalogReply::Denied(
+                        "principal lacks search permission".into(),
+                    )),
+                );
+            }
+            _ => {}
         }
 
         match request.msg_type {
@@ -553,5 +648,51 @@ mod tests {
             codec::decode::<ClientReply>(&reply.payload).unwrap(),
             ClientReply::Unavailable("node is not accepting client work".into())
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_denies_operations_outside_the_authenticated_principal_permissions() {
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                1,
+                vec![crate::transport::security::Principal {
+                    user_id: "app:writer".into(),
+                    curve_public_key: "A".repeat(40),
+                    permissions: vec![Permission::ClientWrite],
+                }],
+            )
+            .unwrap(),
+        );
+        let gateway = ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoRouting),
+        )
+        .with_trust_policy(policy);
+        let request = Envelope::new(
+            7,
+            MsgType::ClientOp,
+            GroupId::Data(0),
+            1,
+            codec::encode(&ClientRequest::Read {
+                key: b"key".to_vec(),
+                consistency: crate::types::Consistency::Linearizable,
+            }),
+        );
+        let reply = gateway
+            .serve_with_context(
+                request,
+                crate::transport::RequestContext {
+                    authenticated_user_id: Some("app:writer".into()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            codec::decode::<ClientReply>(&reply.payload),
+            Ok(ClientReply::Denied(_))
+        ));
     }
 }
