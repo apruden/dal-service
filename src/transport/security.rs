@@ -141,6 +141,7 @@ fn is_z85_public_key(key: &str) -> bool {
 /// libzmq builds without ZAP domain enforcement may admit clients if this
 /// endpoint is removed while those servers remain active.
 pub struct ZapAuthenticator {
+    context: zmq::Context,
     running: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
@@ -164,6 +165,7 @@ impl ZapAuthenticator {
             ));
         }
         let domain = zap_domain(cluster_id);
+        let context = ctx.clone();
         let socket = ctx.socket(zmq::REP).map_err(zmq_error)?;
         socket.set_linger(0).map_err(zmq_error)?;
         socket.set_rcvtimeo(100).map_err(zmq_error)?;
@@ -221,6 +223,7 @@ impl ZapAuthenticator {
             })
             .map_err(crate::Error::Io)?;
         Ok(Self {
+            context,
             running,
             failure,
             worker: Some(worker),
@@ -230,6 +233,12 @@ impl ZapAuthenticator {
 
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// The exact context that owns the ZAP endpoint. Secure sockets must be
+    /// created from this context; ZeroMQ inproc authentication is context-local.
+    pub fn context(&self) -> &zmq::Context {
+        &self.context
     }
 
     /// Return an error after any fatal worker failure. Runtime supervision

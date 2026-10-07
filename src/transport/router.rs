@@ -340,7 +340,6 @@ impl ZmqServer {
     /// Bind a CURVE-protected ROUTER socket using the ZAP domain and lifetime
     /// of `zap`. The private server key is binary 32-byte CURVE material.
     pub fn bind_curve<S>(
-        ctx: zmq::Context,
         addr: &str,
         server: Arc<S>,
         lane: Lane,
@@ -351,7 +350,14 @@ impl ZmqServer {
         S: Server + 'static,
     {
         let limits = RouterLimits::from_env(lane)?;
-        Self::bind_with_limits_and_curve(ctx, addr, server, lane, limits, Some((secret_key, zap)))
+        Self::bind_with_limits_and_curve(
+            zap.context().clone(),
+            addr,
+            server,
+            lane,
+            limits,
+            Some((secret_key, zap)),
+        )
     }
 
     fn bind_with_limits<S>(
