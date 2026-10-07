@@ -133,4 +133,6 @@ Before registration, `dal join` preflights every node in the live directory.
 Each peer must run the same trust-policy generation, trust the joining node's
 key, and have control and bulk endpoint pins for that node. Distribute the
 updated policy and pins to every peer before attempting enrollment; otherwise
-the join is rejected before the cluster directory changes.
+the join is rejected before the cluster directory changes. The operator auth
+file must also pin each live member's control endpoint so the CLI can contact
+every preflight target.
