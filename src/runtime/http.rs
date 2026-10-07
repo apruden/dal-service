@@ -349,6 +349,16 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     metric(
         &mut out,
+        "dal_storage_wal_peak_pending_requests",
+        status.storage_wal_peak_pending_requests as u64,
+    );
+    metric(
+        &mut out,
+        "dal_storage_wal_peak_pending_bytes",
+        status.storage_wal_peak_pending_bytes as u64,
+    );
+    metric(
+        &mut out,
         "dal_snapshot_builds_total",
         status.snapshot_builds,
     );
@@ -359,6 +369,16 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     metric(
         &mut out,
+        "dal_snapshot_build_max_microseconds",
+        status.snapshot_build_max_micros,
+    );
+    metric(
+        &mut out,
+        "dal_snapshot_install_max_microseconds",
+        status.snapshot_install_max_micros,
+    );
+    metric(
+        &mut out,
         "dal_router_admission_rejections_total",
         status.router_admission_rejections,
     );
@@ -366,6 +386,21 @@ fn render_metrics(status: &ClusterStatus) -> String {
         &mut out,
         "dal_authorization_denials_total",
         status.authorization_denials,
+    );
+    metric(
+        &mut out,
+        "dal_router_reply_send_eagain_total",
+        status.router_reply_send_eagain,
+    );
+    metric(
+        &mut out,
+        "dal_router_reply_send_failures_total",
+        status.router_reply_send_failures,
+    );
+    metric(
+        &mut out,
+        "dal_router_max_active_handlers",
+        status.router_max_active_handlers as u64,
     );
     metric(
         &mut out,
@@ -383,9 +418,56 @@ fn render_metrics(status: &ClusterStatus) -> String {
         if let Some(applied) = partition.applied {
             partition_metric(&mut out, "dal_partition_applied_index", id, applied);
         }
+        if let Some(visible) = partition.materialized_visible {
+            partition_metric(&mut out, "dal_partition_visible_index", id, visible);
+        }
         if let Some(durable) = partition.materialized_durable {
             partition_metric(&mut out, "dal_partition_durable_index", id, durable);
         }
+        partition_metric(
+            &mut out,
+            "dal_partition_materialized_pending_entries",
+            id,
+            partition.materialized_pending_entries as u64,
+        );
+        partition_metric(
+            &mut out,
+            "dal_partition_materialized_pending_bytes",
+            id,
+            partition.materialized_pending_bytes as u64,
+        );
+        if let Some(oldest_pending_ms) = partition.materialized_oldest_pending_ms {
+            partition_metric(
+                &mut out,
+                "dal_partition_oldest_pending_milliseconds",
+                id,
+                oldest_pending_ms,
+            );
+        }
+        partition_metric(
+            &mut out,
+            "dal_partition_flush_failures_total",
+            id,
+            partition.materialized_flush_failures,
+        );
+        partition_metric(
+            &mut out,
+            "dal_partition_retained_log_entries",
+            id,
+            partition.materialized_retained_log_entries,
+        );
+        partition_metric(
+            &mut out,
+            "dal_partition_recovery_epoch",
+            id,
+            partition.materialized_recovery_epoch,
+        );
+        partition_metric(
+            &mut out,
+            "dal_partition_recovery_attempts_total",
+            id,
+            partition.materialized_recovery_attempts,
+        );
         partition_metric(
             &mut out,
             "dal_partition_recovery_ready",
@@ -664,7 +746,9 @@ pub(crate) mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("dal_storage_failed 0\n"));
         assert!(body.contains("dal_authorization_denials_total 0\n"));
+        assert!(body.contains("dal_partition_visible_index{partition=\"0\"} 10\n"));
         assert!(body.contains("dal_partition_durable_index{partition=\"0\"} 9\n"));
+        assert!(body.contains("dal_partition_materialized_pending_bytes{partition=\"0\"} 128\n"));
         assert!(!body.contains("articles"));
         assert!(!body.contains("ab".repeat(32).as_str()));
         assert!(!body.contains("node_id"));
