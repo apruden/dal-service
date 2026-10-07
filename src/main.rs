@@ -173,6 +173,7 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
     let node_cfg = match load_node_config(Path::new(config)) {
         Ok(c) => c,
         Err(e) => {
+            tracing::error!(%e, "node config load failed");
             eprintln!("run: config: {e}");
             return ExitCode::FAILURE;
         }
@@ -180,6 +181,7 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
     let desc = match load_init_descriptor(Path::new(cluster)) {
         Ok(d) => d,
         Err(e) => {
+            tracing::error!(%e, "cluster descriptor load failed");
             eprintln!("run: cluster: {e}");
             return ExitCode::FAILURE;
         }
@@ -187,11 +189,13 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
     let security = match load_node_security(Path::new(config), &node_cfg) {
         Ok(security) => security,
         Err(e) => {
+            tracing::error!(%e, "node security load failed");
             eprintln!("run: security: {e}");
             return ExitCode::FAILURE;
         }
     };
     if node_cfg.cluster_id != desc.cluster_id {
+        tracing::error!("node config and cluster descriptor disagree on cluster_id");
         eprintln!("run: node config and cluster descriptor disagree on cluster_id");
         return ExitCode::FAILURE;
     }
@@ -200,6 +204,7 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
         let mut signals = match ShutdownSignals::register() {
             Ok(signals) => signals,
             Err(error) => {
+                tracing::error!(%error, "signal registration failed");
                 eprintln!("run: signal registration: {error}");
                 return ExitCode::FAILURE;
             }
@@ -211,19 +216,23 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
             result = &mut start => match result {
                 Ok(node) => node,
                 Err(error) => {
+                    tracing::error!(%error, "node startup failed");
                     eprintln!("run: start: {error}");
                     return ExitCode::FAILURE;
                 }
             },
             signal = signals.recv() => {
+                tracing::info!(signal, "shutdown requested during startup");
                 eprintln!("dal received {signal} during startup; stopping");
                 return match tokio::time::timeout(shutdown_timeout, &mut start).await {
                     Ok(Ok(node)) => shutdown_node(node).await,
                     Ok(Err(error)) => {
+                        tracing::error!(%error, "node startup failed while shutting down");
                         eprintln!("run: start while stopping: {error}");
                         ExitCode::FAILURE
                     }
                     Err(_) => {
+                        tracing::error!(timeout_ms = shutdown_timeout.as_millis(), "forced stop after startup timeout");
                         eprintln!(
                             "run: forced stop after startup exceeded {} ms",
                             shutdown_timeout.as_millis()
@@ -251,12 +260,18 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
         match event {
             BootstrapEvent::Complete(Ok(())) => {}
             BootstrapEvent::Complete(Err(error)) => {
+                tracing::error!(node_id = node.node_id(), %error, "node bootstrap failed");
                 eprintln!("run: bootstrap: {error}");
                 node.mark_failed();
                 let _ = shutdown_node(node).await;
                 return ExitCode::FAILURE;
             }
             BootstrapEvent::Signal(signal) => {
+                tracing::info!(
+                    node_id = node.node_id(),
+                    signal,
+                    "shutdown requested during bootstrap"
+                );
                 eprintln!(
                     "dal node {} received {signal} during bootstrap",
                     node.node_id()
@@ -264,19 +279,26 @@ fn run_node(config: &str, cluster: &str) -> ExitCode {
                 return shutdown_node(node).await;
             }
             BootstrapEvent::Fatal => {
+                tracing::error!(
+                    node_id = node.node_id(),
+                    "fatal background failure during bootstrap"
+                );
                 eprintln!("dal node {} failed during bootstrap", node.node_id());
                 let _ = shutdown_node(node).await;
                 return ExitCode::FAILURE;
             }
         }
 
+        tracing::info!(node_id = node.node_id(), "node ready");
         eprintln!("dal node {} running; Ctrl-C to stop", node.node_id());
         let failed = tokio::select! {
             signal = signals.recv() => {
+                tracing::info!(node_id = node.node_id(), signal, "shutdown requested");
                 eprintln!("dal node {} received {signal}; shutting down", node.node_id());
                 false
             }
             () = node.wait_for_failure() => {
+                tracing::error!(node_id = node.node_id(), "fatal background failure; shutting down");
                 eprintln!("dal node {} has a fatal background failure; shutting down", node.node_id());
                 true
             }
@@ -309,9 +331,14 @@ impl ShutdownSignals {
 }
 
 async fn shutdown_node(node: Node) -> ExitCode {
+    let node_id = node.node_id();
     match node.shutdown().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!(node_id, "node shutdown complete");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
+            tracing::error!(node_id, %error, "node shutdown failed");
             eprintln!("run: shutdown: {error}");
             ExitCode::FAILURE
         }
