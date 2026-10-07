@@ -3,13 +3,18 @@
 //! are deliberately separate: a valid CURVE key alone grants no operation.
 
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
+use serde::Deserialize;
+
 /// DAL-level permissions attached to an out-of-band authenticated principal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Permission {
     ClientRead,
     ClientWrite,
@@ -20,7 +25,8 @@ pub enum Permission {
 
 /// Identity and permissions supplied by the trusted cluster policy. The
 /// `user_id` is the ZAP identity; it must never be copied from an RPC payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Principal {
     pub user_id: String,
     /// Z85-encoded CURVE public key (40 ASCII bytes), provisioned out of band.
@@ -92,6 +98,25 @@ impl TrustPolicy {
         })
     }
 
+    /// Load the operator-controlled policy document. The file contains only
+    /// public keys and permission bindings; private keys are loaded separately.
+    pub fn load(path: &Path) -> crate::Result<Self> {
+        let bytes = read_protected_file(path, 64 * 1024 * 1024)?;
+        let document: TrustPolicyFile = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::Error::Config(format!("trust policy {}: {error}", path.display()))
+        })?;
+        let cluster_id = u128::from_str_radix(
+            document
+                .cluster_id
+                .strip_prefix("0x")
+                .unwrap_or(&document.cluster_id),
+            16,
+        )
+        .map_err(|error| crate::Error::Config(format!("trust policy cluster_id: {error}")))?;
+        Self::new(cluster_id, document.generation, document.principals)
+            .map_err(crate::Error::Config)
+    }
+
     pub fn cluster_id(&self) -> u128 {
         self.cluster_id
     }
@@ -113,6 +138,75 @@ impl TrustPolicy {
             .get(key)
             .and_then(|user_id| self.principals.get(user_id))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustPolicyFile {
+    cluster_id: String,
+    generation: u64,
+    principals: Vec<Principal>,
+}
+
+/// Read a protected Z85-encoded CURVE key file and decode it to libzmq's
+/// expected 32-byte binary form. The returned bytes must not be logged.
+pub fn load_curve_key(path: &Path) -> crate::Result<[u8; 32]> {
+    let contents = read_protected_file(path, 128)?;
+    let text = std::str::from_utf8(&contents)
+        .map_err(|_| crate::Error::Config(format!("CURVE key {} is not UTF-8", path.display())))?;
+    let encoded = text.trim_end_matches(['\r', '\n']);
+    if !is_z85_public_key(encoded) {
+        return Err(crate::Error::Config(format!(
+            "CURVE key {} is not a valid 40-byte Z85 key",
+            path.display()
+        )));
+    }
+    let decoded = zmq::z85_decode(encoded).map_err(|_| {
+        crate::Error::Config(format!("CURVE key {} cannot be decoded", path.display()))
+    })?;
+    decoded
+        .try_into()
+        .map_err(|_| crate::Error::Config(format!("CURVE key {} has wrong length", path.display())))
+}
+
+fn read_protected_file(path: &Path, max_bytes: u64) -> crate::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).map_err(crate::Error::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(crate::Error::Config(format!(
+            "security file {} must be a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(crate::Error::Config(format!(
+                "security file {} must not be accessible by group or other users",
+                path.display()
+            )));
+        }
+    }
+    if metadata.len() > max_bytes {
+        return Err(crate::Error::Config(format!(
+            "security file {} exceeds the {} byte limit",
+            path.display(),
+            max_bytes
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(crate::Error::Io)?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut contents)
+        .map_err(crate::Error::Io)?;
+    if contents.len() as u64 > max_bytes {
+        return Err(crate::Error::Config(format!(
+            "security file {} exceeds the {} byte limit",
+            path.display(),
+            max_bytes
+        )));
+    }
+    Ok(contents)
 }
 
 fn is_z85_public_key(key: &str) -> bool {
@@ -697,5 +791,45 @@ mod tests {
             permissions: vec![Permission::ClientRead],
         };
         assert!(TrustPolicy::new(7, 1, vec![out_of_range]).is_err());
+    }
+
+    #[test]
+    fn protected_policy_and_curve_key_files_load_without_exposing_secrets() {
+        let key = "A".repeat(40);
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            format!(
+                r#"{{"cluster_id":"0x7","generation":3,"principals":[{{"user_id":"node:1","curve_public_key":"{key}","permissions":["peer_rpc"]}}]}}"#
+            ),
+        )
+        .unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key_file.path(), format!("{key}\n")).unwrap();
+        #[cfg(unix)]
+        for path in [policy_file.path(), key_file.path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let policy = TrustPolicy::load(policy_file.path()).unwrap();
+        let expected_key: [u8; 32] = zmq::z85_decode(&key).unwrap().try_into().unwrap();
+        assert_eq!(policy.cluster_id(), 7);
+        assert_eq!(policy.generation(), 3);
+        assert_eq!(
+            policy
+                .authorize("node:1", Permission::PeerRpc)
+                .unwrap()
+                .user_id,
+            "node:1"
+        );
+        assert_eq!(load_curve_key(key_file.path()).unwrap(), expected_key);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(key_file.path(), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert!(load_curve_key(key_file.path()).is_err());
+        }
     }
 }
