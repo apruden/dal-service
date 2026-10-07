@@ -705,6 +705,14 @@ online backups to meet the recovery objective.
   loaded index writers, and retained logs. Bound or account for each against
   the production profile. A bounded send queue alone does not bound all
   outstanding requests once they have left that queue.
+- Add a node-wide search rebuild coordinator and disk-space admission check for
+  automatic outbox recovery, corrupt-index quarantine, operator rebuilds, and
+  restore reconstruction. Enforce the production profile's concurrency and
+  quarantine bounds. Never silently delete an existing quarantine to make room:
+  stop that index, alert, and require the documented archive/removal procedure.
+  Include active, building, retiring, and quarantined generations in disk and
+  writer-memory accounting. Serialize restore rebuilds through the same path and
+  prove the complete rebuild fits the restore-time objective.
 - Provide an initial Linux service unit running as a dedicated unprivileged
   user, persistent data directories, protected secret paths, SIGTERM handling,
   and the validated termination grace period. Start peers without inter-node

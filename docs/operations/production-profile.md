@@ -9,7 +9,7 @@ measure; passing a local test does not qualify the service on independent hosts.
 | Area | Initial qualification target |
 | --- | --- |
 | Deployment | Linux service units on three independent hosts and failure domains. Kubernetes requires its own qualification. |
-| Storage | Local SSDs with durable `fsync`, ext4, at least 2 TiB usable per host, and no shared volume between voters. Verify filesystem, device, and power-loss guarantees on the actual hosts. |
+| Storage | Local SSDs with durable `fsync`, ext4, at least 3 TiB usable per host, and no shared volume between voters. Verify filesystem, device, and power-loss guarantees on the actual hosts. |
 | Host resources | At least 8 vCPU and 32 GiB RAM per host for the trial. DAL RSS below 24 GiB is an acceptance threshold measured under load, not an enforced process cap. CPU, disk, and network contention must be recorded. These are test inputs, not proven minimums. |
 | Network | TCP between hosts on a dedicated or measured network with at least 1 Gbit/s of usable capacity. Record RTT, loss, and bandwidth during tests. |
 | Topology | Three meta voters, three data replicas per partition, initially three nodes. Qualify at most 16 partitions with eight active search indexes for the initial operating envelope. Test 1 and 16 partitions at full load; 128 partitions is an exploratory scalability case until its aggregate memory use is bounded and separately qualified. |
@@ -21,10 +21,11 @@ The existing three-process TCP benchmarks ran on one host and cannot establish
 cross-host latency, failure-domain independence, or these resource limits.
 
 At the proposed maximum, 16 partitions × 8 indexes × the current 50 MB Tantivy
-writer budget is 6.4 GB of configured writer budgets per node, before RocksDB
-buffers, Raft state, transport queues, and operating-system overhead. At 128
-partitions that product becomes 51.2 GB per node and cannot fit the proposed
-32 GiB host. Phase 6 must bound aggregate search writers and RocksDB memory,
+writer budget is 6.4 GB of configured writer budgets per node; one serialized
+full-index rebuild can add another 0.8 GB across 16 partitions. This is before
+RocksDB buffers, Raft state, transport queues, and operating-system overhead.
+At 128 partitions the active-writer product becomes 51.2 GB per node and cannot
+fit the proposed 32 GiB host. Phase 6 must bound aggregate search writers and RocksDB memory,
 or the supported partition/index combination must be reduced before claiming
 the 24 GiB RSS target. An operating-system memory limit would add an OOM failure
 mode and requires separate fault testing; this profile does not assume one.
@@ -47,7 +48,7 @@ and error counts separately, including while maintenance closes client ingress.
 | Failover | Run at least 300 independent node-crash trials where every affected group retains quorum. Every trial must resume successful writes within 15 s; also report empirical p99 and maximum, ambiguous write outcomes, and quorum-loss intervals. Zero failures in 300 trials gives about 95% confidence that the within-15-second rate exceeds 99%. |
 | Shutdown | Under normal load, close readiness before admission, drain, and stop within the proposed 60 s application deadline and 90 s supervisor grace period in every qualification trial. Report p99 and maximum drain time and classify forced stops as crashes. |
 | Availability and error rate | At least 99% time availability in each 30-day window, including planned maintenance. Send rate-limited valid read/write canaries to every partition and count the cluster unavailable if any required partition fails; report per-partition results too. Measure meta-dependent search separately. A failed or timed-out canary counts unavailable, while deterministically invalid input is excluded. Separately, below 0.1% errors/timeouts on valid operations during normal load with quorum. Safety requires zero lost acknowledged writes after any failure that leaves a durable quorum. |
-| Backlog and resources | Under the supported workload, zero forced search-consumer releases or rebuilds due to the compiled-in outbox bounds of 2,000,000 entries and 512 MiB per group. Keep retained Raft logs below 1 GiB per data group and catch one node up from the resulting 16 GiB maximum across 16 groups within 10 minutes. Add retained-byte accounting before enforcing this gate. Measure DAL RSS below 24 GiB and at least 40% free disk on each trial host. Implement aggregate bounds or reduce the envelope if these targets fail. |
+| Backlog and resources | Under the supported workload, zero forced search-consumer releases or rebuilds due to the compiled-in outbox bounds of 2,000,000 entries and 512 MiB per group. Keep retained Raft logs below 1 GiB per group and catch one node up from the resulting 17 GiB maximum across 16 data groups plus meta within 10 minutes. Add retained-byte accounting before enforcing this gate. Measure DAL RSS below 24 GiB and at least 40% free disk on each trial host. Implement aggregate bounds or reduce the envelope if these targets fail. |
 | Client identities | Applications reuse stable client identities; ephemeral per-request identities are unsupported. The operator trust policy explicitly binds permitted IDs to application principals and contains at most 100,000 IDs cluster-wide. Provision no more than 200 new IDs/day: one year × that rate × a 1.25 safety factor is at most 91,250. Alert at 80% and reject policy additions over the cap without affecting existing streams. Before one year or exhaustion, implement safe expiry or qualify a larger cap. Include the resulting per-partition sequence records in disk accounting. |
 | Disaster recovery | Provisional RPO at most 24 hours, measured from the last verified off-host backup, and RTO at most 4 hours for the 50 GiB dataset. Backup cadence must be shorter than 24 hours by the worst-case backup completion delay; report both actual recovered point and timed restore. |
 
@@ -58,19 +59,21 @@ with equivalent sizing for the other classes. For the mixed soak, use about
 1 MiB keys, distributed across every partition. This is about 50 GiB of value
 payload before keys and metadata. All mutations select from that fixed keyspace.
 
-Budget each 2 TiB host conservatively: at most 150 GiB for authoritative RocksDB
-state plus compaction headroom, 16 GiB for the 1 GiB retained-log limit across
-16 data groups, 600 GiB for eight active search projections plus one full-size
-rebuild generation and one quarantined generation, 150 GiB for backup/checkpoint
-staging, and 50 GiB for service logs and temporary files. Permit only one index
-rebuild at a time. A verified unused quarantine must be removed through the
-runbook before another rebuild; admission preflight refuses work that would
-cross the disk budget. Keep at least 40% (about 819 GiB) free throughout
-qualification. Measure actual projection and rebuild size rather than assuming
-it equals source size, plus physical write volume and disk amplification; reduce
-the operating envelope if any component exceeds its budget.
+Budget each 3 TiB host conservatively: at most 150 GiB for authoritative RocksDB
+state plus compaction headroom, 17 GiB for the 1 GiB retained-log limit across
+16 data groups plus meta, 900 GiB for eight active search projections, at most
+one quarantine per index, and one concurrent full-index rebuild, 150 GiB for
+backup/checkpoint staging, and 50 GiB for service logs and temporary files.
+Phase 6 adds a node-wide rebuild coordinator and disk preflight. An existing
+quarantine blocks silent replacement and raises an operator alert; the runbook
+archives or removes it before another quarantine for that index. Restore rebuilds
+run through the same coordinator. Keep at least 40% (about 1.2 TiB) free
+throughout qualification. Measure actual projection, quarantine, and rebuild
+size rather than assuming each equals source size, plus physical write volume
+and disk amplification; reduce the operating envelope if any component exceeds
+its budget.
 
-The 16 GiB whole-node retained-log budget takes about 2.3 minutes to transfer
+The 17 GiB whole-node retained-log budget takes about 2.4 minutes to transfer
 over an ideal 1 Gbit/s link. The 10-minute catch-up target leaves room for
 protocol overhead and concurrent foreground traffic; qualification must measure
 that contention rather than relying on the ideal calculation.
