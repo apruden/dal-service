@@ -187,10 +187,10 @@ durability shutdown seams.
    emits a failure and exits through a bounded forced-stop path; it does not
    claim a clean drain. Account for non-cancellable blocking tasks and runtime
    destruction so a timeout wrapper alone cannot leave the process hanging.
-6. Serve probes from a cheap in-memory health view. The current `/health` calls
-   `status()`, which can scan search outboxes. Move expensive diagnostics to a
-   bounded background sampler and expose sample age. Preserve or explicitly
-   deprecate the existing `/health` contract rather than silently changing it.
+6. Serve probes from a cheap in-memory health view. Replace the former
+   `/health` path, which called `status()` and could scan search outboxes, with
+   a bounded background sampler and exposed sample age. Preserve `/health` as
+   a documented compatibility liveness alias.
 
 ### Probe contracts
 

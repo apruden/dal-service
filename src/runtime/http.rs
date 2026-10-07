@@ -8,7 +8,7 @@
 //! network round trip, RocksDB scan, or search-outbox scan.
 
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{Json, Router, extract::State, routing::get};
 use serde::{Deserialize, Serialize};
@@ -23,10 +23,15 @@ pub struct ClusterStatus {
     /// Cluster id as a hex string (JSON cannot carry a u128 reliably).
     pub cluster_id: String,
     pub protocol_version: u32,
+    #[serde(default = "default_reported_lifecycle")]
     pub lifecycle: RuntimeLifecycle,
+    #[serde(default = "default_true")]
     pub identity_valid: bool,
     /// Age of the cached diagnostic sample returned by `/status`.
+    #[serde(default)]
     pub diagnostic_sample_age_ms: u64,
+    #[serde(default)]
+    pub diagnostic_sample_stale: bool,
     /// Database-wide fail-stop state. This includes meta-only nodes and remains
     /// true for the rest of the process after any materialization/WAL failure.
     pub storage_failed: bool,
@@ -172,16 +177,11 @@ pub struct ProbeStatus {
 
 impl ProbeStatus {
     fn from_status(status: &ClusterStatus) -> Self {
-        let storage_healthy = !status.storage_failed
-            && status
-                .partitions
-                .iter()
-                .all(|partition| !partition.materialized_failed);
-        let local_groups_ready = status
-            .partitions
-            .iter()
-            .all(|partition| partition.serving && partition.materialized_recovery_ready);
-        let live = status.lifecycle.is_live() && status.identity_valid && storage_healthy;
+        let (storage_healthy, local_groups_ready) = sample_health(status);
+        let live = status.lifecycle.is_live()
+            && status.identity_valid
+            && storage_healthy
+            && !status.diagnostic_sample_stale;
         Self {
             lifecycle: status.lifecycle,
             live,
@@ -213,6 +213,7 @@ pub struct StatusCache {
     sample: RwLock<CachedSample>,
     lifecycle: RuntimeReadiness,
     identity_gate: ProcessIdentityGate,
+    max_age: Duration,
 }
 
 impl StatusCache {
@@ -220,6 +221,7 @@ impl StatusCache {
         status: ClusterStatus,
         lifecycle: RuntimeReadiness,
         identity_gate: ProcessIdentityGate,
+        max_age: Duration,
     ) -> Self {
         let (storage_healthy, local_groups_ready) = sample_health(&status);
         Self {
@@ -231,6 +233,7 @@ impl StatusCache {
             }),
             lifecycle,
             identity_gate,
+            max_age,
         }
     }
 
@@ -254,8 +257,19 @@ fn sample_health(status: &ClusterStatus) -> (bool, bool) {
     let local_groups_ready = status
         .partitions
         .iter()
+        .filter(|partition| matches!(partition.role, Role::Leader | Role::Voter))
         .all(|partition| partition.serving && partition.materialized_recovery_ready);
     (storage_healthy, local_groups_ready)
+}
+
+fn default_reported_lifecycle() -> RuntimeLifecycle {
+    // Status payloads from versions before lifecycle reporting represented a
+    // running process by definition: a caller had just reached its HTTP plane.
+    RuntimeLifecycle::Running
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl StatusSource for StatusCache {
@@ -264,14 +278,18 @@ impl StatusSource for StatusCache {
         let mut status = sample.status.clone();
         status.lifecycle = self.lifecycle.lifecycle();
         status.identity_valid = self.identity_gate.is_open();
-        status.diagnostic_sample_age_ms = sample.sampled_at.elapsed().as_millis() as u64;
+        let age = sample.sampled_at.elapsed();
+        status.diagnostic_sample_age_ms = age.as_millis().min(u64::MAX as u128) as u64;
+        status.diagnostic_sample_stale = age > self.max_age;
         status
     }
 
     fn probe(&self) -> ProbeStatus {
         let sample = self.sample.read().unwrap();
         let lifecycle = self.lifecycle.lifecycle();
-        let live = lifecycle.is_live() && self.identity_gate.is_open() && sample.storage_healthy;
+        let fresh = sample.sampled_at.elapsed() <= self.max_age;
+        let live =
+            lifecycle.is_live() && self.identity_gate.is_open() && sample.storage_healthy && fresh;
         ProbeStatus {
             lifecycle,
             live,
@@ -323,7 +341,7 @@ fn probe_response(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -339,6 +357,7 @@ mod tests {
                 lifecycle: RuntimeLifecycle::Running,
                 identity_valid: true,
                 diagnostic_sample_age_ms: 0,
+                diagnostic_sample_stale: false,
                 storage_failed: false,
                 storage_wal_syncs: None,
                 storage_wal_bytes: None,
@@ -414,6 +433,10 @@ mod tests {
                 directory: Vec::new(),
             }
         }
+    }
+
+    pub(crate) fn test_status() -> ClusterStatus {
+        StubStatus.status()
     }
 
     struct FailedStatus;
@@ -518,6 +541,21 @@ mod tests {
         assert_eq!(got.partitions[0].search_outbox_entries, 3);
     }
 
+    #[test]
+    fn new_status_fields_accept_older_payloads() {
+        let mut value = serde_json::to_value(StubStatus.status()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("lifecycle");
+        object.remove("identity_valid");
+        object.remove("diagnostic_sample_age_ms");
+        object.remove("diagnostic_sample_stale");
+        let decoded: ClusterStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.lifecycle, RuntimeLifecycle::Running);
+        assert!(decoded.identity_valid);
+        assert_eq!(decoded.diagnostic_sample_age_ms, 0);
+        assert!(!decoded.diagnostic_sample_stale);
+    }
+
     /// Design §14: an unusable derived index degrades search only. It must not
     /// change the database health result, which is what an operator's failover
     /// automation keys on.
@@ -545,11 +583,90 @@ mod tests {
         let lifecycle = RuntimeReadiness::default();
         assert!(lifecycle.mark_ready());
         let identity = ProcessIdentityGate::default();
-        let cache = StatusCache::new(StubStatus.status(), lifecycle, identity);
+        let cache = StatusCache::new(
+            StubStatus.status(),
+            lifecycle,
+            identity,
+            std::time::Duration::from_secs(1),
+        );
         let first = cache.status();
         assert_eq!(first.lifecycle, RuntimeLifecycle::Running);
         assert!(cache.probe().ready);
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(cache.status().diagnostic_sample_age_ms >= 1);
+    }
+
+    #[test]
+    fn cache_follows_lifecycle_without_waiting_for_publish() {
+        let lifecycle = RuntimeReadiness::default();
+        assert!(lifecycle.mark_ready());
+        let cache = StatusCache::new(
+            StubStatus.status(),
+            lifecycle.clone(),
+            ProcessIdentityGate::default(),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(cache.probe().ready);
+
+        assert!(lifecycle.begin_draining());
+        assert!(cache.probe().live);
+        assert!(!cache.probe().ready);
+
+        assert!(lifecycle.mark_failed());
+        assert!(!cache.probe().live);
+        cache.publish(StubStatus.status());
+        assert!(!cache.probe().live, "a healthy sample cannot reopen Failed");
+    }
+
+    #[test]
+    fn cache_fails_closed_for_storage_identity_and_staleness() {
+        let lifecycle = RuntimeReadiness::default();
+        assert!(lifecycle.mark_ready());
+        let identity = ProcessIdentityGate::default();
+        let cache = StatusCache::new(
+            StubStatus.status(),
+            lifecycle,
+            identity.clone(),
+            std::time::Duration::from_secs(1),
+        );
+
+        let mut failed = StubStatus.status();
+        failed.storage_failed = true;
+        cache.publish(failed);
+        assert!(!cache.probe().live);
+
+        cache.publish(StubStatus.status());
+        assert!(cache.probe().live);
+        identity.fence();
+        assert!(!cache.probe().live);
+
+        let stale_lifecycle = RuntimeReadiness::default();
+        assert!(stale_lifecycle.mark_ready());
+        let stale = StatusCache::new(
+            StubStatus.status(),
+            stale_lifecycle,
+            ProcessIdentityGate::default(),
+            std::time::Duration::from_millis(1),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(!stale.probe().live);
+        assert!(stale.status().diagnostic_sample_stale);
+    }
+
+    #[test]
+    fn unready_learner_does_not_close_process_readiness() {
+        let lifecycle = RuntimeReadiness::default();
+        assert!(lifecycle.mark_ready());
+        let mut status = StubStatus.status();
+        status.partitions[0].role = Role::Learner;
+        status.partitions[0].serving = false;
+        status.partitions[0].materialized_recovery_ready = false;
+        let cache = StatusCache::new(
+            status,
+            lifecycle,
+            ProcessIdentityGate::default(),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(cache.probe().ready);
     }
 }

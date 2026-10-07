@@ -180,7 +180,9 @@ impl Server for RootDispatch {
     collect one local status snapshot, then sample detailed diagnostics once per
     second on a blocking worker. `/status` returns the cached snapshot with its
     age; `/livez`, `/readyz`, and compatibility `/health` read only lifecycle
-    and cached health flags. `None` → skip the HTTP and sampling tasks.
+    and cached health flags. A sample older than three seconds fails closed, and
+    a storage fail-stop watcher changes lifecycle to `Failed` immediately.
+    `None` → skip the HTTP and sampling tasks.
 11. **Spawn background drivers** — heartbeat emitter (liveness → meta voters), the
     reconcile loop (reacts to placement changes: start/stop partitions, honor
     `BecomeLearner`), and — active only while meta leader — the rebalancer/plan
@@ -196,8 +198,10 @@ Change lifecycle to `Draining` (closing readiness) → abort background loops �
 dispatched handlers → drop `Storage` (flush/close). Poller stopping is
 synchronous, but handler draining yields to Tokio so an in-flight request can
 finish on a single-worker runtime. Successful teardown records `Stopped`; a
-Raft shutdown error records `Failed`. Signal coordination and keeping probes
-available throughout the drain are the next lifecycle milestone.
+Raft shutdown or owned-task error records `Failed`. The diagnostic sampler is
+signalled and joined, including any in-flight blocking collection, before the
+final storage owner is released. The HTTP task remains available throughout
+the drain and receives graceful shutdown last.
 
 ## Example: client write path (once assembled)
 `Client` (DEALER) → target `control_addr` ROUTER → `ClientGateway` →

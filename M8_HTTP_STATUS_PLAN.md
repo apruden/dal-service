@@ -84,17 +84,23 @@ Field → source mapping:
 ## Step 2 — axum router + handlers (`src/runtime/http.rs`)
 
 - `GET /status` → `Json<ClusterStatus>` from `State<Arc<dyn StatusSource>>`.
-- `GET /health` → `200 "ok"` (liveness only; reads no state).
+- `GET /health` → compatibility liveness alias: `200 "ok"` while lifecycle,
+  identity, cached storage health, and diagnostic freshness are healthy;
+  otherwise `503 "failed"`.
+- `GET /livez` has the same health decision with `"live"` as its success body.
+  `GET /readyz` additionally requires lifecycle `Running` and every hosted
+  voter group to pass its serving and recovery gates. Learners do not close
+  process readiness.
 - Router: `http::router(src)` returns the axum `Router`; the caller owns the
   listener and the serving task.
 
-**As built (drift from the original sketch):** there is no `serve(addr, src,
-shutdown)` helper with `.with_graceful_shutdown`. `Node::start` binds the
-`TcpListener` itself — before storage opens, so a bad `http_addr` fails startup
-(`Error::Config` on parse, `Error::Io` on bind) without leaking background
-tasks — then spawns `axum::serve(listener, http::router(src))` into the node's
-task set. Shutdown aborts that task with the other loops rather than driving a
-graceful-shutdown future.
+`Node::start` binds the `TcpListener` itself before storage opens, so a bad
+`http_addr` fails startup (`Error::Config` on parse, `Error::Io` on bind)
+without leaking background tasks. The node owns the HTTP server and diagnostic
+sampler separately. Shutdown first changes lifecycle to `Draining`, joins any
+in-flight blocking diagnostic collection, then drives axum's graceful-shutdown
+future after the data plane has drained. Probes therefore remain available
+during the drain.
 
 ## Step 3 — CLI / runtime wiring (built)
 
@@ -104,6 +110,11 @@ graceful-shutdown future.
 - The `StatusSource` is a dedicated `NodeStatus` struct (holding `node_id`,
   cluster config, `meta`, and the shared `partitions` handle), not `Node`
   itself.
+- A background task samples that source once per second. Request handlers only
+  clone the cached snapshot or read precomputed health flags. A sample older
+  than three seconds closes liveness, and a sampler panic changes lifecycle to
+  `Failed`. A separate storage fail-stop watcher also closes liveness without
+  waiting for the next sample.
 - `dal status` is unchanged by this work (stays on ZMQ); the `status` CLI
   subcommand is currently a stub (see IMPLEMENTATION.md §2 M8 open items).
 
@@ -111,9 +122,11 @@ graceful-shutdown future.
 
 - Stub `StatusSource` returning a fixed `ClusterStatus`; `oneshot` a
   `GET /status`, assert JSON body decodes back to the fixture.
-- `GET /health` returns 200 unconditionally.
-- `ClusterStatus` serialize → deserialize equality (round-trip).
-- No sockets, no runtime, no tokio multi-thread needed for these.
+- Probe handlers never call the live collector; storage, identity, stale-sample,
+  lifecycle, voter, and learner cases exercise the cached decisions.
+- New status fields accept older JSON payloads through serde defaults.
+- Sampler tests cover a blocking collection during shutdown and a collector
+  panic changing lifecycle to `Failed`.
 
 ## Explicitly deferred
 

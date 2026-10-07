@@ -34,7 +34,7 @@ use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
     ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusCache, StatusSource,
 };
-use crate::runtime::readiness::RuntimeReadiness;
+use crate::runtime::readiness::{RuntimeLifecycle, RuntimeReadiness};
 use crate::runtime::rebalance::RebalanceDriver;
 use crate::storage::Storage;
 use crate::transport::dealer::ZmqTransport;
@@ -61,6 +61,7 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 /// Expensive local diagnostics are sampled away from HTTP request handlers.
 const STATUS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const STATUS_SAMPLE_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// The node's meta-group runtime, shared and mutable so a node can start hosting
 /// the meta group at runtime or stop after a drain.
@@ -339,6 +340,17 @@ pub struct Node {
     // no RocksDB/Tantivy owner outlives the node.
     search_shutdown: watch::Sender<bool>,
     search_task: Option<JoinHandle<()>>,
+    // Diagnostic sampling may be inside non-cancellable blocking work. Keep its
+    // handle separate so shutdown signals and then joins it before storage can
+    // be released.
+    status_shutdown: Option<watch::Sender<bool>>,
+    status_task: Option<JoinHandle<()>>,
+    // The HTTP listener remains available while lifecycle is Draining and is
+    // stopped only after owned work and probes have reached a terminal state.
+    http_shutdown: Option<watch::Sender<bool>>,
+    http_task: Option<JoinHandle<()>>,
+    // Converts database fail-stop into process lifecycle immediately.
+    storage_failure_task: Option<JoinHandle<()>>,
     // Dropping these stops the poller threads and closes the sockets.
     _control_srv: Option<ZmqServer>,
     _bulk_srv: Option<ZmqServer>,
@@ -675,8 +687,13 @@ impl Node {
         )));
 
         // Read-only HTTP admin plane. Its listener was bound before runtime
-        // assembly; the serving task is aborted on shutdown with the other
-        // loops.
+        // assembly. Keep diagnostics and serving tasks separately owned so a
+        // blocking sample cannot outlive shutdown and probes remain reachable
+        // while lifecycle is Draining.
+        let mut status_shutdown = None;
+        let mut status_task = None;
+        let mut http_shutdown = None;
+        let mut http_task = None;
         if let Some(listener) = http_listener {
             let live_status = Arc::new(NodeStatus {
                 node_id: cfg.node_id,
@@ -692,25 +709,48 @@ impl Node {
                 live_status.status(),
                 readiness.clone(),
                 identity_gate.clone(),
+                STATUS_SAMPLE_MAX_AGE,
             ));
-            let sampler_source = live_status.clone();
-            let sampler_cache = cache.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(STATUS_SAMPLE_INTERVAL).await;
-                    let source = sampler_source.clone();
-                    let Ok(status) = tokio::task::spawn_blocking(move || source.status()).await
-                    else {
-                        return;
-                    };
-                    sampler_cache.publish(status);
+            let (sampler_tx, sampler_rx) = watch::channel(false);
+            let sampler_source: Arc<dyn StatusSource> = live_status;
+            status_task = Some(tokio::spawn(status_sampler(
+                sampler_source,
+                cache.clone(),
+                readiness.clone(),
+                STATUS_SAMPLE_INTERVAL,
+                sampler_rx,
+            )));
+            status_shutdown = Some(sampler_tx);
+
+            let src: Arc<dyn StatusSource> = cache;
+            let (http_tx, mut http_rx) = watch::channel(false);
+            let http_readiness = readiness.clone();
+            http_task = Some(tokio::spawn(async move {
+                let shutdown = async move {
+                    while !*http_rx.borrow() {
+                        if http_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                if let Err(error) = axum::serve(listener, crate::runtime::http::router(src))
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                {
+                    eprintln!("HTTP admin task failed: {error}");
+                    http_readiness.mark_failed();
                 }
             }));
-            let src: Arc<dyn StatusSource> = cache;
-            tasks.push(tokio::spawn(async move {
-                let _ = axum::serve(listener, crate::runtime::http::router(src)).await;
-            }));
+            http_shutdown = Some(http_tx);
         }
+
+        let failure_storage = storage.clone();
+        let failure_readiness = readiness.clone();
+        let storage_failure_task = tokio::spawn(async move {
+            let error = failure_storage.wait_for_failure().await;
+            eprintln!("database fail-stop: {error}");
+            failure_readiness.mark_failed();
+        });
 
         Ok(Node {
             node_id: cfg.node_id,
@@ -728,6 +768,11 @@ impl Node {
             tasks,
             search_shutdown,
             search_task: Some(search_task),
+            status_shutdown,
+            status_task,
+            http_shutdown,
+            http_task,
+            storage_failure_task: Some(storage_failure_task),
             _control_srv: Some(control_srv),
             _bulk_srv: Some(bulk_srv),
         })
@@ -1037,12 +1082,74 @@ impl Node {
             server.shutdown().await;
         }
 
-        if let Some(error) = first_error {
-            self.readiness.mark_failed();
-            return Err(error);
+        if let Some(shutdown) = self.status_shutdown.take() {
+            let _ = shutdown.send(true);
         }
-        self.readiness.mark_stopped();
-        Ok(())
+        if let Some(task) = self.status_task.take()
+            && let Err(error) = task.await
+            && first_error.is_none()
+        {
+            first_error = Some(Error::Raft(format!("status sampler task failed: {error}")));
+        }
+        if let Some(task) = self.storage_failure_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+
+        if first_error.is_some() {
+            self.readiness.mark_failed();
+        } else if self.readiness.lifecycle() != RuntimeLifecycle::Failed {
+            self.readiness.mark_stopped();
+        }
+
+        if let Some(shutdown) = self.http_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(task) = self.http_task.take()
+            && let Err(error) = task.await
+            && first_error.is_none()
+        {
+            self.readiness.mark_failed();
+            first_error = Some(Error::Raft(format!("HTTP admin task failed: {error}")));
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn status_sampler(
+    source: Arc<dyn StatusSource>,
+    cache: Arc<StatusCache>,
+    readiness: RuntimeReadiness,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        let collector = source.clone();
+        match tokio::task::spawn_blocking(move || collector.status()).await {
+            Ok(status) => cache.publish(status),
+            Err(error) => {
+                eprintln!("status sampler failed: {error}");
+                readiness.mark_failed();
+                return;
+            }
+        }
     }
 }
 
@@ -1243,6 +1350,7 @@ impl StatusSource for NodeStatus {
             lifecycle: self.readiness.lifecycle(),
             identity_valid: self.identity_gate.is_open(),
             diagnostic_sample_age_ms: 0,
+            diagnostic_sample_stale: false,
             storage_failed: self.storage.database_failure().is_some(),
             storage_wal_syncs: rocks.map(|counters| counters.wal_syncs),
             storage_wal_bytes: rocks.map(|counters| counters.wal_bytes),
@@ -1945,6 +2053,7 @@ mod tests {
     use super::*;
     use crate::meta::bootstrap::DirEntry;
     use crate::types::{HashSpec, PROTOCOL_VERSION};
+    use std::sync::Mutex as StdMutex;
 
     fn descriptor() -> BootstrapDescriptor {
         BootstrapDescriptor {
@@ -2036,5 +2145,95 @@ mod tests {
             !data_dir.exists(),
             "storage must not be opened on a bad bind"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_sampler_joins_an_in_flight_blocking_sample() {
+        struct BlockingStatus {
+            entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl StatusSource for BlockingStatus {
+            fn status(&self) -> ClusterStatus {
+                if let Some(entered) = self.entered.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                }
+                self.release.lock().unwrap().recv().unwrap();
+                crate::runtime::http::tests::test_status()
+            }
+        }
+
+        let readiness = RuntimeReadiness::default();
+        assert!(readiness.mark_ready());
+        let cache = Arc::new(StatusCache::new(
+            crate::runtime::http::tests::test_status(),
+            readiness.clone(),
+            ProcessIdentityGate::default(),
+            Duration::from_secs(1),
+        ));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let source: Arc<dyn StatusSource> = Arc::new(BlockingStatus {
+            entered: StdMutex::new(Some(entered_tx)),
+            release: StdMutex::new(release_rx),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut task = tokio::spawn(status_sampler(
+            source,
+            cache,
+            readiness,
+            Duration::ZERO,
+            shutdown_rx,
+        ));
+
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "sampler shutdown must wait for its blocking collector"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_sampler_failure_closes_liveness() {
+        struct PanickingStatus;
+
+        impl StatusSource for PanickingStatus {
+            fn status(&self) -> ClusterStatus {
+                panic!("collector failed")
+            }
+        }
+
+        let readiness = RuntimeReadiness::default();
+        assert!(readiness.mark_ready());
+        let cache = Arc::new(StatusCache::new(
+            crate::runtime::http::tests::test_status(),
+            readiness.clone(),
+            ProcessIdentityGate::default(),
+            Duration::from_secs(1),
+        ));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        status_sampler(
+            Arc::new(PanickingStatus),
+            cache,
+            readiness.clone(),
+            Duration::ZERO,
+            shutdown_rx,
+        )
+        .await;
+
+        assert_eq!(readiness.lifecycle(), RuntimeLifecycle::Failed);
     }
 }
