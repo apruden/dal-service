@@ -7,13 +7,16 @@
 //! byte-identical [`BootstrapDescriptor`] (placements are deterministic), so
 //! the durable bootstrap records written independently on each node agree.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
 use crate::config::{InitConfig, NodeConfig, Timeouts, parse_partition_count};
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{BootstrapDescriptor, DirEntry};
+use crate::transport::security::{Permission, TrustPolicy, load_curve_key};
 use crate::types::{
     ClusterConfig, ClusterId, HashSpec, MAX_ENDPOINT_BYTES, NodeId, PROTOCOL_VERSION,
 };
@@ -80,6 +83,54 @@ struct NodeFile {
     data_dir: PathBuf,
     #[serde(default)]
     timeouts: TimeoutsFile,
+    #[serde(default)]
+    security: Option<NodeSecurityFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeSecurityFile {
+    trust_policy_file: PathBuf,
+    curve_public_key_file: PathBuf,
+    curve_secret_key_file: PathBuf,
+    /// Endpoint to trusted policy principal. Endpoints are provisioned out of
+    /// band; redirects and directory data never create pins.
+    server_key_pins: BTreeMap<String, String>,
+}
+
+/// Validated node credentials loaded from protected files and an operator
+/// policy. This value intentionally has no `Debug` implementation because it
+/// contains the private CURVE secret key.
+pub struct LoadedNodeSecurity {
+    pub policy: Arc<TrustPolicy>,
+    pub user_id: String,
+    pub public_key: [u8; 32],
+    pub secret_key: [u8; 32],
+    pub server_keys: BTreeMap<String, [u8; 32]>,
+}
+
+impl LoadedNodeSecurity {
+    /// Ensure every bootstrap peer endpoint is pinned before any socket starts.
+    pub fn validate_descriptor(
+        &self,
+        desc: &BootstrapDescriptor,
+        local_node_id: NodeId,
+    ) -> Result<()> {
+        for entry in &desc.directory {
+            if entry.node_id == local_node_id {
+                continue;
+            }
+            for endpoint in [&entry.control_addr, &entry.bulk_addr] {
+                if !self.server_keys.contains_key(endpoint) {
+                    return Err(Error::Config(format!(
+                        "security.server_key_pins has no key for node {} endpoint {endpoint}",
+                        entry.node_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Load and validate a per-node config file.
@@ -99,6 +150,83 @@ pub fn load_node_config(path: &Path) -> Result<NodeConfig> {
     };
     cfg.validate()?;
     Ok(cfg)
+}
+
+/// Load trust and key material referenced by a node config. All paths are
+/// relative to the node config file unless absolute. Every peer pin resolves
+/// through the trust policy rather than accepting self-reported keys.
+pub fn load_node_security(path: &Path, cfg: &NodeConfig) -> Result<LoadedNodeSecurity> {
+    let text = std::fs::read_to_string(path)?;
+    let file: NodeFile = serde_json::from_str(&text)
+        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    let security = file
+        .security
+        .ok_or_else(|| Error::Config("node config must include a security section".into()))?;
+    let resolve = |referenced: PathBuf| {
+        if referenced.is_absolute() {
+            referenced
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(referenced)
+        }
+    };
+    let policy = Arc::new(TrustPolicy::load(&resolve(security.trust_policy_file))?);
+    if policy.cluster_id() != cfg.cluster_id {
+        return Err(Error::Config(
+            "trust policy cluster_id does not match node cluster_id".into(),
+        ));
+    }
+    let public_key = load_curve_key(&resolve(security.curve_public_key_file))?;
+    let secret_key = load_curve_key(&resolve(security.curve_secret_key_file))?;
+    let encoded_public_key = zmq::z85_encode(&public_key)
+        .map_err(|_| Error::Config("node CURVE public key cannot be encoded".into()))?;
+    let principal = policy
+        .principal_for_curve_key(&encoded_public_key)
+        .ok_or_else(|| Error::Config("node CURVE public key is absent from trust policy".into()))?;
+    let expected_user_id = format!("node:{}", cfg.node_id);
+    if principal.user_id != expected_user_id
+        || !principal.permissions.contains(&Permission::PeerRpc)
+    {
+        return Err(Error::Config(format!(
+            "node CURVE key must be bound to {expected_user_id} with peer_rpc permission"
+        )));
+    }
+    let user_id = principal.user_id.clone();
+    let mut server_keys = BTreeMap::new();
+    for (endpoint, principal_id) in security.server_key_pins {
+        if endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES {
+            return Err(Error::Config(
+                "security.server_key_pins contains an invalid endpoint".into(),
+            ));
+        }
+        let principal = policy
+            .authorize(&principal_id, Permission::PeerRpc)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "server key pin {endpoint} references unknown or untrusted node {principal_id}"
+                ))
+            })?;
+        let key = zmq::z85_decode(&principal.curve_public_key)
+            .map_err(|_| Error::Config("trust policy contains an invalid CURVE public key".into()))?
+            .try_into()
+            .map_err(|_| Error::Config("trust policy CURVE public key has wrong length".into()))?;
+        server_keys.insert(endpoint, key);
+    }
+    for endpoint in &cfg.seeds {
+        if !server_keys.contains_key(endpoint) {
+            return Err(Error::Config(format!(
+                "security.server_key_pins has no key for configured seed {endpoint}"
+            )));
+        }
+    }
+    Ok(LoadedNodeSecurity {
+        policy,
+        user_id,
+        public_key,
+        secret_key,
+        server_keys,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +384,51 @@ mod tests {
         assert_eq!(cfg.http_addr, None);
         assert!(cfg.seeds.is_empty());
         assert_eq!(cfg.timeouts, Timeouts::default());
+    }
+
+    #[test]
+    fn node_security_resolves_pins_through_the_cluster_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_public = "A".repeat(40);
+        let peer_public = "B".repeat(40);
+        let policy_path = dir.path().join("trust-policy.json");
+        std::fs::write(
+            &policy_path,
+            format!(
+                r#"{{"cluster_id":"7","generation":1,"principals":[{{"user_id":"node:2","curve_public_key":"{node_public}","permissions":["peer_rpc"]}},{{"user_id":"node:3","curve_public_key":"{peer_public}","permissions":["peer_rpc"]}}]}}"#
+            ),
+        )
+        .unwrap();
+        let node_public_path = dir.path().join("node-public.key");
+        let node_secret_path = dir.path().join("node-secret.key");
+        std::fs::write(&node_public_path, &node_public).unwrap();
+        std::fs::write(&node_secret_path, &node_public).unwrap();
+        #[cfg(unix)]
+        for path in [&policy_path, &node_public_path, &node_secret_path] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let node_config = dir.path().join("node.json");
+        std::fs::write(
+            &node_config,
+            format!(
+                r#"{{"cluster_id":"7","node_id":2,"control_addr":"tcp://127.0.0.1:5001","bulk_addr":"tcp://127.0.0.1:5002","seeds":["tcp://127.0.0.1:5003"],"data_dir":"/tmp/dal-node-2","security":{{"trust_policy_file":"{}","curve_public_key_file":"{}","curve_secret_key_file":"{}","server_key_pins":{{"tcp://127.0.0.1:5003":"node:3","tcp://127.0.0.1:5004":"node:3"}}}}}}"#,
+                policy_path.display(),
+                node_public_path.display(),
+                node_secret_path.display(),
+            ),
+        )
+        .unwrap();
+        let cfg = load_node_config(&node_config).unwrap();
+        let security = load_node_security(&node_config, &cfg).unwrap();
+        let expected_peer_key: [u8; 32] =
+            zmq::z85_decode(&peer_public).unwrap().try_into().unwrap();
+        assert_eq!(security.user_id, "node:2");
+        assert_eq!(security.server_keys.len(), 2);
+        assert_eq!(
+            security.server_keys["tcp://127.0.0.1:5003"],
+            expected_peer_key
+        );
     }
 
     #[test]
