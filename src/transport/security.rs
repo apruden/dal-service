@@ -32,6 +32,11 @@ pub struct Principal {
     /// Z85-encoded CURVE public key (40 ASCII bytes), provisioned out of band.
     pub curve_public_key: String,
     pub permissions: Vec<Permission>,
+    /// Stable client identities owned by this principal, as hexadecimal
+    /// strings (`0x` followed by 1..=32 digits). Used to prevent application
+    /// principals from impersonating each other's mutation streams.
+    #[serde(default)]
+    pub client_ids: Vec<String>,
 }
 
 /// Immutable policy snapshot. Replacing the snapshot is the atomic unit for
@@ -42,6 +47,7 @@ pub struct TrustPolicy {
     generation: u64,
     principals: BTreeMap<String, Principal>,
     curve_keys: BTreeMap<String, String>,
+    client_owners: BTreeMap<u128, String>,
 }
 
 impl TrustPolicy {
@@ -58,6 +64,7 @@ impl TrustPolicy {
         }
         let mut indexed = BTreeMap::new();
         let mut curve_keys = BTreeMap::new();
+        let mut client_owners = BTreeMap::new();
         for principal in principals {
             if principal.user_id.is_empty() || principal.user_id.len() > 255 {
                 return Err("principal user_id must be 1..=255 bytes".into());
@@ -68,11 +75,53 @@ impl TrustPolicy {
                     principal.user_id
                 ));
             }
+            if !principal.client_ids.is_empty()
+                && !principal.permissions.contains(&Permission::ClientWrite)
+            {
+                return Err(format!(
+                    "principal {} owns client_ids but lacks client_write permission",
+                    principal.user_id
+                ));
+            }
             if !is_z85_public_key(&principal.curve_public_key) {
                 return Err(format!(
                     "principal {} CURVE public key must be 40 valid Z85 bytes",
                     principal.user_id
                 ));
+            }
+            for client_id in &principal.client_ids {
+                let hex = client_id.strip_prefix("0x").ok_or_else(|| {
+                    format!(
+                        "principal {} client_ids must use 0x-prefixed hexadecimal",
+                        principal.user_id
+                    )
+                })?;
+                if hex.is_empty()
+                    || hex.len() > 32
+                    || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(format!(
+                        "principal {} contains an invalid client id",
+                        principal.user_id
+                    ));
+                }
+                let parsed = u128::from_str_radix(hex, 16).map_err(|_| {
+                    format!(
+                        "principal {} contains an invalid client id",
+                        principal.user_id
+                    )
+                })?;
+                if client_owners.len() >= 100_000 {
+                    return Err(
+                        "trust policy exceeds the 100000 client identity cluster limit".into(),
+                    );
+                }
+                if client_owners
+                    .insert(parsed, principal.user_id.clone())
+                    .is_some()
+                {
+                    return Err("client_id is assigned to multiple principals".into());
+                }
             }
             if curve_keys
                 .insert(
@@ -95,6 +144,7 @@ impl TrustPolicy {
             generation,
             principals: indexed,
             curve_keys,
+            client_owners,
         })
     }
 
@@ -137,6 +187,12 @@ impl TrustPolicy {
         self.curve_keys
             .get(key)
             .and_then(|user_id| self.principals.get(user_id))
+    }
+
+    pub fn owns_client_id(&self, user_id: &str, client_id: u128) -> bool {
+        self.client_owners
+            .get(&client_id)
+            .is_some_and(|owner| owner == user_id)
     }
 }
 
@@ -549,6 +605,7 @@ mod tests {
                 user_id: "app:orders".into(),
                 curve_public_key: "A".repeat(40),
                 permissions: vec![Permission::ClientRead, Permission::ClientWrite],
+                client_ids: Vec::new(),
             }],
         )
         .unwrap()
@@ -575,6 +632,39 @@ mod tests {
                 .is_none()
         );
         assert!(policy.authorize("forged", Permission::ClientRead).is_none());
+    }
+
+    #[test]
+    fn policy_binds_client_mutation_identities_to_one_principal() {
+        let owner = Principal {
+            user_id: "app:orders".into(),
+            curve_public_key: "A".repeat(40),
+            permissions: vec![Permission::ClientWrite],
+            client_ids: vec!["0x1234".into()],
+        };
+        let other = Principal {
+            user_id: "app:billing".into(),
+            curve_public_key: "B".repeat(40),
+            permissions: vec![Permission::ClientWrite],
+            client_ids: vec!["0x5678".into()],
+        };
+        let policy = TrustPolicy::new(7, 1, vec![owner.clone(), other]).unwrap();
+        assert!(policy.owns_client_id("app:orders", 0x1234));
+        assert!(!policy.owns_client_id("app:billing", 0x1234));
+        assert!(!policy.owns_client_id("app:orders", 0x5678));
+        let mut duplicate = owner.clone();
+        duplicate.user_id = "app:other".into();
+        duplicate.curve_public_key = "C".repeat(40);
+        assert!(TrustPolicy::new(7, 1, vec![owner, duplicate]).is_err());
+        let mut malformed = Principal {
+            user_id: "app:malformed".into(),
+            curve_public_key: "D".repeat(40),
+            permissions: vec![Permission::ClientWrite],
+            client_ids: vec!["1234".into()],
+        };
+        assert!(TrustPolicy::new(7, 1, vec![malformed.clone()]).is_err());
+        malformed.client_ids = vec![format!("0x{}", "f".repeat(33))];
+        assert!(TrustPolicy::new(7, 1, vec![malformed]).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -614,6 +704,7 @@ mod tests {
             user_id: "app:orders".into(),
             curve_public_key: zmq::z85_encode(&client_keys.public_key).unwrap(),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         let policy = Arc::new(TrustPolicy::new(7, 1, vec![principal]).unwrap());
         let zap = Arc::new(ZapAuthenticator::start(ctx, policy, 7).unwrap());
@@ -672,6 +763,7 @@ mod tests {
                 user_id: "node:1".into(),
                 curve_public_key: key.clone(),
                 permissions: vec![Permission::PeerRpc],
+                client_ids: Vec::new(),
             }],
         )
         .unwrap();
@@ -753,6 +845,7 @@ mod tests {
             user_id: "same".into(),
             curve_public_key: "A".repeat(40),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         assert!(TrustPolicy::new(7, 1, vec![p.clone(), p.clone()]).is_err());
         assert!(
@@ -762,7 +855,8 @@ mod tests {
                 vec![Principal {
                     user_id: "empty".into(),
                     curve_public_key: "B".repeat(40),
-                    permissions: vec![]
+                    permissions: vec![],
+                    client_ids: Vec::new(),
                 }]
             )
             .is_err()
@@ -771,24 +865,28 @@ mod tests {
             user_id: "other".into(),
             curve_public_key: "A".repeat(40),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         assert!(TrustPolicy::new(7, 1, vec![p.clone(), duplicate_key]).is_err());
         let malformed_key = Principal {
             user_id: "bad-key".into(),
             curve_public_key: "short".into(),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         assert!(TrustPolicy::new(7, 1, vec![malformed_key]).is_err());
         let invalid_z85 = Principal {
             user_id: "invalid-z85".into(),
             curve_public_key: "~".repeat(40),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         assert!(TrustPolicy::new(7, 1, vec![invalid_z85]).is_err());
         let out_of_range = Principal {
             user_id: "out-of-range".into(),
             curve_public_key: "#".repeat(40),
             permissions: vec![Permission::ClientRead],
+            client_ids: Vec::new(),
         };
         assert!(TrustPolicy::new(7, 1, vec![out_of_range]).is_err());
     }

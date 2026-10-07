@@ -25,7 +25,8 @@ policy contains public keys only:
     {
       "user_id": "app:orders",
       "curve_public_key": "<orders-public-key-z85>",
-      "permissions": ["client_read", "client_write", "search"]
+      "permissions": ["client_read", "client_write", "search"],
+      "client_ids": ["0x1234"]
     },
     {
       "user_id": "ops:production",
@@ -40,6 +41,9 @@ Use a unique CURVE key for each principal. Every `node:<id>` must have
 `peer_rpc`; operators need `operator`; application permissions are granted
 individually. A key with no permission is rejected. The generation must be
 nonzero and cluster IDs must match the node and descriptor.
+Assign every persistent mutation `client_id` to exactly one principal in
+`client_ids`; use `0x`-prefixed hexadecimal strings to preserve all 128 bits in
+JSON tooling. A principal may not mutate another principal's idempotency stream.
 Create the generation-marker directory before starting the service. Keep its
 marker and lock files outside the database directory and every backup/restore
 set; protect that directory from deletion by the service account or restore

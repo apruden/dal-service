@@ -135,6 +135,16 @@ impl ClientGateway {
             .any(|permission| policy.authorize(user_id, *permission).is_some())
     }
 
+    fn owns_client_id(&self, context: &crate::transport::RequestContext, client_id: u128) -> bool {
+        let Some(policy) = &self.trust_policy else {
+            return true;
+        };
+        context
+            .authenticated_user_id
+            .as_deref()
+            .is_some_and(|user_id| policy.owns_client_id(user_id, client_id))
+    }
+
     fn accepts_client_work(&self) -> bool {
         self.readiness
             .as_ref()
@@ -458,16 +468,23 @@ impl Server for ClientGateway {
 
         match request.msg_type {
             MsgType::ClientOp => {
-                let permission = match codec::decode::<ClientRequest>(&request.payload) {
-                    Ok(ClientRequest::Read { .. }) => Permission::ClientRead,
-                    Ok(ClientRequest::Mutate(_)) => Permission::ClientWrite,
-                    Err(_) => Permission::ClientRead,
+                let authorized = match codec::decode::<ClientRequest>(&request.payload) {
+                    Ok(ClientRequest::Read { .. }) => {
+                        self.has_permission(&context, &[Permission::ClientRead])
+                    }
+                    Ok(ClientRequest::Mutate(data)) => {
+                        self.has_permission(&context, &[Permission::ClientWrite])
+                            && self.owns_client_id(&context, data.client_id)
+                    }
+                    Err(_) => self.has_permission(&context, &[Permission::ClientRead]),
                 };
-                if !self.has_permission(&context, &[permission]) {
+                if !authorized {
                     return self.client_reply(
                         request.group_id,
                         request.request_id,
-                        ClientReply::Denied("principal lacks permission for ClientOp".into()),
+                        ClientReply::Denied(
+                            "principal lacks permission or ownership for ClientOp".into(),
+                        ),
                     );
                 }
             }
@@ -660,6 +677,7 @@ mod tests {
                     user_id: "app:writer".into(),
                     curve_public_key: "A".repeat(40),
                     permissions: vec![Permission::ClientWrite],
+                    client_ids: Vec::new(),
                 }],
             )
             .unwrap(),
@@ -687,6 +705,58 @@ mod tests {
                 request,
                 crate::transport::RequestContext {
                     authenticated_user_id: Some("app:writer".into()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            codec::decode::<ClientReply>(&reply.payload),
+            Ok(ClientReply::Denied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn gateway_denies_mutation_streams_owned_by_another_principal() {
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                1,
+                vec![crate::transport::security::Principal {
+                    user_id: "app:orders".into(),
+                    curve_public_key: "A".repeat(40),
+                    permissions: vec![Permission::ClientWrite],
+                    client_ids: vec!["0x1".into()],
+                }],
+            )
+            .unwrap(),
+        );
+        let gateway = ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoRouting),
+        )
+        .with_trust_policy(policy);
+        let request = Envelope::new(
+            7,
+            MsgType::ClientOp,
+            GroupId::Data(0),
+            1,
+            codec::encode(&ClientRequest::Mutate(crate::types::DataRequest {
+                client_id: 2,
+                sequence: 1,
+                op: crate::types::DataOp::Put {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    if_version: None,
+                },
+            })),
+        );
+        let reply = gateway
+            .serve_with_context(
+                request,
+                crate::transport::RequestContext {
+                    authenticated_user_id: Some("app:orders".into()),
                 },
             )
             .await;

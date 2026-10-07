@@ -138,7 +138,7 @@ impl RootDispatch {
             MsgType::RaftAppend | MsgType::RaftVote | MsgType::RaftSnapshot => {
                 self.serve_raft(req, &context).await
             }
-            MsgType::DataConfigObservation => self.serve_observation(req).await,
+            MsgType::DataConfigObservation => self.serve_observation(req, &context).await,
             MsgType::JoinRequest => self.serve_join(req).await,
             MsgType::LeaveRequest => self.serve_leave(req).await,
             MsgType::AbortPlanRequest => self.serve_abort_plan(req).await,
@@ -296,10 +296,26 @@ impl RootDispatch {
         self.reply(req, codec::encode(&reply))
     }
 
-    async fn serve_observation(&self, req: Envelope) -> Envelope {
+    async fn serve_observation(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
         let Ok(body) = codec::decode::<ObservationBody>(&req.payload) else {
             return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
         };
+        let sender_node_id = match &body {
+            ObservationBody::Finalize { sender_node_id, .. }
+            | ObservationBody::Abort { sender_node_id, .. } => *sender_node_id,
+        };
+        if !self.authenticated_as_node(context, sender_node_id) {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error(
+                    "authenticated node does not match observation sender".into(),
+                )),
+            );
+        }
         self.submit(&req, body.into_meta_command()).await
     }
 
@@ -872,6 +888,7 @@ mod tests {
                     user_id: "node:1".into(),
                     curve_public_key: "A".repeat(40),
                     permissions: vec![Permission::PeerRpc],
+                    client_ids: Vec::new(),
                 }],
             )
             .unwrap(),
@@ -909,6 +926,70 @@ mod tests {
             Ok(SubmitReply::Error(error)) if error == "authorization denied"));
     }
 
+    #[tokio::test]
+    async fn peer_cannot_spoof_the_sender_of_a_config_observation() {
+        use crate::transport::security::{Permission, Principal, TrustPolicy};
+        let partitions = Arc::new(RwLock::new(HashMap::new()));
+        let gateway = Arc::new(ClientGateway::new(
+            7,
+            1,
+            HashSpec::CANONICAL,
+            partitions.clone(),
+            Arc::new(EmptyRouting),
+        ));
+        let policy = Arc::new(
+            TrustPolicy::new(
+                7,
+                1,
+                vec![Principal {
+                    user_id: "node:1".into(),
+                    curve_public_key: "A".repeat(40),
+                    permissions: vec![Permission::PeerRpc],
+                    client_ids: Vec::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let dispatch = RootDispatch::new(
+            7,
+            gateway,
+            Arc::new(RwLock::new(None)),
+            partitions,
+            Arc::new(Mutex::new(HeartbeatTracker::new())),
+            None,
+            None,
+        )
+        .with_trust_policy(policy);
+        let body = ObservationBody::Finalize {
+            sender_node_id: 2,
+            group: GroupId::Data(0),
+            plan_id: 1,
+            observation: crate::types::DataConfigObservation {
+                group: GroupId::Data(0),
+                plan_id: 1,
+                voter_set: vec![1, 2, 3],
+                config_log_id: crate::types::LogId::new(1, 4),
+            },
+        };
+        let request = Envelope::new(
+            7,
+            MsgType::DataConfigObservation,
+            GroupId::Meta,
+            5,
+            codec::encode(&body),
+        );
+        let reply = dispatch
+            .serve_with_context(
+                request,
+                crate::transport::RequestContext {
+                    authenticated_user_id: Some("node:1".into()),
+                },
+            )
+            .await;
+        assert!(matches!(codec::decode::<SubmitReply>(&reply.payload),
+            Ok(SubmitReply::Error(error)) if error.contains("does not match observation sender")));
+    }
+
     #[test]
     fn peer_sender_identity_must_match_raft_node_id() {
         use crate::transport::security::{Permission, Principal, TrustPolicy};
@@ -928,6 +1009,7 @@ mod tests {
                     user_id: "node:1".into(),
                     curve_public_key: "A".repeat(40),
                     permissions: vec![Permission::PeerRpc],
+                    client_ids: Vec::new(),
                 }],
             )
             .unwrap(),

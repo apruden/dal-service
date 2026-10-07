@@ -51,11 +51,13 @@ pub struct BecomeLearnerBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObservationBody {
     Finalize {
+        sender_node_id: NodeId,
         group: GroupId,
         plan_id: u64,
         observation: DataConfigObservation,
     },
     Abort {
+        sender_node_id: NodeId,
         group: GroupId,
         plan_id: u64,
         observation: DataConfigObservation,
@@ -66,6 +68,7 @@ impl ObservationBody {
     pub fn into_meta_command(self) -> MetaCommand {
         match self {
             ObservationBody::Finalize {
+                sender_node_id: _,
                 group,
                 plan_id,
                 observation,
@@ -75,6 +78,7 @@ impl ObservationBody {
                 observation,
             },
             ObservationBody::Abort {
+                sender_node_id: _,
                 group,
                 plan_id,
                 observation,
@@ -408,6 +412,7 @@ mod tests {
         );
 
         let obs = ObservationBody::Finalize {
+            sender_node_id: 7,
             group: GroupId::Data(7),
             plan_id: 11,
             observation: DataConfigObservation {

@@ -646,6 +646,7 @@ impl RebalanceDriver {
             config_log_id,
         };
         self.submit_observation(ObservationBody::Finalize {
+            sender_node_id: self.node_id,
             group: GroupId::Meta,
             plan_id,
             observation,
@@ -691,6 +692,7 @@ impl RebalanceDriver {
             config_log_id,
         };
         self.submit_observation(ObservationBody::Abort {
+            sender_node_id: self.node_id,
             group: GroupId::Meta,
             plan_id: plan.plan_id,
             observation,
@@ -860,6 +862,7 @@ impl RebalanceDriver {
             config_log_id,
         };
         self.submit_observation(ObservationBody::Finalize {
+            sender_node_id: self.node_id,
             group,
             plan_id,
             observation,
@@ -918,6 +921,7 @@ impl RebalanceDriver {
             config_log_id,
         };
         self.submit_observation(ObservationBody::Abort {
+            sender_node_id: self.node_id,
             group,
             plan_id: plan.plan_id,
             observation,
