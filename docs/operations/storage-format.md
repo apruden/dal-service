@@ -24,10 +24,11 @@ storage version remains 1. A future incompatible format must therefore bump
 binaries reject the marker before opening storage. A future search-engine
 change needs a staged rebuild and marker publication procedure, even though
 the index is derived from authoritative records.
-Version-1 data operation and version predicate tags are frozen in dedicated
-serialization types; their original bytes are archived in
-[`format-v1-data-op.md`](evidence/format-v1-data-op.md). Other persisted enum
-tags still require the same treatment before the initial production format is
+Version-1 data operation, version predicate, and meta command tags are frozen
+in dedicated serialization types. Original bytes are archived in
+[`format-v1-data-op.md`](evidence/format-v1-data-op.md) and the
+[`format-v1` fixtures](evidence/format-v1/README.md). Other persisted enum tags
+still require the same treatment before the initial production format is
 qualified.
 
 There is no legacy import or migration command yet. If startup reports an

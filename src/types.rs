@@ -385,7 +385,7 @@ pub struct NodeDirectoryEntry {
 /// The replicated meta-group command set. All validation runs inside the meta
 /// state machine's `apply` (DESIGN §5.2). `FinalizePlan`/`AbortReport` are
 /// submittable only by the internal peer-control path (ground rule 9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaCommand {
     ClusterInit {
         config: ClusterConfig,
@@ -467,6 +467,104 @@ pub enum MetaCommand {
         definition: crate::search::SearchIndexDefinition,
         engine_revision: u32,
     },
+}
+
+/// Frozen version-1 bincode variant indices for replicated meta commands.
+/// This remote definition deliberately repeats the original declaration order.
+/// New commands need an explicit format transition rather than inserting or
+/// reordering a variant here.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "MetaCommand")]
+#[allow(dead_code)]
+enum MetaCommandV1 {
+    ClusterInit {
+        config: ClusterConfig,
+        meta_voters: Vec<NodeId>,
+    },
+    RegisterNode {
+        node_id: NodeId,
+        control_addr: String,
+        bulk_addr: String,
+    },
+    SeedPlacement {
+        group: GroupId,
+        voters: Vec<NodeId>,
+    },
+    SetNodeState {
+        node_id: NodeId,
+        state: NodeState,
+        incarnation: u64,
+    },
+    CreatePlan {
+        group: GroupId,
+        plan_id: u64,
+        target_voters: Vec<NodeId>,
+    },
+    MarkAborting {
+        group: GroupId,
+        plan_id: u64,
+    },
+    FinalizePlan {
+        group: GroupId,
+        plan_id: u64,
+        observation: DataConfigObservation,
+    },
+    AbortReport {
+        group: GroupId,
+        plan_id: u64,
+        observation: DataConfigObservation,
+    },
+    CreateSearchIndex {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    CreateSearchIndexGeneration {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+    },
+    ReportSearchIndexReady {
+        name: String,
+        observation: crate::search::SearchIndexReady,
+    },
+    ActivateSearchIndexGeneration {
+        name: String,
+        generation: crate::search::SearchIndexGenerationId,
+    },
+    DropSearchIndex {
+        name: String,
+    },
+    FinalizeSearchIndexDrop {
+        name: String,
+        generation: crate::search::SearchIndexGenerationId,
+    },
+    CreateSearchIndexWithRevision {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+        engine_revision: u32,
+    },
+    CreateSearchIndexGenerationWithRevision {
+        name: String,
+        definition: crate::search::SearchIndexDefinition,
+        engine_revision: u32,
+    },
+}
+
+impl Serialize for MetaCommand {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        MetaCommandV1::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MetaCommand {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        MetaCommandV1::deserialize(deserializer)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +665,52 @@ mod tests {
             assert_eq!(
                 crate::codec::decode::<DataOp>(&baseline).unwrap(),
                 operation
+            );
+        }
+    }
+
+    #[test]
+    fn version_one_meta_commands_replay_from_archived_bytes() {
+        let cases: [(MetaCommand, &[u8]); 4] = [
+            (
+                MetaCommand::ClusterInit {
+                    config: ClusterConfig {
+                        cluster_id: 7,
+                        protocol_version: PROTOCOL_VERSION,
+                        p: 1,
+                        r: 3,
+                        hash_spec: HashSpec::CANONICAL,
+                    },
+                    meta_voters: vec![1, 2, 3],
+                },
+                include_bytes!("../docs/operations/evidence/format-v1/meta-cluster_init.bin"),
+            ),
+            (
+                MetaCommand::SetNodeState {
+                    node_id: 2,
+                    state: NodeState::Draining,
+                    incarnation: 7,
+                },
+                include_bytes!("../docs/operations/evidence/format-v1/meta-set_node_state.bin"),
+            ),
+            (
+                MetaCommand::CreatePlan {
+                    group: GroupId::Data(2),
+                    plan_id: 9,
+                    target_voters: vec![1, 2, 4],
+                },
+                include_bytes!("../docs/operations/evidence/format-v1/meta-create_plan.bin"),
+            ),
+            (
+                MetaCommand::DropSearchIndex { name: "x".into() },
+                include_bytes!("../docs/operations/evidence/format-v1/meta-drop_search_index.bin"),
+            ),
+        ];
+        for (command, baseline) in cases {
+            assert_eq!(crate::codec::encode(&command), baseline);
+            assert_eq!(
+                crate::codec::decode::<MetaCommand>(baseline).unwrap(),
+                command
             );
         }
     }
