@@ -558,14 +558,13 @@ pub enum MetaCommand {
         name: String,
         generation: crate::search::SearchIndexGenerationId,
     },
-    /// Revision-aware replacement for `CreateSearchIndex`. Kept as a new,
-    /// appended variant so binaries can replay commands written before engine
-    /// revisions were carried in the replicated command.
+    /// Revision-aware search command in the current command set. The earlier
+    /// variant remains decodable for logs written by this development format.
     CreateSearchIndexWithRevision {
         name: String,
         definition: crate::search::SearchIndexDefinition,
-        /// Stamped by the proposer. Apply records it verbatim so future
-        /// mixed-engine-revision replicas produce identical catalog state.
+        /// Stamped by the proposer so deterministic apply records the same
+        /// catalog state on every current-format replica.
         engine_revision: u32,
     },
     /// Revision-aware replacement for `CreateSearchIndexGeneration`.
@@ -588,10 +587,9 @@ pub enum MetaCommand {
     },
 }
 
-/// Frozen version-1 bincode variant indices for replicated meta commands.
-/// This remote definition deliberately repeats the original declaration order.
-/// New commands need an explicit format transition rather than inserting or
-/// reordering a variant here.
+/// Current bincode variant indices for replicated meta commands. This remote
+/// definition pins the order within this development format. It may be revised
+/// together with current-format fixtures when starting fresh data directories.
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "MetaCommand")]
 #[allow(dead_code)]

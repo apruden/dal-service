@@ -15,4 +15,5 @@ The Absent case was derived from the version-1 bincode tag layout and pinned by
 the same regression; the first two were captured from commit `0434aa5`.
 This fixture covers operation and predicate tags. It is not a complete durable
 format fixture: meta commands, idempotency records, Raft logs, snapshots, and
-whole databases still need archived examples before the release gate.
+whole databases still need recovery evidence before release. These bytes may be
+updated together with a deliberate preproduction format change.

@@ -3,9 +3,8 @@
 Every data directory carries `DAL_FORMAT.json` with a
 `storage_format_version`. The current binary supports storage version `1`,
 durable record version `1`, application snapshot version `1`, and search engine
-revision `2`. New markers record each requirement separately. A version-1
-marker containing only `storage_format_version` has the historical defaults
-`records=1`, `snapshots=1`, and `search=2` for current development data.
+revision `2`. New markers record each requirement separately. All four fields
+are required; incomplete markers from earlier development builds are rejected.
 The application snapshot stream identifies version 1 with the `DALSNP01`
 magic. The wire envelope uses `PROTOCOL_VERSION` independently of these disk
 versions. Backup format versioning begins when a backup artifact exists.

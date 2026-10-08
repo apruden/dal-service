@@ -45,29 +45,17 @@ type RaftApplied = (
 const STORAGE_FORMAT_FILE: &str = "DAL_FORMAT.json";
 const STORAGE_FORMAT_VERSION: u32 = 1;
 /// Version 1 covers the bincode representation of Raft log entries, state
-/// records, identities, and idempotency digests. It cannot be changed in place.
+/// records, identities, and idempotency digests. A change requires a fresh
+/// development data directory.
 const DURABLE_RECORD_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StorageFormatManifest {
     storage_format_version: u32,
-    // A version-1 marker written before these fields existed implies exactly
-    // these historical formats. Keep the defaults literal across upgrades.
-    #[serde(default = "initial_format_version")]
     durable_record_version: u32,
-    #[serde(default = "initial_format_version")]
     snapshot_format_version: u32,
-    #[serde(default = "initial_search_revision")]
     search_engine_revision: u32,
-}
-
-fn initial_format_version() -> u32 {
-    1
-}
-
-fn initial_search_revision() -> u32 {
-    2
 }
 
 impl StorageFormatManifest {
@@ -88,7 +76,7 @@ impl StorageFormatManifest {
             || self.search_engine_revision != current.search_engine_revision
         {
             return Err(Error::Config(format!(
-                "data directory {} has format requirements storage={} records={} snapshots={} search={}; this binary supports storage={} records={} snapshots={} search={}. Use a supported upgrade/import procedure",
+                "data directory {} has format requirements storage={} records={} snapshots={} search={}; this binary supports storage={} records={} snapshots={} search={}. Use a fresh data directory for this development build",
                 path.display(),
                 self.storage_format_version,
                 self.durable_record_version,
@@ -137,7 +125,7 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
     }
     if fs::read_dir(path)?.next().transpose()?.is_some() {
         return Err(Error::Config(format!(
-            "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a supported upgrade/import procedure",
+            "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a fresh data directory for this development build",
             path.display()
         )));
     }
@@ -183,7 +171,7 @@ pub fn check_storage_format(path: &Path) -> Result<()> {
         return Ok(());
     }
     Err(Error::Config(format!(
-        "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a supported upgrade/import procedure",
+        "data directory {} has no {STORAGE_FORMAT_FILE}; refusing to open an unclassified existing database. Use a fresh data directory for this development build",
         path.display()
     )))
 }
@@ -2003,21 +1991,18 @@ mod tests {
     }
 
     #[test]
-    fn format_preflight_accepts_legacy_marker_and_preserves_incompatible_markers() {
+    fn format_preflight_rejects_incomplete_and_unknown_markers_without_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         fs::create_dir(&db).unwrap();
         let marker = db.join(STORAGE_FORMAT_FILE);
 
-        fs::write(&marker, br#"{"storage_format_version":1}"#).unwrap();
-        check_storage_format(&db).unwrap();
-        preflight_storage_format(&db).unwrap();
-
         for bytes in [
-            br#"{"storage_format_version":1,"durable_record_version":2}"#.as_slice(),
-            br#"{"storage_format_version":1,"snapshot_format_version":2}"#.as_slice(),
-            br#"{"storage_format_version":1,"search_engine_revision":3}"#.as_slice(),
-            br#"{"storage_format_version":1,"future_requirement":1}"#.as_slice(),
+            br#"{"storage_format_version":1}"#.as_slice(),
+            br#"{"storage_format_version":1,"durable_record_version":2,"snapshot_format_version":1,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":1,"search_engine_revision":3}"#.as_slice(),
+            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":1,"search_engine_revision":2,"future_requirement":1}"#.as_slice(),
         ] {
             fs::write(&marker, bytes).unwrap();
             assert!(check_storage_format(&db).is_err());

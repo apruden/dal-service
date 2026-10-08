@@ -26,9 +26,9 @@ use crate::types::{
     PROTOCOL_VERSION, Placement, voter_set,
 };
 
-/// Engine identity implied by the legacy search commands that predate an
-/// explicit revision field. Never replace this with the local binary's current
-/// revision: old log replay must remain deterministic after engine upgrades.
+/// Engine identity implied by search commands without an explicit revision.
+/// Keep apply deterministic when the current binary replays those commands.
+/// Earlier development directories are not supported import sources.
 const LEGACY_SEARCH_ENGINE_REVISION: u32 = 1;
 
 /// The outcome of applying one committed meta command.

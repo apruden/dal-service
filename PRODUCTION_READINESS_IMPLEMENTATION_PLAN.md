@@ -98,7 +98,7 @@ means implementation and the stated evidence, not merely merged code.
 | 1 | Lifecycle, termination, and cheap health probes | 0; planned-stop integration uses 5 | Medium |
 | 2 | Authenticated transport and operation authorization | 0 | Large |
 | 3 | Production logs, metrics, audit events, and alerts | 1; audit integration from 2 | Medium |
-| 4 | Current format and restore metadata contract | 0; integrate 2; backup uses 5 | Small |
+| 4 | Current format and restore metadata contract | 0; integrate 2 | Small |
 | 5 | Coordinated backup and verified restore | 1, 2, format definitions from 4 | Large |
 | 6 | Reproducible releases, deployment assets, and operator procedures | 1–5 | Medium |
 | 7 | Independent-host failure, capacity, and soak qualification | 1–6 | Large |
@@ -362,7 +362,7 @@ metrics and audit modules.
   outside the HTTP request path and report stale samples explicitly.
 - Add audit events for authenticated administrative requests and their terminal
   outcomes, credential-policy changes, maintenance enter/release, backup/restore,
-  recovery-epoch changes. Link a committed operation to its Raft
+  and recovery-epoch changes. Link a committed operation to its Raft
   identifier when available; an attempted
   operation is not automatically a committed operation.
 - Provide dashboards and tested alert rules for storage failure, stalled durable
@@ -664,7 +664,7 @@ online backups to meet the recovery objective.
   addresses for discovery, while keeping client routing behind readiness.
 - Document startup, enrollment, credential rotation, draining, replacement of a
   lost node, quorum loss, disk full, storage corruption, search rebuild,
-  backup/restore. Include planned maintenance enter/exit,
+  and backup/restore. Include planned maintenance enter/exit,
   trust distribution/convergence, out-of-band old-deployment fencing, and client
   reconciliation across disaster-recovery epochs. Distinguish an unfenced
   process restart from a coordinated cluster stop. A disk-space procedure must

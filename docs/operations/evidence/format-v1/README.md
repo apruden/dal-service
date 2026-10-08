@@ -20,7 +20,7 @@ before the search-definition enum freeze. They pin both variants of
 revision-carrying meta command. The search-definition regression compares the
 new bytes and digest with these archived values.
 
-These are initial format fixtures. The complete production compatibility gate
-also needs every meta command variant, retained Raft logs, identity and
-idempotency records, snapshots, and a complete database captured from the release
-candidate.
+These are current-format development fixtures. They can be replaced when the
+format changes. Before release, recovery evidence also needs retained Raft logs,
+identity and idempotency records, snapshots, and a complete database captured
+from the release candidate.

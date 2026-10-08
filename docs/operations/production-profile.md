@@ -95,8 +95,8 @@ RPO once capture and verification take time. For these provisional targets,
 the plan's **online backup gates are required before release**. Schedule
 verified off-host backups more often than every 24 hours, with a margin for the
 measured worst-case completion delay. Maintenance-mode backup remains the first
-implementation and upgrade safety path. Planned upgrade downtime also counts
-against 7.2 hours. If agreed product targets differ, repeat this feasibility
+implementation path. Its downtime counts against 7.2 hours. If agreed product
+targets differ, repeat this feasibility
 calculation; no availability or recovery objective has been qualified yet.
 
 ## Release evidence and responsibility
@@ -106,7 +106,6 @@ calculation; no availability or recovery objective has been qualified yet.
 | Capacity and latency | Service maintainer, named before release | Operations lead, named before release | Independent-host workload history and resource report |
 | Security and enrollment | Security implementer, named before release | Security reviewer, named before release | Authenticated transport, denial, rotation, and revocation tests |
 | Backup and restore | Storage implementer, named before release | Operator other than implementer, named before release | Verified artifact and timed CLI restore drill |
-| Upgrade and rollback | Release engineer, named before release | Operations lead, named before release | Source/target digests, migration fixture, and rollback drill |
 | Rollout | Release engineer, named before release | On-call owner, named before release | Staging and pilot observations, alert response, and handoff |
 
 Store each run's exact revision, binary digest, `Cargo.lock`, Rust toolchain,
