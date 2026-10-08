@@ -8,7 +8,7 @@ Status: proposed implementation and release gates
 
 Make DAL operable as a persistent production service: preserve acknowledged
 writes within its Raft fault model, authenticate network participants, expose
-actionable health and diagnostics, support binary upgrades, and recover from
+actionable health and diagnostics, and recover from
 an independently stored backup through a rehearsed procedure.
 
 The initial target is Linux, durable local disks, TCP between independent hosts,
@@ -17,22 +17,19 @@ must place voters in independent failure domains. Keep RocksDB and the current
 consistency model. Storage-engine replacement is outside this release.
 
 The planning assumption is that the first release may use planned maintenance
-windows for upgrades and coordinated backups. This is an assumption, not an
-established product requirement. Phase 0 must validate it against availability
-and recovery objectives. Rolling upgrades and online backups become launch
-requirements if maintenance windows cannot meet those objectives; their extra
-gates are specified below. The provisional
+windows for coordinated backups. Phase 0 must validate this against availability
+and recovery objectives. Online backups become a launch requirement if
+maintenance windows cannot meet those objectives. The provisional
 [operating profile](docs/operations/production-profile.md) combines 99% time
 availability with a 24-hour RPO at 50 GiB; daily offline backups cannot meet
 both, so its online-backup gate applies unless those targets are changed.
 
 This plan extends the current-binary, new-cluster scope in
 [the materialization plan](ASYNC_MATERIALIZED_STATE_IMPLEMENTATION_PLAN.md).
-Existing development data remains subject to that older contract until a
-specific migration is implemented and tested. Baseline `6fabff4` directories
-are not a supported production import source in this release. The first
-production release must establish an explicit compatibility contract for
-subsequent releases; Phase 4 defines the initial versioned upgrade exercise.
+This project has not been deployed to production. Earlier development data,
+storage directories, snapshots, and wire formats are disposable. This plan
+targets fresh directories and the current binary only; it does not include
+migrations or backward compatibility with earlier development revisions.
 
 ## Existing implementation and evidence
 
@@ -62,14 +59,14 @@ also requires the independent-host and sustained-load gates in Phase 7.
 ## Invariants for every phase
 
 1. A successful mutation remains backed by a majority-durable Raft entry and
-   visible, ordered local application. Authentication, shutdown, backup, and
-   upgrades must not introduce an earlier success response.
+   visible, ordered local application. Authentication, shutdown, and backup
+   must not introduce an earlier success response.
 2. Data-group materialization may lag durability. Log purge and snapshot
    publication retain their durable-prefix fences; recovery retains its read
    serving gate. Meta application remains synchronous.
 3. A timeout can leave a mutation outcome unknown. Retrying the same logical
-   command preserves its identity and result across supported restarts and
-   upgrades. Validation failure before the first send does not reserve a new
+   command preserves its identity and result across restarts of the current
+   version. Validation failure before the first send does not reserve a new
    sequence. A committed CAS failure retains its decided-sequence semantics.
    Drain, maintenance, or authorization rejection of a later attempt cannot
    prove that an earlier attempt did not commit. Preserve pending identity on
@@ -85,7 +82,7 @@ also requires the independent-host and sustained-load gates in Phase 7.
 7. Shutdown never reports a clean durable stop while owned work is still using
    storage. A forced stop remains an explicit crash-recovery path.
 8. A restore never starts a second reachable copy of the same cluster identity.
-   An upgrade or rollback never silently discards acknowledged writes.
+   A normal restart never silently discards acknowledged writes.
 9. Planned cluster stops use a replicated maintenance fence that also controls
    automatic directory, placement, and search changes. A process signal alone
    cannot suspend failure detection or authorize maintenance release.
@@ -101,7 +98,7 @@ means implementation and the stated evidence, not merely merged code.
 | 1 | Lifecycle, termination, and cheap health probes | 0; planned-stop integration uses 5 | Medium |
 | 2 | Authenticated transport and operation authorization | 0 | Large |
 | 3 | Production logs, metrics, audit events, and alerts | 1; audit integration from 2 | Medium |
-| 4 | Persistent format contract and upgrade procedure | 0; integrate 2; orchestration and rollback drill use 5 | Large |
+| 4 | Current format and restore metadata contract | 0; integrate 2; backup uses 5 | Small |
 | 5 | Coordinated backup and verified restore | 1, 2, format definitions from 4 | Large |
 | 6 | Reproducible releases, deployment assets, and operator procedures | 1–5 | Medium |
 | 7 | Independent-host failure, capacity, and soak qualification | 1–6 | Large |
@@ -110,9 +107,8 @@ means implementation and the stated evidence, not merely merged code.
 Implement Phase 1's local shutdown independently, then integrate its planned-stop
 behavior with Phase 5. Define maintenance commands, trust-generation requirements,
 and recovery epochs in Phase 4 before implementing their persisted behavior and
-the backup format in Phase 5. Complete upgrade orchestration and the rollback
-drill after backup and restore work. These are staged dependencies; independent
-probe, logging, security, and format work can proceed before the full fence.
+the backup format in Phase 5. Independent probe, logging, security, and current
+format work can proceed before the full fence.
 
 ## Phase 0 Define the operating envelope
 
@@ -366,7 +362,7 @@ metrics and audit modules.
   outside the HTTP request path and report stale samples explicitly.
 - Add audit events for authenticated administrative requests and their terminal
   outcomes, credential-policy changes, maintenance enter/release, backup/restore,
-  recovery-epoch changes, and upgrades. Link a committed operation to its Raft
+  recovery-epoch changes. Link a committed operation to its Raft
   identifier when available; an attempted
   operation is not automatically a committed operation.
 - Provide dashboards and tested alert rules for storage failure, stalled durable
@@ -389,90 +385,32 @@ An operator can identify which node/group failed, whether writes are being
 served, what is blocking recovery, and the applicable next action using the
 shipped diagnostics.
 
-## Phase 4 Establish persistent compatibility and upgrades
+## Phase 4 Define the current format and restore metadata
 
-Primary changes: [codec](src/codec.rs), [wire framing](src/transport/codec.rs),
-[types](src/types.rs), [storage open](src/storage/rocks.rs), both Raft state
-machines/log stores, search engine revision handling, and proposed
-`src/runtime/upgrade.rs`.
+Primary changes: [codec](src/codec.rs), [types](src/types.rs),
+[storage open](src/storage/rocks.rs), state machines, and snapshot handling.
 
 ### Implementation
 
-1. Define separately versioned wire messages, durable records/commands,
-   snapshot and backup formats, and search engine behavior. A single
-   `PROTOCOL_VERSION` and package version do not describe all compatibility.
-   Give persisted enum variants stable encodings rather than relying on future
-   Rust enum declaration order. Include the maintenance operation/stage and
-   commands, runtime fence acknowledgements, required trust generation, recovery
-   epoch, and new client error semantics in these definitions before Phase 5.
-2. Archive serialized commands, membership and identity records, idempotency
-   records and digests, snapshots, and complete databases with retained logs
-   from the first production-format candidate, called `N` in this plan. Baseline
-   `6fabff4` fixtures remain regression references, not supported import inputs.
-   Before release, qualify `N` to an explicitly versioned test successor `N+1`
-   with a deliberate format change, using the real migration and operating
-   procedure. Archive both exact binaries, digests, and fixtures. This proves
-   the initial upgrade mechanism; it does not claim compatibility with an
-   unbuilt future release. Each subsequent production release must repeat the
-   gate for its actual supported source and target versions. Publish which
-   pairs can read, write, and replay each format and whether downgrade is safe.
-3. Add a compatibility preflight before normal database open or startup can
-   mutate an incompatible directory. Record format requirements in an atomically
-   published manifest. Unknown/newer formats fail with an actionable error.
-   Legacy directories require an explicit supported import path, not a guessed
-   format based only on the absence of a marker.
-4. Implement migrations through a staged destination, durable manifest, and
-   atomic activation on the supported filesystem. Interrupted migration resumes
-   or leaves the original usable. Preserve command evaluation, CAS results,
-   stored sequence outcomes, canonical command digests, group membership, and
-   node-local serving authority.
-5. Provide maintenance-mode upgrade preflight and an operator procedure: verify
-   health and redundancy, enter the Phase 5 maintenance fence, drain accepted
-   operations, stop the cluster cleanly, and create a verified offline backup.
-   Keep the cluster stopped for migration if required, start the candidate in
-   isolation with peer startup independent of client readiness, validate recovery,
-   and release the ingress fence explicitly. Preserve planned-stop suppression
-   and the fence across every restart, including nodes without a meta replica.
-   Implement this orchestration after Phase 5 export and restore are available;
-   staged migration machinery can be built earlier. Do not create new empty
-   Raft groups to bypass old data.
-6. Define a rollback boundary. Before new writes resume, revert using the
-   preserved original or sealed backup. After writes resume, allow binary
-   downgrade only if the old binary can read and replay everything the candidate
-   wrote. Otherwise use a forward repair or separately planned data-preserving
-   migration. Restoring an older backup is disaster recovery with an explicit
-   recovery point, not a lossless rollback.
+1. Define the current wire, durable record, snapshot, backup, and search-engine
+   formats independently. Include maintenance operation/stage and commands,
+   runtime fence acknowledgements, required trust generation, recovery epoch,
+   and client error semantics before Phase 5 persists them.
+2. Keep an atomically published format manifest on new data directories. Fail
+   before database open on a missing, corrupt, or unrecognized marker in a
+   nonempty directory. Earlier development directories are disposable; start
+   with a fresh directory when the format changes.
+3. Keep fixtures for the current binary's command, identity, snapshot, and
+   database recovery paths where they help detect accidental changes within
+   this release. Update or replace them when the current format deliberately
+   changes. Do not build a source-to-target version matrix or migration path.
 
-### Tests and completion gate
+### Completion gate
 
-- Run the candidate on fixtures and retained logs from each supported source
-  version. For the initial gate, exercise the archived `N` to test `N+1` pair,
-  including maintenance state, trust requirements, and recovery epochs. Compare
-  values, versions, CAS outcomes, idempotency results, membership, and durable
-  applied prefixes with the source binary. Explicitly reject unsupported
-  `6fabff4` directories without modifying them.
-- Reboot or kill the migration at every publication boundary. Test insufficient
-  space, corrupt manifests, unknown formats, and opening the candidate's data
-  with an unsupported old binary.
-- Upgrade a populated multi-host cluster and rehearse rollback before reopening
-  writes. Test supported downgrade after candidate writes, or verify it is
-  explicitly rejected when compatibility does not permit it.
-
-The release includes the tested compatibility matrix and a complete `N` to
-test `N+1` maintenance upgrade and rollback exercise. Subsequent releases must
-qualify their real release pairs before deployment. Production data has an
-explicit upgrade contract; legacy development directories remain unsupported.
-
-### Additional gates when rolling upgrades are required
-
-Add version/capability negotiation and cluster-wide activation of new command
-formats only after every relevant voter and required learner supports them.
-Maintain compatible behavior while old and new nodes coexist; process upgrade
-order must preserve a quorum of every affected group. Exercise both-version
-leadership, membership changes, snapshot transfer, search generation migration,
-and retained-log replay. Upgrade one node at a time, wait for recovery and
-replication catch-up, and define the point after which downgrade is forbidden.
-These gates are required before claiming rolling support.
+The release binary opens newly created directories, restarts and replays its
+own durable state, and restores backups written by that same release. A malformed
+or unrecognized directory is rejected before mutation. Phase 5 verifies the
+maintenance and recovery metadata through actual backup and restore artifacts.
 
 ## Phase 5 Implement coordinated backup and verified restore
 
@@ -569,7 +507,7 @@ changes [failure detection](src/runtime/node.rs),
 7. Persist completion in the backup catalog. For a normal backup, restart through
    the ordinary recovery gates, enter `Verifying`, and explicitly release
    maintenance after validation. Start all peers independently of client
-   readiness. For an upgrade, keep the cluster stopped for Phase 4. A failed
+   readiness. A failed
    backup leaves a clear resumable or abortable maintenance state. Retention
    cannot delete the last verified usable backup.
 
@@ -612,8 +550,8 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
 
 ### Client streams after disaster recovery
 
-- Distinguish ordinary restart, upgrade, and backup resume from disaster restore
-  to an older point. The former preserve the recovery epoch and retry identity.
+- Distinguish ordinary restart and backup resume from disaster restore to an
+  older point. The former preserve the recovery epoch and retry identity.
   The latter can lose acknowledged operations after the backup's recovery point;
   record that boundary and require application reconciliation before reopening.
 - Provision a new unique recovery epoch for each disaster restore, recorded in
@@ -621,8 +559,8 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
   group while maintenance remains closed. Preserve cluster/node identities and
   restored sequence records. Include the epoch in mutation identity and enforce
   it at admission and deterministic application, so queued requests from an old
-  epoch cannot be evaluated as fresh writes after the transition. Phase 4 must
-  version these fields and commands before the production format is frozen.
+  epoch cannot be evaluated as fresh writes after the transition. Define these
+  fields and commands under the current Phase 4 format contract.
 - Return an explicit recovery-epoch mismatch for old client streams. Clients
   retain unresolved commands and stop automatic replay; they must not silently
   update the epoch, reset sequence counters, or assign old work a new identity.
@@ -635,7 +573,7 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
 ### Tests and completion gate
 
 Test interrupted export/upload/publication, truncated and tampered artifacts,
-mixed backup IDs, incompatible versions, absent meta or partition artifacts,
+mixed backup IDs, unrecognized format markers, absent meta or partition artifacts,
 disk exhaustion, and an active destination. Restore a populated cluster after
 removing every original test data directory. Verify all writes acknowledged
 before the backup fence, preserved sequence outcomes, and eventual index rebuild.
@@ -689,7 +627,7 @@ online backups to meet the recovery objective.
   including libzmq CURVE capability and RocksDB. Build with `--locked` and
   record the resolved dependency inventory and binary digest.
 - Run formatting, compiler/lint checks, normal tests, and all-feature fault
-  tests. Publish failing seeds, test logs, and compatibility fixtures. Production
+  tests. Publish failing seeds and test logs. Production
   binaries must be built without the `failpoints` feature; test both the real
   release binary and the separate fault-injection build.
 - Generate an SBOM and run Rust and native dependency vulnerability checks.
@@ -726,7 +664,7 @@ online backups to meet the recovery objective.
   addresses for discovery, while keeping client routing behind readiness.
 - Document startup, enrollment, credential rotation, draining, replacement of a
   lost node, quorum loss, disk full, storage corruption, search rebuild,
-  backup/restore, upgrade, and rollback. Include planned maintenance enter/exit,
+  backup/restore. Include planned maintenance enter/exit,
   trust distribution/convergence, out-of-band old-deployment fencing, and client
   reconciliation across disaster-recovery epochs. Distinguish an unfenced
   process restart from a coordinated cluster stop. A disk-space procedure must
@@ -764,11 +702,11 @@ resources.
 | Topology | At least three independent hosts/failure domains; the production replica policy; spare-node admission and replacement; partition counts 1, 16, and the intended supported maximum. A 128-partition exploratory case does not expand the supported envelope until aggregate memory and all release gates pass. |
 | Data | 128 B, 4 KiB, 64 KiB, and 1 MiB values; opaque and indexable values; hot-key skew and broad keys; datasets larger than cache and several compaction cycles |
 | Load | Sequential and concurrent writes, CAS, linearizable/stale reads, search, index rebuild, snapshots, and rebalancing; 1, 16, 64 clients plus intended peak concurrency |
-| Process failures | SIGTERM, SIGKILL, reboot, repeated leader loss, planned stops longer than failure timeouts, full-cluster cold start using deployment assets, rolling restart where supported, and failed migration/restore boundaries |
+| Process failures | SIGTERM, SIGKILL, reboot, repeated leader loss, planned stops longer than failure timeouts, full-cluster cold start using deployment assets, and failed restore boundaries |
 | Network failures | Delay, loss, disconnection, asymmetric reachability, partition healing, and exhausted connections; preserve the distinction between safety and availability without quorum |
 | Storage failures | Real disk-full tests in isolated volumes, I/O errors, delayed fsync, corrupted records/snapshots, and restart after each failure |
 | Resource pressure | CPU throttling, memory limits, slow search consumers, full transport/WAL queues, and diagnostic collector outages |
-| Security and operations | Authentication flood, partial trust rollout and revocation, maintenance races/restarts, backup under the supported mode, isolated restore to replacement hosts, client recovery epochs, upgrade, and permitted rollback |
+| Security and operations | Authentication flood, partial trust rollout and revocation, maintenance races/restarts, backup under the supported mode, isolated restore to replacement hosts, and client recovery epochs |
 
 ### Measurement and acceptance
 
@@ -794,8 +732,8 @@ resources.
   retained logs/outboxes do not grow without a documented bound. Alert before
   disk exhaustion; verify the resulting failure remains explicit and safe.
 - Treat any lost acknowledged write, divergent retry result, unsafe admission,
-  unauthorized mutation, corrupt accepted backup, or unsupported successful
-  downgrade as a release blocker. Fix it, add a regression, and repeat the
+  unauthorized mutation, or corrupt accepted backup as a release blocker. Fix it,
+  add a regression, and repeat the
   affected qualification with the final binary.
 - Compare performance changes using unprofiled release binaries on the same
   workload and hardware, with paired trial order and host interference recorded.
@@ -811,16 +749,15 @@ one independently reversible change at a time.
 ## Phase 8 Release through a monitored pilot
 
 1. Produce a release evidence bundle: revision, build digest, dependency
-   inventory, supported profile, compatibility matrix, test/fault histories,
-   authentication tests, capacity results, backup verification, and timed
-   restore and upgrade drills. Include trust rollout completion, maintenance
-   fault tests, old-deployment isolation, client reconciliation, and the exact
-   source/target binary digests used in compatibility exercises.
+   inventory, supported profile, test/fault histories, authentication tests,
+   capacity results, backup verification, and a timed restore drill. Include
+   trust rollout completion, maintenance fault tests, old-deployment isolation,
+   and client reconciliation.
 2. Start an isolated production-shaped staging cluster, then a pilot with
    limited traffic and explicit acceptance targets. Rehearse an alert response
    and node replacement before increasing exposure.
 3. Take and verify the required recovery artifact before changing persistent
-   production state. Use only the compatible rollback path defined in Phase 4.
+   production state. Restore only through the verified Phase 5 procedure.
 4. Increase traffic in measured steps while checking latency, error rate,
    quorum/replication progress, durable lag, disk headroom, search freshness,
    and backup age. Stop expansion when a release gate fails.
@@ -842,18 +779,16 @@ suite alone does not complete this phase.
 | 4 | Structured logs and bounded metric collection | Real-binary output, redaction, scrape-cost tests |
 | 5 | CURVE/ZAP socket setup and authenticated request context | Both-lane TCP authentication tests |
 | 6 | Authorization, trust distribution, enrollment gates, and rotation/revocation | Partial rollout, established-session revocation, lost-reply/denial, forgery, and saturation tests |
-| 7 | Stable formats, maintenance commands, recovery-epoch schema, and compatibility preflight | Versioned fixtures, named upgrade pair, and unsupported legacy rejection |
-| 8 | Staged migration machinery | Crash-cut tests and replay comparison; full orchestration follows restore |
-| 9 | Replicated maintenance protocol and planned-stop integration | Automatic-writer races, non-meta node restart, timeout suppression, and pending-retry tests |
-| 10 | Offline backup export and manifest | Interrupted, incomplete, and mixed-run backup tests |
-| 11 | Offline restore, recovery epochs, and derived-index reconstruction | Complete loss/restore drill, old-deployment fencing, and client reconciliation |
-| 12 | Maintenance upgrade orchestration and rollback | Archived source/target binaries; complete upgrade and rollback drill |
-| 13 | CI artifacts, deployment packaging, dashboards, runbooks | Clean-host installation, full-cluster cold start, and operator rehearsal |
-| 14 | Independent-host harness and qualification evidence | Capacity, failure matrix, soak, and pilot results |
+| 7 | Current format, maintenance commands, and recovery-epoch schema | Fresh-directory replay, malformed-marker rejection, and current-binary fixtures |
+| 8 | Replicated maintenance protocol and planned-stop integration | Automatic-writer races, non-meta node restart, timeout suppression, and pending-retry tests |
+| 9 | Offline backup export and manifest | Interrupted, incomplete, and mixed-run backup tests |
+| 10 | Offline restore, recovery epochs, and derived-index reconstruction | Complete loss/restore drill, old-deployment fencing, and client reconciliation |
+| 11 | CI artifacts, deployment packaging, dashboards, runbooks | Clean-host installation, full-cluster cold start, and operator rehearsal |
+| 12 | Independent-host harness and qualification evidence | Capacity, failure matrix, soak, and pilot results |
 
-Rolling upgrades or online backup support add separate changes and qualification
-gates when required by the operating profile. Do not bundle a storage-engine
-migration or broad performance rewrite into this release sequence.
+Online backup support adds separate changes and qualification gates when
+required by the operating profile. Do not bundle a broad performance rewrite
+into this release sequence.
 
 ## Validation commands and completion record
 
@@ -868,7 +803,7 @@ cargo test --locked --all-targets --all-features
 cargo build --locked --release
 ```
 
-New security, lifecycle, compatibility, and restore test commands belong in CI
+New security, lifecycle, format, and restore test commands belong in CI
 when those suites exist. Run ignored performance measurements explicitly in
 release mode on a verified durable filesystem, with `DAL_BENCH_DIR` pointing to
 that filesystem and every workload parameter recorded. Production acceptance

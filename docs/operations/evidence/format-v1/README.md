@@ -13,7 +13,7 @@ remote serialization types were added. The
 `version_one_nested_records_replay_from_archived_bytes` regression pins every
 variant of those six enums.
 
-The path and field-kind files, `search-definition.bin`, its SHA-256 digest,
+The path and field-kind files, `search-definition.bin`, its raw 32-byte SHA-256 digest,
 and `meta-create_search_with_revision.bin` were captured at commit `510b53c`
 before the search-definition enum freeze. They pin both variants of
 `PathSegment`, all eight variants of `FieldKind`, the definition hash, and a

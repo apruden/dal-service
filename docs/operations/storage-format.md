@@ -5,8 +5,7 @@ Every data directory carries `DAL_FORMAT.json` with a
 durable record version `1`, application snapshot version `1`, and search engine
 revision `2`. New markers record each requirement separately. A version-1
 marker containing only `storage_format_version` has the historical defaults
-`records=1`, `snapshots=1`, and `search=2`. These defaults are fixed to the
-initial format and do not change when a future binary adds a format.
+`records=1`, `snapshots=1`, and `search=2` for current development data.
 The application snapshot stream identifies version 1 with the `DALSNP01`
 magic. The wire envelope uses `PROTOCOL_VERSION` independently of these disk
 versions. Backup format versioning begins when a backup artifact exists.
@@ -17,25 +16,21 @@ refuses to open a non-empty directory without the marker, a malformed marker,
 or a version this binary does not support. Unknown manifest fields also fail
 preflight. It does not rewrite an unknown
 marker or infer compatibility from RocksDB files.
-This binary accepts only the exact listed format requirements. Binaries from
-before the independent fields were added ignore unknown JSON fields while the
-storage version remains 1. A future incompatible format must therefore bump
-`storage_format_version` as well as its specific requirement, so those older
-binaries reject the marker before opening storage. A future search-engine
-change needs a staged rebuild and marker publication procedure, even though
-the index is derived from authoritative records.
+This binary accepts only the exact listed format requirements. When a format
+changes during development, update the current marker and start with fresh data
+directories. Earlier development directories are disposable; there is no
+migration or backward-compatibility requirement.
 Version-1 data operation, version predicate, meta command, group, node-state,
 serving-state, hash algorithm, key-presence, mutation-result, search-path, and
-search-field tags are frozen
+search field-kind tags are frozen
 in dedicated serialization types. Original bytes are archived in
 [`format-v1-data-op.md`](evidence/format-v1-data-op.md) and the
 [`format-v1` fixtures](evidence/format-v1/README.md). Other persisted enum tags
-still require the same treatment before the initial production format is
-qualified.
+can be revised as the current format changes. These fixtures guard current
+serialization and recovery behavior; they do not establish support for older
+development binaries.
 
-There is no legacy import or migration command yet. If startup reports an
-unclassified directory or an unsupported version, stop the node and preserve
-the directory. Do not delete `DAL_FORMAT.json`, copy it from another node, or
-edit the version by hand. Use a release-provided migration procedure once one
-is available; until then, only empty directories and format version `1` are
-supported.
+If startup reports an unclassified directory or an unsupported version, use a
+fresh directory for the current development build. Do not edit `DAL_FORMAT.json`
+to make a mismatched directory appear valid. Only empty directories and the
+current format are supported.
