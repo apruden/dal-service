@@ -1787,14 +1787,18 @@ fn filesystem_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    let block_size = stats.f_frsize;
+    let block_size = widen_statvfs_counter(stats.f_frsize);
     if block_size == 0 || stats.f_blocks == 0 {
         return None;
     }
     Some((
-        stats.f_bavail.saturating_mul(block_size),
-        stats.f_blocks.saturating_mul(block_size),
+        widen_statvfs_counter(stats.f_bavail).saturating_mul(block_size),
+        widen_statvfs_counter(stats.f_blocks).saturating_mul(block_size),
     ))
+}
+
+fn widen_statvfs_counter<T: Into<u64>>(value: T) -> u64 {
+    value.into()
 }
 
 /// Read the authoritative placement before accepting a learner admission. A
@@ -2259,6 +2263,10 @@ async fn failure_detector(
             .iter()
             .map(|e| (e.node_id, e.state, e.incarnation))
             .collect();
+        if !meta.automatic_meta_changes_allowed() {
+            tracker.lock().unwrap().suspend_timeouts(now_ms(), &states);
+            continue;
+        }
         let transitions = {
             let mut tracker = tracker.lock().unwrap();
             tracker.evaluate(now_ms(), &timeouts, &states)

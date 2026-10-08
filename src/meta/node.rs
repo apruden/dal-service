@@ -424,6 +424,19 @@ impl MetaNode {
             .get_state_record(GroupId::Meta, &keyspace::meta_maintenance_key())
     }
 
+    /// Advisory producer gate. Meta apply remains the authority if a caller
+    /// races a newly committed preparation.
+    pub fn automatic_meta_changes_allowed(&self) -> bool {
+        matches!(
+            self.local_maintenance(),
+            Ok(None)
+                | Ok(Some(MaintenanceRecord {
+                    stage: crate::types::MaintenanceStage::Released,
+                    ..
+                }))
+        )
+    }
+
     /// Every node-directory entry from committed local state (non-linearizable),
     /// used by the failure detector to evaluate liveness across the cluster.
     pub fn local_directory(&self) -> Result<Vec<NodeDirectoryEntry>> {

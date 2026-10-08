@@ -206,6 +206,9 @@ impl RebalanceDriver {
             return; // not a meta node; nothing to plan
         };
         let meta = &meta;
+        if !meta.automatic_meta_changes_allowed() {
+            return;
+        }
         let Ok(directory) = meta.local_directory() else {
             return;
         };

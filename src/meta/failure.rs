@@ -89,6 +89,23 @@ impl HeartbeatTracker {
         HeartbeatTracker::default()
     }
 
+    /// Suspend timeout decisions during maintenance while retaining heartbeat
+    /// identity stamps. Restart the timeout grace period so release does not
+    /// replay a pre-maintenance silence decision as an immediate `Down`.
+    pub fn suspend_timeouts(&mut self, now_ms: u64, states: &[(NodeId, NodeState, u64)]) {
+        for &(node, _, incarnation) in states {
+            if self
+                .last_stamp
+                .get(&node)
+                .is_some_and(|(observed, _, _)| *observed == incarnation)
+            {
+                self.last_seen_ms.insert(node, now_ms);
+            } else {
+                self.unobserved_since_ms.insert(node, (incarnation, now_ms));
+            }
+        }
+    }
+
     /// Record a heartbeat. A lower directory incarnation is stale. Within one
     /// directory incarnation, a higher durable process incarnation starts a
     /// fresh stream and only a strictly increasing sequence is accepted. Thus a

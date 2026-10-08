@@ -9,6 +9,8 @@
 //! The Raft wrapper reuses `evaluate` so it can fold the applied `LogId` into
 //! the same batch.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::codec;
@@ -281,24 +283,37 @@ impl MetaStateMachine {
             ));
         }
         let directory = self.directory(s)?;
-        if directory
+        // Directory entries survive decommission and failure. Only Active
+        // runtimes are required participants; every placed voter must still be
+        // Active, so a dead replica cannot be silently omitted from capture.
+        let active: BTreeSet<NodeId> = directory
             .iter()
-            .any(|entry| entry.state != NodeState::Active)
-        {
-            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
-        }
-        let mut expected: Vec<NodeId> = directory.iter().map(|entry| entry.node_id).collect();
-        expected.sort_unstable();
+            .filter(|entry| entry.state == NodeState::Active)
+            .map(|entry| entry.node_id)
+            .collect();
+        let expected: Vec<NodeId> = active.iter().copied().collect();
         if participants != expected.as_slice() {
             return Ok((
-                invalid("maintenance must include every registered node"),
+                invalid("maintenance must include every Active node"),
                 vec![],
             ));
         }
+        let mut data_placements = BTreeMap::new();
         for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
-            if !matches!(self.placement(s, group)?, Some(placement) if placement.r#move.is_none()) {
+            let Some(placement) = self.placement(s, group)? else {
+                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+            };
+            if placement.r#move.is_some()
+                || placement.voters.iter().any(|voter| !active.contains(voter))
+            {
                 return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
             }
+            if let GroupId::Data(partition) = group {
+                data_placements.insert(partition, placement);
+            }
+        }
+        if crate::placement::propose(&directory, &data_placements, cluster.r as usize).is_some() {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
         }
         for (key, value) in s.scan_state(GroupId::Meta)? {
             if key.starts_with(&keyspace::meta_search_index_prefix()) {
