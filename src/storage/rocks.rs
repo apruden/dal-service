@@ -1987,7 +1987,44 @@ mod tests {
         let manifest: StorageFormatManifest =
             serde_json::from_slice(&fs::read(db.join(STORAGE_FORMAT_FILE)).unwrap()).unwrap();
         assert_eq!(manifest.storage_format_version, STORAGE_FORMAT_VERSION);
+        assert_eq!(
+            manifest.durable_record_version,
+            DURABLE_RECORD_FORMAT_VERSION
+        );
+        assert_eq!(
+            manifest.snapshot_format_version,
+            crate::snapshot::FORMAT_VERSION
+        );
+        assert_eq!(
+            manifest.search_engine_revision,
+            crate::search::SEARCH_ENGINE_REVISION
+        );
         preflight_storage_format(&db).unwrap();
+    }
+
+    #[test]
+    fn format_preflight_accepts_legacy_marker_and_preserves_incompatible_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        fs::create_dir(&db).unwrap();
+        let marker = db.join(STORAGE_FORMAT_FILE);
+
+        fs::write(&marker, br#"{"storage_format_version":1}"#).unwrap();
+        check_storage_format(&db).unwrap();
+        preflight_storage_format(&db).unwrap();
+
+        for bytes in [
+            br#"{"storage_format_version":1,"durable_record_version":2}"#.as_slice(),
+            br#"{"storage_format_version":1,"snapshot_format_version":2}"#.as_slice(),
+            br#"{"storage_format_version":1,"search_engine_revision":3}"#.as_slice(),
+            br#"{"storage_format_version":1,"future_requirement":1}"#.as_slice(),
+        ] {
+            fs::write(&marker, bytes).unwrap();
+            assert!(check_storage_format(&db).is_err());
+            assert!(preflight_storage_format(&db).is_err());
+            assert_eq!(fs::read(&marker).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&db).unwrap().count(), 1);
+        }
     }
 
     #[test]
