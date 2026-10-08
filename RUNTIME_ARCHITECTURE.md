@@ -258,6 +258,13 @@ Built (M8):
   `FinalizePlan{Meta}`), self-referentially. The drained node reclaims its meta
   group after a current meta voter reports (over the network) a resolved
   placement excluding it.
+- Maintenance preparation is recorded in meta state with an operation ID,
+  generation, and participant inventory. Meta command application rejects
+  ordinary commands while preparation is active; meta-hosting nodes expose the
+  locally applied record in `/status`. This is internal groundwork only: there
+  is no operator entry point or backup authority yet. Client admission, direct
+  Raft membership changes, participant acknowledgements, and release checks
+  must be fenced before a backup can rely on it.
 
 The M8 runtime slice is now feature-complete for both the partition and
 meta-voter lifecycles (genesis, gain via `BecomeLearner`, drain/reclaim,
