@@ -1704,6 +1704,15 @@ impl StatusSource for NodeStatus {
                 .collect()
         };
         partitions.sort_by_key(|s| s.partition);
+        self.quorum_age
+            .lock()
+            .unwrap()
+            .retain(|group, _| match group {
+                GroupId::Meta => meta_node.is_some(),
+                GroupId::Data(partition) => partitions
+                    .binary_search_by_key(partition, |status| status.partition)
+                    .is_ok(),
+            });
 
         let rocks = crate::perf::write_path_enabled().then(|| self.storage.rocks_counters());
         let rocks_memory = crate::perf::write_path_enabled()
