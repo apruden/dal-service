@@ -11,6 +11,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+macro_rules! frozen_serde {
+    ($type:ty, $remote:ident) => {
+        impl Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                $remote::serialize(self, serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                $remote::deserialize(deserializer)
+            }
+        }
+    };
+}
+
 /// Wire/protocol version. Bumped only on an incompatible envelope or command
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
 pub const PROTOCOL_VERSION: u32 = 5;
@@ -82,11 +104,20 @@ pub enum Consistency {
 ///
 /// `Ord` is derived so groups can live in `BTreeSet`/`BTreeMap` with a stable
 /// order; `Meta` sorts before any `Data`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GroupId {
     Meta,
     Data(u16),
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "GroupId")]
+#[allow(dead_code)]
+enum GroupIdV1 {
+    Meta,
+    Data(u16),
+}
+frozen_serde!(GroupId, GroupIdV1);
 
 impl GroupId {
     /// Canonical stable token used in column-family names and the wire
@@ -278,20 +309,38 @@ pub struct DataRequest {
 }
 
 /// The current presence of a key, returned inside a failed CAS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPresence {
     Absent,
     Present { version: Version },
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "KeyPresence")]
+#[allow(dead_code)]
+enum KeyPresenceV1 {
+    Absent,
+    Present { version: Version },
+}
+frozen_serde!(KeyPresence, KeyPresenceV1);
+
 /// Result of a decided mutation (DESIGN §4.2). A successful mutation — including
 /// an unconditional delete of an absent key — returns the committing log index
 /// as `version`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationResult {
     Applied { version: Version },
     ConditionFailed { current: KeyPresence },
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "MutationResult")]
+#[allow(dead_code)]
+enum MutationResultV1 {
+    Applied { version: Version },
+    ConditionFailed { current: KeyPresence },
+}
+frozen_serde!(MutationResult, MutationResultV1);
 
 // ---------------------------------------------------------------------------
 // Cluster configuration record (DESIGN §3.1, §5.1)
@@ -299,11 +348,19 @@ pub enum MutationResult {
 
 /// The canonical key-hash specification, persisted at `init` as a protocol
 /// constant rather than a crate-version default (IMPLEMENTATION §M1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgo {
     /// xxhash64 over the raw key bytes.
     Xxh64,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "HashAlgo")]
+#[allow(dead_code)]
+enum HashAlgoV1 {
+    Xxh64,
+}
+frozen_serde!(HashAlgo, HashAlgoV1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashSpec {
@@ -380,13 +437,24 @@ pub fn voter_set<I: IntoIterator<Item = NodeId>>(voters: I) -> BTreeSet<NodeId> 
 
 /// Replicated node lifecycle state. Transitions are committed meta-group
 /// decisions, never inferred locally (DESIGN §9.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
     Active,
     Suspect,
     Down,
     Draining,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "NodeState")]
+#[allow(dead_code)]
+enum NodeStateV1 {
+    Active,
+    Suspect,
+    Down,
+    Draining,
+}
+frozen_serde!(NodeState, NodeStateV1);
 
 /// A directory entry for one registered node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,13 +715,22 @@ pub struct DataConfigObservation {
 /// Node-local serving-gate record: whether this node may serve/participate in a
 /// group. A node that has applied its removal records non-serving before
 /// reclaiming CFs (DESIGN §7.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServingState {
     /// Established membership through the group's own Raft state; may serve.
     Serving,
     /// Applied its removal; must not serve and may reclaim local data.
     NonServing,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "ServingState")]
+#[allow(dead_code)]
+enum ServingStateV1 {
+    Serving,
+    NonServing,
+}
+frozen_serde!(ServingState, ServingStateV1);
 
 #[cfg(test)]
 mod tests {
@@ -747,6 +824,72 @@ mod tests {
                 command
             );
         }
+    }
+
+    #[test]
+    fn version_one_nested_records_replay_from_archived_bytes() {
+        fn check<T>(value: T, baseline: &[u8])
+        where
+            T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+        {
+            assert_eq!(crate::codec::encode(&value), baseline);
+            assert_eq!(crate::codec::decode::<T>(baseline).unwrap(), value);
+        }
+
+        check(
+            GroupId::Meta,
+            include_bytes!("../docs/operations/evidence/format-v1/group-meta.bin"),
+        );
+        check(
+            GroupId::Data(2),
+            include_bytes!("../docs/operations/evidence/format-v1/group-data.bin"),
+        );
+        check(
+            NodeState::Active,
+            include_bytes!("../docs/operations/evidence/format-v1/node-active.bin"),
+        );
+        check(
+            NodeState::Suspect,
+            include_bytes!("../docs/operations/evidence/format-v1/node-suspect.bin"),
+        );
+        check(
+            NodeState::Down,
+            include_bytes!("../docs/operations/evidence/format-v1/node-down.bin"),
+        );
+        check(
+            NodeState::Draining,
+            include_bytes!("../docs/operations/evidence/format-v1/node-draining.bin"),
+        );
+        check(
+            ServingState::Serving,
+            include_bytes!("../docs/operations/evidence/format-v1/serving-serving.bin"),
+        );
+        check(
+            ServingState::NonServing,
+            include_bytes!("../docs/operations/evidence/format-v1/serving-non_serving.bin"),
+        );
+        check(
+            HashAlgo::Xxh64,
+            include_bytes!("../docs/operations/evidence/format-v1/hash-xxh64.bin"),
+        );
+        check(
+            KeyPresence::Absent,
+            include_bytes!("../docs/operations/evidence/format-v1/presence-absent.bin"),
+        );
+        check(
+            KeyPresence::Present { version: 7 },
+            include_bytes!("../docs/operations/evidence/format-v1/presence-present.bin"),
+        );
+        check(
+            MutationResult::Applied { version: 7 },
+            include_bytes!("../docs/operations/evidence/format-v1/mutation-applied.bin"),
+        );
+        check(
+            MutationResult::ConditionFailed {
+                current: KeyPresence::Present { version: 7 },
+            },
+            include_bytes!("../docs/operations/evidence/format-v1/mutation-condition_failed.bin"),
+        );
     }
 
     #[test]
