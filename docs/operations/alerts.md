@@ -89,7 +89,7 @@ Compare gateway p99 with request volume, reply outcomes, admission rejections,
 durable lag, and disk pressure on the affected node. The histogram measures
 time inside the client gateway, including authorization and reply encoding; it
 does not include transport or client retry time. Its fixed buckets are 10, 25,
-50, 100, 250, 500, 1000, and 5000 ms plus infinity. The outcome counter has
+50, 100, 250, 500, 1000, and 5000 ms plus infinity. The ClientOp outcome counter has
 fixed applied, condition_failed, rejected, value, redirect, refused, error,
 unavailable, and denied classes. Verify latency and errors return to their
 normal workload baseline before closing the incident.
@@ -111,7 +111,7 @@ authentication to silence it.
 
 ## Coverage limitations
 
-The current endpoint does not expose backup age or end-to-end client latency, or
+The current endpoint does not expose backup age or end-to-end client latency and
 cluster-wide quorum. These rules therefore do
 not cover those release gates. Add corresponding instrumentation and alerts
 before relying on them for production operations.

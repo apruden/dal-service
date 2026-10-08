@@ -176,8 +176,16 @@ impl ClientGateway {
         Envelope::new(self.cluster_id, msg_type, group, request_id, body)
     }
 
-    fn client_reply(&self, group: GroupId, request_id: u64, reply: ClientReply) -> Envelope {
-        crate::perf::record_client_reply(&reply);
+    fn client_reply(
+        &self,
+        group: GroupId,
+        request_id: u64,
+        reply: ClientReply,
+        is_client_op: bool,
+    ) -> Envelope {
+        if is_client_op {
+            crate::perf::record_client_reply(&reply);
+        }
         self.reply(MsgType::ClientOp, group, request_id, codec::encode(&reply))
     }
 
@@ -457,6 +465,7 @@ impl Server for ClientGateway {
                 request.group_id,
                 request.request_id,
                 ClientReply::Error("wrong cluster".to_string()),
+                request.msg_type == MsgType::ClientOp,
             );
         }
 
@@ -466,6 +475,7 @@ impl Server for ClientGateway {
                 request.group_id,
                 request.request_id,
                 ClientReply::Error(RejectFrame::PeerControlOnClientPath.to_string()),
+                false,
             );
         }
 
@@ -489,6 +499,7 @@ impl Server for ClientGateway {
                         ClientReply::Denied(
                             "principal lacks permission or ownership for ClientOp".into(),
                         ),
+                        true,
                     );
                 }
             }
@@ -573,7 +584,7 @@ impl Server for ClientGateway {
             }
             MsgType::ClientOp => {
                 let reply = self.handle_client_op(&request).await;
-                self.client_reply(request.group_id, request.request_id, reply)
+                self.client_reply(request.group_id, request.request_id, reply, true)
             }
             // Addressing selects the role: the meta group asks this node to
             // coordinate a whole search, a data partition asks it to serve one
@@ -625,6 +636,7 @@ impl Server for ClientGateway {
                 request.group_id,
                 request.request_id,
                 ClientReply::Error(format!("unsupported client msg_type {other:?}")),
+                false,
             ),
         }
     }

@@ -351,6 +351,8 @@ async fn metrics(State(src): State<Arc<dyn StatusSource>>) -> axum::http::Respon
 /// restricted to the numeric partition id; user-controlled index names,
 /// client ids, and request data never become metric dimensions.
 fn render_metrics(status: &ClusterStatus) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(2048);
     metric(
         &mut out,
@@ -453,7 +455,6 @@ fn render_metrics(status: &ClusterStatus) -> String {
     let mut cumulative = 0_u64;
     for (index, label) in crate::perf::CLIENT_OP_BUCKET_LABELS.iter().enumerate() {
         cumulative = cumulative.saturating_add(status.client_op_metrics.duration_buckets[index]);
-        use std::fmt::Write as _;
         let _ = writeln!(
             out,
             "dal_client_op_gateway_duration_seconds_bucket{{le=\"{label}\"}} {cumulative}"
@@ -464,7 +465,6 @@ fn render_metrics(status: &ClusterStatus) -> String {
         "dal_client_op_gateway_duration_seconds_count",
         cumulative,
     );
-    use std::fmt::Write as _;
     let _ = writeln!(
         out,
         "dal_client_op_gateway_duration_seconds_sum {}",
@@ -473,7 +473,7 @@ fn render_metrics(status: &ClusterStatus) -> String {
     for (index, label) in crate::perf::CLIENT_REPLY_OUTCOME_LABELS.iter().enumerate() {
         let _ = writeln!(
             out,
-            "dal_client_reply_outcomes_total{{outcome=\"{label}\"}} {}",
+            "dal_client_op_reply_outcomes_total{{outcome=\"{label}\"}} {}",
             status.client_op_metrics.reply_outcomes[index]
         );
     }
