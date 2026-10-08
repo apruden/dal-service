@@ -89,6 +89,7 @@ pub enum MetaReject {
     SearchGenerationMismatch,
     SearchGenerationNotReady,
     MaintenanceActive,
+    MaintenanceBusy,
     MaintenanceMismatch,
 }
 
@@ -264,9 +265,9 @@ impl MetaStateMachine {
         generation: u64,
         participants: &[NodeId],
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
-        if self.cluster(s)?.is_none() {
+        let Some(cluster) = self.cluster(s)? else {
             return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
-        }
+        };
         if operation_id == 0 || generation == 0 || participants.is_empty() {
             return Ok((
                 invalid("maintenance identity and participants are required"),
@@ -280,6 +281,12 @@ impl MetaStateMachine {
             ));
         }
         let directory = self.directory(s)?;
+        if directory
+            .iter()
+            .any(|entry| entry.state != NodeState::Active)
+        {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
         let mut expected: Vec<NodeId> = directory.iter().map(|entry| entry.node_id).collect();
         expected.sort_unstable();
         if participants != expected.as_slice() {
@@ -287,6 +294,19 @@ impl MetaStateMachine {
                 invalid("maintenance must include every registered node"),
                 vec![],
             ));
+        }
+        for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
+            if !matches!(self.placement(s, group)?, Some(placement) if placement.r#move.is_none()) {
+                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+            }
+        }
+        for (key, value) in s.scan_state(GroupId::Meta)? {
+            if key.starts_with(&keyspace::meta_search_index_prefix()) {
+                let record: SearchIndexRecord = codec::decode(&value)?;
+                if record.building.is_some() || !record.retiring.is_empty() {
+                    return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+                }
+            }
         }
         if let Some(previous) = self.maintenance(s)? {
             if previous.stage == MaintenanceStage::Preparing {
