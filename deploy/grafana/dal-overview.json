@@ -156,11 +156,14 @@
     },
     {
       "id": 14,
-      "title": "Authorization denials in 5 minutes",
+      "title": "Security denials in 5 minutes",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "x": 12, "y": 37, "w": 12, "h": 8 },
-      "targets": [{ "refId": "A", "expr": "increase(dal_authorization_denials_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}" }],
+      "targets": [
+        { "refId": "A", "expr": "increase(dal_authentication_denials_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} authentication" },
+        { "refId": "B", "expr": "increase(dal_authorization_denials_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} authorization" }
+      ],
       "fieldConfig": { "defaults": { "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }] } }, "overrides": [] },
       "options": {}
     }

@@ -126,3 +126,12 @@ groups:
         annotations:
           summary: "DAL is rejecting many authenticated requests on {{ $labels.instance }}"
           runbook: "docs/operations/alerts.md#dalauthorizationdenialsspike"
+
+      - alert: DALAuthenticationDenialsSpike
+        expr: increase(dal_authentication_denials_total[5m]) >= 20
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL is rejecting many CURVE authentication attempts on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalauthenticationdenialsspike"

@@ -298,6 +298,13 @@ pub struct ZapAuthenticator {
     domain: String,
 }
 
+static ZAP_DENIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Authentication decisions rejected by this process's CURVE/ZAP handler.
+pub fn authentication_denials() -> u64 {
+    ZAP_DENIALS.load(Ordering::Relaxed)
+}
+
 /// Outbound CURVE identity and the pinned server public keys for destination
 /// endpoints. Missing pins are configuration errors; secure transports never
 /// fall back to plaintext for an unknown address.
@@ -396,6 +403,9 @@ impl ZapAuthenticator {
                             }
                         };
                         let response = zap_response(&request, &worker_domain, &policy);
+                        if response.get(2).is_some_and(|status| status == b"400") {
+                            ZAP_DENIALS.fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Err(error) = send_zap_response(&socket, &response, &worker_running) {
                             fail_closed_until_stopped(
                                 &socket,
@@ -483,6 +493,7 @@ fn fail_closed_until_stopped(
         match socket.recv_multipart(0) {
             Ok(request) => {
                 let denial = zap_denial(&request);
+                ZAP_DENIALS.fetch_add(1, Ordering::Relaxed);
                 if !send_until_stopped(socket, &denial, running) {
                     return;
                 }

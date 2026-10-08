@@ -1757,6 +1757,7 @@ impl StatusSource for NodeStatus {
             search_source_row_peak_bytes,
             snapshot_record_peak_bytes,
             router_admission_rejections: router.admission_rejections,
+            authentication_denials: crate::transport::security::authentication_denials(),
             authorization_denials: crate::perf::authorization_denials(),
             log_dropped_lines: crate::perf::dropped_log_lines(),
             router_reply_send_eagain: router.reply_send_eagain,

@@ -70,6 +70,8 @@ pub struct ClusterStatus {
     pub snapshot_record_peak_bytes: u64,
     pub router_admission_rejections: u64,
     #[serde(default)]
+    pub authentication_denials: u64,
+    #[serde(default)]
     pub authorization_denials: u64,
     #[serde(default)]
     pub log_dropped_lines: u64,
@@ -424,6 +426,11 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     metric(
         &mut out,
+        "dal_authentication_denials_total",
+        status.authentication_denials,
+    );
+    metric(
+        &mut out,
         "dal_authorization_denials_total",
         status.authorization_denials,
     );
@@ -658,6 +665,7 @@ pub(crate) mod tests {
                 search_source_row_peak_bytes: 0,
                 snapshot_record_peak_bytes: 0,
                 router_admission_rejections: 0,
+                authentication_denials: 0,
                 authorization_denials: 0,
                 log_dropped_lines: 0,
                 router_reply_send_eagain: 0,

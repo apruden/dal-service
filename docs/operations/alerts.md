@@ -109,6 +109,15 @@ configuration. The metric does not identify principals, and the threshold can
 also be triggered by stale or misconfigured clients; do not weaken transport
 authentication to silence it.
 
+## DALAuthenticationDenialsSpike
+
+Inspect the node's CURVE/ZAP health, recent trust-policy changes, peer pins,
+and source connection volume. This counter increments for rejected ZAP
+decisions before a request reaches authorization, including fail-closed
+responses after authenticator failure. Investigate a flood or stale credential
+rollout without weakening the trust policy. Verify the denial rate falls and
+legitimate peers can reconnect.
+
 ## Coverage limitations
 
 The current endpoint does not expose backup age or end-to-end client latency and
