@@ -93,8 +93,8 @@ impl StorageFormatManifest {
 }
 
 /// Establish the format marker only for a genuinely empty directory. Existing
-/// RocksDB databases without a marker require an explicit import/migration
-/// path; inferring compatibility from their contents is unsafe.
+/// RocksDB databases without a marker are unsupported development data;
+/// inferring a format from their contents is unsafe.
 fn preflight_storage_format(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     let marker = path.join(STORAGE_FORMAT_FILE);
@@ -103,7 +103,9 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
         let manifest: StorageFormatManifest = serde_json::from_slice(&bytes).map_err(|error| {
             Error::Corrupt(
                 marker.display().to_string(),
-                format!("invalid storage format manifest: {error}"),
+                format!(
+                    "invalid storage format manifest: {error}. Use a fresh data directory for this development build"
+                ),
             )
         })?;
         manifest.validate(path)?;
@@ -161,7 +163,9 @@ pub fn check_storage_format(path: &Path) -> Result<()> {
             serde_json::from_slice(&fs::read(&marker)?).map_err(|error| {
                 Error::Corrupt(
                     marker.display().to_string(),
-                    format!("invalid storage format manifest: {error}"),
+                    format!(
+                        "invalid storage format manifest: {error}. Use a fresh data directory for this development build"
+                    ),
                 )
             })?;
         manifest.validate(path)?;
@@ -1972,6 +1976,7 @@ mod tests {
         check_storage_format(&db).unwrap();
         assert!(!db.exists());
         preflight_storage_format(&db).unwrap();
+        check_storage_format(&db).unwrap();
         let manifest: StorageFormatManifest =
             serde_json::from_slice(&fs::read(db.join(STORAGE_FORMAT_FILE)).unwrap()).unwrap();
         assert_eq!(manifest.storage_format_version, STORAGE_FORMAT_VERSION);

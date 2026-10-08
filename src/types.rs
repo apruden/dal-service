@@ -558,8 +558,9 @@ pub enum MetaCommand {
         name: String,
         generation: crate::search::SearchIndexGenerationId,
     },
-    /// Revision-aware search command in the current command set. The earlier
-    /// variant remains decodable for logs written by this development format.
+    /// Revision-aware search command in the current command set. Earlier
+    /// development variants remain decodable incidentally, without a support
+    /// guarantee for data written by older binaries.
     CreateSearchIndexWithRevision {
         name: String,
         definition: crate::search::SearchIndexDefinition,

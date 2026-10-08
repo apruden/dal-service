@@ -28,9 +28,9 @@ use crate::types::{
     PROTOCOL_VERSION, Placement, voter_set,
 };
 
-/// Engine identity implied by search commands without an explicit revision.
-/// Keep apply deterministic when the current binary replays those commands.
-/// Earlier development directories are not supported import sources.
+/// Engine identity implied by older development search commands without an
+/// explicit revision. Their decoding is incidental, not an import contract;
+/// apply remains deterministic if one is encountered in the current directory.
 const LEGACY_SEARCH_ENGINE_REVISION: u32 = 1;
 
 /// The outcome of applying one committed meta command.

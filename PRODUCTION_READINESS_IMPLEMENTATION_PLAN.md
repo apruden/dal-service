@@ -407,10 +407,9 @@ Primary changes: [codec](src/codec.rs), [types](src/types.rs),
 
 ### Completion gate
 
-The release binary opens newly created directories, restarts and replays its
-own durable state, and restores backups written by that same release. A malformed
-or unrecognized directory is rejected before mutation. Phase 5 verifies the
-maintenance and recovery metadata through actual backup and restore artifacts.
+The release binary opens newly created directories and restarts and replays its
+own durable state. A malformed or unrecognized directory is rejected before
+mutation. Phase 5 verifies backup and restore artifacts written by that release.
 
 ## Phase 5 Implement coordinated backup and verified restore
 
