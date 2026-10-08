@@ -177,6 +177,7 @@ impl ClientGateway {
     }
 
     fn client_reply(&self, group: GroupId, request_id: u64, reply: ClientReply) -> Envelope {
+        crate::perf::record_client_reply(&reply);
         self.reply(MsgType::ClientOp, group, request_id, codec::encode(&reply))
     }
 
@@ -431,6 +432,8 @@ impl Server for ClientGateway {
         request: Envelope,
         context: crate::transport::RequestContext,
     ) -> Envelope {
+        let _client_op_timer =
+            (request.msg_type == MsgType::ClientOp).then(crate::perf::client_op_timer);
         // Wrong cluster: reply stamped with our real cluster id so the client's
         // per-reply cluster check rejects it (DESIGN §8.2).
         if request.cluster_id != self.cluster_id {

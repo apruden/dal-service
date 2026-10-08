@@ -1706,6 +1706,7 @@ impl StatusSource for NodeStatus {
             router_reply_send_eagain: router.reply_send_eagain,
             router_reply_send_failures: router.reply_send_failures,
             router_max_active_handlers: router.max_active_handlers,
+            client_op_metrics: crate::perf::client_op_metrics(),
             meta,
             partitions,
             directory,

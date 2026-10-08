@@ -1,4 +1,4 @@
-//! Opt-in write-path profiling used by the release benchmark.
+//! Bounded operational counters and opt-in write-path profiling.
 //!
 //! Set `DAL_PROFILE_WRITE_PATH=1` before process start. Disabled mode avoids
 //! reading the clock; enabled mode records aggregate wall time around the
@@ -8,11 +8,87 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use crate::api::ops::{ClientReply, WriteReply};
 use crate::transport::codec::MsgType;
 use crate::types::GroupId;
 
 static AUTHORIZATION_DENIALS: AtomicU64 = AtomicU64::new(0);
 static LOG_DROP_COUNTER: OnceLock<tracing_appender::non_blocking::ErrorCounter> = OnceLock::new();
+
+/// Fixed buckets keep client telemetry bounded regardless of request contents.
+pub(crate) const CLIENT_OP_BUCKET_LABELS: [&str; 9] = [
+    "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "5", "+Inf",
+];
+const CLIENT_OP_BUCKET_MICROS: [u64; 8] = [
+    10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
+];
+pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 9] = [
+    "applied",
+    "condition_failed",
+    "rejected",
+    "value",
+    "redirect",
+    "refused",
+    "error",
+    "unavailable",
+    "denied",
+];
+static CLIENT_OP_DURATION_BUCKETS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static CLIENT_OP_DURATION_SUM_MICROS: AtomicU64 = AtomicU64::new(0);
+static CLIENT_REPLY_OUTCOMES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientOpMetrics {
+    pub duration_sum_microseconds: u64,
+    /// Exclusive counts, converted to cumulative buckets during exposition.
+    pub duration_buckets: [u64; 9],
+    pub reply_outcomes: [u64; 9],
+}
+
+pub(crate) fn client_op_metrics() -> ClientOpMetrics {
+    ClientOpMetrics {
+        duration_sum_microseconds: CLIENT_OP_DURATION_SUM_MICROS.load(Ordering::Relaxed),
+        duration_buckets: std::array::from_fn(|i| {
+            CLIENT_OP_DURATION_BUCKETS[i].load(Ordering::Relaxed)
+        }),
+        reply_outcomes: std::array::from_fn(|i| CLIENT_REPLY_OUTCOMES[i].load(Ordering::Relaxed)),
+    }
+}
+
+pub(crate) struct ClientOpTimer(Instant);
+
+pub(crate) fn client_op_timer() -> ClientOpTimer {
+    ClientOpTimer(Instant::now())
+}
+
+impl Drop for ClientOpTimer {
+    fn drop(&mut self) {
+        let micros = self.0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let bucket = CLIENT_OP_BUCKET_MICROS
+            .iter()
+            .position(|upper| micros <= *upper)
+            .unwrap_or(CLIENT_OP_BUCKET_MICROS.len());
+        CLIENT_OP_DURATION_SUM_MICROS.fetch_add(micros, Ordering::Relaxed);
+        CLIENT_OP_DURATION_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_client_reply(reply: &ClientReply) {
+    let outcome = match reply {
+        ClientReply::Mutation(WriteReply::Applied { .. }) => 0,
+        ClientReply::Mutation(WriteReply::ConditionFailed { .. }) => 1,
+        ClientReply::Mutation(WriteReply::Rejected(_)) => 2,
+        ClientReply::Value(_) => 3,
+        ClientReply::Redirect(_) => 4,
+        ClientReply::Refused(_) => 5,
+        ClientReply::Error(_) => 6,
+        ClientReply::Unavailable(_) => 7,
+        ClientReply::Denied(_) => 8,
+    };
+    CLIENT_REPLY_OUTCOMES[outcome].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Count rejected authenticated requests without recording principal identity.
 pub(crate) fn record_authorization_denial() {

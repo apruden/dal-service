@@ -82,6 +82,15 @@ groups:
           summary: "DAL partition {{ $labels.partition }} materialization is over one minute behind"
           runbook: "docs/operations/alerts.md#dalmaterializationlaggrowing"
 
+      - alert: DALClientOpHighLatency
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(dal_client_op_gateway_duration_seconds_bucket[5m]))) > 0.75
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL client operation gateway p99 exceeds 750 ms on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalclientophighlatency"
+
       - alert: DALLogDrops
         expr: increase(dal_log_dropped_lines_total[5m]) > 0
         for: 0m

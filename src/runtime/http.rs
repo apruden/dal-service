@@ -76,6 +76,9 @@ pub struct ClusterStatus {
     pub router_reply_send_eagain: u64,
     pub router_reply_send_failures: u64,
     pub router_max_active_handlers: usize,
+    /// Process-wide gateway counters with fixed buckets and outcome classes.
+    #[serde(default)]
+    pub client_op_metrics: crate::perf::ClientOpMetrics,
     /// Present when this node runs the meta group.
     pub meta: Option<MetaStatus>,
     pub partitions: Vec<PartitionStatus>,
@@ -447,6 +450,33 @@ fn render_metrics(status: &ClusterStatus) -> String {
         "dal_diagnostic_sample_stale",
         u64::from(status.diagnostic_sample_stale),
     );
+    let mut cumulative = 0_u64;
+    for (index, label) in crate::perf::CLIENT_OP_BUCKET_LABELS.iter().enumerate() {
+        cumulative = cumulative.saturating_add(status.client_op_metrics.duration_buckets[index]);
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "dal_client_op_gateway_duration_seconds_bucket{{le=\"{label}\"}} {cumulative}"
+        );
+    }
+    metric(
+        &mut out,
+        "dal_client_op_gateway_duration_seconds_count",
+        cumulative,
+    );
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "dal_client_op_gateway_duration_seconds_sum {}",
+        status.client_op_metrics.duration_sum_microseconds as f64 / 1_000_000.0
+    );
+    for (index, label) in crate::perf::CLIENT_REPLY_OUTCOME_LABELS.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "dal_client_reply_outcomes_total{{outcome=\"{label}\"}} {}",
+            status.client_op_metrics.reply_outcomes[index]
+        );
+    }
     if let Some(meta) = &status.meta {
         metric(&mut out, "dal_meta_is_leader", u64::from(meta.is_leader));
         metric(&mut out, "dal_meta_current_term", meta.current_term);
@@ -633,6 +663,7 @@ pub(crate) mod tests {
                 router_reply_send_eagain: 0,
                 router_reply_send_failures: 0,
                 router_max_active_handlers: 0,
+                client_op_metrics: crate::perf::ClientOpMetrics::default(),
                 meta: Some(MetaStatus {
                     is_leader: true,
                     leader: Some(7),
