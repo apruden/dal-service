@@ -175,8 +175,8 @@ impl From<IfVersionV1> for IfVersion {
 /// The mutating operation, independent of the client/sequence framing. The
 /// command digest (M2) is taken over the canonical bytes of this value, so a
 /// retry at the same sequence matches only an identical operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(into = "DataOpV1", from = "DataOpV1")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "DataOpV1")]
 pub enum DataOp {
     Put {
         key: Vec<u8>,
@@ -191,7 +191,7 @@ pub enum DataOp {
 
 /// Frozen version-1 bincode tags: Put=0, Delete=1. The public operation enum
 /// can be reorganized without changing its persisted command digest bytes.
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 enum DataOpV1 {
     Put {
         key: Vec<u8>,
@@ -204,20 +204,42 @@ enum DataOpV1 {
     },
 }
 
-impl From<DataOp> for DataOpV1 {
-    fn from(value: DataOp) -> Self {
-        match value {
+/// Borrow large fields when encoding version 1. The variant and field order
+/// match DataOpV1, while no key or value allocation occurs during encoding.
+#[derive(Serialize)]
+enum DataOpV1Ref<'a> {
+    Put {
+        key: &'a [u8],
+        value: &'a [u8],
+        if_version: Option<IfVersion>,
+    },
+    Delete {
+        key: &'a [u8],
+        if_version: Option<IfVersion>,
+    },
+}
+
+impl Serialize for DataOp {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let stable = match self {
             DataOp::Put {
                 key,
                 value,
                 if_version,
-            } => Self::Put {
+            } => DataOpV1Ref::Put {
                 key,
                 value,
-                if_version,
+                if_version: *if_version,
             },
-            DataOp::Delete { key, if_version } => Self::Delete { key, if_version },
-        }
+            DataOp::Delete { key, if_version } => DataOpV1Ref::Delete {
+                key,
+                if_version: *if_version,
+            },
+        };
+        stable.serialize(serializer)
     }
 }
 
@@ -659,9 +681,21 @@ mod tests {
                     1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0,
                 ],
             ),
+            (
+                DataOp::Put {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    if_version: Some(IfVersion::Absent),
+                },
+                vec![
+                    0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 0, 0, 0, 118, 1, 1, 0,
+                    0, 0,
+                ],
+            ),
         ];
         for (operation, baseline) in cases {
             assert_eq!(crate::codec::encode(&operation), baseline);
+            assert_eq!(crate::codec::encoded_len(&operation), baseline.len());
             assert_eq!(
                 crate::codec::decode::<DataOp>(&baseline).unwrap(),
                 operation

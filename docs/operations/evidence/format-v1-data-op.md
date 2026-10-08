@@ -9,7 +9,10 @@ little endian fixed integers. These bytes are pinned by
 | --- | --- |
 | `Put { key: "k", value: "v", if_version: None }` | `0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 0, 0, 0, 118, 0` |
 | `Delete { key: "k", if_version: Some(Number(7)) }` | `1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0` |
+| `Put { key: "k", value: "v", if_version: Some(Absent) }` | `0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 0, 0, 0, 118, 1, 1, 0, 0, 0` |
 
+The Absent case was derived from the version-1 bincode tag layout and pinned by
+the same regression; the first two were captured from commit `0434aa5`.
 This fixture covers operation and predicate tags. It is not a complete durable
 format fixture: meta commands, idempotency records, Raft logs, snapshots, and
 whole databases still need archived examples before the release gate.
