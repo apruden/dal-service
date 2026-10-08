@@ -768,8 +768,8 @@ impl RootDispatch {
         req: Envelope,
         context: &crate::transport::RequestContext,
     ) -> Envelope {
-        // Only the meta leader's detector ever reads this evidence, and it is
-        // reachable only from a node hosting meta. Recording it elsewhere would
+        // Meta hosts retain this evidence for leader changes and maintenance
+        // timeout suspension. Recording it on non-meta nodes would
         // accumulate state from unauthenticated frames that nothing consumes.
         if self.meta().is_none() {
             return self.reply(&req, Vec::new());

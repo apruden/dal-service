@@ -76,6 +76,9 @@ pub struct HeartbeatTracker {
     /// matching heartbeat has been observed. This prevents a newly registered
     /// node (or a freshly started detector) from becoming Down immediately.
     unobserved_since_ms: HashMap<NodeId, (u64, u64)>,
+    /// `(directory incarnation, grace start)` for timeout decisions suspended
+    /// by maintenance. It never substitutes for a real heartbeat timestamp.
+    maintenance_grace_since_ms: HashMap<NodeId, (u64, u64)>,
 }
 
 /// Ceiling on distinct nodes tracked at once. Heartbeat frames are
@@ -89,20 +92,13 @@ impl HeartbeatTracker {
         HeartbeatTracker::default()
     }
 
-    /// Suspend timeout decisions during maintenance while retaining heartbeat
-    /// identity stamps. Restart the timeout grace period so release does not
-    /// replay a pre-maintenance silence decision as an immediate `Down`.
+    /// Suspend timeout decisions during maintenance without changing heartbeat
+    /// evidence. Release gets one down-timeout grace period before acting on
+    /// silence that began before maintenance.
     pub fn suspend_timeouts(&mut self, now_ms: u64, states: &[(NodeId, NodeState, u64)]) {
         for &(node, _, incarnation) in states {
-            if self
-                .last_stamp
-                .get(&node)
-                .is_some_and(|(observed, _, _)| *observed == incarnation)
-            {
-                self.last_seen_ms.insert(node, now_ms);
-            } else {
-                self.unobserved_since_ms.insert(node, (incarnation, now_ms));
-            }
+            self.maintenance_grace_since_ms
+                .insert(node, (incarnation, now_ms));
         }
     }
 
@@ -142,6 +138,13 @@ impl HeartbeatTracker {
         self.last_stamp
             .insert(node, (incarnation, process_incarnation, seq));
         self.last_seen_ms.insert(node, now_ms);
+        if self
+            .maintenance_grace_since_ms
+            .get(&node)
+            .is_some_and(|(expected, _)| *expected == incarnation)
+        {
+            self.maintenance_grace_since_ms.remove(&node);
+        }
         true
     }
 
@@ -196,10 +199,20 @@ impl HeartbeatTracker {
         self.last_seen_ms.retain(|node, _| known.contains(node));
         self.unobserved_since_ms
             .retain(|node, _| known.contains(node));
+        self.maintenance_grace_since_ms
+            .retain(|node, _| known.contains(node));
 
         states
             .iter()
             .filter_map(|&(node, current, incarnation)| {
+                if let Some(&(expected, since)) = self.maintenance_grace_since_ms.get(&node) {
+                    if expected == incarnation
+                        && u128::from(now_ms.saturating_sub(since)) < timeouts.down.as_millis()
+                    {
+                        return None;
+                    }
+                    self.maintenance_grace_since_ms.remove(&node);
+                }
                 let silence = self.silence_ms(node, incarnation, now_ms)?;
                 let evidence = classify(Duration::from_millis(silence), timeouts);
                 next_state(current, evidence).map(|s| (node, s))
