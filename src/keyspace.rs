@@ -72,6 +72,12 @@ pub fn meta_cluster_key() -> Vec<u8> {
     vec![TAG_META, b'C']
 }
 
+/// The latest replicated maintenance operation, retained after release so its
+/// generation cannot be reused by a later coordinator.
+pub fn meta_maintenance_key() -> Vec<u8> {
+    vec![TAG_META, b'M']
+}
+
 /// One node-directory entry, keyed by node id.
 pub fn meta_node_key(node_id: crate::types::NodeId) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 8);

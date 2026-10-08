@@ -21,8 +21,9 @@ use crate::search::{
 };
 use crate::storage::{StateMutation, Storage};
 use crate::types::{
-    ClusterConfig, GroupId, LogId, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MetaCommand, MovePlan,
-    NodeDirectoryEntry, NodeId, NodeState, PROTOCOL_VERSION, Placement, voter_set,
+    ClusterConfig, GroupId, LogId, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MaintenanceRecord,
+    MaintenanceStage, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId, NodeState,
+    PROTOCOL_VERSION, Placement, voter_set,
 };
 
 /// Engine identity implied by the legacy search commands that predate an
@@ -87,6 +88,8 @@ pub enum MetaReject {
     SearchGenerationExists,
     SearchGenerationMismatch,
     SearchGenerationNotReady,
+    MaintenanceActive,
+    MaintenanceMismatch,
 }
 
 pub struct MetaStateMachine;
@@ -104,6 +107,10 @@ impl MetaStateMachine {
 
     fn node(&self, s: &Storage, id: NodeId) -> Result<Option<NodeDirectoryEntry>> {
         s.get_state_record(GroupId::Meta, &keyspace::meta_node_key(id))
+    }
+
+    fn maintenance(&self, s: &Storage) -> Result<Option<MaintenanceRecord>> {
+        s.get_state_record(GroupId::Meta, &keyspace::meta_maintenance_key())
     }
 
     fn placement(&self, s: &Storage, g: GroupId) -> Result<Option<Placement>> {
@@ -155,6 +162,16 @@ impl MetaStateMachine {
         cmd: &MetaCommand,
         log_id: LogId,
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        if self
+            .maintenance(s)?
+            .is_some_and(|record| record.stage == MaintenanceStage::Preparing)
+            && !matches!(
+                cmd,
+                MetaCommand::BeginMaintenance { .. } | MetaCommand::ReleaseMaintenance { .. }
+            )
+        {
+            return Ok((reject(MetaReject::MaintenanceActive), vec![]));
+        }
         match cmd {
             MetaCommand::ClusterInit {
                 config,
@@ -226,10 +243,102 @@ impl MetaStateMachine {
                 definition,
                 engine_revision,
             } => self.create_search_index(s, name, definition, *engine_revision, log_id, true),
+            MetaCommand::BeginMaintenance {
+                operation_id,
+                generation,
+                participants,
+            } => self.begin_maintenance(s, *operation_id, *generation, participants),
+            MetaCommand::ReleaseMaintenance {
+                operation_id,
+                generation,
+            } => self.release_maintenance(s, *operation_id, *generation),
         }
     }
 
     // -- command handlers ---------------------------------------------------
+
+    fn begin_maintenance(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+        participants: &[NodeId],
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        if self.cluster(s)?.is_none() {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        }
+        if operation_id == 0 || generation == 0 || participants.is_empty() {
+            return Ok((
+                invalid("maintenance identity and participants are required"),
+                vec![],
+            ));
+        }
+        if participants.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Ok((
+                invalid("maintenance participants must be sorted and unique"),
+                vec![],
+            ));
+        }
+        let directory = self.directory(s)?;
+        let mut expected: Vec<NodeId> = directory.iter().map(|entry| entry.node_id).collect();
+        expected.sort_unstable();
+        if participants != expected.as_slice() {
+            return Ok((
+                invalid("maintenance must include every registered node"),
+                vec![],
+            ));
+        }
+        if let Some(previous) = self.maintenance(s)? {
+            if previous.stage == MaintenanceStage::Preparing {
+                if previous.operation_id == operation_id
+                    && previous.generation == generation
+                    && previous.participants == participants
+                {
+                    return Ok((MetaApplyResult::NoOp, vec![]));
+                }
+                return Ok((reject(MetaReject::MaintenanceActive), vec![]));
+            }
+            if previous.operation_id == operation_id
+                || previous.generation.checked_add(1) != Some(generation)
+            {
+                return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+            }
+        } else if generation != 1 {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        let record = MaintenanceRecord {
+            operation_id,
+            generation,
+            participants: participants.to_vec(),
+            stage: MaintenanceStage::Preparing,
+        };
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
+
+    fn release_maintenance(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.maintenance(s)? else {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        };
+        if record.operation_id != operation_id || record.generation != generation {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        if record.stage == MaintenanceStage::Released {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        record.stage = MaintenanceStage::Released;
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
 
     fn cluster_init(
         &self,

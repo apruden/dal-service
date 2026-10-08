@@ -468,6 +468,22 @@ pub struct NodeDirectoryEntry {
     pub incarnation: u64,
 }
 
+/// The replicated cluster-wide maintenance operation. A released record remains
+/// durable to fence stale coordinator commands from earlier generations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceRecord {
+    pub operation_id: u128,
+    pub generation: u64,
+    pub participants: Vec<NodeId>,
+    pub stage: MaintenanceStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceStage {
+    Preparing,
+    Released,
+}
+
 // ---------------------------------------------------------------------------
 // Meta commands (IMPLEMENTATION §M1, DESIGN §5, §7)
 // ---------------------------------------------------------------------------
@@ -557,6 +573,17 @@ pub enum MetaCommand {
         definition: crate::search::SearchIndexDefinition,
         engine_revision: u32,
     },
+    /// Install the first stage of a cluster-wide maintenance operation.
+    BeginMaintenance {
+        operation_id: u128,
+        generation: u64,
+        participants: Vec<NodeId>,
+    },
+    /// Abort a preparation before ingress has been declared quiesced.
+    ReleaseMaintenance {
+        operation_id: u128,
+        generation: u64,
+    },
 }
 
 /// Frozen version-1 bincode variant indices for replicated meta commands.
@@ -636,6 +663,15 @@ enum MetaCommandV1 {
         name: String,
         definition: crate::search::SearchIndexDefinition,
         engine_revision: u32,
+    },
+    BeginMaintenance {
+        operation_id: u128,
+        generation: u64,
+        participants: Vec<NodeId>,
+    },
+    ReleaseMaintenance {
+        operation_id: u128,
+        generation: u64,
     },
 }
 

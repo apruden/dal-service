@@ -23,7 +23,9 @@ use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
 use crate::search::SearchIndexRecord;
 use crate::storage::Storage;
-use crate::types::{ClusterConfig, GroupId, MetaCommand, NodeDirectoryEntry, Placement};
+use crate::types::{
+    ClusterConfig, GroupId, MaintenanceRecord, MetaCommand, NodeDirectoryEntry, Placement,
+};
 
 /// Outcome of a proposal submitted to the meta group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +357,15 @@ impl MetaNode {
         .await
     }
 
+    /// Read the replicated maintenance operation after a ReadIndex barrier.
+    pub async fn read_maintenance(&self) -> Result<MetaRead<Option<MaintenanceRecord>>> {
+        let storage = self.storage.clone();
+        self.linearizable(move || {
+            storage.get_state_record(GroupId::Meta, &keyspace::meta_maintenance_key())
+        })
+        .await
+    }
+
     pub async fn read_placement(&self, group: GroupId) -> Result<MetaRead<Option<Placement>>> {
         let storage = self.storage.clone();
         self.linearizable(move || {
@@ -406,6 +417,11 @@ impl MetaNode {
     pub fn local_node(&self, node_id: NodeId) -> Result<Option<NodeDirectoryEntry>> {
         self.storage
             .get_state_record(GroupId::Meta, &keyspace::meta_node_key(node_id))
+    }
+
+    pub fn local_maintenance(&self) -> Result<Option<MaintenanceRecord>> {
+        self.storage
+            .get_state_record(GroupId::Meta, &keyspace::meta_maintenance_key())
     }
 
     /// Every node-directory entry from committed local state (non-linearizable),
