@@ -1,12 +1,18 @@
 # Storage format preflight
 
 Every data directory carries `DAL_FORMAT.json` with a
-`storage_format_version`. The current binary supports version `1`.
+`storage_format_version`. The current binary supports storage version `1`,
+durable record version `1`, application snapshot version `1`, and search engine
+revision `2`. New markers record each requirement separately. A version-1
+marker containing only `storage_format_version` has the historical defaults
+`records=1`, `snapshots=1`, and `search=2`. These defaults are fixed to the
+initial format and do not change when a future binary adds a format.
 
 A new empty data directory receives the manifest before RocksDB opens. The
 manifest and its directory entry are synced before startup proceeds. Startup
 refuses to open a non-empty directory without the marker, a malformed marker,
-or a version this binary does not support. It does not rewrite an unknown
+or a version this binary does not support. Unknown manifest fields also fail
+preflight. It does not rewrite an unknown
 marker or infer compatibility from RocksDB files.
 
 There is no legacy import or migration command yet. If startup reports an

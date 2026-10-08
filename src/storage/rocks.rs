@@ -44,10 +44,66 @@ type RaftApplied = (
 
 const STORAGE_FORMAT_FILE: &str = "DAL_FORMAT.json";
 const STORAGE_FORMAT_VERSION: u32 = 1;
+/// Version 1 covers the bincode representation of Raft log entries, state
+/// records, identities, and idempotency digests. It cannot be changed in place.
+const DURABLE_RECORD_FORMAT_VERSION: u32 = 1;
+/// Version 1 covers DAL's application snapshot framing and state records.
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StorageFormatManifest {
     storage_format_version: u32,
+    // A version-1 marker written before these fields existed implies exactly
+    // these historical formats. Keep the defaults literal across upgrades.
+    #[serde(default = "initial_format_version")]
+    durable_record_version: u32,
+    #[serde(default = "initial_format_version")]
+    snapshot_format_version: u32,
+    #[serde(default = "initial_search_revision")]
+    search_engine_revision: u32,
+}
+
+fn initial_format_version() -> u32 {
+    1
+}
+
+fn initial_search_revision() -> u32 {
+    2
+}
+
+impl StorageFormatManifest {
+    fn current() -> Self {
+        Self {
+            storage_format_version: STORAGE_FORMAT_VERSION,
+            durable_record_version: DURABLE_RECORD_FORMAT_VERSION,
+            snapshot_format_version: SNAPSHOT_FORMAT_VERSION,
+            search_engine_revision: crate::search::SEARCH_ENGINE_REVISION,
+        }
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        let current = Self::current();
+        if self.storage_format_version != current.storage_format_version
+            || self.durable_record_version != current.durable_record_version
+            || self.snapshot_format_version != current.snapshot_format_version
+            || self.search_engine_revision != current.search_engine_revision
+        {
+            return Err(Error::Config(format!(
+                "data directory {} has format requirements storage={} records={} snapshots={} search={}; this binary supports storage={} records={} snapshots={} search={}. Use a supported upgrade/import procedure",
+                path.display(),
+                self.storage_format_version,
+                self.durable_record_version,
+                self.snapshot_format_version,
+                self.search_engine_revision,
+                current.storage_format_version,
+                current.durable_record_version,
+                current.snapshot_format_version,
+                current.search_engine_revision,
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Establish the format marker only for a genuinely empty directory. Existing
@@ -64,14 +120,7 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
                 format!("invalid storage format manifest: {error}"),
             )
         })?;
-        if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
-            return Err(Error::Config(format!(
-                "data directory {} uses storage format {}; this binary supports format {}. Use a supported upgrade/import procedure",
-                path.display(),
-                manifest.storage_format_version,
-                STORAGE_FORMAT_VERSION
-            )));
-        }
+        manifest.validate(path)?;
         return Ok(());
     }
 
@@ -96,10 +145,7 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
     }
 
     let temporary = path.join(format!("{temporary_prefix}{}", std::process::id()));
-    let bytes = serde_json::to_vec(&StorageFormatManifest {
-        storage_format_version: STORAGE_FORMAT_VERSION,
-    })
-    .map_err(Error::codec)?;
+    let bytes = serde_json::to_vec(&StorageFormatManifest::current()).map_err(Error::codec)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -132,14 +178,7 @@ pub fn check_storage_format(path: &Path) -> Result<()> {
                     format!("invalid storage format manifest: {error}"),
                 )
             })?;
-        if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
-            return Err(Error::Config(format!(
-                "data directory {} uses storage format {}; this binary supports format {}. Use a supported upgrade/import procedure",
-                path.display(),
-                manifest.storage_format_version,
-                STORAGE_FORMAT_VERSION
-            )));
-        }
+        manifest.validate(path)?;
         return Ok(());
     }
     if fs::read_dir(path)?.next().transpose()?.is_none() {
