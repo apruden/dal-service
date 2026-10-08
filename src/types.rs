@@ -140,15 +140,43 @@ impl LogId {
 /// accepted by `put` only, and a `delete` carrying it is rejected as malformed
 /// before any Raft proposal (DESIGN §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "IfVersionV1", from = "IfVersionV1")]
 pub enum IfVersion {
     Number(u64),
     Absent,
+}
+
+/// Frozen version-1 bincode tags: Number=0, Absent=1. New durable variants
+/// require a new format and an explicit conversion, not an insertion here.
+#[derive(Serialize, Deserialize)]
+enum IfVersionV1 {
+    Number(u64),
+    Absent,
+}
+
+impl From<IfVersion> for IfVersionV1 {
+    fn from(value: IfVersion) -> Self {
+        match value {
+            IfVersion::Number(number) => Self::Number(number),
+            IfVersion::Absent => Self::Absent,
+        }
+    }
+}
+
+impl From<IfVersionV1> for IfVersion {
+    fn from(value: IfVersionV1) -> Self {
+        match value {
+            IfVersionV1::Number(number) => Self::Number(number),
+            IfVersionV1::Absent => Self::Absent,
+        }
+    }
 }
 
 /// The mutating operation, independent of the client/sequence framing. The
 /// command digest (M2) is taken over the canonical bytes of this value, so a
 /// retry at the same sequence matches only an identical operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "DataOpV1", from = "DataOpV1")]
 pub enum DataOp {
     Put {
         key: Vec<u8>,
@@ -159,6 +187,55 @@ pub enum DataOp {
         key: Vec<u8>,
         if_version: Option<IfVersion>,
     },
+}
+
+/// Frozen version-1 bincode tags: Put=0, Delete=1. The public operation enum
+/// can be reorganized without changing its persisted command digest bytes.
+#[derive(Serialize, Deserialize)]
+enum DataOpV1 {
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        if_version: Option<IfVersion>,
+    },
+    Delete {
+        key: Vec<u8>,
+        if_version: Option<IfVersion>,
+    },
+}
+
+impl From<DataOp> for DataOpV1 {
+    fn from(value: DataOp) -> Self {
+        match value {
+            DataOp::Put {
+                key,
+                value,
+                if_version,
+            } => Self::Put {
+                key,
+                value,
+                if_version,
+            },
+            DataOp::Delete { key, if_version } => Self::Delete { key, if_version },
+        }
+    }
+}
+
+impl From<DataOpV1> for DataOp {
+    fn from(value: DataOpV1) -> Self {
+        match value {
+            DataOpV1::Put {
+                key,
+                value,
+                if_version,
+            } => Self::Put {
+                key,
+                value,
+                if_version,
+            },
+            DataOpV1::Delete { key, if_version } => Self::Delete { key, if_version },
+        }
+    }
 }
 
 impl DataOp {
@@ -461,6 +538,38 @@ pub enum ServingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_one_data_operations_keep_their_canonical_bytes() {
+        let cases = [
+            (
+                DataOp::Put {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    if_version: None,
+                },
+                vec![
+                    0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 0, 0, 0, 118, 0,
+                ],
+            ),
+            (
+                DataOp::Delete {
+                    key: b"k".to_vec(),
+                    if_version: Some(IfVersion::Number(7)),
+                },
+                vec![
+                    1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 107, 1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        ];
+        for (operation, baseline) in cases {
+            assert_eq!(crate::codec::encode(&operation), baseline);
+            assert_eq!(
+                crate::codec::decode::<DataOp>(&baseline).unwrap(),
+                operation
+            );
+        }
+    }
 
     #[test]
     fn group_cf_names_are_stable() {
