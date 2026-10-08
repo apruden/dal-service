@@ -104,7 +104,7 @@ fn preflight_storage_format(path: &Path) -> Result<()> {
             Error::Corrupt(
                 marker.display().to_string(),
                 format!(
-                    "invalid storage format manifest: {error}. Use a fresh data directory for this development build"
+                    "invalid storage format manifest: {error}. Preserve this directory for investigation; use a fresh directory only if its contents are disposable"
                 ),
             )
         })?;
@@ -164,7 +164,7 @@ pub fn check_storage_format(path: &Path) -> Result<()> {
                 Error::Corrupt(
                     marker.display().to_string(),
                     format!(
-                        "invalid storage format manifest: {error}. Use a fresh data directory for this development build"
+                        "invalid storage format manifest: {error}. Preserve this directory for investigation; use a fresh directory only if its contents are disposable"
                     ),
                 )
             })?;

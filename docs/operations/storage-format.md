@@ -30,6 +30,7 @@ serialization and recovery behavior; they do not establish support for older
 development binaries.
 
 If startup reports an unclassified directory or an unsupported version, use a
-fresh directory for the current development build. Do not edit `DAL_FORMAT.json`
-to make a mismatched directory appear valid. Only empty directories and the
-current format are supported.
+fresh directory for the current development build when the old contents are
+disposable. Preserve a directory with an unexpectedly damaged marker for
+investigation. Do not edit `DAL_FORMAT.json` to make a mismatched directory
+appear valid. Only empty directories and the current format are supported.

@@ -9,7 +9,7 @@
 //! The Raft wrapper reuses `evaluate` so it can fold the applied `LogId` into
 //! the same batch.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -298,7 +298,6 @@ impl MetaStateMachine {
                 vec![],
             ));
         }
-        let mut data_placements = BTreeMap::new();
         for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
             let Some(placement) = self.placement(s, group)? else {
                 return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
@@ -308,12 +307,6 @@ impl MetaStateMachine {
             {
                 return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
             }
-            if let GroupId::Data(partition) = group {
-                data_placements.insert(partition, placement);
-            }
-        }
-        if crate::placement::propose(&directory, &data_placements, cluster.r as usize).is_some() {
-            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
         }
         for (key, value) in s.scan_state(GroupId::Meta)? {
             if key.starts_with(&keyspace::meta_search_index_prefix()) {

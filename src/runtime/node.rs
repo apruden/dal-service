@@ -2245,6 +2245,7 @@ async fn failure_detector(
     interval: Duration,
     identity_gate: ProcessIdentityGate,
 ) {
+    let mut observed_maintenance_generation = 0;
     loop {
         if !identity_gate.is_open() {
             return;
@@ -2253,7 +2254,17 @@ async fn failure_detector(
         let Some(meta) = ({ meta_handle.read().unwrap().clone() }) else {
             continue;
         };
-        if meta.current_leader() != Some(meta.node_id()) {
+        let Ok(maintenance) = meta.local_maintenance() else {
+            continue;
+        };
+        let preparing = maintenance
+            .as_ref()
+            .is_some_and(|record| record.stage == crate::types::MaintenanceStage::Preparing);
+        let unseen_generation = maintenance
+            .as_ref()
+            .is_some_and(|record| record.generation > observed_maintenance_generation);
+        let is_leader = meta.current_leader() == Some(meta.node_id());
+        if !preparing && !unseen_generation && !is_leader {
             continue;
         }
         let Ok(directory) = meta.local_directory() else {
@@ -2263,8 +2274,14 @@ async fn failure_detector(
             .iter()
             .map(|e| (e.node_id, e.state, e.incarnation))
             .collect();
-        if !meta.automatic_meta_changes_allowed() {
+        if preparing || unseen_generation {
             tracker.lock().unwrap().suspend_timeouts(now_ms(), &states);
+            observed_maintenance_generation = maintenance
+                .as_ref()
+                .map(|record| record.generation)
+                .unwrap_or(observed_maintenance_generation);
+        }
+        if preparing || !is_leader {
             continue;
         }
         let transitions = {
