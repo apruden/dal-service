@@ -11,7 +11,7 @@ groups:
           runbook: "docs/operations/alerts.md#dalstoragefailed"
 
       - alert: DALDiskHeadroomLow
-        expr: dal_storage_filesystem_available_bytes / dal_storage_filesystem_total_bytes < 0.45
+        expr: (dal_storage_filesystem_available_bytes / dal_storage_filesystem_total_bytes < 0.45) and (dal_storage_filesystem_available_bytes / dal_storage_filesystem_total_bytes >= 0.40)
         for: 5m
         labels:
           severity: ticket

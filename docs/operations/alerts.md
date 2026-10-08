@@ -5,6 +5,11 @@ as a Prometheus rule file and scrape each node's `/metrics` endpoint. These
 rules use only metrics currently exported by DAL. Thresholds are initial
 operational defaults; validate them against the deployed workload before
 enabling paging. A local node metric does not establish cluster-wide quorum.
+The cached `/status` sample includes `storage_filesystem_available_bytes` and
+`storage_filesystem_total_bytes`. `/metrics` exports these as
+`dal_storage_filesystem_available_bytes` and
+`dal_storage_filesystem_total_bytes`, plus `dal_storage_filesystem_sample_ok`.
+The capacity gauges are absent when sampling fails.
 
 ## DALStorageFailed
 
@@ -17,7 +22,7 @@ gates.
 ## DALDiskHeadroomLow
 
 Check the data filesystem's available and total bytes, including other users
-of the volume. The initial 45% alert precedes the proposed 40% qualification
+of the volume. The 40–45% warning band precedes the proposed 40% qualification
 floor. Find growth in RocksDB, retained logs, search generations, and backup
 staging before scheduling cleanup. Preserve live WAL and SST files and the log
 purge fence. Verify free space recovers above the alert threshold.
