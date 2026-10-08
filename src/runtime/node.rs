@@ -1556,11 +1556,17 @@ impl StatusSource for NodeStatus {
     fn status(&self) -> ClusterStatus {
         let filesystem = filesystem_capacity(self.storage.path());
         let meta_node = self.meta.read().unwrap().clone();
-        let meta = meta_node.as_ref().map(|m| MetaStatus {
-            is_leader: m.current_leader() == Some(self.node_id),
-            leader: m.current_leader(),
-            applied: m.applied_index(),
-            voters: m.voters(),
+        let meta = meta_node.as_ref().map(|m| {
+            let metrics = m.raft().metrics();
+            let metrics = metrics.borrow();
+            MetaStatus {
+                is_leader: metrics.current_leader == Some(self.node_id),
+                leader: metrics.current_leader,
+                current_term: metrics.current_term,
+                quorum_ack_age_ms: metrics.millis_since_quorum_ack,
+                applied: metrics.last_applied.map(|log_id| log_id.index),
+                voters: metrics.membership_config.membership().voter_ids().collect(),
+            }
         });
         let directory = meta_node
             .as_ref()
@@ -1574,12 +1580,14 @@ impl StatusSource for NodeStatus {
                     let committed = node.committed_voter_set();
                     let leader = node.current_leader();
                     let materialized = node.materialized_state_status();
-                    let (last_log_index, raft_snapshot_index) = {
+                    let (last_log_index, raft_snapshot_index, current_term, quorum_ack_age_ms) = {
                         let metrics = node.raft().metrics();
                         let metrics = metrics.borrow();
                         (
                             metrics.last_log_index,
                             metrics.snapshot.map(|log_id| log_id.index),
+                            metrics.current_term,
+                            metrics.millis_since_quorum_ack,
                         )
                     };
                     let retained_log_entries = match (
@@ -1612,6 +1620,8 @@ impl StatusSource for NodeStatus {
                         partition,
                         role,
                         leader,
+                        current_term,
+                        quorum_ack_age_ms,
                         applied: node.applied_index(),
                         raft_snapshot_index,
                         materialized_visible: materialized.visible.map(|log_id| log_id.index),

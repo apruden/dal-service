@@ -88,6 +88,13 @@ pub struct ClusterStatus {
 pub struct MetaStatus {
     pub is_leader: bool,
     pub leader: Option<NodeId>,
+    /// Local Raft term. Changes indicate campaigns, not necessarily a new
+    /// successfully elected leader.
+    #[serde(default)]
+    pub current_term: u64,
+    /// Present only while this node is leader and has a quorum acknowledgement.
+    #[serde(default)]
+    pub quorum_ack_age_ms: Option<u64>,
     pub applied: Option<u64>,
     pub voters: Vec<NodeId>,
 }
@@ -104,6 +111,10 @@ pub struct PartitionStatus {
     pub partition: u16,
     pub role: Role,
     pub leader: Option<NodeId>,
+    #[serde(default)]
+    pub current_term: u64,
+    #[serde(default)]
+    pub quorum_ack_age_ms: Option<u64>,
     pub applied: Option<u64>,
     /// Highest log entry covered by the Raft snapshot on this node.
     pub raft_snapshot_index: Option<u64>,
@@ -438,12 +449,30 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     if let Some(meta) = &status.meta {
         metric(&mut out, "dal_meta_is_leader", u64::from(meta.is_leader));
+        metric(&mut out, "dal_meta_current_term", meta.current_term);
+        if let Some(age) = meta.quorum_ack_age_ms {
+            metric(&mut out, "dal_meta_quorum_ack_age_milliseconds", age);
+        }
         if let Some(applied) = meta.applied {
             metric(&mut out, "dal_meta_applied_index", applied);
         }
     }
     for partition in &status.partitions {
         let id = partition.partition;
+        partition_metric(
+            &mut out,
+            "dal_partition_current_term",
+            id,
+            partition.current_term,
+        );
+        if let Some(age) = partition.quorum_ack_age_ms {
+            partition_metric(
+                &mut out,
+                "dal_partition_quorum_ack_age_milliseconds",
+                id,
+                age,
+            );
+        }
         if let Some(applied) = partition.applied {
             partition_metric(&mut out, "dal_partition_applied_index", id, applied);
         }
@@ -607,6 +636,8 @@ pub(crate) mod tests {
                 meta: Some(MetaStatus {
                     is_leader: true,
                     leader: Some(7),
+                    current_term: 2,
+                    quorum_ack_age_ms: Some(10),
                     applied: Some(42),
                     voters: vec![7, 8, 9],
                 }),
@@ -614,6 +645,8 @@ pub(crate) mod tests {
                     partition: 0,
                     role: Role::Leader,
                     leader: Some(7),
+                    current_term: 2,
+                    quorum_ack_age_ms: Some(10),
                     applied: Some(10),
                     raft_snapshot_index: None,
                     materialized_visible: Some(10),

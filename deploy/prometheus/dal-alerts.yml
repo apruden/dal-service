@@ -46,6 +46,33 @@ groups:
           summary: "DAL partition {{ $labels.partition }} is not ready on {{ $labels.instance }}"
           runbook: "docs/operations/alerts.md#dalpartitionnotrecovering"
 
+      - alert: DALMetaTermChurn
+        expr: changes(dal_meta_current_term[10m]) >= 3
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL meta Raft term is changing repeatedly on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalrafttermchurn"
+
+      - alert: DALPartitionTermChurn
+        expr: changes(dal_partition_current_term[10m]) >= 3
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL partition {{ $labels.partition }} Raft term is changing repeatedly on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#dalrafttermchurn"
+
+      - alert: DALLeaderQuorumAckStale
+        expr: dal_meta_quorum_ack_age_milliseconds > 10000 or dal_partition_quorum_ack_age_milliseconds > 10000
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL leader on {{ $labels.instance }} has not observed a quorum acknowledgement for over 10 seconds"
+          runbook: "docs/operations/alerts.md#dalleaderquorumackstale"
+
       - alert: DALMaterializationLagGrowing
         expr: dal_partition_oldest_pending_milliseconds > 60000
         for: 5m

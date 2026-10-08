@@ -48,6 +48,23 @@ durable positions, and local readiness. Check peer reachability and snapshot
 transfer progress. Keep the node out of client routing until the recovery gate
 opens; do not force readiness manually.
 
+## DALRaftTermChurn
+
+Inspect the affected group's current leader, term, voter set, peer reachability,
+and node lifecycle in `/status`. Check recent node restarts, network loss, and
+disk stalls. The term counter can advance during unsuccessful campaigns; a
+change does not prove a leader was elected. Verify the term stabilizes and
+operations on the affected group resume.
+
+## DALLeaderQuorumAckStale
+
+The local leader has not seen a recent quorum acknowledgement. Check voter
+connectivity and durable replication progress; avoid planned voter stops until
+the group is stable. The metric exists only while this node has a leader-side
+acknowledgement sample. Its absence cannot prove cluster-wide quorum, so use
+external client canaries to establish service availability. Verify the age
+falls and valid operations succeed.
+
 ## DALMaterializationLagGrowing
 
 Inspect pending entries and bytes for the partition in `/status`. Check storage
@@ -72,7 +89,7 @@ authentication to silence it.
 
 ## Coverage limitations
 
-The current endpoint does not expose backup age, election
-frequency, request latency, or cluster-wide quorum. These rules therefore do
+The current endpoint does not expose backup age, request latency, or
+cluster-wide quorum. These rules therefore do
 not cover those release gates. Add corresponding instrumentation and alerts
 before relying on them for production operations.
