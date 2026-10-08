@@ -96,10 +96,22 @@ impl HeartbeatTracker {
     /// evidence. Release gets one down-timeout grace period before acting on
     /// silence that began before maintenance.
     pub fn suspend_timeouts(&mut self, now_ms: u64, states: &[(NodeId, NodeState, u64)]) {
+        self.retain_known_nodes(states);
         for &(node, _, incarnation) in states {
             self.maintenance_grace_since_ms
                 .insert(node, (incarnation, now_ms));
         }
+    }
+
+    fn retain_known_nodes(&mut self, states: &[(NodeId, NodeState, u64)]) {
+        let known: std::collections::HashSet<NodeId> =
+            states.iter().map(|&(node, _, _)| node).collect();
+        self.last_stamp.retain(|node, _| known.contains(node));
+        self.last_seen_ms.retain(|node, _| known.contains(node));
+        self.unobserved_since_ms
+            .retain(|node, _| known.contains(node));
+        self.maintenance_grace_since_ms
+            .retain(|node, _| known.contains(node));
     }
 
     /// Record a heartbeat. A lower directory incarnation is stale. Within one
@@ -193,14 +205,7 @@ impl HeartbeatTracker {
         // anything absent from it is either departed or never real. Dropping
         // those here is what keeps the `observe` cap from being held down by
         // ids the cluster has no record of.
-        let known: std::collections::HashSet<NodeId> =
-            states.iter().map(|&(node, _, _)| node).collect();
-        self.last_stamp.retain(|node, _| known.contains(node));
-        self.last_seen_ms.retain(|node, _| known.contains(node));
-        self.unobserved_since_ms
-            .retain(|node, _| known.contains(node));
-        self.maintenance_grace_since_ms
-            .retain(|node, _| known.contains(node));
+        self.retain_known_nodes(states);
 
         states
             .iter()
@@ -212,9 +217,28 @@ impl HeartbeatTracker {
                         return None;
                     }
                     self.maintenance_grace_since_ms.remove(&node);
+                    if expected == incarnation
+                        && !self
+                            .last_stamp
+                            .get(&node)
+                            .is_some_and(|(observed, _, _)| *observed == incarnation)
+                    {
+                        // The maintenance grace is the full timeout allowance
+                        // for a node that has never sent a matching heartbeat.
+                        self.unobserved_since_ms.insert(node, (incarnation, since));
+                    }
                 }
+                let has_heartbeat = self
+                    .last_stamp
+                    .get(&node)
+                    .is_some_and(|(observed, _, _)| *observed == incarnation);
                 let silence = self.silence_ms(node, incarnation, now_ms)?;
                 let evidence = classify(Duration::from_millis(silence), timeouts);
+                // A grace timestamp records silence, not proof of life. Only
+                // an accepted heartbeat can reactivate a Suspect node.
+                if !has_heartbeat && evidence == Liveness::Alive {
+                    return None;
+                }
                 next_state(current, evidence).map(|s| (node, s))
             })
             .collect()
