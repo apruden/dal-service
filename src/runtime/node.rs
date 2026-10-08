@@ -1787,13 +1787,13 @@ fn filesystem_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    let block_size = u64::from(stats.f_frsize);
+    let block_size = stats.f_frsize;
     if block_size == 0 || stats.f_blocks == 0 {
         return None;
     }
     Some((
-        u64::from(stats.f_bavail).saturating_mul(block_size),
-        u64::from(stats.f_blocks).saturating_mul(block_size),
+        stats.f_bavail.saturating_mul(block_size),
+        stats.f_blocks.saturating_mul(block_size),
     ))
 }
 
