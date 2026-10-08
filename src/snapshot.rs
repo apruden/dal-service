@@ -18,7 +18,10 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
 
+/// Version encoded by the trailing digits of the snapshot magic.
+pub const FORMAT_VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"DALSNP01";
+const _: () = assert!(MAGIC[6] == b'0' && MAGIC[7] == b'0' + FORMAT_VERSION as u8);
 const END: u32 = u32::MAX;
 /// Any individual state record came from a Raft append bounded below 64 MiB.
 /// Enforce the same order of magnitude before allocating while decoding.

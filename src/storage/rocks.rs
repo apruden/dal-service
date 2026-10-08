@@ -47,8 +47,6 @@ const STORAGE_FORMAT_VERSION: u32 = 1;
 /// Version 1 covers the bincode representation of Raft log entries, state
 /// records, identities, and idempotency digests. It cannot be changed in place.
 const DURABLE_RECORD_FORMAT_VERSION: u32 = 1;
-/// Version 1 covers DAL's application snapshot framing and state records.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +75,7 @@ impl StorageFormatManifest {
         Self {
             storage_format_version: STORAGE_FORMAT_VERSION,
             durable_record_version: DURABLE_RECORD_FORMAT_VERSION,
-            snapshot_format_version: SNAPSHOT_FORMAT_VERSION,
+            snapshot_format_version: crate::snapshot::FORMAT_VERSION,
             search_engine_revision: crate::search::SEARCH_ENGINE_REVISION,
         }
     }
