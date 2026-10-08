@@ -50,7 +50,7 @@
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "x": 18, "y": 0, "w": 6, "h": 5 },
-      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(dal_client_op_gateway_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))", "legendFormat": "{{instance}}" }],
+      "targets": [{ "refId": "A", "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(dal_client_op_gateway_duration_seconds_bucket{instance=~\"$instance\"}[5m])))", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "s", "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.75 }] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
     },
@@ -64,7 +64,7 @@
         { "refId": "A", "expr": "changes(dal_meta_current_term{instance=~\"$instance\"}[10m])", "legendFormat": "{{instance}} meta" },
         { "refId": "B", "expr": "changes(dal_partition_current_term{instance=~\"$instance\"}[10m])", "legendFormat": "{{instance}} partition {{partition}}" }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 3 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 3 }] } }, "overrides": [] },
       "options": {}
     },
     {
@@ -77,7 +77,7 @@
         { "refId": "A", "expr": "dal_meta_quorum_ack_age_milliseconds{instance=~\"$instance\"}", "legendFormat": "{{instance}} meta" },
         { "refId": "B", "expr": "dal_partition_quorum_ack_age_milliseconds{instance=~\"$instance\"}", "legendFormat": "{{instance}} partition {{partition}}" }
       ],
-      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10000 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10000 }] } }, "overrides": [] },
       "options": {}
     },
     {
@@ -131,7 +131,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "x": 0, "y": 29, "w": 12, "h": 8 },
       "targets": [{ "refId": "A", "expr": "dal_partition_recovery_ready{instance=~\"$instance\"}", "legendFormat": "{{instance}} partition {{partition}}" }],
-      "fieldConfig": { "defaults": { "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
       "options": {}
     },
     {
@@ -141,7 +141,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "x": 12, "y": 29, "w": 12, "h": 8 },
       "targets": [{ "refId": "A", "expr": "dal_partition_oldest_pending_milliseconds{instance=~\"$instance\"}", "legendFormat": "{{instance}} partition {{partition}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60000 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60000 }] } }, "overrides": [] },
       "options": {}
     },
     {
@@ -151,7 +151,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "x": 0, "y": 37, "w": 12, "h": 8 },
       "targets": [{ "refId": "A", "expr": "increase(dal_log_dropped_lines_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}" }],
-      "fieldConfig": { "defaults": { "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.001 }] } }, "overrides": [] },
       "options": {}
     },
     {
@@ -164,8 +164,18 @@
         { "refId": "A", "expr": "increase(dal_authentication_denials_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} authentication" },
         { "refId": "B", "expr": "increase(dal_authorization_denials_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} authorization" }
       ],
-      "fieldConfig": { "defaults": { "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }] } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "min": 0, "custom": { "thresholdsStyle": { "mode": "dashed" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }] } }, "overrides": [] },
       "options": {}
+    },
+    {
+      "id": 15,
+      "title": "Data filesystem sample healthy",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "x": 0, "y": 45, "w": 6, "h": 5 },
+      "targets": [{ "refId": "A", "expr": "dal_storage_filesystem_sample_ok{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
     }
   ],
   "refresh": "30s",
