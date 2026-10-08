@@ -3,7 +3,9 @@
 Import `dal-overview.json` in Grafana and map its Prometheus input to the data
 source scraping each node's `/metrics` endpoint. The dashboard uses the Classic
 JSON model, fixed `instance`, `partition`, histogram bucket, and outcome labels,
-and a six-hour default time range.
+and a six-hour default time range. The panels include the signals used by the
+shipped Prometheus alert rules; their displayed thresholds are triage guides,
+while alert `for` durations remain defined in `dal-alerts.yml`.
 
 The panels show node-local signals. Leader acknowledgement age and Raft term
 changes can indicate instability, but they do not establish cluster-wide quorum
