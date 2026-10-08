@@ -12,7 +12,9 @@
 //! keep the running membership synchronized with committed meta state.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::future::Future;
+use std::os::unix::ffi::OsStrExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -1552,6 +1554,7 @@ struct NodeStatus {
 
 impl StatusSource for NodeStatus {
     fn status(&self) -> ClusterStatus {
+        let filesystem = filesystem_capacity(self.storage.path());
         let meta_node = self.meta.read().unwrap().clone();
         let meta = meta_node.as_ref().map(|m| MetaStatus {
             is_leader: m.current_leader() == Some(self.node_id),
@@ -1665,6 +1668,8 @@ impl StatusSource for NodeStatus {
             diagnostic_sample_age_ms: 0,
             diagnostic_sample_stale: false,
             storage_failed: self.storage.database_failure().is_some(),
+            storage_filesystem_available_bytes: filesystem.map(|(available, _)| available),
+            storage_filesystem_total_bytes: filesystem.map(|(_, total)| total),
             storage_wal_syncs: rocks.map(|counters| counters.wal_syncs),
             storage_wal_bytes: rocks.map(|counters| counters.wal_bytes),
             storage_stall_micros: rocks.map(|counters| counters.stall_micros),
@@ -1696,6 +1701,28 @@ impl StatusSource for NodeStatus {
             directory,
         }
     }
+}
+
+/// statvfs is sampled by the status worker, never by an HTTP handler. A failed
+/// sample stays absent so monitoring cannot mistake it for zero free space.
+fn filesystem_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: path is NUL terminated, stats points to writable storage, and
+    // both remain alive for the duration of this synchronous libc call.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    let block_size = u64::from(stats.f_frsize);
+    if block_size == 0 || stats.f_blocks == 0 {
+        return None;
+    }
+    Some((
+        u64::from(stats.f_bavail).saturating_mul(block_size),
+        u64::from(stats.f_blocks).saturating_mul(block_size),
+    ))
 }
 
 /// Read the authoritative placement before accepting a learner admission. A

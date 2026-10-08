@@ -35,6 +35,10 @@ pub struct ClusterStatus {
     /// Database-wide fail-stop state. This includes meta-only nodes and remains
     /// true for the rest of the process after any materialization/WAL failure.
     pub storage_failed: bool,
+    /// Capacity of the filesystem containing the data directory, sampled off
+    /// the HTTP request path. Available bytes respect unprivileged reserves.
+    pub storage_filesystem_available_bytes: Option<u64>,
+    pub storage_filesystem_total_bytes: Option<u64>,
     /// RocksDB counters when write-path profiling is enabled for this node.
     pub storage_wal_syncs: Option<u64>,
     pub storage_wal_bytes: Option<u64>,
@@ -341,6 +345,24 @@ fn render_metrics(status: &ClusterStatus) -> String {
     );
     metric(
         &mut out,
+        "dal_storage_filesystem_sample_ok",
+        u64::from(
+            status.storage_filesystem_available_bytes.is_some()
+                && status.storage_filesystem_total_bytes.is_some(),
+        ),
+    );
+    if let Some(available) = status.storage_filesystem_available_bytes {
+        metric(
+            &mut out,
+            "dal_storage_filesystem_available_bytes",
+            available,
+        );
+    }
+    if let Some(total) = status.storage_filesystem_total_bytes {
+        metric(&mut out, "dal_storage_filesystem_total_bytes", total);
+    }
+    metric(
+        &mut out,
         "dal_storage_wal_pending_requests",
         status.storage_wal_pending_requests as u64,
     );
@@ -554,6 +576,8 @@ pub(crate) mod tests {
                 diagnostic_sample_age_ms: 0,
                 diagnostic_sample_stale: false,
                 storage_failed: false,
+                storage_filesystem_available_bytes: Some(800),
+                storage_filesystem_total_bytes: Some(1_000),
                 storage_wal_syncs: None,
                 storage_wal_bytes: None,
                 storage_stall_micros: None,

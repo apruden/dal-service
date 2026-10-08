@@ -14,6 +14,28 @@ and filesystem health; do not delete WAL or database files to clear the alert.
 Restore service only after the node passes its normal storage and recovery
 gates.
 
+## DALDiskHeadroomLow
+
+Check the data filesystem's available and total bytes, including other users
+of the volume. The initial 45% alert precedes the proposed 40% qualification
+floor. Find growth in RocksDB, retained logs, search generations, and backup
+staging before scheduling cleanup. Preserve live WAL and SST files and the log
+purge fence. Verify free space recovers above the alert threshold.
+
+## DALDiskHeadroomCritical
+
+The filesystem is below the proposed 40% operating floor. Pause capacity-heavy
+work and investigate immediately using the disk-headroom procedure above.
+Restore headroom before resuming rebuilds, staging, or expansion; verify the
+sample and free-space ratio recover on the affected node.
+
+## DALDiskCapacitySampleFailed
+
+Check the data directory mount and node logs for filesystem errors. Confirm
+the filesystem is accessible to the DAL service user, then verify that
+`dal_storage_filesystem_sample_ok` returns to 1. Treat the free-space state as
+unknown until sampling recovers.
+
 ## DALPartitionNotRecovering
 
 Inspect `/status` for the partition recovery epoch, attempts, applied and
@@ -45,7 +67,7 @@ authentication to silence it.
 
 ## Coverage limitations
 
-The current endpoint does not expose disk headroom, backup age, election
+The current endpoint does not expose backup age, election
 frequency, request latency, or cluster-wide quorum. These rules therefore do
 not cover those release gates. Add corresponding instrumentation and alerts
 before relying on them for production operations.

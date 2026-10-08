@@ -10,6 +10,33 @@ groups:
           summary: "DAL storage has failed on {{ $labels.instance }}"
           runbook: "docs/operations/alerts.md#dalstoragefailed"
 
+      - alert: DALDiskHeadroomLow
+        expr: dal_storage_filesystem_available_bytes / dal_storage_filesystem_total_bytes < 0.45
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL data filesystem on {{ $labels.instance }} is below 45% free"
+          runbook: "docs/operations/alerts.md#daldiskheadroomlow"
+
+      - alert: DALDiskHeadroomCritical
+        expr: dal_storage_filesystem_available_bytes / dal_storage_filesystem_total_bytes < 0.40
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "DAL data filesystem on {{ $labels.instance }} is below the 40% free-space floor"
+          runbook: "docs/operations/alerts.md#daldiskheadroomcritical"
+
+      - alert: DALDiskCapacitySampleFailed
+        expr: dal_storage_filesystem_sample_ok == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL cannot sample data filesystem capacity on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#daldiskcapacitysamplefailed"
+
       - alert: DALPartitionNotRecovering
         expr: dal_partition_recovery_ready == 0
         for: 10m
