@@ -32,13 +32,40 @@ pub fn validate_index_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathSegment {
     Key(String),
     Index(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Frozen version-1 tags used inside the persisted definition hash.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "PathSegment")]
+#[allow(dead_code)]
+enum PathSegmentV1 {
+    Key(String),
+    Index(u32),
+}
+
+impl Serialize for PathSegment {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        PathSegmentV1::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PathSegment {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        PathSegmentV1::deserialize(deserializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldKind {
     Text {
         tokenizer: String,
@@ -52,6 +79,40 @@ pub enum FieldKind {
     /// Unix timestamp in milliseconds.
     Date,
     Facet,
+}
+
+/// Frozen version-1 field-kind tags. Reordering this definition would change
+/// both retained meta commands and the SHA-256 definition hash.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "FieldKind")]
+#[allow(dead_code)]
+enum FieldKindV1 {
+    Text { tokenizer: String, positions: bool },
+    Keyword,
+    U64,
+    I64,
+    F64,
+    Bool,
+    Date,
+    Facet,
+}
+
+impl Serialize for FieldKind {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        FieldKindV1::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        FieldKindV1::deserialize(deserializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +637,97 @@ pub enum ShardExecuteReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_one_search_definition_and_tags_match_archived_bytes() {
+        fn check<T>(value: T, baseline: &[u8])
+        where
+            T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+        {
+            assert_eq!(crate::codec::encode(&value), baseline);
+            assert_eq!(crate::codec::decode::<T>(baseline).unwrap(), value);
+        }
+
+        check(
+            PathSegment::Key("body".into()),
+            include_bytes!("../../docs/operations/evidence/format-v1/path-key.bin"),
+        );
+        check(
+            PathSegment::Index(3),
+            include_bytes!("../../docs/operations/evidence/format-v1/path-index.bin"),
+        );
+        check(
+            FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            include_bytes!("../../docs/operations/evidence/format-v1/field-text.bin"),
+        );
+        check(
+            FieldKind::Keyword,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-keyword.bin"),
+        );
+        check(
+            FieldKind::U64,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-u64.bin"),
+        );
+        check(
+            FieldKind::I64,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-i64.bin"),
+        );
+        check(
+            FieldKind::F64,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-f64.bin"),
+        );
+        check(
+            FieldKind::Bool,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-bool.bin"),
+        );
+        check(
+            FieldKind::Date,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-date.bin"),
+        );
+        check(
+            FieldKind::Facet,
+            include_bytes!("../../docs/operations/evidence/format-v1/field-facet.bin"),
+        );
+
+        let definition = SearchIndexDefinition {
+            document_type: "doc".into(),
+            fields: vec![SearchField {
+                name: "body".into(),
+                source_path: vec![PathSegment::Key("body".into())],
+                kind: FieldKind::Text {
+                    tokenizer: "default".into(),
+                    positions: true,
+                },
+                required: false,
+                multi_valued: false,
+                indexed: true,
+                stored: false,
+                fast: false,
+            }],
+            default_search_fields: vec!["body".into()],
+        };
+        check(
+            definition.clone(),
+            include_bytes!("../../docs/operations/evidence/format-v1/search-definition.bin"),
+        );
+        assert_eq!(
+            definition.definition_hash().unwrap().as_slice(),
+            include_bytes!("../../docs/operations/evidence/format-v1/search-definition.sha256")
+        );
+        check(
+            crate::types::MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition,
+                engine_revision: 2,
+            },
+            include_bytes!(
+                "../../docs/operations/evidence/format-v1/meta-create_search_with_revision.bin"
+            ),
+        );
+    }
 
     fn definition() -> SearchIndexDefinition {
         SearchIndexDefinition {

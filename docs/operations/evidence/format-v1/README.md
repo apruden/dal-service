@@ -13,6 +13,13 @@ remote serialization types were added. The
 `version_one_nested_records_replay_from_archived_bytes` regression pins every
 variant of those six enums.
 
+The path and field-kind files, `search-definition.bin`, its SHA-256 digest,
+and `meta-create_search_with_revision.bin` were captured at commit `510b53c`
+before the search-definition enum freeze. They pin both variants of
+`PathSegment`, all eight variants of `FieldKind`, the definition hash, and a
+revision-carrying meta command. The search-definition regression compares the
+new bytes and digest with these archived values.
+
 These are initial format fixtures. The complete production compatibility gate
 also needs every meta command variant, retained Raft logs, identity and
 idempotency records, snapshots, and a complete database captured from the release

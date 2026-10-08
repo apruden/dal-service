@@ -25,7 +25,8 @@ binaries reject the marker before opening storage. A future search-engine
 change needs a staged rebuild and marker publication procedure, even though
 the index is derived from authoritative records.
 Version-1 data operation, version predicate, meta command, group, node-state,
-serving-state, hash algorithm, key-presence, and mutation-result tags are frozen
+serving-state, hash algorithm, key-presence, mutation-result, search-path, and
+search-field tags are frozen
 in dedicated serialization types. Original bytes are archived in
 [`format-v1-data-op.md`](evidence/format-v1-data-op.md) and the
 [`format-v1` fixtures](evidence/format-v1/README.md). Other persisted enum tags
