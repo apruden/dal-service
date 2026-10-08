@@ -1765,6 +1765,10 @@ impl StatusSource for NodeStatus {
             router_max_active_handlers: router.max_active_handlers,
             client_op_metrics: crate::perf::client_op_metrics(),
             meta,
+            maintenance: meta_node
+                .as_ref()
+                .and_then(|m| m.local_maintenance().ok().flatten())
+                .map(Into::into),
             partitions,
             directory,
         }

@@ -83,6 +83,9 @@ pub struct ClusterStatus {
     pub client_op_metrics: crate::perf::ClientOpMetrics,
     /// Present when this node runs the meta group.
     pub meta: Option<MetaStatus>,
+    /// Locally applied replicated maintenance state on a meta-hosting node.
+    #[serde(default)]
+    pub maintenance: Option<MaintenanceStatus>,
     pub partitions: Vec<PartitionStatus>,
     /// The committed node directory as this node sees it (empty on non-meta
     /// nodes). Reflects failure-detector transitions.
@@ -102,6 +105,26 @@ pub struct MetaStatus {
     pub quorum_ack_age_ms: Option<u64>,
     pub applied: Option<u64>,
     pub voters: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceStatus {
+    /// Hex string because JSON clients cannot represent every u128 exactly.
+    pub operation_id: String,
+    pub generation: u64,
+    pub participants: Vec<NodeId>,
+    pub stage: crate::types::MaintenanceStage,
+}
+
+impl From<crate::types::MaintenanceRecord> for MaintenanceStatus {
+    fn from(record: crate::types::MaintenanceRecord) -> Self {
+        Self {
+            operation_id: format!("{:#x}", record.operation_id),
+            generation: record.generation,
+            participants: record.participants,
+            stage: record.stage,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +384,17 @@ fn render_metrics(status: &ClusterStatus) -> String {
         "dal_storage_failed",
         u64::from(status.storage_failed),
     );
+    if status.meta.is_some() {
+        metric(
+            &mut out,
+            "dal_maintenance_preparing",
+            u64::from(
+                status.maintenance.as_ref().is_some_and(|record| {
+                    record.stage == crate::types::MaintenanceStage::Preparing
+                }),
+            ),
+        );
+    }
     metric(
         &mut out,
         "dal_storage_filesystem_sample_ok",
@@ -680,6 +714,7 @@ pub(crate) mod tests {
                     applied: Some(42),
                     voters: vec![7, 8, 9],
                 }),
+                maintenance: None,
                 partitions: vec![PartitionStatus {
                     partition: 0,
                     role: Role::Leader,
