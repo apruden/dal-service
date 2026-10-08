@@ -55,6 +55,8 @@ and node lifecycle in `/status`. Check recent node restarts, network loss, and
 disk stalls. The term counter can advance during unsuccessful campaigns; a
 change does not prove a leader was elected. Verify the term stabilizes and
 operations on the affected group resume.
+One election can raise this ticket on several voters; group alerts by the
+affected cluster and group during triage.
 
 ## DALLeaderQuorumAckStale
 
@@ -63,7 +65,16 @@ connectivity and durable replication progress; avoid planned voter stops until
 the group is stable. The metric exists only while this node has a leader-side
 acknowledgement sample. Its absence cannot prove cluster-wide quorum, so use
 external client canaries to establish service availability. Verify the age
-falls and valid operations succeed.
+falls and valid operations succeed. DAL advances a published Openraft age using
+its own monotonic clock; an age that rises while the term and applied index are
+static can indicate a stalled Raft core.
+
+## DALDiagnosticSampleStale
+
+Check the node logs and status worker for a blocked filesystem or runtime task.
+`/metrics` serves the last cached sample and marks it stale after three seconds.
+Treat its other values as historical until `dal_diagnostic_sample_stale` returns
+to zero. Confirm the node's liveness and readiness probes recover.
 
 ## DALMaterializationLagGrowing
 

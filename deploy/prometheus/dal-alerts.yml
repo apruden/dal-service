@@ -64,14 +64,32 @@ groups:
           summary: "DAL partition {{ $labels.partition }} Raft term is changing repeatedly on {{ $labels.instance }}"
           runbook: "docs/operations/alerts.md#dalrafttermchurn"
 
-      - alert: DALLeaderQuorumAckStale
-        expr: dal_meta_quorum_ack_age_milliseconds > 10000 or dal_partition_quorum_ack_age_milliseconds > 10000
+      - alert: DALMetaLeaderQuorumAckStale
+        expr: dal_meta_quorum_ack_age_milliseconds > 10000
         for: 1m
         labels:
           severity: ticket
         annotations:
-          summary: "DAL leader on {{ $labels.instance }} has not observed a quorum acknowledgement for over 10 seconds"
+          summary: "DAL meta leader on {{ $labels.instance }} has not observed a quorum acknowledgement for over 10 seconds"
           runbook: "docs/operations/alerts.md#dalleaderquorumackstale"
+
+      - alert: DALPartitionLeaderQuorumAckStale
+        expr: dal_partition_quorum_ack_age_milliseconds > 10000
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL partition {{ $labels.partition }} leader on {{ $labels.instance }} has not observed a quorum acknowledgement for over 10 seconds"
+          runbook: "docs/operations/alerts.md#dalleaderquorumackstale"
+
+      - alert: DALDiagnosticSampleStale
+        expr: dal_diagnostic_sample_stale == 1
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "DAL diagnostic sampler is stale on {{ $labels.instance }}"
+          runbook: "docs/operations/alerts.md#daldiagnosticsamplestale"
 
       - alert: DALMaterializationLagGrowing
         expr: dal_partition_oldest_pending_milliseconds > 60000

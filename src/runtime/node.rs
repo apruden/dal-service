@@ -851,6 +851,7 @@ impl Node {
                 search: search.clone(),
                 readiness: readiness.clone(),
                 identity_gate: identity_gate.clone(),
+                quorum_age: Mutex::new(HashMap::new()),
             });
             let cache = Arc::new(StatusCache::new(
                 live_status.status(),
@@ -1550,6 +1551,49 @@ struct NodeStatus {
     search: Arc<crate::search::SearchService>,
     readiness: RuntimeReadiness,
     identity_gate: ProcessIdentityGate,
+    quorum_age: Mutex<HashMap<GroupId, QuorumAgeSample>>,
+}
+
+type RaftMetricsReceiver = watch::Receiver<openraft::RaftMetrics<NodeId, openraft::BasicNode>>;
+
+/// Openraft publishes quorum age only when it updates its metrics channel.
+/// Keep the publication time so the age continues to advance if the core stops
+/// publishing while the status sampler remains live.
+struct QuorumAgeSample {
+    receiver: RaftMetricsReceiver,
+    published_age_ms: Option<u64>,
+    observed_at: Instant,
+}
+
+impl NodeStatus {
+    fn quorum_ack_age_ms(&self, group: GroupId, mut receiver: RaftMetricsReceiver) -> Option<u64> {
+        let mut samples = self.quorum_age.lock().unwrap();
+        let sample = samples.entry(group).or_insert_with(|| {
+            let published_age_ms = receiver.borrow_and_update().millis_since_quorum_ack;
+            QuorumAgeSample {
+                published_age_ms,
+                receiver: receiver.clone(),
+                observed_at: Instant::now(),
+            }
+        });
+        if !sample.receiver.same_channel(&receiver) {
+            sample.published_age_ms = receiver.borrow_and_update().millis_since_quorum_ack;
+            sample.receiver = receiver;
+            sample.observed_at = Instant::now();
+        } else if sample.receiver.has_changed().unwrap_or(false) {
+            sample.published_age_ms = sample.receiver.borrow_and_update().millis_since_quorum_ack;
+            sample.observed_at = Instant::now();
+        }
+        sample.published_age_ms.map(|age| {
+            age.saturating_add(
+                sample
+                    .observed_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            )
+        })
+    }
 }
 
 impl StatusSource for NodeStatus {
@@ -1558,12 +1602,13 @@ impl StatusSource for NodeStatus {
         let meta_node = self.meta.read().unwrap().clone();
         let meta = meta_node.as_ref().map(|m| {
             let metrics = m.raft().metrics();
+            let quorum_ack_age_ms = self.quorum_ack_age_ms(GroupId::Meta, metrics.clone());
             let metrics = metrics.borrow();
             MetaStatus {
                 is_leader: metrics.current_leader == Some(self.node_id),
                 leader: metrics.current_leader,
                 current_term: metrics.current_term,
-                quorum_ack_age_ms: metrics.millis_since_quorum_ack,
+                quorum_ack_age_ms,
                 applied: metrics.last_applied.map(|log_id| log_id.index),
                 voters: metrics.membership_config.membership().voter_ids().collect(),
             }
@@ -1582,12 +1627,14 @@ impl StatusSource for NodeStatus {
                     let materialized = node.materialized_state_status();
                     let (last_log_index, raft_snapshot_index, current_term, quorum_ack_age_ms) = {
                         let metrics = node.raft().metrics();
+                        let quorum_ack_age_ms =
+                            self.quorum_ack_age_ms(GroupId::Data(partition), metrics.clone());
                         let metrics = metrics.borrow();
                         (
                             metrics.last_log_index,
                             metrics.snapshot.map(|log_id| log_id.index),
                             metrics.current_term,
-                            metrics.millis_since_quorum_ack,
+                            quorum_ack_age_ms,
                         )
                     };
                     let retained_log_entries = match (
