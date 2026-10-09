@@ -436,7 +436,9 @@ the `Quiesced` and `Verifying` transitions, release checks, and backup/restore.
   process restart, and timeout never implicitly release maintenance.
 - In `Preparing`, close new client mutations at gateways and partition entry
   points, block enrollment and new placement/index-definition changes, and
-  drain already admitted mutations. Stop failure-driven `SetNodeState` proposals
+  drain already admitted mutations. Direct reads and searches may continue
+  during preparation until planned shutdown, while `/readyz` remains closed.
+  Stop failure-driven `SetNodeState` proposals
   and new placement plans before stopping any process. Continue heartbeat
   collection and expose prolonged maintenance through status and alerts.
   Resolve existing moves through a bounded completion or abort sequence; if

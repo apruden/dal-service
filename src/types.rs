@@ -574,8 +574,8 @@ pub enum MetaCommand {
         definition: crate::search::SearchIndexDefinition,
         engine_revision: u32,
     },
-    /// Install the first stage of a cluster-wide maintenance operation. Internal
-    /// groundwork only until runtime admission and participant fences exist.
+    /// Install the first stage of a cluster-wide maintenance operation. The
+    /// operator entry point and participant acknowledgements are still pending.
     BeginMaintenance {
         operation_id: u128,
         generation: u64,

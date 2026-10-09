@@ -53,7 +53,9 @@ impl MaintenanceAdmission {
 
     /// Apply a ReadIndex-confirmed meta view. Returning from a Preparing view
     /// means the local record is durable and every earlier admitted operation
-    /// has completed. A release is persisted before admission reopens.
+    /// has completed. A release is persisted before admission reopens. Keep the
+    /// reconcile lock through the drain: a hung accepted Raft proposal must
+    /// hold preparation closed instead of letting a later release overtake it.
     pub async fn reconcile(&self, authoritative: Option<MaintenanceRecord>) -> Result<()> {
         let _reconcile = self.reconcile_lock.lock().await;
         {
@@ -104,6 +106,8 @@ fn validate_transition(
         return Ok(());
     };
     let Some(next) = next else {
+        // Meta retains released generations. A missing record beside a local
+        // fence indicates a different or damaged cluster state; keep closed.
         return Err(Error::Raft(
             "authoritative maintenance record disappeared".into(),
         ));

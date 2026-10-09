@@ -359,10 +359,10 @@ impl StatusSource for StatusCache {
             live,
             ready: live
                 && lifecycle.is_ready()
-                && self
-                    .maintenance
-                    .as_ref()
-                    .is_none_or(MaintenanceAdmission::is_open)
+                && self.maintenance.as_ref().map_or(
+                    sample.status.maintenance_admission_open,
+                    MaintenanceAdmission::is_open,
+                )
                 && sample.local_groups_ready,
         }
     }

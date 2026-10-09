@@ -783,6 +783,8 @@ impl Node {
             readiness.clone(),
             maintenance_reconciler(
                 cfg.cluster_id,
+                meta_handle.clone(),
+                desc.meta_voters.clone(),
                 control.clone(),
                 addrs.clone(),
                 cfg.timeouts.request,
@@ -1023,14 +1025,31 @@ impl Node {
             }
             node.initialize(voters).await?;
         }
-        let authoritative = fetch_authoritative_maintenance(
-            &self.control,
-            self.cluster.cluster_id,
-            self.addrs.control_addrs(),
-            self.request_timeout,
-        )
-        .await?;
-        self.maintenance.reconcile(authoritative).await?;
+        let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
+        loop {
+            match read_runtime_maintenance(
+                &self.meta,
+                &self.meta_voters,
+                &self.control,
+                self.cluster.cluster_id,
+                &self.addrs,
+                self.request_timeout,
+            )
+            .await
+            {
+                Ok(authoritative) => {
+                    self.maintenance.reconcile(authoritative).await?;
+                    break;
+                }
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(Error::Raft(format!(
+                        "node {} timed out waiting for authoritative maintenance state: {error}",
+                        self.node_id
+                    )));
+                }
+                Err(_) => tokio::time::sleep(BOOTSTRAP_POLL).await,
+            }
+        }
         if self.readiness.mark_ready() {
             Ok(())
         } else {
@@ -2272,8 +2291,11 @@ async fn heartbeat_emitter(
 /// Keep every runtime's local admission fence aligned with a ReadIndex-fenced
 /// meta view. Query failures leave the last durable fence in force. The meta
 /// operation cannot become quiesced until participants acknowledge this step.
+#[allow(clippy::too_many_arguments)]
 async fn maintenance_reconciler(
     cluster_id: ClusterId,
+    meta: MetaHandle,
+    preferred_meta_voters: Vec<NodeId>,
     control: ZmqTransport,
     addrs: AddrBook,
     timeout: Duration,
@@ -2286,9 +2308,15 @@ async fn maintenance_reconciler(
         if !identity_gate.is_open() {
             return;
         }
-        let Ok(record) =
-            fetch_authoritative_maintenance(&control, cluster_id, addrs.control_addrs(), timeout)
-                .await
+        let Ok(record) = read_runtime_maintenance(
+            &meta,
+            &preferred_meta_voters,
+            &control,
+            cluster_id,
+            &addrs,
+            timeout,
+        )
+        .await
         else {
             continue;
         };
@@ -2296,6 +2324,42 @@ async fn maintenance_reconciler(
             tracing::error!(%error, "maintenance admission reconciliation failed");
         }
     }
+}
+
+async fn read_runtime_maintenance(
+    meta_handle: &MetaHandle,
+    preferred_meta_voters: &[NodeId],
+    control: &ZmqTransport,
+    cluster_id: ClusterId,
+    addrs: &AddrBook,
+    timeout: Duration,
+) -> Result<Option<crate::types::MaintenanceRecord>> {
+    let local = { meta_handle.read().unwrap().clone() };
+    if let Some(meta) = local
+        && meta.current_leader() == Some(meta.node_id())
+        && let Ok(Ok(MetaRead::Value(record))) =
+            tokio::time::timeout(timeout, meta.read_maintenance()).await
+    {
+        return Ok(record);
+    }
+
+    let preferred: Vec<String> = preferred_meta_voters
+        .iter()
+        .filter_map(|node| addrs.control(*node))
+        .collect();
+    if !preferred.is_empty()
+        && let Ok(record) = fetch_authoritative_maintenance(
+            control,
+            cluster_id,
+            preferred,
+            timeout.min(Duration::from_secs(1)),
+        )
+        .await
+    {
+        return Ok(record);
+    }
+    // A rebalanced meta leader may no longer be among the genesis voters.
+    fetch_authoritative_maintenance(control, cluster_id, addrs.control_addrs(), timeout).await
 }
 
 /// The meta leader's failure detector: turn collected heartbeat evidence into

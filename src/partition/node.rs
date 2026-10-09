@@ -28,6 +28,8 @@ use crate::types::{Consistency, DataRequest, GroupId, Version};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
     Applied(ApplyResult),
+    /// No proposal was made because the local maintenance fence is closed.
+    AdmissionClosed,
     /// This node is not the leader; retry the hinted leader (DESIGN §8.2).
     NotLeader {
         leader: Option<NodeId>,
@@ -564,11 +566,10 @@ impl PartitionNode {
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
         let _maintenance = match &self.maintenance {
-            Some(gate) => Some(
-                gate.admit()
-                    .await
-                    .ok_or_else(|| Error::Raft("maintenance admission is closed".into()))?,
-            ),
+            Some(gate) => match gate.admit().await {
+                Some(permit) => Some(permit),
+                None => return Ok(WriteOutcome::AdmissionClosed),
+            },
             None => None,
         };
         self.storage.require_serving(self.group)?;
@@ -864,7 +865,8 @@ mod tests {
             if let Some(idx) = leader_idx(nodes) {
                 match nodes[idx].write(req.clone()).await {
                     Ok(WriteOutcome::Applied(result)) => return result,
-                    Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                    Ok(WriteOutcome::NotLeader { .. } | WriteOutcome::AdmissionClosed) | Err(_) => {
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -890,7 +892,8 @@ mod tests {
             if let Some(idx) = active_leader_idx(nodes) {
                 match nodes[idx].as_ref().unwrap().write(req.clone()).await {
                     Ok(WriteOutcome::Applied(result)) => return result,
-                    Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                    Ok(WriteOutcome::NotLeader { .. } | WriteOutcome::AdmissionClosed) | Err(_) => {
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

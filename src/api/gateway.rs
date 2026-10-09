@@ -157,10 +157,6 @@ impl ClientGateway {
         self.readiness
             .as_ref()
             .is_none_or(RuntimeReadiness::is_ready)
-            && self
-                .maintenance
-                .as_ref()
-                .is_none_or(MaintenanceAdmission::is_open)
     }
 
     pub fn set_search_service(&self, search: Arc<crate::search::SearchService>) {
@@ -243,6 +239,15 @@ impl ClientGateway {
             Err(e) => return ClientReply::Refused(e.to_string()),
         };
 
+        if matches!(&req, ClientRequest::Mutate(_))
+            && self
+                .maintenance
+                .as_ref()
+                .is_some_and(|gate| !gate.is_open())
+        {
+            return ClientReply::Unavailable("maintenance admission is closed".into());
+        }
+
         let node = self.partitions.read().unwrap().get(&partition).cloned();
         let Some(node) = node else {
             // We do not host this partition: redirect to its candidate voters.
@@ -279,13 +284,8 @@ impl ClientGateway {
                         leader,
                         candidates: self.candidates(partition).await,
                     }),
-                    Err(e)
-                        if self
-                            .maintenance
-                            .as_ref()
-                            .is_some_and(|gate| !gate.is_open()) =>
-                    {
-                        ClientReply::Unavailable(format!("maintenance admission is closed: {e}"))
+                    Ok(WriteOutcome::AdmissionClosed) => {
+                        ClientReply::Unavailable("maintenance admission is closed".into())
                     }
                     Err(e) => ClientReply::Error(format!("write failed: {e}")),
                 }
