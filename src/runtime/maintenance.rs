@@ -69,20 +69,28 @@ impl MaintenanceAdmission {
                 );
                 return Ok(());
             }
+            if let Err(error) = validate_transition(current.as_ref(), authoritative.as_ref()) {
+                let stale = matches!(
+                    (current.as_ref(), authoritative.as_ref()),
+                    (Some(installed), Some(observed))
+                        if observed.generation < installed.generation
+                            || (observed.generation == installed.generation
+                                && installed.stage == MaintenanceStage::Released
+                                && observed.stage != MaintenanceStage::Released
+                                && observed.operation_id == installed.operation_id
+                                && observed.participants == installed.participants)
+                );
+                // A delayed confirmed read cannot undo a newer installed
+                // release. A conflicting or vanished record fails closed.
+                if !stale {
+                    self.open.store(false, Ordering::Release);
+                }
+                return Err(error);
+            }
         }
 
         self.open.store(false, Ordering::Release);
         let mut current = self.record.write().await;
-        if *current == authoritative {
-            self.open.store(
-                authoritative
-                    .as_ref()
-                    .is_none_or(|record| record.stage == MaintenanceStage::Released),
-                Ordering::Release,
-            );
-            return Ok(());
-        }
-        validate_transition(current.as_ref(), authoritative.as_ref())?;
         if let Some(record) = &authoritative {
             self.storage
                 .put_local(&keyspace::maintenance_fence_key(), record)?;

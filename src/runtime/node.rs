@@ -1052,6 +1052,7 @@ impl Node {
                 Err(_) => tokio::time::sleep(BOOTSTRAP_POLL).await,
             }
         }
+        self.require_identity_open()?;
         if self.readiness.mark_ready() {
             Ok(())
         } else {
