@@ -45,6 +45,7 @@ pub struct MaintenanceRecoveryAckBody {
     pub incarnation: u64,
     pub process_incarnation: u64,
     pub topology_digest: [u8; 32],
+    pub policy_digest: [u8; 32],
 }
 
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node

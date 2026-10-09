@@ -706,6 +706,17 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                 println!("participants: {:?}", record.participants);
                 println!("preparation acknowledged: {:?}", record.acknowledged);
                 println!("recovery acknowledged: {:?}", record.recovered);
+                println!("recovery processes: {:?}", record.recovery_processes);
+                println!(
+                    "verification trust policy: {}",
+                    record
+                        .verification_policy_digest
+                        .map(|digest| digest
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>())
+                        .unwrap_or_else(|| "pending".into())
+                );
                 ExitCode::SUCCESS
             }
             Ok(None) => {

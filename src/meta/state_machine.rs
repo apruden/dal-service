@@ -94,6 +94,7 @@ pub enum MetaReject {
     MaintenanceBusy,
     MaintenanceMismatch,
     MaintenanceTopologyMismatch,
+    MaintenancePolicyMismatch,
     StaleMaintenanceProcess,
 }
 
@@ -285,6 +286,7 @@ impl MetaStateMachine {
                 incarnation,
                 process_incarnation,
                 topology_digest,
+                policy_digest,
             } => self.acknowledge_maintenance_recovery(
                 s,
                 *operation_id,
@@ -293,6 +295,7 @@ impl MetaStateMachine {
                 *incarnation,
                 *process_incarnation,
                 *topology_digest,
+                *policy_digest,
             ),
         }
     }
@@ -380,6 +383,7 @@ impl MetaStateMachine {
             acknowledged: Vec::new(),
             recovered: Vec::new(),
             recovery_processes: Vec::new(),
+            verification_policy_digest: None,
             stage: MaintenanceStage::Preparing,
         };
         Ok((
@@ -507,6 +511,7 @@ impl MetaStateMachine {
         record.stage = MaintenanceStage::Verifying;
         record.recovered.clear();
         record.recovery_processes.clear();
+        record.verification_policy_digest = None;
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],
@@ -523,6 +528,7 @@ impl MetaStateMachine {
         incarnation: u64,
         process_incarnation: u64,
         topology_digest: [u8; 32],
+        policy_digest: [u8; 32],
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         let Some(mut record) = self.maintenance(s)? else {
             return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
@@ -550,6 +556,18 @@ impl MetaStateMachine {
                 invalid("maintenance process incarnation is required"),
                 vec![],
             ));
+        }
+        if policy_digest == [0; 32] {
+            return Ok((
+                invalid("maintenance trust-policy digest is required"),
+                vec![],
+            ));
+        }
+        if record
+            .verification_policy_digest
+            .is_some_and(|current| current != policy_digest)
+        {
+            return Ok((reject(MetaReject::MaintenancePolicyMismatch), vec![]));
         }
         if let Ok(index) = record
             .recovery_processes
@@ -581,6 +599,7 @@ impl MetaStateMachine {
         if topology_digest != maintenance_topology_digest(&expected) {
             return Ok((reject(MetaReject::MaintenanceTopologyMismatch), vec![]));
         }
+        record.verification_policy_digest = Some(policy_digest);
         if let Err(index) = record.recovered.binary_search(&node_id) {
             record.recovered.insert(index, node_id);
         }

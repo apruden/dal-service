@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 /// DAL-level permissions attached to an out-of-band authenticated principal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -172,6 +173,47 @@ impl TrustPolicy {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Stable digest of the effective public trust policy. Input ordering and
+    /// JSON formatting do not affect this identity.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"dal-trust-policy-v1");
+        hash.update(self.cluster_id.to_be_bytes());
+        hash.update(self.generation.to_be_bytes());
+        hash.update((self.principals.len() as u64).to_be_bytes());
+        for principal in self.principals.values() {
+            for value in [
+                principal.user_id.as_bytes(),
+                principal.curve_public_key.as_bytes(),
+            ] {
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value);
+            }
+            let mut permissions: Vec<u8> = principal
+                .permissions
+                .iter()
+                .map(|permission| match permission {
+                    Permission::ClientRead => 1,
+                    Permission::ClientWrite => 2,
+                    Permission::Search => 3,
+                    Permission::PeerRpc => 4,
+                    Permission::Operator => 5,
+                })
+                .collect();
+            permissions.sort_unstable();
+            permissions.dedup();
+            hash.update((permissions.len() as u64).to_be_bytes());
+            hash.update(&permissions);
+        }
+        hash.update((self.client_owners.len() as u64).to_be_bytes());
+        for (client_id, user_id) in &self.client_owners {
+            hash.update(client_id.to_be_bytes());
+            hash.update((user_id.len() as u64).to_be_bytes());
+            hash.update(user_id.as_bytes());
+        }
+        hash.finalize().into()
     }
 
     /// Resolve an authenticated ZAP identity and require an explicit

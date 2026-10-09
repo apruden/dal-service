@@ -786,6 +786,9 @@ impl Node {
             maintenance_reconciler(
                 registration.clone(),
                 heartbeat_incarnation,
+                secure
+                    .as_ref()
+                    .map(|security| security.policy.fingerprint()),
                 meta_handle.clone(),
                 desc.meta_voters.clone(),
                 control.clone(),
@@ -2304,6 +2307,7 @@ async fn heartbeat_emitter(
 async fn maintenance_reconciler(
     registration: RegistrationBinding,
     process_incarnation: u64,
+    policy_digest: Option<[u8; 32]>,
     meta: MetaHandle,
     preferred_meta_voters: Vec<NodeId>,
     control: ZmqTransport,
@@ -2358,6 +2362,7 @@ async fn maintenance_reconciler(
                 .binary_search(&registration.node_id)
                 .is_ok()
                 && !current_process_recovered
+                && let Some(policy_digest) = policy_digest
                 && let Some(topology_digest) = local_recovery_topology_digest(
                     registration.node_id,
                     &record,
@@ -2371,6 +2376,7 @@ async fn maintenance_reconciler(
                     &record,
                     process_incarnation,
                     topology_digest,
+                    policy_digest,
                     &meta,
                     &preferred_meta_voters,
                     &control,
@@ -2513,6 +2519,7 @@ async fn acknowledge_runtime_recovery(
     record: &crate::types::MaintenanceRecord,
     process_incarnation: u64,
     topology_digest: [u8; 32],
+    policy_digest: [u8; 32],
     meta: &MetaHandle,
     preferred_meta_voters: &[NodeId],
     control: &ZmqTransport,
@@ -2526,6 +2533,7 @@ async fn acknowledge_runtime_recovery(
         incarnation: registration.directory_incarnation,
         process_incarnation,
         topology_digest,
+        policy_digest,
     };
     let body = MaintenanceRecoveryAckBody {
         operation_id: record.operation_id,
@@ -2534,6 +2542,7 @@ async fn acknowledge_runtime_recovery(
         incarnation: registration.directory_incarnation,
         process_incarnation,
         topology_digest,
+        policy_digest,
     };
     submit_runtime_maintenance_command(
         registration,

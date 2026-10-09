@@ -838,6 +838,7 @@ impl RootDispatch {
                 incarnation: body.incarnation,
                 process_incarnation: body.process_incarnation,
                 topology_digest: body.topology_digest,
+                policy_digest: body.policy_digest,
             },
         )
         .await
