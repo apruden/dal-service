@@ -532,13 +532,16 @@ impl MetaStateMachine {
         if entry.state != NodeState::Active {
             return Ok((reject(MetaReject::IneligibleTarget), vec![]));
         }
+        if record.recovered.binary_search(&node_id).is_ok() {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
         let Some(cluster) = self.cluster(s)? else {
             return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
         };
         let mut expected = Vec::new();
         for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
             let Some(placement) = self.placement(s, group)? else {
-                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+                return Ok((reject(MetaReject::NoPlacement), vec![]));
             };
             if placement.r#move.is_some() {
                 return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
@@ -550,10 +553,8 @@ impl MetaStateMachine {
         if topology_digest != maintenance_topology_digest(&expected) {
             return Ok((reject(MetaReject::MaintenanceTopologyMismatch), vec![]));
         }
-        match record.recovered.binary_search(&node_id) {
-            Ok(_) => return Ok((MetaApplyResult::NoOp, vec![])),
-            Err(index) => record.recovered.insert(index, node_id),
-        }
+        let index = record.recovered.binary_search(&node_id).unwrap_err();
+        record.recovered.insert(index, node_id);
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],
