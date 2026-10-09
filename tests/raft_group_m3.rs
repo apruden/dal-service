@@ -96,7 +96,7 @@ async fn write_to_leader(nodes: &[PartitionNode], req: DataRequest) -> ApplyResu
         if let Some(li) = leader_idx(nodes) {
             match nodes[li].write(req.clone()).await {
                 Ok(WriteOutcome::Applied(r)) => return r,
-                Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                Ok(WriteOutcome::NotLeader { .. } | WriteOutcome::AdmissionClosed) | Err(_) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

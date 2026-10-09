@@ -584,7 +584,7 @@ pub enum MetaCommand {
         generation: u64,
         participants: Vec<NodeId>,
     },
-    /// Abort a preparation before ingress has been declared quiesced.
+    /// Explicitly release a preparation or quiesced operation.
     ReleaseMaintenance {
         operation_id: u128,
         generation: u64,

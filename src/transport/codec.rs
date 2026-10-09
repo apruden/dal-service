@@ -113,6 +113,9 @@ pub enum MsgType {
     /// Peer-control: ReadIndex-confirmed maintenance state for every runtime,
     /// including nodes that do not host a meta replica.
     MaintenanceQuery = 24,
+    /// Peer-control: one participant confirms its durable local fence and
+    /// drained client writes for the named maintenance operation.
+    MaintenanceAck = 25,
 }
 
 impl MsgType {
@@ -143,6 +146,7 @@ impl MsgType {
             22 => MsgType::SearchIndexAdmin,
             23 => MsgType::TransferLeadership,
             24 => MsgType::MaintenanceQuery,
+            25 => MsgType::MaintenanceAck,
             _ => return None,
         })
     }
@@ -186,6 +190,7 @@ impl MsgType {
             MsgType::TransferLeadership => 4 * KIB,
             // The participant inventory can contain every cluster node.
             MsgType::MaintenanceQuery => 64 * KIB,
+            MsgType::MaintenanceAck => 4 * KIB,
         }
     }
 
@@ -236,6 +241,7 @@ impl MsgType {
                 | MsgType::SearchIndexAdmin
                 | MsgType::TransferLeadership
                 | MsgType::MaintenanceQuery
+                | MsgType::MaintenanceAck
         )
     }
 }

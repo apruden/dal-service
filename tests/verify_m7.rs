@@ -90,7 +90,7 @@ async fn do_write(s: &Shared, req: &DataRequest) -> Option<ApplyResult> {
         if let Some(li) = s.leader() {
             match s.nodes[li].write(req.clone()).await {
                 Ok(WriteOutcome::Applied(r)) => return Some(r),
-                Ok(WriteOutcome::NotLeader { .. }) | Err(_) => {}
+                Ok(WriteOutcome::NotLeader { .. } | WriteOutcome::AdmissionClosed) | Err(_) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

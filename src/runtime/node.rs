@@ -30,7 +30,8 @@ use crate::config::{InitConfig, NodeConfig, RaftTuning, Timeouts, validate_routi
 use crate::error::{Error, Result};
 use crate::meta::bootstrap::{self, BootstrapDescriptor};
 use crate::meta::failure::HeartbeatTracker;
-use crate::meta::node::{MetaNode, MetaRead};
+use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
+use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::node::PartitionNode;
 use crate::runtime::config_file::{LoadedNodeSecurity, cluster_id_hex};
 use crate::runtime::directory::fetch_authoritative_directory;
@@ -51,7 +52,8 @@ use crate::transport::{
     codec::{Envelope, Lane, MsgType},
     raft_wire::{
         BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, LeadershipTransferReply,
-        PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
+        MaintenanceAckBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
+        RecoveryFenceRequest, SubmitReply,
     },
 };
 use crate::types::{
@@ -782,7 +784,7 @@ impl Node {
             "maintenance reconciler",
             readiness.clone(),
             maintenance_reconciler(
-                cfg.cluster_id,
+                registration.clone(),
                 meta_handle.clone(),
                 desc.meta_voters.clone(),
                 control.clone(),
@@ -2296,7 +2298,7 @@ async fn heartbeat_emitter(
 /// operation cannot become quiesced until participants acknowledge this step.
 #[allow(clippy::too_many_arguments)]
 async fn maintenance_reconciler(
-    cluster_id: ClusterId,
+    registration: RegistrationBinding,
     meta: MetaHandle,
     preferred_meta_voters: Vec<NodeId>,
     control: ZmqTransport,
@@ -2316,7 +2318,7 @@ async fn maintenance_reconciler(
             &meta,
             &preferred_meta_voters,
             &control,
-            cluster_id,
+            registration.cluster_id,
             &addrs,
             timeout,
         )
@@ -2324,10 +2326,165 @@ async fn maintenance_reconciler(
         else {
             continue;
         };
-        if let Err(error) = admission.reconcile(record).await {
+        if let Err(error) = admission.reconcile(record.clone()).await {
             tracing::error!(%error, "maintenance admission reconciliation failed");
+            continue;
+        }
+        if !identity_gate.is_open() {
+            return;
+        }
+        let Some(record) = record else { continue };
+        if record.stage != crate::types::MaintenanceStage::Preparing {
+            continue;
+        }
+        if record
+            .participants
+            .binary_search(&registration.node_id)
+            .is_ok()
+            && record
+                .acknowledged
+                .binary_search(&registration.node_id)
+                .is_err()
+            && let Err(error) = acknowledge_runtime_maintenance(
+                &registration,
+                &record,
+                &meta,
+                &preferred_meta_voters,
+                &control,
+                &addrs,
+                timeout,
+            )
+            .await
+        {
+            tracing::warn!(%error, "maintenance acknowledgement pending");
+        }
+        if record.acknowledged == record.participants
+            && let Some(local) = { meta.read().unwrap().clone() }
+            && local.current_leader() == Some(local.node_id())
+        {
+            match local
+                .propose(MetaCommand::QuiesceMaintenance {
+                    operation_id: record.operation_id,
+                    generation: record.generation,
+                })
+                .await
+            {
+                Ok(ProposeOutcome::Applied(MetaApplyResult::Applied | MetaApplyResult::NoOp)) => {}
+                Ok(outcome) => tracing::warn!(?outcome, "maintenance quiescence pending"),
+                Err(error) => tracing::warn!(%error, "maintenance quiescence pending"),
+            }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge_runtime_maintenance(
+    registration: &RegistrationBinding,
+    record: &crate::types::MaintenanceRecord,
+    meta: &MetaHandle,
+    preferred_meta_voters: &[NodeId],
+    control: &ZmqTransport,
+    addrs: &AddrBook,
+    timeout: Duration,
+) -> Result<()> {
+    let command = MetaCommand::AcknowledgeMaintenance {
+        operation_id: record.operation_id,
+        generation: record.generation,
+        node_id: registration.node_id,
+        incarnation: registration.directory_incarnation,
+    };
+    let local = { meta.read().unwrap().clone() };
+    if let Some(local) = &local
+        && local.current_leader() == Some(local.node_id())
+        && let Ok(ProposeOutcome::Applied(MetaApplyResult::Applied | MetaApplyResult::NoOp)) =
+            local.propose(command).await
+    {
+        return Ok(());
+    }
+
+    let body = MaintenanceAckBody {
+        operation_id: record.operation_id,
+        generation: record.generation,
+        node_id: registration.node_id,
+        incarnation: registration.directory_incarnation,
+    };
+    let committed_voters = local
+        .as_ref()
+        .map(|meta| meta.voters())
+        .filter(|voters| !voters.is_empty());
+    let preferred_ids = committed_voters.as_deref().unwrap_or(preferred_meta_voters);
+    let preferred: Vec<String> = preferred_ids
+        .iter()
+        .filter(|&&node| local.as_ref().is_none_or(|meta| node != meta.node_id()))
+        .filter_map(|node| addrs.control(*node))
+        .collect();
+    if !preferred.is_empty()
+        && submit_remote_maintenance_ack(
+            control,
+            registration.cluster_id,
+            body,
+            preferred,
+            timeout.min(Duration::from_secs(1)),
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    submit_remote_maintenance_ack(
+        control,
+        registration.cluster_id,
+        body,
+        addrs.control_addrs(),
+        timeout,
+    )
+    .await
+}
+
+async fn submit_remote_maintenance_ack(
+    control: &ZmqTransport,
+    cluster_id: ClusterId,
+    body: MaintenanceAckBody,
+    addresses: Vec<String>,
+    timeout: Duration,
+) -> Result<()> {
+    let submit = async {
+        let payload = crate::codec::encode(&body);
+        let mut pending = FuturesUnordered::new();
+        for address in addresses {
+            let request = Envelope::new(
+                cluster_id,
+                MsgType::MaintenanceAck,
+                GroupId::Meta,
+                0,
+                payload.clone(),
+            );
+            pending.push(async move { control.call(&address, request).await });
+        }
+        while let Some(reply) = pending.next().await {
+            let Ok(reply) = reply else { continue };
+            if reply.cluster_id != cluster_id
+                || reply.msg_type != MsgType::MaintenanceAck
+                || reply.group_id != GroupId::Meta
+            {
+                continue;
+            }
+            if matches!(
+                crate::codec::decode::<SubmitReply>(&reply.payload),
+                Ok(SubmitReply::Outcome(
+                    MetaApplyResult::Applied | MetaApplyResult::NoOp
+                ))
+            ) {
+                return Ok(());
+            }
+        }
+        Err(Error::Raft(
+            "no meta leader accepted maintenance acknowledgement".into(),
+        ))
+    };
+    tokio::time::timeout(timeout, submit)
+        .await
+        .map_err(|_| Error::Raft("maintenance acknowledgement timed out".into()))?
 }
 
 async fn read_runtime_maintenance(

@@ -25,9 +25,9 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
-    MaintenanceQueryReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
-    RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody,
-    SearchIndexStatusReply, SubmitReply,
+    MaintenanceAckBody, MaintenanceQueryReply, ObservationBody, PlacementQueryBody,
+    PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody,
+    SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
@@ -156,6 +156,7 @@ impl RootDispatch {
             MsgType::PlacementQuery => self.serve_placement_query(req).await,
             MsgType::DirectoryQuery => self.serve_directory_query(req).await,
             MsgType::MaintenanceQuery => self.serve_maintenance_query(req).await,
+            MsgType::MaintenanceAck => self.serve_maintenance_ack(req, &context).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -777,6 +778,34 @@ impl RootDispatch {
             None => MaintenanceQueryReply::Unavailable,
         };
         self.reply(&req, codec::encode(&reply))
+    }
+
+    async fn serve_maintenance_ack(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
+        let Ok(body) = codec::decode::<MaintenanceAckBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        if !self.authenticated_as_node(context, body.node_id) {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error(
+                    "authenticated node does not match maintenance participant".into(),
+                )),
+            );
+        }
+        self.submit(
+            &req,
+            MetaCommand::AcknowledgeMaintenance {
+                operation_id: body.operation_id,
+                generation: body.generation,
+                node_id: body.node_id,
+                incarnation: body.incarnation,
+            },
+        )
+        .await
     }
 
     /// Record heartbeat liveness evidence. The reply is a bare ack — the emitter

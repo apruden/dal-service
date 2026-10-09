@@ -24,6 +24,17 @@ pub enum MaintenanceQueryReply {
     Unavailable,
 }
 
+/// Sent only after the node-local admission fence has been persisted and all
+/// earlier accepted writes have completed. The receiver authenticates node_id;
+/// meta apply checks the current directory incarnation and operation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceAckBody {
+    pub operation_id: u128,
+    pub generation: u64,
+    pub node_id: NodeId,
+    pub incarnation: u64,
+}
+
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
 pub type AppendReply = Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;

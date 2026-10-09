@@ -377,9 +377,6 @@ impl MetaStateMachine {
         if record.stage == MaintenanceStage::Released {
             return Ok((MetaApplyResult::NoOp, vec![]));
         }
-        if record.stage != MaintenanceStage::Preparing {
-            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
-        }
         record.stage = MaintenanceStage::Released;
         Ok((
             MetaApplyResult::Applied,

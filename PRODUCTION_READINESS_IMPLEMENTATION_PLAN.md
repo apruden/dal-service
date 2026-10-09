@@ -421,11 +421,13 @@ changes [failure detection](src/runtime/node.rs),
 [automatic search transitions](src/runtime/search.rs), and both state machines.
 
 Implementation in progress: the replicated `Preparing` record pauses automatic
-meta writers and failure transitions. Participant runtimes now start with client
+meta writers and failure transitions. Participant runtimes start with client
 admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
-writes, and then persist the local generation fence. The remaining protocol work
-is participant acknowledgements, the `Quiesced` and `Verifying` transitions,
-release checks, and backup/restore.
+writes, and persist the local generation fence before submitting an authenticated
+acknowledgement. The meta leader advances to `Quiesced` only after every listed
+participant acknowledges the same operation and generation. The remaining
+protocol work is an operator entry point, `Verifying`, release checks, and
+backup/restore.
 
 ### Maintenance protocol
 
