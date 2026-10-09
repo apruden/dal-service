@@ -118,6 +118,8 @@ pub enum MsgType {
     MaintenanceAck = 25,
     /// Operator-control: ReadIndex-confirmed maintenance progress.
     MaintenanceStatus = 26,
+    /// Peer-control: a participant confirms recovery and its local voter sets.
+    MaintenanceRecoveryAck = 27,
 }
 
 impl MsgType {
@@ -150,6 +152,7 @@ impl MsgType {
             24 => MsgType::MaintenanceQuery,
             25 => MsgType::MaintenanceAck,
             26 => MsgType::MaintenanceStatus,
+            27 => MsgType::MaintenanceRecoveryAck,
             _ => return None,
         })
     }
@@ -193,7 +196,7 @@ impl MsgType {
             MsgType::TransferLeadership => 4 * KIB,
             // The participant inventory can contain every cluster node.
             MsgType::MaintenanceQuery | MsgType::MaintenanceStatus => 64 * KIB,
-            MsgType::MaintenanceAck => 4 * KIB,
+            MsgType::MaintenanceAck | MsgType::MaintenanceRecoveryAck => 4 * KIB,
         }
     }
 
@@ -246,6 +249,7 @@ impl MsgType {
                 | MsgType::MaintenanceQuery
                 | MsgType::MaintenanceAck
                 | MsgType::MaintenanceStatus
+                | MsgType::MaintenanceRecoveryAck
         )
     }
 }

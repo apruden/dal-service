@@ -35,6 +35,17 @@ pub struct MaintenanceAckBody {
     pub incarnation: u64,
 }
 
+/// Sent only after normal runtime bootstrap and every hosted voting group's
+/// recovery gate is open. Meta apply compares this digest with frozen placements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceRecoveryAckBody {
+    pub operation_id: u128,
+    pub generation: u64,
+    pub node_id: NodeId,
+    pub incarnation: u64,
+    pub topology_digest: [u8; 32],
+}
+
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
 pub type AppendReply = Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;

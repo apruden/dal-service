@@ -52,14 +52,14 @@ use crate::transport::{
     codec::{Envelope, Lane, MsgType},
     raft_wire::{
         BootstrapStatusBody, BootstrapStatusReply, HeartbeatBody, LeadershipTransferReply,
-        MaintenanceAckBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
-        RecoveryFenceRequest, SubmitReply,
+        MaintenanceAckBody, MaintenanceRecoveryAckBody, PlacementQueryBody, PlacementQueryReply,
+        RecoveryFenceReply, RecoveryFenceRequest, SubmitReply,
     },
 };
 use crate::types::{
     BootstrapGroup, ClusterConfig, ClusterId, GroupId, LearnerAdmission, LogId, MetaCommand,
     NodeDirectoryEntry, NodeId, NodeState, PROTOCOL_VERSION, Placement, ProcessIdentityGate,
-    RegistrationBinding, ServingState,
+    RegistrationBinding, ServingState, maintenance_topology_digest,
 };
 
 /// How long [`Node::bootstrap`] waits for genesis to seed and replicate before
@@ -791,6 +791,9 @@ impl Node {
                 addrs.clone(),
                 cfg.timeouts.request,
                 maintenance.clone(),
+                readiness.clone(),
+                storage.clone(),
+                partitions.clone(),
                 identity_gate.clone(),
             ),
         )));
@@ -2305,6 +2308,9 @@ async fn maintenance_reconciler(
     addrs: AddrBook,
     timeout: Duration,
     admission: MaintenanceAdmission,
+    readiness: RuntimeReadiness,
+    storage: Arc<Storage>,
+    partitions: PartitionMap,
     identity_gate: ProcessIdentityGate,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -2334,6 +2340,39 @@ async fn maintenance_reconciler(
             return;
         }
         let Some(record) = record else { continue };
+        if record.stage == crate::types::MaintenanceStage::Verifying {
+            if record
+                .participants
+                .binary_search(&registration.node_id)
+                .is_ok()
+                && record
+                    .recovered
+                    .binary_search(&registration.node_id)
+                    .is_err()
+                && let Some(topology_digest) = local_recovery_topology_digest(
+                    registration.node_id,
+                    &record,
+                    &meta,
+                    &partitions,
+                    &readiness,
+                    &storage,
+                )
+                && let Err(error) = acknowledge_runtime_recovery(
+                    &registration,
+                    &record,
+                    topology_digest,
+                    &meta,
+                    &preferred_meta_voters,
+                    &control,
+                    &addrs,
+                    timeout,
+                )
+                .await
+            {
+                tracing::warn!(%error, "maintenance recovery acknowledgement pending");
+            }
+            continue;
+        }
         if record.stage != crate::types::MaintenanceStage::Preparing {
             continue;
         }
@@ -2377,6 +2416,51 @@ async fn maintenance_reconciler(
     }
 }
 
+fn local_recovery_topology_digest(
+    node_id: NodeId,
+    record: &crate::types::MaintenanceRecord,
+    meta: &MetaHandle,
+    partitions: &PartitionMap,
+    readiness: &RuntimeReadiness,
+    storage: &Storage,
+) -> Option<[u8; 32]> {
+    if !readiness.is_ready() || storage.require_healthy().is_err() {
+        return None;
+    }
+    let mut groups = Vec::new();
+    if let Some(local_meta) = { meta.read().unwrap().clone() } {
+        let voters = local_meta.voters();
+        if voters.contains(&node_id) {
+            let local_record = local_meta.local_maintenance().ok().flatten()?;
+            if !local_meta.raft_storage_healthy()
+                || local_record.operation_id != record.operation_id
+                || local_record.generation != record.generation
+                || local_record.stage != crate::types::MaintenanceStage::Verifying
+            {
+                return None;
+            }
+            groups.push((GroupId::Meta, voters));
+        }
+    }
+    let nodes: Vec<_> = partitions.read().unwrap().values().cloned().collect();
+    for node in nodes {
+        let voters = node.committed_voter_set();
+        if !voters.contains(&node_id) {
+            continue;
+        }
+        let materialized = node.materialized_state_status();
+        if !node.is_serving()
+            || !materialized.recovery_ready
+            || materialized.failed.is_some()
+            || node.applied_index().is_none()
+        {
+            return None;
+        }
+        groups.push((node.group(), voters.into_iter().collect()));
+    }
+    Some(maintenance_topology_digest(&groups))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn acknowledge_runtime_maintenance(
     registration: &RegistrationBinding,
@@ -2393,6 +2477,77 @@ async fn acknowledge_runtime_maintenance(
         node_id: registration.node_id,
         incarnation: registration.directory_incarnation,
     };
+    let body = MaintenanceAckBody {
+        operation_id: record.operation_id,
+        generation: record.generation,
+        node_id: registration.node_id,
+        incarnation: registration.directory_incarnation,
+    };
+    submit_runtime_maintenance_command(
+        registration,
+        meta,
+        preferred_meta_voters,
+        control,
+        addrs,
+        timeout,
+        command,
+        MsgType::MaintenanceAck,
+        crate::codec::encode(&body),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge_runtime_recovery(
+    registration: &RegistrationBinding,
+    record: &crate::types::MaintenanceRecord,
+    topology_digest: [u8; 32],
+    meta: &MetaHandle,
+    preferred_meta_voters: &[NodeId],
+    control: &ZmqTransport,
+    addrs: &AddrBook,
+    timeout: Duration,
+) -> Result<()> {
+    let command = MetaCommand::AcknowledgeMaintenanceRecovery {
+        operation_id: record.operation_id,
+        generation: record.generation,
+        node_id: registration.node_id,
+        incarnation: registration.directory_incarnation,
+        topology_digest,
+    };
+    let body = MaintenanceRecoveryAckBody {
+        operation_id: record.operation_id,
+        generation: record.generation,
+        node_id: registration.node_id,
+        incarnation: registration.directory_incarnation,
+        topology_digest,
+    };
+    submit_runtime_maintenance_command(
+        registration,
+        meta,
+        preferred_meta_voters,
+        control,
+        addrs,
+        timeout,
+        command,
+        MsgType::MaintenanceRecoveryAck,
+        crate::codec::encode(&body),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_runtime_maintenance_command(
+    registration: &RegistrationBinding,
+    meta: &MetaHandle,
+    preferred_meta_voters: &[NodeId],
+    control: &ZmqTransport,
+    addrs: &AddrBook,
+    timeout: Duration,
+    command: MetaCommand,
+    msg_type: MsgType,
+    payload: Vec<u8>,
+) -> Result<()> {
     let local = { meta.read().unwrap().clone() };
     if let Some(local) = &local
         && local.current_leader() == Some(local.node_id())
@@ -2402,12 +2557,6 @@ async fn acknowledge_runtime_maintenance(
         return Ok(());
     }
 
-    let body = MaintenanceAckBody {
-        operation_id: record.operation_id,
-        generation: record.generation,
-        node_id: registration.node_id,
-        incarnation: registration.directory_incarnation,
-    };
     let committed_voters = local
         .as_ref()
         .map(|meta| meta.voters())
@@ -2419,10 +2568,11 @@ async fn acknowledge_runtime_maintenance(
         .filter_map(|node| addrs.control(*node))
         .collect();
     if !preferred.is_empty()
-        && submit_remote_maintenance_ack(
+        && submit_remote_maintenance_command(
             control,
             registration.cluster_id,
-            body,
+            msg_type,
+            &payload,
             preferred,
             timeout.min(Duration::from_secs(1)),
         )
@@ -2431,40 +2581,35 @@ async fn acknowledge_runtime_maintenance(
     {
         return Ok(());
     }
-    submit_remote_maintenance_ack(
+    submit_remote_maintenance_command(
         control,
         registration.cluster_id,
-        body,
+        msg_type,
+        &payload,
         addrs.control_addrs(),
         timeout,
     )
     .await
 }
 
-async fn submit_remote_maintenance_ack(
+async fn submit_remote_maintenance_command(
     control: &ZmqTransport,
     cluster_id: ClusterId,
-    body: MaintenanceAckBody,
+    msg_type: MsgType,
+    payload: &[u8],
     addresses: Vec<String>,
     timeout: Duration,
 ) -> Result<()> {
     let submit = async {
-        let payload = crate::codec::encode(&body);
         let mut pending = FuturesUnordered::new();
         for address in addresses {
-            let request = Envelope::new(
-                cluster_id,
-                MsgType::MaintenanceAck,
-                GroupId::Meta,
-                0,
-                payload.clone(),
-            );
+            let request = Envelope::new(cluster_id, msg_type, GroupId::Meta, 0, payload.to_vec());
             pending.push(async move { control.call(&address, request).await });
         }
         while let Some(reply) = pending.next().await {
             let Ok(reply) = reply else { continue };
             if reply.cluster_id != cluster_id
-                || reply.msg_type != MsgType::MaintenanceAck
+                || reply.msg_type != msg_type
                 || reply.group_id != GroupId::Meta
             {
                 continue;

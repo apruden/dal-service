@@ -426,12 +426,15 @@ admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
 writes, and persist the local generation fence before submitting an authenticated
 acknowledgement. The meta leader advances to `Quiesced` only after every listed
 participant acknowledges the same operation and generation. The replicated
-`Verifying` stage now keeps admission closed and requires a fresh recovery
-acknowledgement from every participant before release. An operator can inspect
-the ReadIndex-confirmed record with `dal maintenance-status`; no mutation entry
-point exposes these transitions yet. Next, bind recovery acknowledgements to
-runtime health and group catch-up, add topology and trust checks at release,
-then expose operator commands and implement backup/restore.
+`Verifying` stage keeps admission closed and requires a fresh recovery
+acknowledgement from every participant before release. A runtime submits that
+acknowledgement only after bootstrap and its hosted voting groups' recovery
+gates are open; meta compares its voter-set digest with frozen placements. An
+operator can inspect the ReadIndex-confirmed record with
+`dal maintenance-status`; no mutation entry point exposes these transitions
+yet. Next, require fresh post-verification liveness and trust-policy convergence
+at release, provide an explicit missing-participant recovery procedure, then
+expose operator commands and implement backup/restore.
 
 ### Maintenance protocol
 

@@ -25,9 +25,9 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
-    MaintenanceAckBody, MaintenanceQueryReply, ObservationBody, PlacementQueryBody,
-    PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody,
-    SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
+    MaintenanceAckBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody, ObservationBody,
+    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
+    SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
@@ -159,6 +159,9 @@ impl RootDispatch {
                 self.serve_maintenance_query(req).await
             }
             MsgType::MaintenanceAck => self.serve_maintenance_ack(req, &context).await,
+            MsgType::MaintenanceRecoveryAck => {
+                self.serve_maintenance_recovery_ack(req, &context).await
+            }
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -805,6 +808,35 @@ impl RootDispatch {
                 generation: body.generation,
                 node_id: body.node_id,
                 incarnation: body.incarnation,
+            },
+        )
+        .await
+    }
+
+    async fn serve_maintenance_recovery_ack(
+        &self,
+        req: Envelope,
+        context: &crate::transport::RequestContext,
+    ) -> Envelope {
+        let Ok(body) = codec::decode::<MaintenanceRecoveryAckBody>(&req.payload) else {
+            return self.reply(&req, codec::encode(&SubmitReply::Error("malformed".into())));
+        };
+        if !self.authenticated_as_node(context, body.node_id) {
+            return self.reply(
+                &req,
+                codec::encode(&SubmitReply::Error(
+                    "authenticated node does not match maintenance participant".into(),
+                )),
+            );
+        }
+        self.submit(
+            &req,
+            MetaCommand::AcknowledgeMaintenanceRecovery {
+                operation_id: body.operation_id,
+                generation: body.generation,
+                node_id: body.node_id,
+                incarnation: body.incarnation,
+                topology_digest: body.topology_digest,
             },
         )
         .await
