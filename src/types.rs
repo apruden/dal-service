@@ -1,6 +1,6 @@
 //! Core wire and state types shared across every module.
 //!
-//! These are deliberately dependency-light (serde only) so the storage and
+//! These are deliberately dependency-light so the storage and
 //! state-machine layers can be built and tested before openraft or ZMQ enter
 //! the picture. openraft's own `LogId`/`Membership` are mapped onto the local
 //! [`LogId`]/voter-set representations at the M3 boundary.
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 macro_rules! frozen_serde {
     ($type:ty, $remote:ident) => {
@@ -431,6 +432,32 @@ pub fn voter_set<I: IntoIterator<Item = NodeId>>(voters: I) -> BTreeSet<NodeId> 
     voters.into_iter().collect()
 }
 
+/// Canonical digest of the voter configurations a maintenance participant
+/// hosts. Include group identity and sorted voter sets so a missing, extra, or
+/// stale local group cannot match the frozen meta placement inventory.
+pub fn maintenance_topology_digest(groups: &[(GroupId, Vec<NodeId>)]) -> [u8; 32] {
+    let mut canonical = groups.to_vec();
+    canonical.sort_by_key(|(group, _)| *group);
+    let mut digest = Sha256::new();
+    digest.update(b"dal-maintenance-topology-v1");
+    digest.update((canonical.len() as u32).to_be_bytes());
+    for (group, voters) in canonical {
+        match group {
+            GroupId::Meta => digest.update([0, 0, 0]),
+            GroupId::Data(partition) => {
+                digest.update([1]);
+                digest.update(partition.to_be_bytes());
+            }
+        }
+        let voters = voter_set(voters);
+        digest.update((voters.len() as u16).to_be_bytes());
+        for voter in voters {
+            digest.update(voter.to_be_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
 // ---------------------------------------------------------------------------
 // Node directory (DESIGN §9.1)
 // ---------------------------------------------------------------------------
@@ -613,6 +640,7 @@ pub enum MetaCommand {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        topology_digest: [u8; 32],
     },
 }
 
@@ -721,6 +749,7 @@ enum MetaCommandV1 {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        topology_digest: [u8; 32],
     },
 }
 

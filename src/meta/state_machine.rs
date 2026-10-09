@@ -25,7 +25,7 @@ use crate::storage::{StateMutation, Storage};
 use crate::types::{
     ClusterConfig, GroupId, LogId, MAX_CLUSTER_NODES, MAX_ENDPOINT_BYTES, MaintenanceRecord,
     MaintenanceStage, MetaCommand, MovePlan, NodeDirectoryEntry, NodeId, NodeState,
-    PROTOCOL_VERSION, Placement, voter_set,
+    PROTOCOL_VERSION, Placement, maintenance_topology_digest, voter_set,
 };
 
 /// Engine identity implied by older development search commands without an
@@ -93,6 +93,7 @@ pub enum MetaReject {
     MaintenanceActive,
     MaintenanceBusy,
     MaintenanceMismatch,
+    MaintenanceTopologyMismatch,
 }
 
 pub struct MetaStateMachine;
@@ -281,12 +282,14 @@ impl MetaStateMachine {
                 generation,
                 node_id,
                 incarnation,
+                topology_digest,
             } => self.acknowledge_maintenance_recovery(
                 s,
                 *operation_id,
                 *generation,
                 *node_id,
                 *incarnation,
+                *topology_digest,
             ),
         }
     }
@@ -506,6 +509,7 @@ impl MetaStateMachine {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        topology_digest: [u8; 32],
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         let Some(mut record) = self.maintenance(s)? else {
             return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
@@ -527,6 +531,24 @@ impl MetaStateMachine {
         }
         if entry.state != NodeState::Active {
             return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        let Some(cluster) = self.cluster(s)? else {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        };
+        let mut expected = Vec::new();
+        for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
+            let Some(placement) = self.placement(s, group)? else {
+                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+            };
+            if placement.r#move.is_some() {
+                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+            }
+            if placement.voters.contains(&node_id) {
+                expected.push((group, placement.voters));
+            }
+        }
+        if topology_digest != maintenance_topology_digest(&expected) {
+            return Ok((reject(MetaReject::MaintenanceTopologyMismatch), vec![]));
         }
         match record.recovered.binary_search(&node_id) {
             Ok(_) => return Ok((MetaApplyResult::NoOp, vec![])),
