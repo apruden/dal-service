@@ -374,8 +374,9 @@ impl MetaStateMachine {
         if record.operation_id != operation_id || record.generation != generation {
             return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
         }
-        if record.stage == MaintenanceStage::Released {
-            return Ok((MetaApplyResult::NoOp, vec![]));
+        match record.stage {
+            MaintenanceStage::Released => return Ok((MetaApplyResult::NoOp, vec![])),
+            MaintenanceStage::Preparing | MaintenanceStage::Quiesced => {}
         }
         record.stage = MaintenanceStage::Released;
         Ok((
