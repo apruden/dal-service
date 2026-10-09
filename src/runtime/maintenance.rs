@@ -61,6 +61,8 @@ impl MaintenanceAdmission {
         {
             let current = self.record.read().await;
             if *current == authoritative {
+                // A fresh ReadIndex-confirmed exact match with the durable
+                // local record resolves any earlier conflicting observation.
                 self.open.store(
                     authoritative
                         .as_ref()
@@ -69,23 +71,17 @@ impl MaintenanceAdmission {
                 );
                 return Ok(());
             }
-            if let Err(error) = validate_transition(current.as_ref(), authoritative.as_ref()) {
-                let stale = matches!(
-                    (current.as_ref(), authoritative.as_ref()),
-                    (Some(installed), Some(observed))
-                        if observed.generation < installed.generation
-                            || (observed.generation == installed.generation
-                                && installed.stage == MaintenanceStage::Released
-                                && observed.stage != MaintenanceStage::Released
-                                && observed.operation_id == installed.operation_id
-                                && observed.participants == installed.participants)
-                );
-                // A delayed confirmed read cannot undo a newer installed
-                // release. A conflicting or vanished record fails closed.
-                if !stale {
-                    self.open.store(false, Ordering::Release);
+            match validate_transition(current.as_ref(), authoritative.as_ref()) {
+                Ok(()) => {}
+                Err(TransitionIssue::Stale) => {
+                    // A delayed confirmed read cannot undo a newer installed
+                    // release or generation.
+                    return Err(Error::Raft("stale maintenance generation".into()));
                 }
-                return Err(error);
+                Err(TransitionIssue::Conflict(reason)) => {
+                    self.open.store(false, Ordering::Release);
+                    return Err(Error::Raft(reason.into()));
+                }
             }
         }
 
@@ -106,30 +102,37 @@ impl MaintenanceAdmission {
     }
 }
 
+enum TransitionIssue {
+    Stale,
+    Conflict(&'static str),
+}
+
 fn validate_transition(
     current: Option<&MaintenanceRecord>,
     next: Option<&MaintenanceRecord>,
-) -> Result<()> {
+) -> std::result::Result<(), TransitionIssue> {
     let Some(current) = current else {
         return Ok(());
     };
     let Some(next) = next else {
         // Meta retains released generations. A missing record beside a local
         // fence indicates a different or damaged cluster state; keep closed.
-        return Err(Error::Raft(
-            "authoritative maintenance record disappeared".into(),
+        return Err(TransitionIssue::Conflict(
+            "authoritative maintenance record disappeared",
         ));
     };
     if next.generation < current.generation {
-        return Err(Error::Raft("stale maintenance generation".into()));
+        return Err(TransitionIssue::Stale);
     }
-    if next.generation == current.generation
-        && (next.operation_id != current.operation_id
-            || next.participants != current.participants
-            || (current.stage == MaintenanceStage::Released
-                && next.stage != MaintenanceStage::Released))
-    {
-        return Err(Error::Raft("conflicting maintenance generation".into()));
+    if next.generation == current.generation {
+        if next.operation_id != current.operation_id || next.participants != current.participants {
+            return Err(TransitionIssue::Conflict(
+                "conflicting maintenance generation",
+            ));
+        }
+        if current.stage == MaintenanceStage::Released && next.stage != MaintenanceStage::Released {
+            return Err(TransitionIssue::Stale);
+        }
     }
     Ok(())
 }
