@@ -475,6 +475,9 @@ pub struct MaintenanceRecord {
     pub operation_id: u128,
     pub generation: u64,
     pub participants: Vec<NodeId>,
+    /// Participants that durably installed this exact operation and generation.
+    /// Sorted and unique, like `participants`.
+    pub acknowledged: Vec<NodeId>,
     pub stage: MaintenanceStage,
 }
 
@@ -482,6 +485,7 @@ pub struct MaintenanceRecord {
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceStage {
     Preparing,
+    Quiesced,
     Released,
 }
 
@@ -574,8 +578,7 @@ pub enum MetaCommand {
         definition: crate::search::SearchIndexDefinition,
         engine_revision: u32,
     },
-    /// Install the first stage of a cluster-wide maintenance operation. The
-    /// operator entry point and participant acknowledgements are still pending.
+    /// Install the first stage of a cluster-wide maintenance operation.
     BeginMaintenance {
         operation_id: u128,
         generation: u64,
@@ -583,6 +586,16 @@ pub enum MetaCommand {
     },
     /// Abort a preparation before ingress has been declared quiesced.
     ReleaseMaintenance {
+        operation_id: u128,
+        generation: u64,
+    },
+    AcknowledgeMaintenance {
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
+    },
+    QuiesceMaintenance {
         operation_id: u128,
         generation: u64,
     },
@@ -671,6 +684,16 @@ enum MetaCommandV1 {
         participants: Vec<NodeId>,
     },
     ReleaseMaintenance {
+        operation_id: u128,
+        generation: u64,
+    },
+    AcknowledgeMaintenance {
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
+    },
+    QuiesceMaintenance {
         operation_id: u128,
         generation: u64,
     },

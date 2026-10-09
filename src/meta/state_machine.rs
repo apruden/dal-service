@@ -167,10 +167,13 @@ impl MetaStateMachine {
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         if self
             .maintenance(s)?
-            .is_some_and(|record| record.stage == MaintenanceStage::Preparing)
+            .is_some_and(|record| record.stage != MaintenanceStage::Released)
             && !matches!(
                 cmd,
-                MetaCommand::BeginMaintenance { .. } | MetaCommand::ReleaseMaintenance { .. }
+                MetaCommand::BeginMaintenance { .. }
+                    | MetaCommand::ReleaseMaintenance { .. }
+                    | MetaCommand::AcknowledgeMaintenance { .. }
+                    | MetaCommand::QuiesceMaintenance { .. }
             )
         {
             return Ok((reject(MetaReject::MaintenanceActive), vec![]));
@@ -255,6 +258,18 @@ impl MetaStateMachine {
                 operation_id,
                 generation,
             } => self.release_maintenance(s, *operation_id, *generation),
+            MetaCommand::AcknowledgeMaintenance {
+                operation_id,
+                generation,
+                node_id,
+                incarnation,
+            } => {
+                self.acknowledge_maintenance(s, *operation_id, *generation, *node_id, *incarnation)
+            }
+            MetaCommand::QuiesceMaintenance {
+                operation_id,
+                generation,
+            } => self.quiesce_maintenance(s, *operation_id, *generation),
         }
     }
 
@@ -317,7 +332,7 @@ impl MetaStateMachine {
             }
         }
         if let Some(previous) = self.maintenance(s)? {
-            if previous.stage == MaintenanceStage::Preparing {
+            if previous.stage != MaintenanceStage::Released {
                 if previous.operation_id == operation_id
                     && previous.generation == generation
                     && previous.participants == participants
@@ -338,6 +353,7 @@ impl MetaStateMachine {
             operation_id,
             generation,
             participants: participants.to_vec(),
+            acknowledged: Vec::new(),
             stage: MaintenanceStage::Preparing,
         };
         Ok((
@@ -361,7 +377,75 @@ impl MetaStateMachine {
         if record.stage == MaintenanceStage::Released {
             return Ok((MetaApplyResult::NoOp, vec![]));
         }
+        if record.stage != MaintenanceStage::Preparing {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
         record.stage = MaintenanceStage::Released;
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
+
+    fn acknowledge_maintenance(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.maintenance(s)? else {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        };
+        if record.operation_id != operation_id || record.generation != generation {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        if record.stage != MaintenanceStage::Preparing {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
+        if record.participants.binary_search(&node_id).is_err() {
+            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        let Some(entry) = self.node(s, node_id)? else {
+            return Ok((reject(MetaReject::UnknownNode), vec![]));
+        };
+        if entry.incarnation != incarnation {
+            return Ok((reject(MetaReject::StaleIncarnation), vec![]));
+        }
+        if entry.state != NodeState::Active {
+            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        match record.acknowledged.binary_search(&node_id) {
+            Ok(_) => return Ok((MetaApplyResult::NoOp, vec![])),
+            Err(index) => record.acknowledged.insert(index, node_id),
+        }
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
+
+    fn quiesce_maintenance(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.maintenance(s)? else {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        };
+        if record.operation_id != operation_id || record.generation != generation {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        if record.stage == MaintenanceStage::Quiesced {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        if record.stage != MaintenanceStage::Preparing || record.acknowledged != record.participants
+        {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
+        record.stage = MaintenanceStage::Quiesced;
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],

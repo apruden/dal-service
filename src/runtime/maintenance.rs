@@ -60,9 +60,9 @@ impl MaintenanceAdmission {
         let _reconcile = self.reconcile_lock.lock().await;
         {
             let current = self.record.read().await;
-            if *current == authoritative {
-                // A fresh ReadIndex-confirmed exact match with the durable
-                // local record resolves any earlier conflicting observation.
+            if same_fence(current.as_ref(), authoritative.as_ref()) {
+                // Acknowledgements are replicated progress, not part of the
+                // node-local admission fence. Avoid a local fsync per peer ack.
                 self.open.store(
                     authoritative
                         .as_ref()
@@ -107,6 +107,19 @@ enum TransitionIssue {
     Conflict(&'static str),
 }
 
+fn same_fence(current: Option<&MaintenanceRecord>, next: Option<&MaintenanceRecord>) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => {
+            current.operation_id == next.operation_id
+                && current.generation == next.generation
+                && current.participants == next.participants
+                && current.stage == next.stage
+        }
+        _ => false,
+    }
+}
+
 fn validate_transition(
     current: Option<&MaintenanceRecord>,
     next: Option<&MaintenanceRecord>,
@@ -130,7 +143,13 @@ fn validate_transition(
                 "conflicting maintenance generation",
             ));
         }
-        if current.stage == MaintenanceStage::Released && next.stage != MaintenanceStage::Released {
+        if matches!(
+            (current.stage, next.stage),
+            (
+                MaintenanceStage::Released,
+                MaintenanceStage::Preparing | MaintenanceStage::Quiesced
+            ) | (MaintenanceStage::Quiesced, MaintenanceStage::Preparing)
+        ) {
             return Err(TransitionIssue::Stale);
         }
     }

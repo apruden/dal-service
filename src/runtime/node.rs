@@ -2395,14 +2395,14 @@ async fn failure_detector(
         let Ok(maintenance) = meta.local_maintenance() else {
             continue;
         };
-        let preparing = maintenance
+        let maintenance_active = maintenance
             .as_ref()
-            .is_some_and(|record| record.stage == crate::types::MaintenanceStage::Preparing);
+            .is_some_and(|record| record.stage != crate::types::MaintenanceStage::Released);
         let unseen_generation = maintenance
             .as_ref()
             .is_some_and(|record| record.generation > observed_maintenance_generation);
         let is_leader = meta.current_leader() == Some(meta.node_id());
-        if !preparing && !unseen_generation && !is_leader {
+        if !maintenance_active && !unseen_generation && !is_leader {
             continue;
         }
         let Ok(directory) = meta.local_directory() else {
@@ -2412,14 +2412,14 @@ async fn failure_detector(
             .iter()
             .map(|e| (e.node_id, e.state, e.incarnation))
             .collect();
-        if preparing || unseen_generation {
+        if maintenance_active || unseen_generation {
             tracker.lock().unwrap().suspend_timeouts(now_ms(), &states);
             observed_maintenance_generation = maintenance
                 .as_ref()
                 .map(|record| record.generation)
                 .unwrap_or(observed_maintenance_generation);
         }
-        if preparing || !is_leader {
+        if maintenance_active || !is_leader {
             continue;
         }
         let transitions = {
