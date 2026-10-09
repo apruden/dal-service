@@ -264,6 +264,7 @@ fn max_reply_bytes(msg_type: MsgType) -> usize {
     match msg_type {
         MsgType::ClientOp => MsgType::ClientOp.max_payload() + 36,
         MsgType::DirectoryQuery => MsgType::DirectoryQuery.max_payload() + 36,
+        MsgType::MaintenanceQuery => MsgType::MaintenanceQuery.max_payload() + 36,
         MsgType::Redirect => MsgType::Redirect.max_payload() + 36,
         MsgType::MetaQuery => MsgType::MetaQuery.max_payload() + 36,
         MsgType::SearchOp | MsgType::SearchExecute => MsgType::SearchOp.max_payload() + 36,

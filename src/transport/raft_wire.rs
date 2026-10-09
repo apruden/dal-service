@@ -11,7 +11,18 @@ use openraft::raft::{AppendEntriesResponse, InstallSnapshotResponse, VoteRespons
 use serde::{Deserialize, Serialize};
 
 use crate::meta::state_machine::MetaApplyResult;
-use crate::types::{DataConfigObservation, GroupId, MetaCommand, NodeDirectoryEntry, NodeId};
+use crate::types::{
+    DataConfigObservation, GroupId, MaintenanceRecord, MetaCommand, NodeDirectoryEntry, NodeId,
+};
+
+/// Only a current meta leader returns `Value`, after a ReadIndex barrier.
+/// An absent maintenance record is a valid authoritative value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintenanceQueryReply {
+    Value(Option<MaintenanceRecord>),
+    NotLeader,
+    Unavailable,
+}
 
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.

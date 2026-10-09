@@ -186,6 +186,13 @@ pub fn registration_binding_key() -> Vec<u8> {
     b"local/registration_binding".to_vec()
 }
 
+/// Last maintenance operation installed by this runtime. Kept outside group
+/// state so a non-meta node and a node restarting after snapshot install retain
+/// the admission fence.
+pub fn maintenance_fence_key() -> Vec<u8> {
+    b"local/maintenance_fence".to_vec()
+}
+
 pub fn serving_key(group: GroupId) -> Vec<u8> {
     format!("local/serving/{}", group.token()).into_bytes()
 }

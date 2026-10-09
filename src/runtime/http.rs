@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use axum::{Json, Router, extract::State, routing::get};
 use serde::{Deserialize, Serialize};
 
+use crate::runtime::maintenance::MaintenanceAdmission;
 use crate::runtime::readiness::{RuntimeLifecycle, RuntimeReadiness};
 use crate::types::{NodeDirectoryEntry, NodeId, ProcessIdentityGate};
 
@@ -86,6 +87,9 @@ pub struct ClusterStatus {
     /// Locally applied replicated maintenance state on a meta-hosting node.
     #[serde(default)]
     pub maintenance: Option<MaintenanceStatus>,
+    /// The local durable admission fence has been reconciled against a
+    /// ReadIndex-confirmed meta view and currently permits client work.
+    pub maintenance_admission_open: bool,
     pub partitions: Vec<PartitionStatus>,
     /// The committed node directory as this node sees it (empty on non-meta
     /// nodes). Reflects failure-detector transitions.
@@ -232,7 +236,10 @@ impl ProbeStatus {
         Self {
             lifecycle: status.lifecycle,
             live,
-            ready: live && status.lifecycle.is_ready() && local_groups_ready,
+            ready: live
+                && status.lifecycle.is_ready()
+                && status.maintenance_admission_open
+                && local_groups_ready,
         }
     }
 }
@@ -260,6 +267,7 @@ pub struct StatusCache {
     sample: RwLock<CachedSample>,
     lifecycle: RuntimeReadiness,
     identity_gate: ProcessIdentityGate,
+    maintenance: Option<MaintenanceAdmission>,
     max_age: Duration,
 }
 
@@ -280,6 +288,7 @@ impl StatusCache {
             }),
             lifecycle,
             identity_gate,
+            maintenance: None,
             max_age,
         }
     }
@@ -292,6 +301,11 @@ impl StatusCache {
             storage_healthy,
             local_groups_ready,
         };
+    }
+
+    pub fn with_maintenance_admission(mut self, admission: MaintenanceAdmission) -> Self {
+        self.maintenance = Some(admission);
+        self
     }
 }
 
@@ -325,6 +339,9 @@ impl StatusSource for StatusCache {
         let mut status = sample.status.clone();
         status.lifecycle = self.lifecycle.lifecycle();
         status.identity_valid = self.identity_gate.is_open();
+        if let Some(admission) = &self.maintenance {
+            status.maintenance_admission_open = admission.is_open();
+        }
         let age = sample.sampled_at.elapsed();
         status.diagnostic_sample_age_ms = age.as_millis().min(u64::MAX as u128) as u64;
         status.diagnostic_sample_stale = age > self.max_age;
@@ -340,7 +357,13 @@ impl StatusSource for StatusCache {
         ProbeStatus {
             lifecycle,
             live,
-            ready: live && lifecycle.is_ready() && sample.local_groups_ready,
+            ready: live
+                && lifecycle.is_ready()
+                && self
+                    .maintenance
+                    .as_ref()
+                    .is_none_or(MaintenanceAdmission::is_open)
+                && sample.local_groups_ready,
         }
     }
 }
@@ -383,6 +406,11 @@ fn render_metrics(status: &ClusterStatus) -> String {
         &mut out,
         "dal_storage_failed",
         u64::from(status.storage_failed),
+    );
+    metric(
+        &mut out,
+        "dal_maintenance_admission_open",
+        u64::from(status.maintenance_admission_open),
     );
     if status.meta.is_some() {
         metric(
@@ -715,6 +743,7 @@ pub(crate) mod tests {
                     voters: vec![7, 8, 9],
                 }),
                 maintenance: None,
+                maintenance_admission_open: true,
                 partitions: vec![PartitionStatus {
                     partition: 0,
                     role: Role::Leader,

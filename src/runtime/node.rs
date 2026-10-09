@@ -38,6 +38,7 @@ use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
     ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusCache, StatusSource,
 };
+use crate::runtime::maintenance::{MaintenanceAdmission, fetch_authoritative_maintenance};
 use crate::runtime::readiness::{RuntimeLifecycle, RuntimeReadiness};
 use crate::runtime::rebalance::RebalanceDriver;
 use crate::storage::Storage;
@@ -338,6 +339,7 @@ pub struct Node {
     /// initial hints and must not become a permanent bootstrap dependency.
     addrs: AddrBook,
     readiness: RuntimeReadiness,
+    maintenance: MaintenanceAdmission,
     identity_gate: ProcessIdentityGate,
     search: Arc<crate::search::SearchService>,
     storage: Arc<Storage>,
@@ -465,6 +467,7 @@ impl Node {
         let registration = resolve_registration_binding(&cfg, &desc, &storage, &control).await?;
         let identity_gate = ProcessIdentityGate::default();
         let readiness = RuntimeReadiness::default();
+        let maintenance = MaintenanceAdmission::new(storage.clone())?;
         let heartbeat_incarnation = storage.next_heartbeat_incarnation()?;
 
         let cluster = desc.config.clone();
@@ -564,7 +567,8 @@ impl Node {
             .with_identity_gate(identity_gate.clone());
             let node =
                 PartitionNode::start_with_network(cfg.node_id, group, storage.clone(), net, tuning)
-                    .await?;
+                    .await?
+                    .with_maintenance_admission(maintenance.clone());
             map.insert(*p, Arc::new(node));
         }
         let partitions: PartitionMap = Arc::new(RwLock::new(map));
@@ -583,7 +587,8 @@ impl Node {
             partitions.clone(),
             routing.clone(),
         )
-        .with_readiness(readiness.clone());
+        .with_readiness(readiness.clone())
+        .with_maintenance_admission(maintenance.clone());
         let gateway = match &secure {
             Some(security) => gateway.with_trust_policy(security.policy.clone()),
             None => gateway,
@@ -623,6 +628,7 @@ impl Node {
             verification_timeout: cfg.timeouts.request.mul_f64(0.8),
             lifecycle: AsyncMutex::new(()),
             identity_gate: identity_gate.clone(),
+            maintenance: maintenance.clone(),
         });
         let meta_starter = Arc::new(MetaStarter {
             node_id: cfg.node_id,
@@ -772,6 +778,18 @@ impl Node {
                 identity_gate.clone(),
             ),
         )));
+        tasks.push(tokio::spawn(required_background_task(
+            "maintenance reconciler",
+            readiness.clone(),
+            maintenance_reconciler(
+                cfg.cluster_id,
+                control.clone(),
+                addrs.clone(),
+                cfg.timeouts.request,
+                maintenance.clone(),
+                identity_gate.clone(),
+            ),
+        )));
         // The rebalance driver runs on every node: its data-leader role must run
         // wherever a partition is led, including on non-meta-voter nodes (which
         // read the plan and report observations over the network).
@@ -850,15 +868,19 @@ impl Node {
                 partitions: partitions.clone(),
                 search: search.clone(),
                 readiness: readiness.clone(),
+                maintenance: maintenance.clone(),
                 identity_gate: identity_gate.clone(),
                 quorum_age: Mutex::new(HashMap::new()),
             });
-            let cache = Arc::new(StatusCache::new(
-                live_status.status(),
-                readiness.clone(),
-                identity_gate.clone(),
-                STATUS_SAMPLE_MAX_AGE,
-            ));
+            let cache = Arc::new(
+                StatusCache::new(
+                    live_status.status(),
+                    readiness.clone(),
+                    identity_gate.clone(),
+                    STATUS_SAMPLE_MAX_AGE,
+                )
+                .with_maintenance_admission(maintenance.clone()),
+            );
             let (sampler_tx, sampler_rx) = watch::channel(false);
             let sampler_source: Arc<dyn StatusSource> = live_status;
             status_task = Some(tokio::spawn(required_background_task(
@@ -917,6 +939,7 @@ impl Node {
             control,
             addrs,
             readiness,
+            maintenance,
             identity_gate,
             search,
             storage,
@@ -1000,6 +1023,14 @@ impl Node {
             }
             node.initialize(voters).await?;
         }
+        let authoritative = fetch_authoritative_maintenance(
+            &self.control,
+            self.cluster.cluster_id,
+            self.addrs.control_addrs(),
+            self.request_timeout,
+        )
+        .await?;
+        self.maintenance.reconcile(authoritative).await?;
         if self.readiness.mark_ready() {
             Ok(())
         } else {
@@ -1550,6 +1581,7 @@ struct NodeStatus {
     partitions: PartitionMap,
     search: Arc<crate::search::SearchService>,
     readiness: RuntimeReadiness,
+    maintenance: MaintenanceAdmission,
     identity_gate: ProcessIdentityGate,
     quorum_age: Mutex<HashMap<GroupId, QuorumAgeSample>>,
 }
@@ -1769,6 +1801,7 @@ impl StatusSource for NodeStatus {
                 .as_ref()
                 .and_then(|m| m.local_maintenance().ok().flatten())
                 .map(Into::into),
+            maintenance_admission_open: self.maintenance.is_open(),
             partitions,
             directory,
         }
@@ -1929,6 +1962,7 @@ pub struct PartitionStarter {
     verification_timeout: Duration,
     lifecycle: AsyncMutex<()>,
     identity_gate: ProcessIdentityGate,
+    maintenance: MaintenanceAdmission,
 }
 
 impl PartitionStarter {
@@ -2007,7 +2041,8 @@ impl PartitionStarter {
             net,
             self.tuning,
         )
-        .await?;
+        .await?
+        .with_maintenance_admission(self.maintenance.clone());
         self.search.allow_partition(partition).await;
         self.partitions
             .write()
@@ -2231,6 +2266,35 @@ async fn heartbeat_emitter(
         let _ = futures::future::join_all(sends).await;
         seq = seq.wrapping_add(1);
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Keep every runtime's local admission fence aligned with a ReadIndex-fenced
+/// meta view. Query failures leave the last durable fence in force. The meta
+/// operation cannot become quiesced until participants acknowledge this step.
+async fn maintenance_reconciler(
+    cluster_id: ClusterId,
+    control: ZmqTransport,
+    addrs: AddrBook,
+    timeout: Duration,
+    admission: MaintenanceAdmission,
+    identity_gate: ProcessIdentityGate,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if !identity_gate.is_open() {
+            return;
+        }
+        let Ok(record) =
+            fetch_authoritative_maintenance(&control, cluster_id, addrs.control_addrs(), timeout)
+                .await
+        else {
+            continue;
+        };
+        if let Err(error) = admission.reconcile(record).await {
+            tracing::error!(%error, "maintenance admission reconciliation failed");
+        }
     }
 }
 

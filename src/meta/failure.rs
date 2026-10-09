@@ -92,9 +92,9 @@ impl HeartbeatTracker {
         HeartbeatTracker::default()
     }
 
-    /// Suspend timeout decisions during maintenance without changing heartbeat
-    /// evidence. Release gets one down-timeout grace period before acting on
-    /// silence that began before maintenance.
+    /// Suspend timeout decisions during maintenance without inventing heartbeat
+    /// evidence. This also prunes entries absent from the locally applied
+    /// directory; release gets one down-timeout grace period.
     pub fn suspend_timeouts(&mut self, now_ms: u64, states: &[(NodeId, NodeState, u64)]) {
         self.retain_known_nodes(states);
         for &(node, _, incarnation) in states {
@@ -125,7 +125,8 @@ impl HeartbeatTracker {
     /// live node's stamp and restart its grace period, letting a flood of
     /// synthetic ids push real nodes toward `Down`. Refusing instead caps
     /// memory while leaving established liveness untouched; [`Self::evaluate`]
-    /// reclaims the slots of nodes the directory no longer lists.
+    /// reclaims the slots of nodes the directory no longer lists. A maintenance
+    /// suspension does the same pruning on followers.
     pub fn observe(
         &mut self,
         node: NodeId,

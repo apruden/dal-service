@@ -61,6 +61,7 @@ pub struct PartitionNode {
     group: GroupId,
     raft: Raft,
     storage: Arc<Storage>,
+    maintenance: Option<crate::runtime::maintenance::MaintenanceAdmission>,
     data: DataStateMachine,
     storage_failure_monitor: tokio::task::JoinHandle<()>,
 }
@@ -204,6 +205,7 @@ impl PartitionNode {
             group,
             raft,
             storage,
+            maintenance: None,
             data: DataStateMachine::new(group),
             storage_failure_monitor,
         })
@@ -211,6 +213,16 @@ impl PartitionNode {
 
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Attach the runtime-wide maintenance admission fence before publishing
+    /// this partition to client dispatch.
+    pub fn with_maintenance_admission(
+        mut self,
+        admission: crate::runtime::maintenance::MaintenanceAdmission,
+    ) -> Self {
+        self.maintenance = Some(admission);
+        self
     }
 
     pub fn group(&self) -> GroupId {
@@ -551,6 +563,14 @@ impl PartitionNode {
 
     /// Submit a mutation through the serving gate.
     pub async fn write(&self, req: DataRequest) -> Result<WriteOutcome> {
+        let _maintenance = match &self.maintenance {
+            Some(gate) => Some(
+                gate.admit()
+                    .await
+                    .ok_or_else(|| Error::Raft("maintenance admission is closed".into()))?,
+            ),
+            None => None,
+        };
         self.storage.require_serving(self.group)?;
         if let crate::types::DataOp::Put { value, .. } = &req.op
             && value.len() > crate::types::MAX_VALUE_BYTES

@@ -420,6 +420,13 @@ changes [failure detection](src/runtime/node.rs),
 [rebalancing](src/runtime/rebalance.rs),
 [automatic search transitions](src/runtime/search.rs), and both state machines.
 
+Implementation in progress: the replicated `Preparing` record pauses automatic
+meta writers and failure transitions. Participant runtimes now start with client
+admission closed, obtain a ReadIndex-confirmed maintenance view, and persist a
+local generation fence before a newly observed preparation can finish draining
+accepted writes. The remaining protocol work is participant acknowledgements,
+the `Quiesced` and `Verifying` transitions, release checks, and backup/restore.
+
 ### Maintenance protocol
 
 - Store a unique operation ID, monotonically ordered fence generation, stage,

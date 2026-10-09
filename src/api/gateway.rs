@@ -19,6 +19,7 @@ use crate::api::ops::{
 use crate::codec;
 use crate::partition::node::{PartitionNode, ReadOutcome, WriteOutcome};
 use crate::perf::WriteStage;
+use crate::runtime::maintenance::MaintenanceAdmission;
 use crate::runtime::readiness::RuntimeReadiness;
 use crate::search::ShardSearchOutcome;
 use crate::transport::Server;
@@ -82,6 +83,7 @@ pub struct ClientGateway {
     search_catalog: RwLock<Option<Arc<dyn SearchCatalogSource>>>,
     shard_source: RwLock<Option<Arc<dyn ShardSourceFactory>>>,
     readiness: Option<RuntimeReadiness>,
+    maintenance: Option<MaintenanceAdmission>,
     trust_policy: Option<Arc<TrustPolicy>>,
 }
 
@@ -103,6 +105,7 @@ impl ClientGateway {
             search_catalog: RwLock::new(None),
             shard_source: RwLock::new(None),
             readiness: None,
+            maintenance: None,
             trust_policy: None,
         }
     }
@@ -111,6 +114,11 @@ impl ClientGateway {
     /// lower-level tests omit it and retain their historical always-open mode.
     pub fn with_readiness(mut self, readiness: RuntimeReadiness) -> Self {
         self.readiness = Some(readiness);
+        self
+    }
+
+    pub fn with_maintenance_admission(mut self, admission: MaintenanceAdmission) -> Self {
+        self.maintenance = Some(admission);
         self
     }
 
@@ -149,6 +157,10 @@ impl ClientGateway {
         self.readiness
             .as_ref()
             .is_none_or(RuntimeReadiness::is_ready)
+            && self
+                .maintenance
+                .as_ref()
+                .is_none_or(MaintenanceAdmission::is_open)
     }
 
     pub fn set_search_service(&self, search: Arc<crate::search::SearchService>) {
@@ -267,6 +279,14 @@ impl ClientGateway {
                         leader,
                         candidates: self.candidates(partition).await,
                     }),
+                    Err(e)
+                        if self
+                            .maintenance
+                            .as_ref()
+                            .is_some_and(|gate| !gate.is_open()) =>
+                    {
+                        ClientReply::Unavailable(format!("maintenance admission is closed: {e}"))
+                    }
                     Err(e) => ClientReply::Error(format!("write failed: {e}")),
                 }
             }

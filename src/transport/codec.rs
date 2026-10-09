@@ -110,6 +110,9 @@ pub enum MsgType {
     /// Peer-control: ask a current meta voter to campaign immediately so a
     /// draining meta leader can hand leadership off before replacement.
     TransferLeadership = 23,
+    /// Peer-control: ReadIndex-confirmed maintenance state for every runtime,
+    /// including nodes that do not host a meta replica.
+    MaintenanceQuery = 24,
 }
 
 impl MsgType {
@@ -139,6 +142,7 @@ impl MsgType {
             21 => MsgType::SearchCatalogQuery,
             22 => MsgType::SearchIndexAdmin,
             23 => MsgType::TransferLeadership,
+            24 => MsgType::MaintenanceQuery,
             _ => return None,
         })
     }
@@ -180,6 +184,8 @@ impl MsgType {
             MsgType::SearchCatalogQuery => crate::search::SEARCH_MAX_CATALOG_FRAME_BYTES,
             MsgType::SearchIndexAdmin => crate::search::SEARCH_MAX_DEFINITION_BYTES + 4 * KIB,
             MsgType::TransferLeadership => 4 * KIB,
+            // The participant inventory can contain every cluster node.
+            MsgType::MaintenanceQuery => 64 * KIB,
         }
     }
 
@@ -229,6 +235,7 @@ impl MsgType {
                 | MsgType::SearchIndexStatus
                 | MsgType::SearchIndexAdmin
                 | MsgType::TransferLeadership
+                | MsgType::MaintenanceQuery
         )
     }
 }

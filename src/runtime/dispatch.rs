@@ -25,9 +25,9 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
-    ObservationBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
-    RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply,
-    SubmitReply,
+    MaintenanceQueryReply, ObservationBody, PlacementQueryBody, PlacementQueryReply,
+    RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody,
+    SearchIndexStatusReply, SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
@@ -155,6 +155,7 @@ impl RootDispatch {
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
             MsgType::PlacementQuery => self.serve_placement_query(req).await,
             MsgType::DirectoryQuery => self.serve_directory_query(req).await,
+            MsgType::MaintenanceQuery => self.serve_maintenance_query(req).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -755,6 +756,25 @@ impl RootDispatch {
                 Err(_) => DirectoryQueryReply::Unavailable,
             },
             None => DirectoryQueryReply::Unavailable,
+        };
+        self.reply(&req, codec::encode(&reply))
+    }
+
+    async fn serve_maintenance_query(&self, req: Envelope) -> Envelope {
+        let reply = match self.meta() {
+            Some(meta) if meta.current_leader() != Some(meta.node_id()) => {
+                MaintenanceQueryReply::NotLeader
+            }
+            Some(meta) => match meta.read_maintenance().await {
+                Ok(crate::meta::node::MetaRead::Value(record)) => {
+                    MaintenanceQueryReply::Value(record)
+                }
+                Ok(crate::meta::node::MetaRead::NotLeader { .. }) => {
+                    MaintenanceQueryReply::NotLeader
+                }
+                Err(_) => MaintenanceQueryReply::Unavailable,
+            },
+            None => MaintenanceQueryReply::Unavailable,
         };
         self.reply(&req, codec::encode(&reply))
     }
