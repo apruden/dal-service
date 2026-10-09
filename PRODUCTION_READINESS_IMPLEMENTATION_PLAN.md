@@ -425,9 +425,12 @@ meta writers and failure transitions. Participant runtimes start with client
 admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
 writes, and persist the local generation fence before submitting an authenticated
 acknowledgement. The meta leader advances to `Quiesced` only after every listed
-participant acknowledges the same operation and generation. The remaining
-protocol work is an operator entry point, `Verifying`, release checks, and
-backup/restore.
+participant acknowledges the same operation and generation. The replicated
+`Verifying` stage now keeps admission closed and requires a fresh recovery
+acknowledgement from every participant before release; no runtime producer or
+operator entry point exposes those transitions yet. Next, bind recovery
+acknowledgements to runtime health and group catch-up, add topology and trust
+checks at release, then expose operator commands and implement backup/restore.
 
 ### Maintenance protocol
 

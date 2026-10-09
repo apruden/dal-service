@@ -478,6 +478,9 @@ pub struct MaintenanceRecord {
     /// Participants that durably installed this exact operation and generation.
     /// Sorted and unique, like `participants`.
     pub acknowledged: Vec<NodeId>,
+    /// Participants that confirmed recovery for this verification pass.
+    /// Cleared whenever verification begins and kept sorted and unique.
+    pub recovered: Vec<NodeId>,
     pub stage: MaintenanceStage,
 }
 
@@ -486,6 +489,7 @@ pub struct MaintenanceRecord {
 pub enum MaintenanceStage {
     Preparing,
     Quiesced,
+    Verifying,
     Released,
 }
 
@@ -584,7 +588,8 @@ pub enum MetaCommand {
         generation: u64,
         participants: Vec<NodeId>,
     },
-    /// Explicitly release a preparation or quiesced operation.
+    /// Abort preparation or release verification after every participant has
+    /// confirmed recovery. Quiesced operations must enter verification first.
     ReleaseMaintenance {
         operation_id: u128,
         generation: u64,
@@ -598,6 +603,16 @@ pub enum MetaCommand {
     QuiesceMaintenance {
         operation_id: u128,
         generation: u64,
+    },
+    EnterMaintenanceVerification {
+        operation_id: u128,
+        generation: u64,
+    },
+    AcknowledgeMaintenanceRecovery {
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
     },
 }
 
@@ -696,6 +711,16 @@ enum MetaCommandV1 {
     QuiesceMaintenance {
         operation_id: u128,
         generation: u64,
+    },
+    EnterMaintenanceVerification {
+        operation_id: u128,
+        generation: u64,
+    },
+    AcknowledgeMaintenanceRecovery {
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
     },
 }
 

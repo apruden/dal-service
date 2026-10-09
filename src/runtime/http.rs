@@ -118,6 +118,7 @@ pub struct MaintenanceStatus {
     pub generation: u64,
     pub participants: Vec<NodeId>,
     pub acknowledged: Vec<NodeId>,
+    pub recovered: Vec<NodeId>,
     pub stage: crate::types::MaintenanceStage,
 }
 
@@ -128,6 +129,7 @@ impl From<crate::types::MaintenanceRecord> for MaintenanceStatus {
             generation: record.generation,
             participants: record.participants,
             acknowledged: record.acknowledged,
+            recovered: record.recovered,
             stage: record.stage,
         }
     }
@@ -432,6 +434,15 @@ fn render_metrics(status: &ClusterStatus) -> String {
                     .maintenance
                     .as_ref()
                     .is_some_and(|record| record.stage == crate::types::MaintenanceStage::Quiesced),
+            ),
+        );
+        metric(
+            &mut out,
+            "dal_maintenance_verifying",
+            u64::from(
+                status.maintenance.as_ref().is_some_and(|record| {
+                    record.stage == crate::types::MaintenanceStage::Verifying
+                }),
             ),
         );
     }

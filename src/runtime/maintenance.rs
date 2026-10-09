@@ -143,17 +143,20 @@ fn validate_transition(
                 "conflicting maintenance generation",
             ));
         }
-        if matches!(
-            (current.stage, next.stage),
-            (
-                MaintenanceStage::Released,
-                MaintenanceStage::Preparing | MaintenanceStage::Quiesced
-            ) | (MaintenanceStage::Quiesced, MaintenanceStage::Preparing)
-        ) {
+        if maintenance_stage_rank(next.stage) < maintenance_stage_rank(current.stage) {
             return Err(TransitionIssue::Stale);
         }
     }
     Ok(())
+}
+
+fn maintenance_stage_rank(stage: MaintenanceStage) -> u8 {
+    match stage {
+        MaintenanceStage::Preparing => 0,
+        MaintenanceStage::Quiesced => 1,
+        MaintenanceStage::Verifying => 2,
+        MaintenanceStage::Released => 3,
+    }
 }
 
 /// Read the maintenance record from the current meta leader. Follower and

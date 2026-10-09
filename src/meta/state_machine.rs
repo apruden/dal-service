@@ -174,6 +174,8 @@ impl MetaStateMachine {
                     | MetaCommand::ReleaseMaintenance { .. }
                     | MetaCommand::AcknowledgeMaintenance { .. }
                     | MetaCommand::QuiesceMaintenance { .. }
+                    | MetaCommand::EnterMaintenanceVerification { .. }
+                    | MetaCommand::AcknowledgeMaintenanceRecovery { .. }
             )
         {
             return Ok((reject(MetaReject::MaintenanceActive), vec![]));
@@ -270,6 +272,22 @@ impl MetaStateMachine {
                 operation_id,
                 generation,
             } => self.quiesce_maintenance(s, *operation_id, *generation),
+            MetaCommand::EnterMaintenanceVerification {
+                operation_id,
+                generation,
+            } => self.enter_maintenance_verification(s, *operation_id, *generation),
+            MetaCommand::AcknowledgeMaintenanceRecovery {
+                operation_id,
+                generation,
+                node_id,
+                incarnation,
+            } => self.acknowledge_maintenance_recovery(
+                s,
+                *operation_id,
+                *generation,
+                *node_id,
+                *incarnation,
+            ),
         }
     }
 
@@ -354,6 +372,7 @@ impl MetaStateMachine {
             generation,
             participants: participants.to_vec(),
             acknowledged: Vec::new(),
+            recovered: Vec::new(),
             stage: MaintenanceStage::Preparing,
         };
         Ok((
@@ -376,7 +395,11 @@ impl MetaStateMachine {
         }
         match record.stage {
             MaintenanceStage::Released => return Ok((MetaApplyResult::NoOp, vec![])),
-            MaintenanceStage::Preparing | MaintenanceStage::Quiesced => {}
+            MaintenanceStage::Preparing => {}
+            MaintenanceStage::Verifying if record.recovered == record.participants => {}
+            MaintenanceStage::Quiesced | MaintenanceStage::Verifying => {
+                return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+            }
         }
         record.stage = MaintenanceStage::Released;
         Ok((
@@ -444,6 +467,71 @@ impl MetaStateMachine {
             return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
         }
         record.stage = MaintenanceStage::Quiesced;
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
+
+    fn enter_maintenance_verification(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.maintenance(s)? else {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        };
+        if record.operation_id != operation_id || record.generation != generation {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        if record.stage == MaintenanceStage::Verifying {
+            return Ok((MetaApplyResult::NoOp, vec![]));
+        }
+        if record.stage != MaintenanceStage::Quiesced {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
+        record.stage = MaintenanceStage::Verifying;
+        record.recovered.clear();
+        Ok((
+            MetaApplyResult::Applied,
+            vec![put(keyspace::meta_maintenance_key(), &record)],
+        ))
+    }
+
+    fn acknowledge_maintenance_recovery(
+        &self,
+        s: &Storage,
+        operation_id: u128,
+        generation: u64,
+        node_id: NodeId,
+        incarnation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        let Some(mut record) = self.maintenance(s)? else {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        };
+        if record.operation_id != operation_id || record.generation != generation {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
+        }
+        if record.stage != MaintenanceStage::Verifying {
+            return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
+        }
+        if record.participants.binary_search(&node_id).is_err() {
+            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        let Some(entry) = self.node(s, node_id)? else {
+            return Ok((reject(MetaReject::UnknownNode), vec![]));
+        };
+        if entry.incarnation != incarnation {
+            return Ok((reject(MetaReject::StaleIncarnation), vec![]));
+        }
+        if entry.state != NodeState::Active {
+            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        match record.recovered.binary_search(&node_id) {
+            Ok(_) => return Ok((MetaApplyResult::NoOp, vec![])),
+            Err(index) => record.recovered.insert(index, node_id),
+        }
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],
