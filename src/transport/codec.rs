@@ -116,6 +116,8 @@ pub enum MsgType {
     /// Peer-control: one participant confirms its durable local fence and
     /// drained client writes for the named maintenance operation.
     MaintenanceAck = 25,
+    /// Operator-control: ReadIndex-confirmed maintenance progress.
+    MaintenanceStatus = 26,
 }
 
 impl MsgType {
@@ -147,6 +149,7 @@ impl MsgType {
             23 => MsgType::TransferLeadership,
             24 => MsgType::MaintenanceQuery,
             25 => MsgType::MaintenanceAck,
+            26 => MsgType::MaintenanceStatus,
             _ => return None,
         })
     }
@@ -189,7 +192,7 @@ impl MsgType {
             MsgType::SearchIndexAdmin => crate::search::SEARCH_MAX_DEFINITION_BYTES + 4 * KIB,
             MsgType::TransferLeadership => 4 * KIB,
             // The participant inventory can contain every cluster node.
-            MsgType::MaintenanceQuery => 64 * KIB,
+            MsgType::MaintenanceQuery | MsgType::MaintenanceStatus => 64 * KIB,
             MsgType::MaintenanceAck => 4 * KIB,
         }
     }
@@ -242,6 +245,7 @@ impl MsgType {
                 | MsgType::TransferLeadership
                 | MsgType::MaintenanceQuery
                 | MsgType::MaintenanceAck
+                | MsgType::MaintenanceStatus
         )
     }
 }

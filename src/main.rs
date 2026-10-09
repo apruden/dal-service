@@ -36,7 +36,8 @@ fn usage() -> &'static str {
        index-create  --auth <operator.json> --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
        index-rebuild --auth <operator.json> --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
        index-drop    --auth <operator.json> --cluster <init.json> --name <name> [--seed <addr>]\n\
-       status      --auth <operator.json> --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n"
+       status      --auth <operator.json> --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n\
+       maintenance-status --auth <operator.json> --cluster <init.json> [--seed <addr>]   print maintenance progress\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -151,6 +152,15 @@ fn main() -> ExitCode {
             (Some(auth), Some(cluster)) => status(auth, cluster, flag(rest, "--seed")),
             _ => {
                 eprintln!("status: --auth <operator.json> and --cluster <init.json> required");
+                ExitCode::FAILURE
+            }
+        },
+        "maintenance-status" => match (flag(rest, "--auth"), flag(rest, "--cluster")) {
+            (Some(auth), Some(cluster)) => maintenance_status(auth, cluster, flag(rest, "--seed")),
+            _ => {
+                eprintln!(
+                    "maintenance-status: --auth <operator.json> and --cluster <init.json> required"
+                );
                 ExitCode::FAILURE
             }
         },
@@ -663,6 +673,47 @@ fn status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("status: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode {
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(desc) => desc,
+        Err(error) => {
+            eprintln!("maintenance-status: cluster: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let curve = match load_cli_curve(auth, &desc) {
+        Ok(curve) => curve,
+        Err(error) => {
+            eprintln!("maintenance-status: security: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        match admin::maintenance_status_secure(zmq::Context::new(), &desc, seed.as_deref(), curve)
+            .await
+        {
+            Ok(Some(record)) => {
+                println!("operation: {:#x}", record.operation_id);
+                println!("generation: {}", record.generation);
+                println!("stage: {:?}", record.stage);
+                println!("participants: {:?}", record.participants);
+                println!("preparation acknowledged: {:?}", record.acknowledged);
+                println!("recovery acknowledged: {:?}", record.recovered);
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("no maintenance operation");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("maintenance-status: {error}");
                 ExitCode::FAILURE
             }
         }

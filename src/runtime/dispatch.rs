@@ -155,7 +155,9 @@ impl RootDispatch {
             MsgType::BootstrapStatus => self.serve_bootstrap_status(req).await,
             MsgType::PlacementQuery => self.serve_placement_query(req).await,
             MsgType::DirectoryQuery => self.serve_directory_query(req).await,
-            MsgType::MaintenanceQuery => self.serve_maintenance_query(req).await,
+            MsgType::MaintenanceQuery | MsgType::MaintenanceStatus => {
+                self.serve_maintenance_query(req).await
+            }
             MsgType::MaintenanceAck => self.serve_maintenance_ack(req, &context).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
@@ -902,6 +904,7 @@ impl Server for RootDispatch {
                     | MsgType::LeaveRequest
                     | MsgType::AbortPlanRequest
                     | MsgType::SearchIndexAdmin => Permission::Operator,
+                    MsgType::MaintenanceStatus => Permission::Operator,
                     _ => Permission::PeerRpc,
                 };
                 let authorized = context
@@ -917,6 +920,7 @@ impl Server for RootDispatch {
                             | MsgType::LeaveRequest
                             | MsgType::AbortPlanRequest
                             | MsgType::SearchIndexAdmin
+                            | MsgType::MaintenanceStatus
                     ) {
                         self.reply(
                             &request,

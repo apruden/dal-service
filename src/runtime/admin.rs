@@ -23,10 +23,10 @@ use crate::transport::Transport;
 use crate::transport::codec::{Envelope, Lane, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
-    AbortPlanBody, JoinBody, LeaveBody, SearchIndexAdminBody, SubmitReply,
+    AbortPlanBody, JoinBody, LeaveBody, MaintenanceQueryReply, SearchIndexAdminBody, SubmitReply,
 };
 use crate::transport::security::CurveClientConfig;
-use crate::types::{ClusterId, GroupId, NodeId};
+use crate::types::{ClusterId, GroupId, MaintenanceRecord, NodeId};
 
 /// Per-call request timeout for an operator command. Operator commands are
 /// interactive one-shots, so a few seconds is ample and a hung member should
@@ -271,6 +271,58 @@ async fn status_with_transport(
     }
     Err(Error::Raft(last_error.unwrap_or_else(|| {
         "no cluster member answered a routing query".into()
+    })))
+}
+
+/// Read the maintenance operation from the current meta leader through the
+/// operator-only control path. A follower's cached record is never returned.
+pub async fn maintenance_status_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<Option<MaintenanceRecord>> {
+    let transport = secure_transport(ctx, curve, seed)?;
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    let mut last_error = None;
+    for address in &targets.candidates {
+        let request = Envelope::new(
+            desc.cluster_id,
+            MsgType::MaintenanceStatus,
+            GroupId::Meta,
+            0,
+            Vec::new(),
+        );
+        let reply = match transport.call(address, request).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        if reply.cluster_id != desc.cluster_id
+            || reply.msg_type != MsgType::MaintenanceStatus
+            || reply.group_id != GroupId::Meta
+        {
+            last_error = Some(format!("unexpected maintenance reply from {address}"));
+            continue;
+        }
+        match codec::decode::<MaintenanceQueryReply>(&reply.payload) {
+            Ok(MaintenanceQueryReply::Value(record)) => return Ok(record),
+            Ok(MaintenanceQueryReply::NotLeader | MaintenanceQueryReply::Unavailable) => {}
+            Err(_) => {
+                if let Ok(SubmitReply::Error(error)) = codec::decode(&reply.payload) {
+                    last_error = Some(error);
+                } else {
+                    last_error = Some(format!("undecodable maintenance reply from {address}"));
+                }
+            }
+        }
+    }
+    Err(Error::Raft(last_error.unwrap_or_else(|| {
+        "no meta leader answered the maintenance status query".into()
     })))
 }
 
