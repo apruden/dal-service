@@ -119,6 +119,7 @@ pub struct MaintenanceStatus {
     pub participants: Vec<NodeId>,
     pub acknowledged: Vec<NodeId>,
     pub recovered: Vec<NodeId>,
+    pub recovery_processes: Vec<(NodeId, u64)>,
     pub stage: crate::types::MaintenanceStage,
 }
 
@@ -130,6 +131,7 @@ impl From<crate::types::MaintenanceRecord> for MaintenanceStatus {
             participants: record.participants,
             acknowledged: record.acknowledged,
             recovered: record.recovered,
+            recovery_processes: record.recovery_processes,
             stage: record.stage,
         }
     }

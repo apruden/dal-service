@@ -508,6 +508,9 @@ pub struct MaintenanceRecord {
     /// Participants that confirmed recovery for this verification pass.
     /// Cleared whenever verification begins and kept sorted and unique.
     pub recovered: Vec<NodeId>,
+    /// Durable process incarnation for each recovery acknowledgement, sorted
+    /// by node ID. A restarted participant must replace its earlier proof.
+    pub recovery_processes: Vec<(NodeId, u64)>,
     pub stage: MaintenanceStage,
 }
 
@@ -640,6 +643,7 @@ pub enum MetaCommand {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        process_incarnation: u64,
         topology_digest: [u8; 32],
     },
 }
@@ -749,6 +753,7 @@ enum MetaCommandV1 {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        process_incarnation: u64,
         topology_digest: [u8; 32],
     },
 }

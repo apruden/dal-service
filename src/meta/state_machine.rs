@@ -94,6 +94,7 @@ pub enum MetaReject {
     MaintenanceBusy,
     MaintenanceMismatch,
     MaintenanceTopologyMismatch,
+    StaleMaintenanceProcess,
 }
 
 pub struct MetaStateMachine;
@@ -282,6 +283,7 @@ impl MetaStateMachine {
                 generation,
                 node_id,
                 incarnation,
+                process_incarnation,
                 topology_digest,
             } => self.acknowledge_maintenance_recovery(
                 s,
@@ -289,6 +291,7 @@ impl MetaStateMachine {
                 *generation,
                 *node_id,
                 *incarnation,
+                *process_incarnation,
                 *topology_digest,
             ),
         }
@@ -376,6 +379,7 @@ impl MetaStateMachine {
             participants: participants.to_vec(),
             acknowledged: Vec::new(),
             recovered: Vec::new(),
+            recovery_processes: Vec::new(),
             stage: MaintenanceStage::Preparing,
         };
         Ok((
@@ -399,7 +403,13 @@ impl MetaStateMachine {
         match record.stage {
             MaintenanceStage::Released => return Ok((MetaApplyResult::NoOp, vec![])),
             MaintenanceStage::Preparing => {}
-            MaintenanceStage::Verifying if record.recovered == record.participants => {}
+            MaintenanceStage::Verifying
+                if record.recovered == record.participants
+                    && record
+                        .recovery_processes
+                        .iter()
+                        .map(|(node, _)| *node)
+                        .eq(record.participants.iter().copied()) => {}
             MaintenanceStage::Quiesced | MaintenanceStage::Verifying => {
                 return Ok((reject(MetaReject::MaintenanceBusy), vec![]));
             }
@@ -496,12 +506,14 @@ impl MetaStateMachine {
         }
         record.stage = MaintenanceStage::Verifying;
         record.recovered.clear();
+        record.recovery_processes.clear();
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn acknowledge_maintenance_recovery(
         &self,
         s: &Storage,
@@ -509,6 +521,7 @@ impl MetaStateMachine {
         generation: u64,
         node_id: NodeId,
         incarnation: u64,
+        process_incarnation: u64,
         topology_digest: [u8; 32],
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         let Some(mut record) = self.maintenance(s)? else {
@@ -532,8 +545,23 @@ impl MetaStateMachine {
         if entry.state != NodeState::Active {
             return Ok((reject(MetaReject::IneligibleTarget), vec![]));
         }
-        if record.recovered.binary_search(&node_id).is_ok() {
-            return Ok((MetaApplyResult::NoOp, vec![]));
+        if process_incarnation == 0 {
+            return Ok((
+                invalid("maintenance process incarnation is required"),
+                vec![],
+            ));
+        }
+        if let Ok(index) = record
+            .recovery_processes
+            .binary_search_by_key(&node_id, |(node, _)| *node)
+        {
+            let previous = record.recovery_processes[index].1;
+            if process_incarnation < previous {
+                return Ok((reject(MetaReject::StaleMaintenanceProcess), vec![]));
+            }
+            if process_incarnation == previous && record.recovered.binary_search(&node_id).is_ok() {
+                return Ok((MetaApplyResult::NoOp, vec![]));
+            }
         }
         let Some(cluster) = self.cluster(s)? else {
             return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
@@ -553,8 +581,18 @@ impl MetaStateMachine {
         if topology_digest != maintenance_topology_digest(&expected) {
             return Ok((reject(MetaReject::MaintenanceTopologyMismatch), vec![]));
         }
-        let index = record.recovered.binary_search(&node_id).unwrap_err();
-        record.recovered.insert(index, node_id);
+        if let Err(index) = record.recovered.binary_search(&node_id) {
+            record.recovered.insert(index, node_id);
+        }
+        match record
+            .recovery_processes
+            .binary_search_by_key(&node_id, |(node, _)| *node)
+        {
+            Ok(index) => record.recovery_processes[index].1 = process_incarnation,
+            Err(index) => record
+                .recovery_processes
+                .insert(index, (node_id, process_incarnation)),
+        }
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],

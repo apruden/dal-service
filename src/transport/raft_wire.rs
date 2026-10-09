@@ -43,6 +43,7 @@ pub struct MaintenanceRecoveryAckBody {
     pub generation: u64,
     pub node_id: NodeId,
     pub incarnation: u64,
+    pub process_incarnation: u64,
     pub topology_digest: [u8; 32],
 }
 

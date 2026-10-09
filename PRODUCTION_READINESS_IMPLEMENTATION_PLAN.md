@@ -429,7 +429,9 @@ participant acknowledges the same operation and generation. The replicated
 `Verifying` stage keeps admission closed and requires a fresh recovery
 acknowledgement from every participant before release. A runtime submits that
 acknowledgement only after bootstrap and its hosted voting groups' recovery
-gates are open; meta compares its voter-set digest with frozen placements. An
+gates are open; meta compares its voter-set digest with frozen placements and
+records the durable process incarnation so a restarted node must acknowledge
+again. An
 operator can inspect the ReadIndex-confirmed record with
 `dal maintenance-status`; no mutation entry point exposes these transitions
 yet. Next, require fresh post-verification liveness and trust-policy convergence

@@ -836,6 +836,7 @@ impl RootDispatch {
                 generation: body.generation,
                 node_id: body.node_id,
                 incarnation: body.incarnation,
+                process_incarnation: body.process_incarnation,
                 topology_digest: body.topology_digest,
             },
         )

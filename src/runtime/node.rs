@@ -785,6 +785,7 @@ impl Node {
             readiness.clone(),
             maintenance_reconciler(
                 registration.clone(),
+                heartbeat_incarnation,
                 meta_handle.clone(),
                 desc.meta_voters.clone(),
                 control.clone(),
@@ -2302,6 +2303,7 @@ async fn heartbeat_emitter(
 #[allow(clippy::too_many_arguments)]
 async fn maintenance_reconciler(
     registration: RegistrationBinding,
+    process_incarnation: u64,
     meta: MetaHandle,
     preferred_meta_voters: Vec<NodeId>,
     control: ZmqTransport,
@@ -2341,14 +2343,21 @@ async fn maintenance_reconciler(
         }
         let Some(record) = record else { continue };
         if record.stage == crate::types::MaintenanceStage::Verifying {
+            let current_process_recovered = record
+                .recovery_processes
+                .binary_search_by_key(&registration.node_id, |(node, _)| *node)
+                .is_ok_and(|index| {
+                    record.recovery_processes[index].1 == process_incarnation
+                        && record
+                            .recovered
+                            .binary_search(&registration.node_id)
+                            .is_ok()
+                });
             if record
                 .participants
                 .binary_search(&registration.node_id)
                 .is_ok()
-                && record
-                    .recovered
-                    .binary_search(&registration.node_id)
-                    .is_err()
+                && !current_process_recovered
                 && let Some(topology_digest) = local_recovery_topology_digest(
                     registration.node_id,
                     &record,
@@ -2360,6 +2369,7 @@ async fn maintenance_reconciler(
                 && let Err(error) = acknowledge_runtime_recovery(
                     &registration,
                     &record,
+                    process_incarnation,
                     topology_digest,
                     &meta,
                     &preferred_meta_voters,
@@ -2501,6 +2511,7 @@ async fn acknowledge_runtime_maintenance(
 async fn acknowledge_runtime_recovery(
     registration: &RegistrationBinding,
     record: &crate::types::MaintenanceRecord,
+    process_incarnation: u64,
     topology_digest: [u8; 32],
     meta: &MetaHandle,
     preferred_meta_voters: &[NodeId],
@@ -2513,6 +2524,7 @@ async fn acknowledge_runtime_recovery(
         generation: record.generation,
         node_id: registration.node_id,
         incarnation: registration.directory_incarnation,
+        process_incarnation,
         topology_digest,
     };
     let body = MaintenanceRecoveryAckBody {
@@ -2520,6 +2532,7 @@ async fn acknowledge_runtime_recovery(
         generation: record.generation,
         node_id: registration.node_id,
         incarnation: registration.directory_incarnation,
+        process_incarnation,
         topology_digest,
     };
     submit_runtime_maintenance_command(
