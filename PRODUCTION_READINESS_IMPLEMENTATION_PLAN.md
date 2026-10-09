@@ -431,12 +431,15 @@ acknowledgement from every participant before release. A runtime submits that
 acknowledgement only after bootstrap and its hosted voting groups' recovery
 gates are open; meta compares its voter-set digest with frozen placements and
 records the durable process incarnation so a restarted node must acknowledge
-again. An
-operator can inspect the ReadIndex-confirmed record with
-`dal maintenance-status`; no mutation entry point exposes these transitions
-yet. Next, require fresh post-verification liveness and trust-policy convergence
-at release, provide an explicit missing-participant recovery procedure, then
-expose operator commands and implement backup/restore.
+again. Recovery acknowledgements also record each participant's effective
+trust-policy digest. Release requires all digests to agree with the current
+meta leader's policy, and an authenticated operator release request waits for
+a new heartbeat from every exact recovery process before submitting its
+directory and process bindings to replicated apply. An operator can inspect
+the ReadIndex-confirmed record with `dal maintenance-status`; release currently
+has a typed operator RPC but no CLI subcommand. Next, provide an explicit
+missing-participant recovery procedure, expose the maintenance CLI commands,
+then implement backup/restore.
 
 ### Maintenance protocol
 

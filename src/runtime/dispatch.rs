@@ -25,15 +25,17 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
-    MaintenanceAckBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody, ObservationBody,
-    PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply, RecoveryFenceRequest,
-    SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply, SubmitReply,
+    MaintenanceAckBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody, MaintenanceReleaseBody,
+    ObservationBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
+    RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply,
+    SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
 
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock milliseconds, the time base the [`HeartbeatTracker`] is fed.
@@ -51,6 +53,7 @@ pub struct RootDispatch {
     meta: MetaHandle,
     partitions: PartitionMap,
     heartbeats: Arc<Mutex<HeartbeatTracker>>,
+    heartbeat_freshness: Duration,
     starter: Option<Arc<PartitionStarter>>,
     meta_starter: Option<Arc<MetaStarter>>,
     identity_gate: ProcessIdentityGate,
@@ -75,6 +78,7 @@ impl RootDispatch {
             meta,
             partitions,
             heartbeats,
+            heartbeat_freshness: Duration::from_secs(3),
             starter,
             meta_starter,
             identity_gate: ProcessIdentityGate::default(),
@@ -85,6 +89,11 @@ impl RootDispatch {
 
     pub fn with_identity_gate(mut self, identity_gate: ProcessIdentityGate) -> Self {
         self.identity_gate = identity_gate;
+        self
+    }
+
+    pub fn with_heartbeat_freshness(mut self, freshness: Duration) -> Self {
+        self.heartbeat_freshness = freshness;
         self
     }
 
@@ -162,6 +171,7 @@ impl RootDispatch {
             MsgType::MaintenanceRecoveryAck => {
                 self.serve_maintenance_recovery_ack(req, &context).await
             }
+            MsgType::MaintenanceRelease => self.serve_maintenance_release(req).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -844,6 +854,132 @@ impl RootDispatch {
         .await
     }
 
+    async fn serve_maintenance_release(&self, req: Envelope) -> Envelope {
+        let respond = |reply: SubmitReply| self.reply(&req, codec::encode(&reply));
+        let Ok(body) = codec::decode::<MaintenanceReleaseBody>(&req.payload) else {
+            return respond(SubmitReply::Error("malformed".into()));
+        };
+        let Some(local_policy) = self.trust_policy.as_ref() else {
+            return respond(SubmitReply::Error("secure trust policy required".into()));
+        };
+        let Some(meta) = self.meta() else {
+            return respond(SubmitReply::Error(
+                "node does not run the meta group".into(),
+            ));
+        };
+        let record = match meta.read_maintenance().await {
+            Ok(crate::meta::node::MetaRead::Value(Some(record))) => record,
+            Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
+                return respond(SubmitReply::NotLeader { leader });
+            }
+            _ => return respond(SubmitReply::Error("maintenance record unavailable".into())),
+        };
+        if record.operation_id != body.operation_id || record.generation != body.generation {
+            return respond(SubmitReply::Error("maintenance identity mismatch".into()));
+        }
+        if record.stage == crate::types::MaintenanceStage::Released {
+            return respond(SubmitReply::Outcome(
+                crate::meta::state_machine::MetaApplyResult::NoOp,
+            ));
+        }
+        if record.stage != crate::types::MaintenanceStage::Verifying
+            || record.recovered != record.participants
+            || record.recovery_processes.len() != record.participants.len()
+        {
+            return respond(SubmitReply::Error("maintenance recovery incomplete".into()));
+        }
+        let policy_digest = local_policy.fingerprint();
+        if record.verification_policy_digest != Some(policy_digest) {
+            return respond(SubmitReply::Error(
+                "maintenance trust policy mismatch".into(),
+            ));
+        }
+        let directory = match meta.read_directory().await {
+            Ok(crate::meta::node::MetaRead::Value(directory)) => directory,
+            Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
+                return respond(SubmitReply::NotLeader { leader });
+            }
+            Err(error) => return respond(SubmitReply::Error(error.to_string())),
+        };
+        let entries: std::collections::BTreeMap<_, _> = directory
+            .into_iter()
+            .map(|entry| (entry.node_id, entry))
+            .collect();
+        let mut live_incarnations = Vec::with_capacity(record.participants.len());
+        for &(node, _) in &record.recovery_processes {
+            let Some(entry) = entries.get(&node) else {
+                return respond(SubmitReply::Error("maintenance participant missing".into()));
+            };
+            if entry.state != NodeState::Active {
+                return respond(SubmitReply::Error(
+                    "maintenance participant is not active".into(),
+                ));
+            }
+            live_incarnations.push((node, entry.incarnation));
+        }
+        let baseline: Vec<u64> = {
+            let tracker = self.heartbeats.lock().unwrap();
+            record
+                .recovery_processes
+                .iter()
+                .zip(&live_incarnations)
+                .map(|(&(node, process), &(_, incarnation))| {
+                    tracker
+                        .fresh_process_sequence(
+                            node,
+                            incarnation,
+                            process,
+                            now_ms(),
+                            self.heartbeat_freshness,
+                        )
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + self.heartbeat_freshness;
+        loop {
+            let all_advanced = {
+                let tracker = self.heartbeats.lock().unwrap();
+                record
+                    .recovery_processes
+                    .iter()
+                    .zip(&live_incarnations)
+                    .zip(&baseline)
+                    .all(|((&(node, process), &(_, incarnation)), &previous)| {
+                        tracker
+                            .fresh_process_sequence(
+                                node,
+                                incarnation,
+                                process,
+                                now_ms(),
+                                self.heartbeat_freshness,
+                            )
+                            .is_some_and(|sequence| sequence > previous)
+                    })
+            };
+            if all_advanced {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return respond(SubmitReply::Error(
+                    "fresh participant heartbeats unavailable".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.submit(
+            &req,
+            MetaCommand::ReleaseMaintenance {
+                operation_id: body.operation_id,
+                generation: body.generation,
+                live_processes: record.recovery_processes,
+                live_incarnations,
+                policy_digest,
+            },
+        )
+        .await
+    }
+
     /// Record heartbeat liveness evidence. The reply is a bare ack — the emitter
     /// only needs to know the frame was delivered. A stale/replayed sequence is
     /// dropped by the tracker; the meta leader's detector loop turns accepted
@@ -938,7 +1074,9 @@ impl Server for RootDispatch {
                     | MsgType::LeaveRequest
                     | MsgType::AbortPlanRequest
                     | MsgType::SearchIndexAdmin => Permission::Operator,
-                    MsgType::MaintenanceStatus => Permission::Operator,
+                    MsgType::MaintenanceStatus | MsgType::MaintenanceRelease => {
+                        Permission::Operator
+                    }
                     _ => Permission::PeerRpc,
                 };
                 let authorized = context
@@ -955,6 +1093,7 @@ impl Server for RootDispatch {
                             | MsgType::AbortPlanRequest
                             | MsgType::SearchIndexAdmin
                             | MsgType::MaintenanceStatus
+                            | MsgType::MaintenanceRelease
                     ) {
                         self.reply(
                             &request,
@@ -974,6 +1113,7 @@ impl Server for RootDispatch {
                     | MsgType::LeaveRequest
                     | MsgType::AbortPlanRequest
                     | MsgType::SearchIndexAdmin
+                    | MsgType::MaintenanceRelease
             ) {
                 tracing::info!(
                     principal = principal.as_deref().unwrap_or("unknown"),

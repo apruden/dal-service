@@ -683,7 +683,8 @@ impl Node {
             Some(starter.clone()),
             Some(meta_starter.clone()),
         )
-        .with_identity_gate(identity_gate.clone());
+        .with_identity_gate(identity_gate.clone())
+        .with_heartbeat_freshness(cfg.timeouts.suspect);
         let dispatch = match &secure {
             Some(security) => dispatch
                 .with_trust_policy(security.policy.clone())
@@ -786,9 +787,11 @@ impl Node {
             maintenance_reconciler(
                 registration.clone(),
                 heartbeat_incarnation,
+                // Only start_insecure_for_tests lacks a policy; keep its
+                // recovery protocol operable with a fixed test-only identity.
                 secure
                     .as_ref()
-                    .map(|security| security.policy.fingerprint()),
+                    .map_or([1; 32], |security| security.policy.fingerprint()),
                 meta_handle.clone(),
                 desc.meta_voters.clone(),
                 control.clone(),
@@ -2307,7 +2310,7 @@ async fn heartbeat_emitter(
 async fn maintenance_reconciler(
     registration: RegistrationBinding,
     process_incarnation: u64,
-    policy_digest: Option<[u8; 32]>,
+    policy_digest: [u8; 32],
     meta: MetaHandle,
     preferred_meta_voters: Vec<NodeId>,
     control: ZmqTransport,
@@ -2362,7 +2365,6 @@ async fn maintenance_reconciler(
                 .binary_search(&registration.node_id)
                 .is_ok()
                 && !current_process_recovered
-                && let Some(policy_digest) = policy_digest
                 && let Some(topology_digest) = local_recovery_topology_digest(
                     registration.node_id,
                     &record,

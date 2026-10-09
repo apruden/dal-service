@@ -48,6 +48,14 @@ pub struct MaintenanceRecoveryAckBody {
     pub policy_digest: [u8; 32],
 }
 
+/// Operator request to release a verified maintenance operation. Heartbeat
+/// evidence is gathered by the current meta leader, not supplied by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceReleaseBody {
+    pub operation_id: u128,
+    pub generation: u64,
+}
+
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
 pub type AppendReply = Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;

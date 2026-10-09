@@ -707,6 +707,10 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                 println!("preparation acknowledged: {:?}", record.acknowledged);
                 println!("recovery acknowledged: {:?}", record.recovered);
                 println!("recovery processes: {:?}", record.recovery_processes);
+                for (node, digest) in &record.recovery_policy_digests {
+                    let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                    println!("participant {node} trust policy: {digest}");
+                }
                 println!(
                     "verification trust policy: {}",
                     record

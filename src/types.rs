@@ -511,7 +511,9 @@ pub struct MaintenanceRecord {
     /// Durable process incarnation for each recovery acknowledgement, sorted
     /// by node ID. A restarted participant must replace its earlier proof.
     pub recovery_processes: Vec<(NodeId, u64)>,
-    /// Common public trust-policy snapshot proved by recovery participants.
+    /// Public trust-policy digest reported by each recovery process.
+    pub recovery_policy_digests: Vec<(NodeId, [u8; 32])>,
+    /// Common public trust-policy snapshot once all participants agree.
     pub verification_policy_digest: Option<[u8; 32]>,
     pub stage: MaintenanceStage,
 }
@@ -625,6 +627,10 @@ pub enum MetaCommand {
     ReleaseMaintenance {
         operation_id: u128,
         generation: u64,
+        /// Process set with newly observed heartbeats at release submission.
+        live_processes: Vec<(NodeId, u64)>,
+        live_incarnations: Vec<(NodeId, u64)>,
+        policy_digest: [u8; 32],
     },
     AcknowledgeMaintenance {
         operation_id: u128,
@@ -736,6 +742,9 @@ enum MetaCommandV1 {
     ReleaseMaintenance {
         operation_id: u128,
         generation: u64,
+        live_processes: Vec<(NodeId, u64)>,
+        live_incarnations: Vec<(NodeId, u64)>,
+        policy_digest: [u8; 32],
     },
     AcknowledgeMaintenance {
         operation_id: u128,

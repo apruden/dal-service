@@ -161,6 +161,26 @@ impl HeartbeatTracker {
         true
     }
 
+    /// Return the sequence of a recent heartbeat from the exact directory and
+    /// process incarnations named by a maintenance recovery proof.
+    pub fn fresh_process_sequence(
+        &self,
+        node: NodeId,
+        incarnation: u64,
+        process_incarnation: u64,
+        now_ms: u64,
+        max_age: Duration,
+    ) -> Option<u64> {
+        let &(observed_incarnation, observed_process, sequence) = self.last_stamp.get(&node)?;
+        let &seen_ms = self.last_seen_ms.get(&node)?;
+        (observed_incarnation == incarnation
+            && observed_process == process_incarnation
+            && sequence > 0
+            && seen_ms <= now_ms
+            && now_ms - seen_ms <= max_age.as_millis() as u64)
+            .then_some(sequence)
+    }
+
     /// Time since the last heartbeat matching the directory's committed
     /// incarnation. `None` starts a full grace period and intentionally causes
     /// no transition during this evaluation. Heartbeats from an older or
