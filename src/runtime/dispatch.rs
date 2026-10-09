@@ -917,6 +917,9 @@ impl RootDispatch {
             }
             live_incarnations.push((node, entry.incarnation));
         }
+        // Heartbeat timing is local to this meta leader. Replicated apply
+        // rechecks the durable process and directory bindings, while this
+        // preflight supplies the time-sensitive liveness observation.
         let baseline: Vec<u64> = {
             let tracker = self.heartbeats.lock().unwrap();
             record

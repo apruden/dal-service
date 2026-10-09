@@ -674,6 +674,7 @@ impl Node {
             meta_starter.resume_meta().await?;
         }
 
+        let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
         let dispatch = RootDispatch::new(
             cfg.cluster_id,
             gateway,
@@ -684,7 +685,7 @@ impl Node {
             Some(meta_starter.clone()),
         )
         .with_identity_gate(identity_gate.clone())
-        .with_heartbeat_freshness(cfg.timeouts.suspect);
+        .with_heartbeat_freshness(cfg.timeouts.suspect.max(hb_interval * 3));
         let dispatch = match &secure {
             Some(security) => dispatch
                 .with_trust_policy(security.policy.clone())
@@ -725,7 +726,6 @@ impl Node {
         // promoted to meta voter later already holds liveness evidence; the
         // meta leader turns that evidence into directory transitions. The cost
         // is O(N) frames per node per interval — revisit if clusters outgrow it.
-        let hb_interval = (cfg.timeouts.suspect / 3).max(Duration::from_millis(50));
         let directory_timeout = cfg.timeouts.request;
         let hb_control = match &secure {
             Some(security) => ZmqTransport::new_curve(
