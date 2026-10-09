@@ -422,10 +422,10 @@ changes [failure detection](src/runtime/node.rs),
 
 Implementation in progress: the replicated `Preparing` record pauses automatic
 meta writers and failure transitions. Participant runtimes now start with client
-admission closed, obtain a ReadIndex-confirmed maintenance view, and persist a
-local generation fence before a newly observed preparation can finish draining
-accepted writes. The remaining protocol work is participant acknowledgements,
-the `Quiesced` and `Verifying` transitions, release checks, and backup/restore.
+admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
+writes, and then persist the local generation fence. The remaining protocol work
+is participant acknowledgements, the `Quiesced` and `Verifying` transitions,
+release checks, and backup/restore.
 
 ### Maintenance protocol
 

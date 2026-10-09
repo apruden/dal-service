@@ -1027,7 +1027,8 @@ impl Node {
         }
         let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
         loop {
-            match read_runtime_maintenance(
+            self.require_identity_open()?;
+            let result = read_runtime_maintenance(
                 &self.meta,
                 &self.meta_voters,
                 &self.control,
@@ -1035,12 +1036,13 @@ impl Node {
                 &self.addrs,
                 self.request_timeout,
             )
-            .await
-            {
-                Ok(authoritative) => {
-                    self.maintenance.reconcile(authoritative).await?;
-                    break;
-                }
+            .await;
+            let result = match result {
+                Ok(authoritative) => self.maintenance.reconcile(authoritative).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => break,
                 Err(error) if Instant::now() >= deadline => {
                     return Err(Error::Raft(format!(
                         "node {} timed out waiting for authoritative maintenance state: {error}",
@@ -2303,6 +2305,7 @@ async fn maintenance_reconciler(
     identity_gate: ProcessIdentityGate,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         if !identity_gate.is_open() {
@@ -2335,7 +2338,7 @@ async fn read_runtime_maintenance(
     timeout: Duration,
 ) -> Result<Option<crate::types::MaintenanceRecord>> {
     let local = { meta_handle.read().unwrap().clone() };
-    if let Some(meta) = local
+    if let Some(meta) = &local
         && meta.current_leader() == Some(meta.node_id())
         && let Ok(Ok(MetaRead::Value(record))) =
             tokio::time::timeout(timeout, meta.read_maintenance()).await
@@ -2343,8 +2346,14 @@ async fn read_runtime_maintenance(
         return Ok(record);
     }
 
-    let preferred: Vec<String> = preferred_meta_voters
+    let committed_voters = local
+        .as_ref()
+        .map(|meta| meta.voters())
+        .filter(|voters| !voters.is_empty());
+    let preferred_ids = committed_voters.as_deref().unwrap_or(preferred_meta_voters);
+    let preferred: Vec<String> = preferred_ids
         .iter()
+        .filter(|&&node| local.as_ref().is_none_or(|meta| node != meta.node_id()))
         .filter_map(|node| addrs.control(*node))
         .collect();
     if !preferred.is_empty()

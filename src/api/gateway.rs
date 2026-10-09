@@ -228,6 +228,19 @@ impl ClientGateway {
                 crate::types::MAX_VALUE_BYTES
             ));
         }
+        // A delete cannot use the create-only Absent condition. This depends
+        // only on request bytes, so reject it before routing or admission.
+        if let ClientRequest::Mutate(data) = &req
+            && matches!(
+                data.op,
+                DataOp::Delete {
+                    if_version: Some(IfVersion::Absent),
+                    ..
+                }
+            )
+        {
+            return ClientReply::Refused("delete does not support if_version=Absent".into());
+        }
 
         let partition = match check_partition(&req, env.group_id, self.p, &self.hash_spec) {
             Ok(p) => p,
@@ -238,15 +251,6 @@ impl ClientGateway {
             }
             Err(e) => return ClientReply::Refused(e.to_string()),
         };
-
-        if matches!(&req, ClientRequest::Mutate(_))
-            && self
-                .maintenance
-                .as_ref()
-                .is_some_and(|gate| !gate.is_open())
-        {
-            return ClientReply::Unavailable("maintenance admission is closed".into());
-        }
 
         let node = self.partitions.read().unwrap().get(&partition).cloned();
         let Some(node) = node else {
@@ -260,20 +264,12 @@ impl ClientGateway {
 
         match req {
             ClientRequest::Mutate(data) => {
-                // `Absent` is meaningful only for create-only puts. Reject a
-                // malformed delete before it reaches the replicated log, so it
-                // cannot consume a Raft entry or masquerade as a decided
-                // client operation.
-                if matches!(
-                    data.op,
-                    DataOp::Delete {
-                        if_version: Some(IfVersion::Absent),
-                        ..
-                    }
-                ) {
-                    return ClientReply::Refused(
-                        "delete does not support if_version=Absent".into(),
-                    );
+                if self
+                    .maintenance
+                    .as_ref()
+                    .is_some_and(|gate| !gate.is_open())
+                {
+                    return ClientReply::Unavailable("maintenance admission is closed".into());
                 }
                 match node.write(data).await {
                     Ok(WriteOutcome::Applied(result)) => {
