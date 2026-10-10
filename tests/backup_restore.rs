@@ -211,15 +211,15 @@ async fn wait_until_ready(address: &str, processes: &mut [Process]) {
     }
 }
 
-async fn wait_for_meta_leader(addresses: &[String], processes: &mut [Process]) {
+async fn wait_for_meta_leader(addresses: &[String], processes: &mut [Process]) -> usize {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        for address in addresses {
+        for (index, address) in addresses.iter().enumerate() {
             if status(address)
                 .await
                 .is_some_and(|value| value["meta"]["is_leader"] == true)
             {
-                return;
+                return index;
             }
         }
         for process in processes.iter_mut() {
@@ -232,7 +232,42 @@ async fn wait_for_meta_leader(addresses: &[String], processes: &mut [Process]) {
         }
         assert!(
             Instant::now() < deadline,
-            "restored meta quorum did not elect a leader"
+            "meta quorum did not elect a leader"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_meta_convergence(addresses: &[String], processes: &mut [Process]) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let mut applied = Vec::new();
+        for address in addresses {
+            let Some(value) = status(address).await else {
+                break;
+            };
+            if value["maintenance"]["stage"] != "quiesced" {
+                break;
+            }
+            let Some(index) = value["meta"]["applied"].as_u64() else {
+                break;
+            };
+            applied.push(index);
+        }
+        if applied.len() == addresses.len() && applied.windows(2).all(|pair| pair[0] == pair[1]) {
+            return;
+        }
+        for process in processes.iter_mut() {
+            if let Some(exit) = process.child.try_wait().unwrap() {
+                panic!(
+                    "node exited before meta convergence ({exit}): {}",
+                    process.log.display()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "meta replicas did not reach one applied barrier: {applied:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -382,7 +417,7 @@ impl Fixture {
                     "server_key_pins": pins
                 },
                 "timeouts": {
-                    "suspect_ms": 3000, "down_ms": 12000,
+                    "suspect_ms": 20000, "down_ms": 40000,
                     "request_ms": 500, "shutdown_ms": 10000
                 }
             })).unwrap()).unwrap();
@@ -466,6 +501,10 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
             .unwrap(),
         WriteReply::Applied { .. }
     ));
+    let mut interrupted = nodes.remove(2);
+    interrupted.child.kill().unwrap();
+    interrupted.child.wait().unwrap();
+    drop(interrupted);
     cli(
         &[
             "maintenance-begin",
@@ -478,10 +517,34 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         ],
         true,
     );
+    let preparing = wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "preparing"
+    })
+    .await;
+    assert!(
+        preparing["maintenance"]["acknowledged"]
+            .as_array()
+            .is_some_and(|acks| acks.len() < 3)
+    );
+    for address in &fixture.http[..2] {
+        assert!(!ready(address).await);
+    }
+    nodes.push(spawn(
+        &fixture.configs[2],
+        &fixture.cluster,
+        &fixture.root.join("node-3-restarted.log"),
+    ));
     let quiesced = wait_for(&fixture.http[0], &mut nodes, |value| {
         value["maintenance"]["stage"] == "quiesced"
     })
     .await;
+    assert_eq!(
+        quiesced["maintenance"]["acknowledged"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     let generation = quiesced["maintenance"]["generation"]
         .as_u64()
         .unwrap()
@@ -495,6 +558,44 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     for address in &fixture.http {
         assert!(!ready(address).await);
     }
+    let old_leader = wait_for_meta_leader(&fixture.http, &mut nodes).await;
+    let mut interrupted = nodes.remove(old_leader);
+    stop(&mut interrupted).await;
+    drop(interrupted);
+    let surviving_http = fixture
+        .http
+        .iter()
+        .enumerate()
+        .filter_map(|(index, address)| (index != old_leader).then_some(address.clone()))
+        .collect::<Vec<_>>();
+    wait_for_meta_leader(&surviving_http, &mut nodes).await;
+    for address in &surviving_http {
+        let still_fenced = wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+        assert_eq!(
+            still_fenced["maintenance"]["generation"],
+            quiesced["maintenance"]["generation"]
+        );
+        assert!(!ready(address).await);
+    }
+    nodes.insert(
+        old_leader,
+        spawn(
+            &fixture.configs[old_leader],
+            &fixture.cluster,
+            &fixture
+                .root
+                .join(format!("node-{}-restarted.log", old_leader + 1)),
+        ),
+    );
+    wait_for(&fixture.http[old_leader], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "quiesced"
+    })
+    .await;
+    assert!(!ready(&fixture.http[old_leader]).await);
+    wait_for_meta_convergence(&fixture.http, &mut nodes).await;
     let fenced_write = client
         .put(b"during-fence", b"must-not-commit", None)
         .await
@@ -694,16 +795,67 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         ],
         true,
     );
-    wait_for(&fixture.http[0], &mut nodes, |value| {
+    let verified = wait_for(&fixture.http[0], &mut nodes, |value| {
         value["maintenance"]["stage"] == "verifying"
             && value["maintenance"]["recovered"]
                 .as_array()
                 .is_some_and(|nodes| nodes.len() == 3)
     })
     .await;
+    let prior_processes = verified["maintenance"]["recovery_processes"].clone();
     for address in &fixture.http {
         assert!(!ready(address).await);
     }
+    let leader = wait_for_meta_leader(&fixture.http, &mut nodes).await;
+    let interrupted_index = (leader + 1) % 3;
+    let mut interrupted = nodes.remove(interrupted_index);
+    stop(&mut interrupted).await;
+    drop(interrupted);
+    cli(
+        &[
+            "maintenance-release",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+            "--generation",
+            &generation,
+            "--wait-seconds",
+            "8",
+        ],
+        false,
+    );
+    for (index, address) in fixture.http.iter().enumerate() {
+        if index == interrupted_index {
+            continue;
+        }
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "verifying"
+        })
+        .await;
+        assert!(!ready(address).await);
+    }
+    nodes.insert(
+        interrupted_index,
+        spawn(
+            &fixture.configs[interrupted_index],
+            &fixture.cluster,
+            &fixture
+                .root
+                .join(format!("node-{}-reverified.log", interrupted_index + 1)),
+        ),
+    );
+    wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "verifying"
+            && value["maintenance"]["recovered"]
+                .as_array()
+                .is_some_and(|nodes| nodes.len() == 3)
+            && value["maintenance"]["recovery_processes"] != prior_processes
+    })
+    .await;
+    assert!(!ready(&fixture.http[interrupted_index]).await);
     cli(
         &[
             "maintenance-release",

@@ -464,6 +464,13 @@ this drill requires CURVE and runs in the normal test build. The remaining
 failure and recovery checks below still need evidence before Phase 5 can be
 declared verified.
 
+The live drill also interrupts fence installation by restarting a missing
+participant while the operation is `Preparing`, changes meta leadership while
+`Quiesced`, and confirms a release attempt fails when a verified participant
+stops. Release succeeds only after that participant restarts and records a new
+recovery process proof. The separate non-meta data-leader and routing-only
+restart cases remain to be exercised.
+
 ### Maintenance protocol
 
 - Store a unique operation ID, monotonically ordered fence generation, stage,
