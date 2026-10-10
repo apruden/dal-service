@@ -6,14 +6,18 @@ use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dal::api::client::Client;
-use dal::api::ops::WriteReply;
-use dal::transport::codec::Lane;
+use dal::api::ops::{ClientReply, ClientRequest, WriteReply};
+use dal::transport::Transport;
+use dal::transport::codec::{Envelope, Lane, MsgType};
 use dal::transport::dealer::ZmqTransport;
 use dal::transport::security::CurveClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 
 const CID: u128 = 0xDA1_BACC;
 const OPERATION: &str = "0xabc51";
@@ -23,6 +27,40 @@ const BACKUP_ID: u128 = 0xabc52;
 struct Process {
     child: Child,
     log: PathBuf,
+}
+
+#[derive(Clone)]
+struct WithheldWriteReply {
+    inner: ZmqTransport,
+    hide_first_decision: Arc<AtomicBool>,
+    decided: Arc<Notify>,
+    resume: Arc<Notify>,
+    original: Arc<Mutex<Option<WriteReply>>>,
+}
+
+impl Transport for WithheldWriteReply {
+    async fn call(&self, addr: &str, request: Envelope) -> dal::Result<Envelope> {
+        let mutation = request.msg_type == MsgType::ClientOp
+            && matches!(
+                dal::codec::decode::<ClientRequest>(&request.payload),
+                Ok(ClientRequest::Mutate(_))
+            );
+        let reply = self.inner.call(addr, request).await?;
+        if mutation
+            && let Ok(ClientReply::Mutation(outcome @ WriteReply::Applied { .. })) =
+                dal::codec::decode::<ClientReply>(&reply.payload)
+            && self.hide_first_decision.swap(false, Ordering::AcqRel)
+        {
+            *self.original.lock().unwrap() = Some(outcome);
+            self.decided.notify_one();
+            self.resume.notified().await;
+            return Err(dal::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated lost committed reply",
+            )));
+        }
+        Ok(reply)
+    }
 }
 
 impl Drop for Process {
@@ -903,6 +941,153 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     assert!(restored.get(b"during-fence").await.unwrap().is_none());
     assert!(matches!(
         restored.put(b"after-restore", b"new", None).await.unwrap(),
+        WriteReply::Applied { .. }
+    ));
+    for node in &mut nodes {
+        stop(node).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_reply_lost_before_maintenance_replays_after_release() {
+    assert_eq!(zmq::has("curve"), Some(true));
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(temp.path());
+    let curve = fixture.security(1);
+    let mut nodes = fixture.start();
+    for address in &fixture.http {
+        wait_until_ready(address, &mut nodes).await;
+    }
+
+    let transport = ZmqTransport::new_curve(
+        zmq::Context::new(),
+        Duration::from_secs(2),
+        Lane::Control,
+        curve,
+    );
+    let withheld = WithheldWriteReply {
+        inner: transport.clone(),
+        hide_first_decision: Arc::new(AtomicBool::new(true)),
+        decided: Arc::new(Notify::new()),
+        resume: Arc::new(Notify::new()),
+        original: Arc::new(Mutex::new(None)),
+    };
+    let client = Arc::new(Client::new(
+        CID,
+        0x50,
+        fixture.controls.clone(),
+        withheld.clone(),
+    ));
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.put(b"reply-lost", b"saved", None).await });
+    tokio::time::timeout(Duration::from_secs(15), withheld.decided.notified())
+        .await
+        .expect("write did not commit before its reply was withheld");
+    let original = withheld.original.lock().unwrap().clone().unwrap();
+    let observer = Client::new(CID, 0x60, fixture.controls.clone(), transport);
+    let before_fence = observer.get(b"reply-lost").await.unwrap().unwrap();
+    assert_eq!(before_fence.1, b"saved");
+    assert_eq!(
+        original,
+        WriteReply::Applied {
+            version: before_fence.0
+        }
+    );
+
+    cli(
+        &[
+            "maintenance-begin",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+        ],
+        true,
+    );
+    let quiesced = wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "quiesced"
+    })
+    .await;
+    let generation = quiesced["maintenance"]["generation"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    for address in &fixture.http {
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+        assert!(!ready(address).await);
+    }
+
+    withheld.resume.notify_one();
+    let first_error = first.await.unwrap().unwrap_err();
+    assert!(
+        first_error
+            .to_string()
+            .contains("maintenance admission is closed"),
+        "unexpected first write error: {first_error}"
+    );
+    assert!(
+        client
+            .put(b"different", b"blocked", None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("is unresolved")
+    );
+    cli(
+        &[
+            "maintenance-verify",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+            "--generation",
+            &generation,
+        ],
+        true,
+    );
+    wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "verifying"
+            && value["maintenance"]["recovered"]
+                .as_array()
+                .is_some_and(|recovered| recovered.len() == 3)
+    })
+    .await;
+    cli(
+        &[
+            "maintenance-release",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+            "--generation",
+            &generation,
+            "--wait-seconds",
+            "30",
+        ],
+        true,
+    );
+    for address in &fixture.http {
+        wait_until_ready(address, &mut nodes).await;
+    }
+    assert_eq!(
+        client.put(b"reply-lost", b"saved", None).await.unwrap(),
+        original
+    );
+    assert_eq!(
+        observer.get(b"reply-lost").await.unwrap().unwrap(),
+        before_fence
+    );
+    assert!(matches!(
+        client.put(b"different", b"next", None).await.unwrap(),
         WriteReply::Applied { .. }
     ));
     for node in &mut nodes {
