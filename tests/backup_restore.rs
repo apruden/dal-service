@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use dal::api::client::Client;
 use dal::api::ops::{ClientReply, ClientRequest, WriteReply};
+use dal::search::{
+    FieldKind, GenerationSelection, PathSegment, ScoringMode, SearchConsistency, SearchField,
+    SearchIndexDefinition, SearchQuery, SearchRequest, encode_search_value,
+};
 use dal::transport::Transport;
 use dal::transport::codec::{Envelope, Lane, MsgType};
 use dal::transport::dealer::ZmqTransport;
@@ -23,6 +27,52 @@ const CID: u128 = 0xDA1_BACC;
 const OPERATION: &str = "0xabc51";
 const BACKUP: &str = "0xabc52";
 const BACKUP_ID: u128 = 0xabc52;
+
+fn search_definition() -> SearchIndexDefinition {
+    SearchIndexDefinition {
+        document_type: "article".into(),
+        fields: vec![SearchField {
+            name: "title".into(),
+            source_path: vec![PathSegment::Key("title".into())],
+            kind: FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            required: true,
+            multi_valued: false,
+            indexed: true,
+            stored: true,
+            fast: false,
+        }],
+        default_search_fields: vec!["title".into()],
+    }
+}
+
+fn indexed_value(title: &str) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Article<'a> {
+        title: &'a str,
+    }
+    encode_search_value("article", &flexbuffers::to_vec(Article { title }).unwrap()).unwrap()
+}
+
+fn search_request(query: &str) -> SearchRequest {
+    SearchRequest {
+        index: "articles".into(),
+        generation: GenerationSelection::Active,
+        query: SearchQuery::Text {
+            query: query.into(),
+            fields: Vec::new(),
+        },
+        limit: 10,
+        offset: 0,
+        sort: Vec::new(),
+        scoring: ScoringMode::LocalBm25,
+        consistency: SearchConsistency::Strict,
+        allow_partial: false,
+        deadline_ms: 5_000,
+    }
+}
 
 struct Process {
     child: Child,
@@ -388,7 +438,7 @@ impl Fixture {
         principals.push(serde_json::json!({
             "user_id": "app:recovery",
             "curve_public_key": zmq::z85_encode(&app.public_key).unwrap(),
-            "permissions": ["client_read", "client_write"],
+            "permissions": ["client_read", "client_write", "search"],
             "client_ids": ["0x50", "0x60", "0x61"]
         }));
         principals.push(serde_json::json!({
@@ -563,17 +613,55 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         WriteReply::Applied { .. }
     ));
     for sequence in 2..=10 {
+        let value = if sequence == 10 {
+            indexed_value("retained searchable")
+        } else {
+            format!("retained-{sequence}").into_bytes()
+        };
         assert!(matches!(
             client
-                .put(
-                    format!("before-backup-{sequence}").as_bytes(),
-                    format!("retained-{sequence}").as_bytes(),
-                    None,
-                )
+                .put(format!("before-backup-{sequence}").as_bytes(), &value, None,)
                 .await
                 .unwrap(),
             WriteReply::Applied { .. }
         ));
+    }
+    let definition = fixture.root.join("articles.json");
+    std::fs::write(
+        &definition,
+        serde_json::to_vec(&search_definition()).unwrap(),
+    )
+    .unwrap();
+    cli(
+        &[
+            "index-create",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--name",
+            "articles",
+            "--definition",
+            definition.to_str().unwrap(),
+        ],
+        true,
+    );
+    let search_deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Ok(reply) = client.search_active(&search_request("retained")).await
+            && reply.total_hits == 1
+            && reply
+                .hits
+                .first()
+                .is_some_and(|hit| hit.key == b"before-backup-10")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < search_deadline,
+            "search index did not activate before backup"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let mut interrupted = nodes.remove(2);
     interrupted.child.kill().unwrap();
@@ -693,6 +781,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         stop(node).await;
     }
     drop(nodes);
+    assert!(fixture.dirs[0].join("search").exists());
 
     let artifacts = (0..3)
         .map(|i| fixture.root.join(format!("artifact-{}", i + 1)))
@@ -740,6 +829,9 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         &["backup-verify", "--package", package.to_str().unwrap()],
         true,
     );
+    for node_id in 1..=3 {
+        assert!(!package.join(format!("node-{node_id}/db/search")).exists());
+    }
     let node_manifest = package.join("node-1/node.json");
     let original = std::fs::read(&node_manifest).unwrap();
     std::fs::write(&node_manifest, b"truncated").unwrap();
@@ -799,13 +891,14 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         wait_until_ready(address, &mut resumed).await;
     }
     for sequence in 11..=20 {
+        let value = if sequence == 11 {
+            indexed_value("lost searchable")
+        } else {
+            format!("lost-{sequence}").into_bytes()
+        };
         assert!(matches!(
             client
-                .put(
-                    format!("after-backup-{sequence}").as_bytes(),
-                    format!("lost-{sequence}").as_bytes(),
-                    None,
-                )
+                .put(format!("after-backup-{sequence}").as_bytes(), &value, None,)
                 .await
                 .unwrap(),
             WriteReply::Applied { .. }
@@ -913,6 +1006,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         assert!(!fixture.dirs[i].exists());
         cli(&args, true);
         cli(&args, false);
+        assert!(!fixture.dirs[i].join("search").exists());
     }
     // The backup's old credentials must be rejected before restored peers start.
     let mut stale = spawn(
@@ -1101,6 +1195,11 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         "unexpected old-stream pending outcome: {different_error}"
     );
     for sequence in 2..=10 {
+        let expected = if sequence == 10 {
+            indexed_value("retained searchable")
+        } else {
+            format!("retained-{sequence}").into_bytes()
+        };
         assert_eq!(
             restored
                 .get(format!("before-backup-{sequence}").as_bytes())
@@ -1108,7 +1207,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
                 .unwrap()
                 .unwrap()
                 .1,
-            format!("retained-{sequence}").as_bytes()
+            expected
         );
     }
     for sequence in 11..=21 {
@@ -1121,6 +1220,17 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         );
     }
     assert!(restored.get(b"during-fence").await.unwrap().is_none());
+    let retained_search = restored
+        .search_active(&search_request("retained"))
+        .await
+        .unwrap();
+    assert_eq!(retained_search.total_hits, 1);
+    assert_eq!(retained_search.hits[0].key, b"before-backup-10");
+    let lost_search = restored
+        .search_active(&search_request("lost"))
+        .await
+        .unwrap();
+    assert_eq!(lost_search.total_hits, 0);
     assert!(matches!(
         restored.put(b"after-restore", b"new", None).await.unwrap(),
         WriteReply::Applied { .. }

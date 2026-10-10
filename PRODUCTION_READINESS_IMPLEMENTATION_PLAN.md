@@ -481,6 +481,12 @@ new epoch can write. This drill exposed a metrics counter with nine slots for
 ten client reply outcomes; recording an epoch mismatch panicked a gateway task
 and made the client time out. The counter and its exported label now include the
 epoch-mismatch outcome, with a focused regression test.
+The same process drill now creates a populated search index before export and
+adds a second indexed document after the backup point. It confirms source index
+files are absent from the package and restored directories, then verifies a
+strict search after recovery finds the retained document and excludes the lost
+document. Maintenance recovery acknowledgement and release complete only after
+the restored active generation has rebuilt a valid checkpoint.
 
 The live drill also interrupts fence installation by restarting a missing
 participant while the operation is `Preparing`, changes meta leadership while
