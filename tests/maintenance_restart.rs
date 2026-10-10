@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dal::api::ops::{ClientReply, ClientRequest};
-use dal::config::{NodeConfig, Timeouts};
+use dal::config::{NodeConfig, RaftTuning, Timeouts};
 use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
 use dal::meta::state_machine::MetaApplyResult;
 use dal::runtime::node::Node;
@@ -312,7 +312,8 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
                 .into_iter()
                 .filter(|&voter| voter != data_leader)
                 .collect::<Vec<_>>();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now()
+                + Duration::from_millis(RaftTuning::durable_tcp().election_timeout_max * 2);
             loop {
                 if other_voters.iter().any(|&voter| {
                     nodes[(voter - 1) as usize]
