@@ -38,6 +38,9 @@ fn usage() -> &'static str {
        index-drop    --auth <operator.json> --cluster <init.json> --name <name> [--seed <addr>]\n\
        status      --auth <operator.json> --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n\
        maintenance-status --auth <operator.json> --cluster <init.json> [--seed <addr>]   print maintenance progress\n\
+       maintenance-begin --auth <operator.json> --cluster <init.json> --operation <hex> [--seed <addr>]   install a new maintenance fence\n\
+       maintenance-quiesce --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   commit the drain barrier\n\
+       maintenance-verify --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   begin recovery verification\n\
        maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n"
 }
 
@@ -183,6 +186,45 @@ fn main() -> ExitCode {
                 eprintln!(
                     "maintenance-release: --auth, --cluster, --operation, and --generation required"
                 );
+                ExitCode::FAILURE
+            }
+        },
+        "maintenance-begin" => match (
+            flag(rest, "--auth"),
+            flag(rest, "--cluster"),
+            flag(rest, "--operation"),
+        ) {
+            (Some(auth), Some(cluster), Some(operation)) => maintenance_transition(
+                "maintenance-begin",
+                auth,
+                cluster,
+                operation,
+                None,
+                flag(rest, "--seed"),
+            ),
+            _ => {
+                eprintln!("maintenance-begin: --auth, --cluster, and --operation required");
+                ExitCode::FAILURE
+            }
+        },
+        "maintenance-quiesce" | "maintenance-verify" => match (
+            flag(rest, "--auth"),
+            flag(rest, "--cluster"),
+            flag(rest, "--operation"),
+            flag(rest, "--generation"),
+        ) {
+            (Some(auth), Some(cluster), Some(operation), Some(generation)) => {
+                maintenance_transition(
+                    command,
+                    auth,
+                    cluster,
+                    operation,
+                    Some(generation),
+                    flag(rest, "--seed"),
+                )
+            }
+            _ => {
+                eprintln!("{command}: --auth, --cluster, --operation, and --generation required");
                 ExitCode::FAILURE
             }
         },
@@ -865,6 +907,85 @@ fn maintenance_release(
                 code
             }
         }
+    })
+}
+
+fn maintenance_transition(
+    command: &str,
+    auth: &str,
+    cluster: &str,
+    operation: &str,
+    generation: Option<&str>,
+    seed: Option<&str>,
+) -> ExitCode {
+    let Some(operation_id) = operation
+        .strip_prefix("0x")
+        .and_then(|hex| u128::from_str_radix(hex, 16).ok())
+        .filter(|value| *value != 0)
+    else {
+        eprintln!("{command}: --operation must be a nonzero 0x-prefixed hex ID");
+        return ExitCode::FAILURE;
+    };
+    let generation = match generation {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => {
+                eprintln!("{command}: --generation must be a positive integer");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(desc) => desc,
+        Err(error) => {
+            eprintln!("{command}: cluster: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let curve = match load_cli_curve(auth, &desc) {
+        Ok(curve) => curve,
+        Err(error) => {
+            eprintln!("{command}: security: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = seed.map(str::to_string);
+    let command_name = command.to_string();
+    with_runtime(async move {
+        let result = match generation {
+            None => {
+                admin::maintenance_begin_secure(
+                    zmq::Context::new(),
+                    &desc,
+                    operation_id,
+                    seed.as_deref(),
+                    curve,
+                )
+                .await
+            }
+            Some(generation) => {
+                admin::maintenance_stage_secure(
+                    zmq::Context::new(),
+                    &desc,
+                    operation_id,
+                    generation,
+                    command_name == "maintenance-verify",
+                    seed.as_deref(),
+                    curve,
+                )
+                .await
+            }
+        };
+        let ambiguous = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !matches!(error, dal::error::Error::Config(_)));
+        let code = report(&command_name, result);
+        if ambiguous {
+            eprintln!("Check maintenance-status before retrying with the same operation ID.");
+        }
+        code
     })
 }
 

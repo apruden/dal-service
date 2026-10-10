@@ -122,6 +122,12 @@ pub enum MsgType {
     MaintenanceRecoveryAck = 27,
     /// Operator-control: release only after current recovery and heartbeat proofs.
     MaintenanceRelease = 28,
+    /// Operator-control: install the next maintenance fence from live meta state.
+    MaintenanceBegin = 29,
+    /// Operator-control: commit the participant acknowledgement barrier.
+    MaintenanceQuiesce = 30,
+    /// Operator-control: begin fresh recovery verification after capture.
+    MaintenanceVerify = 31,
 }
 
 impl MsgType {
@@ -156,6 +162,9 @@ impl MsgType {
             26 => MsgType::MaintenanceStatus,
             27 => MsgType::MaintenanceRecoveryAck,
             28 => MsgType::MaintenanceRelease,
+            29 => MsgType::MaintenanceBegin,
+            30 => MsgType::MaintenanceQuiesce,
+            31 => MsgType::MaintenanceVerify,
             _ => return None,
         })
     }
@@ -201,7 +210,10 @@ impl MsgType {
             MsgType::MaintenanceQuery | MsgType::MaintenanceStatus => 64 * KIB,
             MsgType::MaintenanceAck
             | MsgType::MaintenanceRecoveryAck
-            | MsgType::MaintenanceRelease => 4 * KIB,
+            | MsgType::MaintenanceRelease
+            | MsgType::MaintenanceBegin
+            | MsgType::MaintenanceQuiesce
+            | MsgType::MaintenanceVerify => 4 * KIB,
         }
     }
 
@@ -256,6 +268,9 @@ impl MsgType {
                 | MsgType::MaintenanceStatus
                 | MsgType::MaintenanceRecoveryAck
                 | MsgType::MaintenanceRelease
+                | MsgType::MaintenanceBegin
+                | MsgType::MaintenanceQuiesce
+                | MsgType::MaintenanceVerify
         )
     }
 }

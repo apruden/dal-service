@@ -56,6 +56,13 @@ pub struct MaintenanceReleaseBody {
     pub generation: u64,
 }
 
+/// The leader derives the generation and complete participant inventory from
+/// ReadIndex-confirmed meta state; an operator supplies only a retryable ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceBeginBody {
+    pub operation_id: u128,
+}
+
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
 pub type AppendReply = Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;

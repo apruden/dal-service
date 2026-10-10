@@ -25,10 +25,10 @@ use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::{
     AbortPlanBody, BecomeLearnerBody, BootstrapStatusBody, BootstrapStatusReply,
     DirectoryQueryReply, HeartbeatBody, JoinBody, LeadershipTransferReply, LearnerReply, LeaveBody,
-    MaintenanceAckBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody, MaintenanceReleaseBody,
-    ObservationBody, PlacementQueryBody, PlacementQueryReply, RecoveryFenceReply,
-    RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody, SearchIndexStatusReply,
-    SubmitReply,
+    MaintenanceAckBody, MaintenanceBeginBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody,
+    MaintenanceReleaseBody, ObservationBody, PlacementQueryBody, PlacementQueryReply,
+    RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody,
+    SearchIndexStatusReply, SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
@@ -172,6 +172,9 @@ impl RootDispatch {
                 self.serve_maintenance_recovery_ack(req, &context).await
             }
             MsgType::MaintenanceRelease => self.serve_maintenance_release(req).await,
+            MsgType::MaintenanceBegin => self.serve_maintenance_begin(req).await,
+            MsgType::MaintenanceQuiesce => self.serve_maintenance_stage(req, false).await,
+            MsgType::MaintenanceVerify => self.serve_maintenance_stage(req, true).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -795,6 +798,94 @@ impl RootDispatch {
         self.reply(&req, codec::encode(&reply))
     }
 
+    async fn serve_maintenance_begin(&self, req: Envelope) -> Envelope {
+        let respond = |reply: SubmitReply| self.reply(&req, codec::encode(&reply));
+        let Ok(body) = codec::decode::<MaintenanceBeginBody>(&req.payload) else {
+            return respond(SubmitReply::Error("malformed".into()));
+        };
+        if body.operation_id == 0 {
+            return respond(SubmitReply::Error(
+                "maintenance operation ID is required".into(),
+            ));
+        }
+        let Some(meta) = self.meta() else {
+            return respond(SubmitReply::Error(
+                "node does not run the meta group".into(),
+            ));
+        };
+        let previous = match meta.read_maintenance().await {
+            Ok(crate::meta::node::MetaRead::Value(record)) => record,
+            Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
+                return respond(SubmitReply::NotLeader { leader });
+            }
+            Err(error) => return respond(SubmitReply::Error(error.to_string())),
+        };
+        let generation = match previous {
+            Some(ref record) if record.operation_id == body.operation_id => record.generation,
+            Some(ref record) if record.stage != crate::types::MaintenanceStage::Released => {
+                return respond(SubmitReply::Error(
+                    "another maintenance operation is active".into(),
+                ));
+            }
+            Some(ref record) => match record.generation.checked_add(1) {
+                Some(generation) => generation,
+                None => {
+                    return respond(SubmitReply::Error(
+                        "maintenance generation exhausted".into(),
+                    ));
+                }
+            },
+            None => 1,
+        };
+        let directory = match meta.read_directory().await {
+            Ok(crate::meta::node::MetaRead::Value(directory)) => directory,
+            Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
+                return respond(SubmitReply::NotLeader { leader });
+            }
+            Err(error) => return respond(SubmitReply::Error(error.to_string())),
+        };
+        let mut participants: Vec<_> = directory
+            .into_iter()
+            .filter(|entry| entry.state == NodeState::Active)
+            .map(|entry| entry.node_id)
+            .collect();
+        participants.sort_unstable();
+        participants.dedup();
+        self.submit(
+            &req,
+            MetaCommand::BeginMaintenance {
+                operation_id: body.operation_id,
+                generation,
+                participants,
+            },
+        )
+        .await
+    }
+
+    async fn serve_maintenance_stage(&self, req: Envelope, verify: bool) -> Envelope {
+        let respond = |reply: SubmitReply| self.reply(&req, codec::encode(&reply));
+        let Ok(body) = codec::decode::<MaintenanceReleaseBody>(&req.payload) else {
+            return respond(SubmitReply::Error("malformed".into()));
+        };
+        if body.operation_id == 0 || body.generation == 0 {
+            return respond(SubmitReply::Error(
+                "maintenance identity is required".into(),
+            ));
+        }
+        let command = if verify {
+            MetaCommand::EnterMaintenanceVerification {
+                operation_id: body.operation_id,
+                generation: body.generation,
+            }
+        } else {
+            MetaCommand::QuiesceMaintenance {
+                operation_id: body.operation_id,
+                generation: body.generation,
+            }
+        };
+        self.submit(&req, command).await
+    }
+
     async fn serve_maintenance_ack(
         &self,
         req: Envelope,
@@ -1077,9 +1168,11 @@ impl Server for RootDispatch {
                     | MsgType::LeaveRequest
                     | MsgType::AbortPlanRequest
                     | MsgType::SearchIndexAdmin => Permission::Operator,
-                    MsgType::MaintenanceStatus | MsgType::MaintenanceRelease => {
-                        Permission::Operator
-                    }
+                    MsgType::MaintenanceStatus
+                    | MsgType::MaintenanceRelease
+                    | MsgType::MaintenanceBegin
+                    | MsgType::MaintenanceQuiesce
+                    | MsgType::MaintenanceVerify => Permission::Operator,
                     _ => Permission::PeerRpc,
                 };
                 let authorized = context
@@ -1097,6 +1190,9 @@ impl Server for RootDispatch {
                             | MsgType::SearchIndexAdmin
                             | MsgType::MaintenanceStatus
                             | MsgType::MaintenanceRelease
+                            | MsgType::MaintenanceBegin
+                            | MsgType::MaintenanceQuiesce
+                            | MsgType::MaintenanceVerify
                     ) {
                         self.reply(
                             &request,
@@ -1117,6 +1213,9 @@ impl Server for RootDispatch {
                     | MsgType::AbortPlanRequest
                     | MsgType::SearchIndexAdmin
                     | MsgType::MaintenanceRelease
+                    | MsgType::MaintenanceBegin
+                    | MsgType::MaintenanceQuiesce
+                    | MsgType::MaintenanceVerify
             ) {
                 tracing::info!(
                     principal = principal.as_deref().unwrap_or("unknown"),

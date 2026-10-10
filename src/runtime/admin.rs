@@ -23,8 +23,8 @@ use crate::transport::Transport;
 use crate::transport::codec::{Envelope, Lane, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
-    AbortPlanBody, JoinBody, LeaveBody, MaintenanceQueryReply, MaintenanceReleaseBody,
-    SearchIndexAdminBody, SubmitReply,
+    AbortPlanBody, JoinBody, LeaveBody, MaintenanceBeginBody, MaintenanceQueryReply,
+    MaintenanceReleaseBody, SearchIndexAdminBody, SubmitReply,
 };
 use crate::transport::security::CurveClientConfig;
 use crate::types::{ClusterId, GroupId, MaintenanceRecord, NodeId};
@@ -359,6 +359,67 @@ pub async fn maintenance_release_secure(
         desc.cluster_id,
         &targets,
         MsgType::MaintenanceRelease,
+        codec::encode(&MaintenanceReleaseBody {
+            operation_id,
+            generation,
+        }),
+    )
+    .await
+}
+
+/// Begin a new operation, or retry the same operation after an ambiguous reply.
+/// The meta leader chooses the next generation and all Active participants.
+pub async fn maintenance_begin_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    operation_id: u128,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    if operation_id == 0 {
+        return Err(Error::Config("maintenance operation ID is required".into()));
+    }
+    let transport = secure_transport(ctx, curve, seed)?;
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    submit(
+        &transport,
+        desc.cluster_id,
+        &targets,
+        MsgType::MaintenanceBegin,
+        codec::encode(&MaintenanceBeginBody { operation_id }),
+    )
+    .await
+}
+
+/// Commit the acknowledgement barrier or enter recovery verification for one
+/// exact operation. The replicated state machine enforces the stage order.
+pub async fn maintenance_stage_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    operation_id: u128,
+    generation: u64,
+    verify: bool,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<MetaApplyResult> {
+    if operation_id == 0 || generation == 0 {
+        return Err(Error::Config("maintenance identity is required".into()));
+    }
+    let transport = secure_transport(ctx, curve, seed)?;
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    submit(
+        &transport,
+        desc.cluster_id,
+        &targets,
+        if verify {
+            MsgType::MaintenanceVerify
+        } else {
+            MsgType::MaintenanceQuiesce
+        },
         codec::encode(&MaintenanceReleaseBody {
             operation_id,
             generation,
