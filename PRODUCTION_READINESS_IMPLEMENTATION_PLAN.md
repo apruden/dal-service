@@ -447,9 +447,14 @@ policy that excludes the backed-up credentials. Recovery acknowledgement waits
 for active local search generations to have valid checkpoints, and an operator
 can inspect retained client sequence outcomes under maintenance.
 
-The implementation is compile-checked. The Phase 5 completion gate below still
-requires an exported-artifact restore drill and the listed failure and recovery
-tests before Phase 5 can be declared verified.
+The offline exported-artifact drill in `tests/backup_restore.rs` verifies CLI
+package inspection, catalog publication, restore initialization, dry-run and
+restore, retained data and sequence state, epoch rejection, and trust exclusion.
+A second drill exercises the secure three-process maintenance, backup, complete
+loss, and restored-cluster release path. It requires a CURVE-enabled libzmq;
+the current vendored libzmq reports CURVE unavailable, so that drill has not
+run here. The remaining failure and recovery checks below still need evidence
+before Phase 5 can be declared verified.
 
 ### Maintenance protocol
 

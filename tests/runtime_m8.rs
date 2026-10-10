@@ -471,7 +471,9 @@ async fn become_learner_requires_a_live_plan() {
             .await
             .unwrap(),
     );
-    node.bootstrap().await.unwrap();
+    // No meta voters are running in this isolated rejection case. Bootstrap
+    // correctly waits for an authoritative maintenance view, so exercise the
+    // learner RPC while this node is still closed instead.
     settle();
     assert!(!node.hosts_partition(0), "node 4 should host nothing yet");
 
