@@ -423,7 +423,7 @@ async fn abort_driver_rolls_back_a_plan_whose_target_dies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn become_learner_requires_a_live_plan() {
+async fn unreachable_meta_never_admits_a_learner() {
     let _slot = RUNTIME_TEST_SLOTS.acquire().await.unwrap();
     use dal::transport::codec::{Envelope, MsgType};
     use dal::transport::raft_wire::{BecomeLearnerBody, LearnerReply};
@@ -465,7 +465,7 @@ async fn become_learner_requires_a_live_plan() {
         timeouts: Timeouts::default(),
     };
 
-    // Without a live, linearly-read plan an arbitrary admission must be refused.
+    // Without a reachable authoritative meta view an arbitrary admission must be refused.
     let node = Arc::new(
         Node::start_insecure_for_tests(ctx.clone(), cfg, desc)
             .await

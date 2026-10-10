@@ -451,10 +451,15 @@ The offline exported-artifact drill in `tests/backup_restore.rs` verifies CLI
 package inspection, catalog publication, restore initialization, dry-run and
 restore, retained data and sequence state, epoch rejection, and trust exclusion.
 A second drill exercises the secure three-process maintenance, backup, complete
-loss, and restored-cluster release path. It requires a CURVE-enabled libzmq;
-the current vendored libzmq reports CURVE unavailable, so that drill has not
-run here. The remaining failure and recovery checks below still need evidence
-before Phase 5 can be declared verified.
+loss, and restored-cluster release path. It passed with the system's CURVE-enabled
+libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
+positions, rejection of an incomplete assembly and tampered package, old-policy
+startup refusal, restored maintenance fencing, explicit verification and release,
+old-epoch rejection, and retained data after complete loss. The default vendored
+libzmq reports CURVE unavailable, so this drill skips in the default build; run
+it with a CURVE-enabled libzmq and `DAL_REQUIRE_CURVE_TESTS=1` when changing this
+path. The remaining failure and recovery checks below still need evidence before
+Phase 5 can be declared verified.
 
 ### Maintenance protocol
 

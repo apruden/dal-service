@@ -152,11 +152,13 @@ async fn wait_for<F: Fn(&serde_json::Value) -> bool>(
     predicate: F,
 ) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_status = None;
     loop {
         if let Some(value) = status(address).await {
             if predicate(&value) {
                 return value;
             }
+            last_status = Some(value);
         }
         for process in processes.iter_mut() {
             if let Some(exit) = process.child.try_wait().unwrap() {
@@ -168,7 +170,68 @@ async fn wait_for<F: Fn(&serde_json::Value) -> bool>(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for cluster state"
+            "timed out waiting for cluster state at {address}: {last_status:?}; logs: {:?}",
+            processes
+                .iter()
+                .map(|process| {
+                    std::fs::read_to_string(&process.log)
+                        .unwrap_or_default()
+                        .lines()
+                        .rev()
+                        .take(8)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_until_ready(address: &str, processes: &mut [Process]) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if ready(address).await {
+            return;
+        }
+        for process in processes.iter_mut() {
+            if let Some(exit) = process.child.try_wait().unwrap() {
+                panic!(
+                    "node exited ({exit}): {}",
+                    std::fs::read_to_string(&process.log).unwrap_or_default()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node did not become ready at {address}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_meta_leader(addresses: &[String], processes: &mut [Process]) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        for address in addresses {
+            if status(address)
+                .await
+                .is_some_and(|value| value["meta"]["is_leader"] == true)
+            {
+                return;
+            }
+        }
+        for process in processes.iter_mut() {
+            if let Some(exit) = process.child.try_wait().unwrap() {
+                panic!(
+                    "node exited before meta election ({exit}): {}",
+                    process.log.display()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restored meta quorum did not elect a leader"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -250,7 +313,8 @@ impl Fixture {
         principals.push(serde_json::json!({
             "user_id": "app:recovery",
             "curve_public_key": zmq::z85_encode(&app.public_key).unwrap(),
-            "permissions": ["client_read", "client_write"]
+            "permissions": ["client_read", "client_write"],
+            "client_ids": ["0x50", "0x60", "0x61"]
         }));
         principals.push(serde_json::json!({
             "user_id": "ops:recovery",
@@ -385,7 +449,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     let old_curve = fixture.security(1);
     let mut nodes = fixture.start();
     for address in &fixture.http {
-        wait_for(address, &mut nodes, |value| value["ready"] == true).await;
+        wait_until_ready(address, &mut nodes).await;
     }
     let client = Client::new(
         CID,
@@ -418,13 +482,19 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         true,
     );
     let quiesced = wait_for(&fixture.http[0], &mut nodes, |value| {
-        value["maintenance"]["stage"] == "Quiesced"
+        value["maintenance"]["stage"] == "quiesced"
     })
     .await;
     let generation = quiesced["maintenance"]["generation"]
         .as_u64()
         .unwrap()
         .to_string();
+    for address in &fixture.http[1..] {
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+    }
     for address in &fixture.http {
         assert!(!ready(address).await);
     }
@@ -581,7 +651,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     let new_curve = fixture.security(2);
     let mut nodes = fixture.start();
     let quiesced = wait_for(&fixture.http[0], &mut nodes, |value| {
-        value["maintenance"]["stage"] == "Quiesced"
+        value["maintenance"]["stage"] == "quiesced"
     })
     .await;
     assert_eq!(
@@ -591,9 +661,16 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
             .to_string(),
         generation
     );
+    for address in &fixture.http[1..] {
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+    }
     for address in &fixture.http {
         assert!(!ready(address).await);
     }
+    wait_for_meta_leader(&fixture.http, &mut nodes).await;
     cli(
         &[
             "maintenance-verify",
@@ -609,7 +686,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         true,
     );
     wait_for(&fixture.http[0], &mut nodes, |value| {
-        value["maintenance"]["stage"] == "Verifying"
+        value["maintenance"]["stage"] == "verifying"
             && value["maintenance"]["recovered"]
                 .as_array()
                 .is_some_and(|nodes| nodes.len() == 3)
@@ -635,7 +712,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         true,
     );
     for address in &fixture.http {
-        wait_for(address, &mut nodes, |value| value["ready"] == true).await;
+        wait_until_ready(address, &mut nodes).await;
     }
     let transport = ZmqTransport::new_curve(
         zmq::Context::new(),
@@ -671,7 +748,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
     use dal::meta::bootstrap::{BootstrapDescriptor, DirEntry};
     use dal::meta::state_machine::{MetaApplyResult, MetaStateMachine};
     use dal::partition::{ApplyResult, DataStateMachine, RejectReason};
-    use dal::storage::Storage;
+    use dal::storage::{StateMutation, Storage};
     use dal::types::{
         ClusterConfig, DataOp, DataRequest, GroupId, HashSpec, LogId, MaintenanceRecord,
         MetaCommand, PROTOCOL_VERSION,
@@ -771,6 +848,28 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             10,
         )
         .unwrap();
+        // The running Raft adapter writes this record. The direct state-machine
+        // setup above does not, so install its equivalent before offline export.
+        for (group, index) in [
+            (GroupId::Meta, commands.len() as u64),
+            (GroupId::Data(0), 10),
+        ] {
+            let applied = openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+            let record: (
+                Option<openraft::LogId<u64>>,
+                openraft::StoredMembership<u64, openraft::BasicNode>,
+            ) = (Some(applied), openraft::StoredMembership::default());
+            storage
+                .apply_state(
+                    group,
+                    &[StateMutation::Put {
+                        key: dal::keyspace::raft_applied_key(),
+                        value: dal::codec::encode(&record),
+                    }],
+                    LogId::new(1, index),
+                )
+                .unwrap();
+        }
         let fence: MaintenanceRecord = storage
             .get_state_record(GroupId::Meta, &dal::keyspace::meta_maintenance_key())
             .unwrap()
@@ -918,7 +1017,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         assert!(!source.exists());
         cli(&args, true);
         cli(&args, false);
-        let storage = Storage::open(source).unwrap();
+        let storage = Storage::open_checked(source, CID, *id).unwrap();
         assert_eq!(storage.local_recovery_epoch().unwrap(), plan.recovery_epoch);
         assert_eq!(
             storage.recovery_epoch(GroupId::Meta).unwrap(),

@@ -1525,6 +1525,16 @@ impl Storage {
         self.get_state_record(group, &keyspace::last_applied_key())
     }
 
+    /// The durable applied position from the running Raft state machine.
+    /// Offline backup must use this record, not the legacy direct-apply key.
+    pub fn raft_applied_position(&self, group: GroupId) -> Result<Option<LogId>> {
+        let Some(bytes) = self.raft_applied(group)? else {
+            return Ok(None);
+        };
+        let (applied, _membership): RaftApplied = codec::decode(&bytes)?;
+        Ok(applied.map(|id| LogId::new(id.leader_id.term, id.index)))
+    }
+
     /// Full key/value dump of a group's state CF, for snapshot building (M3).
     pub fn scan_state(&self, group: GroupId) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let cf = self.state_cf(group)?;

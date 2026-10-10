@@ -405,8 +405,8 @@ pub fn export_node(
                 )));
             }
             let applied = storage
-                .last_applied(group)?
-                .ok_or_else(|| Error::Config(format!("{group:?} has no applied position")))?;
+                .raft_applied_position(group)?
+                .ok_or_else(|| Error::Config(format!("{group:?} has no Raft applied position")))?;
             positions.push(GroupPosition { group, applied });
         }
     }
