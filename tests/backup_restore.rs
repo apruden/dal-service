@@ -501,6 +501,8 @@ impl Fixture {
         for path in &self.configs {
             let mut config: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            config["timeouts"]["suspect_ms"].as_u64().unwrap();
+            config["timeouts"]["down_ms"].as_u64().unwrap();
             config["timeouts"]["suspect_ms"] = serde_json::json!(suspect_ms);
             config["timeouts"]["down_ms"] = serde_json::json!(down_ms);
             std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -1080,7 +1082,7 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
         ),
     );
     wait_for(&fixture.http[stopped_index], &mut nodes, |value| {
-        value["maintenance"]["stage"] == "quiesced"
+        value["maintenance"]["stage"] == "quiesced" && value["directory"] == frozen_directory
     })
     .await;
     assert!(!ready(&fixture.http[stopped_index]).await);
