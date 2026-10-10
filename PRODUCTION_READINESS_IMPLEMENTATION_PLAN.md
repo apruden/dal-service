@@ -479,7 +479,8 @@ dependency's vendored build disabled CURVE; this drill requires CURVE and runs
 in the normal test build. The Phase 5 gate run on 2026-10-10 passed all 29 tests
 in `backup_restore`, `maintenance_restart`, `meta_group_m5`, and `meta_m5`.
 The focused restore-copy `ENOSPC` test and restore-space boundary test also
-passed.
+passed. The [captured test run](docs/evidence/phase5-2026-10-10.md) records the
+commands, output, and fixture scope.
 
 The live drill now writes sequences 1–10 before export, resumes and releases
 the original cluster, acknowledges sequences 11–20, and commits sequence 21
@@ -684,6 +685,12 @@ and recovery record of the package it is given.
   Raft recovery, and index counts before reopening ingress.
   Preserve the restored maintenance fence until an authenticated operator
   explicitly releases it after verification.
+
+Capacity-scale recovery-time qualification from the archived production
+profile is outside this repository's service implementation scope under
+`AGENTS.md`. The Phase 5 fixture verifies the recovered point and recovery
+safety on a small dataset; its test duration does not establish a 50 GiB
+recovery-time target.
 
 ### Client streams after disaster recovery
 

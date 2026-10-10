@@ -1,0 +1,63 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running tests/backup_restore.rs (target/debug/deps/backup_restore-ef59c06d4b509846)
+
+running 3 tests
+test committed_reply_lost_before_maintenance_replays_after_release ... ok
+test full_cli_backup_restore_remains_fenced_until_verified ... ok
+test offline_artifacts_survive_cli_verification_and_restore ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.80s
+
+     Running tests/maintenance_restart.rs (target/debug/deps/maintenance_restart-d46cb81907242689)
+
+running 1 test
+test data_leader_and_routing_only_restart_stay_fenced_through_verification ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.49s
+
+     Running tests/meta_group_m5.rs (target/debug/deps/meta_group_m5-aba7ad469c259afa)
+
+running 7 tests
+test bootstrap_init_and_linearizable_read ... ok
+test commands_replicate_and_converge ... ok
+test concurrent_move_and_maintenance_begin_follow_log_order ... ok
+test concurrent_search_activation_and_maintenance_begin_follow_log_order ... ok
+test follower_restarts_from_log ... ok
+test leader_failover_preserves_committed_meta ... ok
+test queued_search_and_move_proposals_stay_behind_committed_maintenance ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.93s
+
+     Running tests/meta_m5.rs (target/debug/deps/meta_m5-0acdd1063913a19f)
+
+running 18 tests
+test abort_only_clears_an_aborting_plan_rolled_back ... ok
+test abort_report_with_target_finalizes_a_completed_move ... ok
+test cluster_init_is_immutable_but_idempotent ... ok
+test commands_before_init_are_rejected ... ok
+test create_plan_rejects_bad_targets ... ok
+test create_plan_requires_single_voter_change ... ok
+test explicit_registration_revives_a_down_node_at_the_same_addresses ... ok
+test finalize_commits_target_voters ... ok
+test finalize_rejects_mismatched_observation ... ok
+test init_validates_config_and_meta_voters ... ok
+test maintenance_waits_for_inflight_move_and_search_build ... ok
+test meta_membership_change_rules ... ok
+test meta_removal_cannot_drop_below_three ... ok
+test meta_replacement_is_not_blocked_by_data_replication_factor ... ok
+test queued_search_and_move_commands_cannot_cross_maintenance_fence ... ok
+test registration_rejects_addresses_owned_by_another_node ... ok
+test seed_placement_rules ... ok
+test set_node_state_guards_incarnation ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/dal-36548a6266add9b9)
+
+running 2 tests
+test backup::restore_space_tests::disk_full_during_restore_copy_removes_partial_stage_and_allows_retry ... ok
+test backup::restore_space_tests::restore_space_admission_rejects_shortfall_and_overflow ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 250 filtered out; finished in 0.00s
+
