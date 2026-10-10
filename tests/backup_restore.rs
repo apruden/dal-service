@@ -416,6 +416,9 @@ impl Fixture {
                     "curve_secret_key_file": secret,
                     "server_key_pins": pins
                 },
+                // Keep the crashed participant Active long enough for the
+                // authenticated begin command to install the fence. Raft
+                // election and maintenance convergence do not wait for Down.
                 "timeouts": {
                     "suspect_ms": 20000, "down_ms": 40000,
                     "request_ms": 500, "shutdown_ms": 10000
@@ -592,6 +595,9 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     );
     wait_for(&fixture.http[old_leader], &mut nodes, |value| {
         value["maintenance"]["stage"] == "quiesced"
+            && value["maintenance"]["acknowledged"]
+                .as_array()
+                .is_some_and(|acks| acks.len() == 3)
     })
     .await;
     assert!(!ready(&fixture.http[old_leader]).await);
