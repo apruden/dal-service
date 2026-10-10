@@ -842,19 +842,25 @@ fn maintenance_release(
     };
     let seed = seed.map(str::to_string);
     with_runtime(async move {
-        report(
-            "maintenance-release",
-            admin::maintenance_release_secure(
-                zmq::Context::new(),
-                &desc,
-                operation_id,
-                generation,
-                seed.as_deref(),
-                curve,
-                Duration::from_secs(wait_seconds),
-            )
-            .await,
+        match admin::maintenance_release_secure(
+            zmq::Context::new(),
+            &desc,
+            operation_id,
+            generation,
+            seed.as_deref(),
+            curve,
+            Duration::from_secs(wait_seconds),
         )
+        .await
+        {
+            Ok(outcome) => report("maintenance-release", Ok(outcome)),
+            Err(error) => {
+                eprintln!(
+                    "maintenance-release: {error}; outcome may be pending; check maintenance-status before retrying"
+                );
+                ExitCode::FAILURE
+            }
+        }
     })
 }
 

@@ -347,10 +347,12 @@ pub async fn maintenance_release_secure(
             "maintenance release identity and timeout are required".into(),
         ));
     }
-    let transport = secure_transport_with_timeout(ctx, curve, seed, timeout)?;
+    let discovery = secure_transport(ctx.clone(), curve.clone(), seed)?;
     let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
-        .discover_live(&transport, desc.cluster_id)
+        .discover_live(&discovery, desc.cluster_id)
         .await;
+    drop(discovery);
+    let transport = secure_transport_with_timeout(ctx, curve, seed, timeout)?;
     submit(
         &transport,
         desc.cluster_id,

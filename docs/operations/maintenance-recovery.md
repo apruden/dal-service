@@ -44,8 +44,10 @@ force-release command.
    ```
 
    The current meta leader waits for a new heartbeat from each recorded
-   process, checks its own trust policy, and submits the release. A failed or
-   timed-out request leaves maintenance fenced. Re-read status before retrying.
+   process, checks its own trust policy, and submits the release. A rejected
+   request leaves maintenance fenced. A client timeout has an unknown outcome:
+   the release may have committed before its reply was lost. Re-read status
+   before retrying the same operation ID and generation.
    Increase `--wait-seconds` if the configured heartbeat interval makes the
    default 60-second client timeout too short.
 
