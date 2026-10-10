@@ -28,6 +28,7 @@ fn sm_storage() -> (
 
 fn put(client: u128, seq: u64, key: &[u8], val: &[u8], iv: Option<IfVersion>) -> DataRequest {
     DataRequest {
+        recovery_epoch: 0,
         client_id: client,
         sequence: seq,
         op: DataOp::Put {
@@ -40,6 +41,7 @@ fn put(client: u128, seq: u64, key: &[u8], val: &[u8], iv: Option<IfVersion>) ->
 
 fn del(client: u128, seq: u64, key: &[u8], iv: Option<IfVersion>) -> DataRequest {
     DataRequest {
+        recovery_epoch: 0,
         client_id: client,
         sequence: seq,
         op: DataOp::Delete {

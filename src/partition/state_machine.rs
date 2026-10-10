@@ -176,6 +176,8 @@ impl ApplyResult {
 /// Why a committed entry was rejected without mutating state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
+    /// A queued or replayed command belongs to a history before disaster restore.
+    RecoveryEpochMismatch { expected: u128, got: u128 },
     /// `sequence > highest + 1`: a hole in the client's stream.
     SequenceGap { expected: Sequence, got: Sequence },
     /// `sequence < highest`, or `== highest` with no stored result.
@@ -256,6 +258,18 @@ impl DataStateMachine {
         req: &DataRequest,
         log_index: u64,
     ) -> Result<(ApplyResult, Vec<StateMutation>)> {
+        let recovery_epoch: u128 = reader
+            .read_state(self.group, &keyspace::recovery_epoch_key())?
+            .unwrap_or(0);
+        if req.recovery_epoch != recovery_epoch {
+            return Ok((
+                ApplyResult::Rejected(RejectReason::RecoveryEpochMismatch {
+                    expected: recovery_epoch,
+                    got: req.recovery_epoch,
+                }),
+                vec![],
+            ));
+        }
         // Structural validation of commands the API layer should have caught.
         if let DataOp::Put { value, .. } = &req.op
             && value.len() > crate::types::MAX_VALUE_BYTES

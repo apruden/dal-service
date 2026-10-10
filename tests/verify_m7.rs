@@ -176,6 +176,7 @@ async fn client(s: Arc<Shared>, client_id: u128, mut rng: Rng) {
                 },
             };
             let req = DataRequest {
+                recovery_epoch: 0,
                 client_id,
                 sequence: seq,
                 op,

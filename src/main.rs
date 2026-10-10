@@ -43,8 +43,10 @@ fn usage() -> &'static str {
        maintenance-verify --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   begin recovery verification\n\
        maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n\
        backup-export-node --cluster <init.json> --node <id> --data-dir <dir> --backup <hex> --operation <hex> --generation <n> --destination <dir>   export a stopped node\n\
-       backup-assemble --cluster <init.json> --artifact <dir> [--artifact <dir> ...] --destination <dir>   assemble a full package\n\
-       backup-verify --package <dir>   verify every package artifact\n"
+       backup-assemble --auth <operator.json> --cluster <init.json> --artifact <dir> [--artifact <dir> ...] --destination <dir>   assemble a full package\n\
+       backup-verify --package <dir>   verify every package artifact\n\
+       restore-init --package <dir> --fencing-evidence <json> --record <json>   create a shared recovery epoch\n\
+       restore --package <dir> --record <json> --node <id> --destination <dir> [--dry-run]   restore one fenced node\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -261,6 +263,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "restore-init" => restore_init(rest),
+        "restore" => restore(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             eprint!("{}", usage());
@@ -340,9 +344,12 @@ fn backup_export_node(args: &[String]) -> ExitCode {
 }
 
 fn backup_assemble(args: &[String]) -> ExitCode {
-    let (Some(cluster), Some(destination)) = (flag(args, "--cluster"), flag(args, "--destination"))
-    else {
-        eprintln!("backup-assemble: --cluster and --destination required");
+    let (Some(auth), Some(cluster), Some(destination)) = (
+        flag(args, "--auth"),
+        flag(args, "--cluster"),
+        flag(args, "--destination"),
+    ) else {
+        eprintln!("backup-assemble: --auth, --cluster, and --destination required");
         return ExitCode::FAILURE;
     };
     let artifacts: Vec<PathBuf> = flags(args, "--artifact")
@@ -353,8 +360,19 @@ fn backup_assemble(args: &[String]) -> ExitCode {
         eprintln!("backup-assemble: at least one --artifact required");
         return ExitCode::FAILURE;
     }
-    let result = load_init_descriptor(Path::new(cluster))
-        .and_then(|desc| dal::backup::assemble(&desc, &artifacts, Path::new(destination)));
+    let result = load_init_descriptor(Path::new(cluster)).and_then(|desc| {
+        let security = load_operator_security(Path::new(auth), desc.cluster_id)?;
+        security.validate_descriptor(&desc)?;
+        dal::backup::assemble(
+            &desc,
+            &artifacts,
+            Path::new(destination),
+            dal::backup::TrustSnapshot {
+                generation: security.policy.generation(),
+                digest: security.policy.fingerprint(),
+            },
+        )
+    });
     match result {
         Ok(package) => {
             println!(
@@ -366,6 +384,83 @@ fn backup_assemble(args: &[String]) -> ExitCode {
         }
         Err(error) => {
             eprintln!("backup-assemble: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn restore_init(args: &[String]) -> ExitCode {
+    let (Some(package), Some(evidence), Some(record)) = (
+        flag(args, "--package"),
+        flag(args, "--fencing-evidence"),
+        flag(args, "--record"),
+    ) else {
+        eprintln!("restore-init: --package, --fencing-evidence, and --record required");
+        return ExitCode::FAILURE;
+    };
+    match dal::backup::initialize_restore(
+        Path::new(package),
+        Path::new(evidence),
+        Path::new(record),
+    ) {
+        Ok(plan) => {
+            println!(
+                "restore-init: recovery epoch {:#x} for backup {:#x}",
+                plan.recovery_epoch, plan.backup_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("restore-init: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn restore(args: &[String]) -> ExitCode {
+    let (Some(package), Some(record), Some(node), Some(destination)) = (
+        flag(args, "--package"),
+        flag(args, "--record"),
+        flag(args, "--node"),
+        flag(args, "--destination"),
+    ) else {
+        eprintln!("restore: --package, --record, --node, and --destination required");
+        return ExitCode::FAILURE;
+    };
+    let Ok(node) = node.parse::<u64>() else {
+        eprintln!("restore: --node must be a numeric node ID");
+        return ExitCode::FAILURE;
+    };
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let result = if dry_run {
+        dal::backup::restore_inventory(
+            Path::new(package),
+            Path::new(record),
+            node,
+            Path::new(destination),
+        )
+    } else {
+        dal::backup::restore_node(
+            Path::new(package),
+            Path::new(record),
+            node,
+            Path::new(destination),
+        )
+    };
+    match result {
+        Ok(inventory) => {
+            println!(
+                "restore: {} node {}, {} files, {} bytes, epoch {:#x}",
+                if dry_run { "inventory for" } else { "staged" },
+                inventory.node_id,
+                inventory.files,
+                inventory.bytes,
+                inventory.recovery_epoch,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("restore: {error}");
             ExitCode::FAILURE
         }
     }
@@ -941,6 +1036,13 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                             .collect::<String>())
                         .unwrap_or_else(|| "pending".into())
                 );
+                println!(
+                    "verification recovery epoch: {}",
+                    record
+                        .verification_recovery_epoch
+                        .map(|epoch| format!("{epoch:#x}"))
+                        .unwrap_or_else(|| "pending".into())
+                );
                 if record.stage == dal::types::MaintenanceStage::Verifying {
                     if !pending.is_empty() {
                         println!(
@@ -1180,6 +1282,7 @@ fn report(command: &str, result: dal::error::Result<MetaApplyResult>) -> ExitCod
 
 fn print_routing(info: &RoutingInfo) {
     println!("cluster_id: {:#x}", info.cluster_id);
+    println!("recovery_epoch: {:#x}", info.recovery_epoch);
     println!("partitions (p): {}", info.p);
     println!("nodes:");
     for e in &info.directory {

@@ -122,6 +122,7 @@ pub struct MaintenanceStatus {
     pub recovery_processes: Vec<(NodeId, u64)>,
     pub recovery_policy_digests: Vec<(NodeId, String)>,
     pub verification_policy_digest: Option<String>,
+    pub verification_recovery_epoch: Option<String>,
     pub stage: crate::types::MaintenanceStage,
 }
 
@@ -147,6 +148,9 @@ impl From<crate::types::MaintenanceRecord> for MaintenanceStatus {
             verification_policy_digest: record
                 .verification_policy_digest
                 .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect()),
+            verification_recovery_epoch: record
+                .verification_recovery_epoch
+                .map(|epoch| format!("{epoch:#x}")),
             stage: record.stage,
         }
     }

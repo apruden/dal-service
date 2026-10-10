@@ -601,6 +601,48 @@ impl Storage {
         Ok(())
     }
 
+    pub fn recovery_epoch(&self, group: GroupId) -> Result<u128> {
+        Ok(self
+            .get_state_record(group, &keyspace::recovery_epoch_key())?
+            .unwrap_or(0))
+    }
+
+    pub fn local_recovery_epoch(&self) -> Result<u128> {
+        Ok(self
+            .get_local(&keyspace::local_recovery_epoch_key())?
+            .unwrap_or(0))
+    }
+
+    /// Offline restore step under exclusive RocksDB ownership. Install the
+    /// epoch in every hosted state machine and invalidate all derived search
+    /// checkpoints in one sync-durable batch. The package omits Tantivy files.
+    pub fn install_restored_epoch_offline(&self, epoch: u128, partition_count: u16) -> Result<()> {
+        if epoch == 0 || epoch == self.local_recovery_epoch()? {
+            return Err(Error::Config(
+                "restore requires a new nonzero recovery epoch".into(),
+            ));
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(keyspace::local_recovery_epoch_key(), codec::encode(&epoch));
+        for group in std::iter::once(GroupId::Meta).chain((0..partition_count).map(GroupId::Data)) {
+            if !self.group_exists(group) {
+                continue;
+            }
+            let cf = self.state_cf(group)?;
+            batch.put_cf(&cf, keyspace::recovery_epoch_key(), codec::encode(&epoch));
+            if matches!(group, GroupId::Data(_)) {
+                for (key, mut consumer) in self.search_consumers(group)? {
+                    consumer.checkpoint = None;
+                    consumer.retention_floor = None;
+                    consumer.needs_rebuild = true;
+                    batch.put(key, codec::encode(&consumer));
+                }
+            }
+        }
+        self.db.write_opt(batch, &sync_write())?;
+        Ok(())
+    }
+
     // ---- identity ----------------------------------------------------------
 
     pub fn identity(&self) -> Result<Option<Identity>> {

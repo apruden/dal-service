@@ -481,6 +481,7 @@ mod tests {
         Entry {
             log_id: log_id(index),
             payload: EntryPayload::Normal(DataRequest {
+                recovery_epoch: 0,
                 client_id: 7,
                 sequence,
                 op,

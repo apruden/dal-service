@@ -117,6 +117,11 @@ pub struct Redirect {
 /// A reply to a `ClientOp`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientReply {
+    /// Old streams must stop replaying and reconcile with the recovery point.
+    RecoveryEpochMismatch {
+        expected: u128,
+        got: u128,
+    },
     Mutation(WriteReply),
     Value(Option<(Version, Vec<u8>)>),
     Redirect(Redirect),
@@ -166,6 +171,9 @@ impl ClientReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingInfo {
     pub cluster_id: ClusterId,
+    /// Zero before disaster restore; a restored cluster advertises its new
+    /// stream epoch so applications can explicitly start fresh identities.
+    pub recovery_epoch: u128,
     pub p: u16,
     pub hash_spec: HashSpec,
     pub directory: Vec<NodeDirectoryEntry>,
@@ -354,6 +362,7 @@ mod tests {
     fn valid_routing() -> RoutingInfo {
         RoutingInfo {
             cluster_id: 7,
+            recovery_epoch: 0,
             p: 1,
             hash_spec: HashSpec::CANONICAL,
             directory: vec![NodeDirectoryEntry {

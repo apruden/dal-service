@@ -105,6 +105,7 @@ struct PendingMutation {
 pub struct Client<T: Transport> {
     cluster_id: ClusterId,
     client_id: ClientId,
+    recovery_epoch: u128,
     seeds: Vec<String>,
     transport: T,
     cache: Mutex<Cache>,
@@ -143,6 +144,7 @@ impl<T: Transport> Client<T> {
         Client {
             cluster_id,
             client_id,
+            recovery_epoch: 0,
             seeds,
             transport,
             cache: Mutex::new(Cache::default()),
@@ -151,6 +153,21 @@ impl<T: Transport> Client<T> {
             request_id: AtomicU64::new(1),
             rotation: AtomicU64::new(0),
         }
+    }
+
+    /// Start a fresh client identity after disaster restore using the epoch
+    /// reported by cluster status. An old client must never update its epoch
+    /// in place, because its unresolved mutations belong to the prior history.
+    pub fn new_for_recovery_epoch(
+        cluster_id: ClusterId,
+        client_id: ClientId,
+        recovery_epoch: u128,
+        seeds: Vec<String>,
+        transport: T,
+    ) -> Client<T> {
+        let mut client = Self::new(cluster_id, client_id, seeds, transport);
+        client.recovery_epoch = recovery_epoch;
+        client
     }
 
     fn next_request_id(&self) -> u64 {
@@ -466,6 +483,7 @@ impl<T: Transport> Client<T> {
         let _stream = lock.lock().await;
         let sequence = self.next_mutation_sequence(partition, &op)?;
         let request = ClientRequest::Mutate(DataRequest {
+            recovery_epoch: self.recovery_epoch,
             client_id: self.client_id,
             sequence,
             op: op.clone(),
@@ -493,6 +511,17 @@ impl<T: Transport> Client<T> {
             .await?;
 
         match reply {
+            ClientReply::RecoveryEpochMismatch { expected, got } => Err(Error::Raft(format!(
+                "recovery epoch mismatch: stream {got:#x}, cluster {expected:#x}; reconcile pending mutations and start a new client identity"
+            ))),
+            ClientReply::Mutation(WriteReply::Rejected(
+                crate::partition::state_machine::RejectReason::RecoveryEpochMismatch {
+                    expected,
+                    got,
+                },
+            )) => Err(Error::Raft(format!(
+                "recovery epoch mismatch: stream {got:#x}, cluster {expected:#x}; reconcile pending mutations and start a new client identity"
+            ))),
             // A rejection is decided *before* the state machine reaches
             // `decide`, so it writes no sequence record and leaves `highest`
             // exactly where it was. Advancing the stream here would leave the
@@ -1046,6 +1075,7 @@ mod tests {
         let client = Client::new(1, 1, Vec::new(), InProcess::new());
         client.cache.lock().unwrap().routing = Some(RoutingInfo {
             cluster_id: 1,
+            recovery_epoch: 0,
             p: 1,
             hash_spec: HashSpec::CANONICAL,
             directory: Vec::new(),
@@ -1187,6 +1217,7 @@ mod tests {
     fn routing(voters: Vec<NodeId>, voters_log_id: LogId) -> RoutingInfo {
         RoutingInfo {
             cluster_id: 1,
+            recovery_epoch: 0,
             p: 1,
             hash_spec: HashSpec::CANONICAL,
             directory: voters
@@ -1379,6 +1410,7 @@ mod tests {
 
         let fresh = RoutingInfo {
             cluster_id: 1,
+            recovery_epoch: 0,
             p: 1,
             hash_spec: HashSpec::CANONICAL,
             directory: vec![
@@ -1421,6 +1453,7 @@ mod tests {
         let client = Client::new(1, 9, vec!["seed".into()], transport);
         client.cache.lock().unwrap().routing = Some(RoutingInfo {
             cluster_id: 1,
+            recovery_epoch: 0,
             p: 1,
             hash_spec: HashSpec::CANONICAL,
             directory: vec![NodeDirectoryEntry {

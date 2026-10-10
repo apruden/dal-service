@@ -203,6 +203,7 @@ async fn bootstrap(c: &mut Cluster) {
 
 fn put(seq: u64, key: &[u8], val: &[u8]) -> DataRequest {
     DataRequest {
+        recovery_epoch: 0,
         client_id: 0xC0,
         sequence: seq,
         op: DataOp::Put {

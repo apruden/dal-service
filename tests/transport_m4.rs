@@ -114,6 +114,7 @@ fn ctrl_addr(node: u64) -> String {
 fn base_routing() -> RoutingInfo {
     RoutingInfo {
         cluster_id: CID,
+        recovery_epoch: 0,
         p: 1,
         hash_spec: HashSpec::CANONICAL,
         directory: VOTERS
@@ -316,6 +317,7 @@ async fn value_limit_accepts_one_mib_and_rejects_oversize_before_proposal() {
     // The in-process carrier skips framing; check that both boundary-sized
     // wire bodies fit the tightened client envelope too.
     let request = ClientRequest::Mutate(DataRequest {
+        recovery_epoch: 0,
         client_id: 0xC5,
         sequence: 1,
         op: DataOp::Put {
@@ -345,6 +347,7 @@ async fn value_limit_accepts_one_mib_and_rejects_oversize_before_proposal() {
         .unwrap();
     let before = node.applied_index();
     let request = DataRequest {
+        recovery_epoch: 0,
         client_id: 0xC6,
         sequence: 1,
         op: DataOp::Put {
@@ -493,6 +496,7 @@ async fn mispartitioned_key_is_rejected() {
     // before any node lookup, so an empty partition map is fine here.
     let routing = Arc::new(StaticRouting(Mutex::new(RoutingInfo {
         cluster_id: CID,
+        recovery_epoch: 0,
         p: 4,
         hash_spec: HashSpec::CANONICAL,
         directory: Vec::new(),
@@ -550,6 +554,7 @@ async fn peer_control_on_client_path_is_rejected() {
 async fn decoded_values_cannot_consume_client_frame_headroom() {
     let routing = Arc::new(StaticRouting(Mutex::new(RoutingInfo {
         cluster_id: CID,
+        recovery_epoch: 0,
         p: 1,
         hash_spec: HashSpec::CANONICAL,
         directory: Vec::new(),
@@ -565,6 +570,7 @@ async fn decoded_values_cannot_consume_client_frame_headroom() {
     let switch: InProcess<ClientGateway> = InProcess::new();
     switch.register("gw", Arc::new(gw));
     let request = ClientRequest::Mutate(DataRequest {
+        recovery_epoch: 0,
         client_id: 1,
         sequence: 1,
         op: DataOp::Put {
@@ -604,6 +610,7 @@ async fn retry_across_leader_change_applies_exactly_once() {
 
     // A fixed idempotency key we will replay verbatim after failover.
     let req = ClientRequest::Mutate(DataRequest {
+        recovery_epoch: 0,
         client_id: 0xC4,
         sequence: 1,
         op: DataOp::Put {

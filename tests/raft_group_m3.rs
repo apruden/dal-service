@@ -64,6 +64,7 @@ impl Harness {
 
 fn put(client: u128, seq: u64, key: &[u8], val: &[u8]) -> DataRequest {
     DataRequest {
+        recovery_epoch: 0,
         client_id: client,
         sequence: seq,
         op: DataOp::Put {

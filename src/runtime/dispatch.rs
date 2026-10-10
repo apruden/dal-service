@@ -940,6 +940,7 @@ impl RootDispatch {
                 process_incarnation: body.process_incarnation,
                 topology_digest: body.topology_digest,
                 policy_digest: body.policy_digest,
+                recovery_epoch: body.recovery_epoch,
             },
         )
         .await
@@ -1266,6 +1267,7 @@ mod tests {
             Box::pin(async {
                 Some(RoutingInfo {
                     cluster_id: 7,
+                    recovery_epoch: 0,
                     p: 1,
                     hash_spec: HashSpec::CANONICAL,
                     directory: Vec::new(),

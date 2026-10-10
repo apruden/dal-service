@@ -86,6 +86,7 @@ pub(crate) fn record_client_reply(reply: &ClientReply) {
         ClientReply::Error(_) => 6,
         ClientReply::Unavailable(_) => 7,
         ClientReply::Denied(_) => 8,
+        ClientReply::RecoveryEpochMismatch { .. } => 9,
     };
     CLIENT_REPLY_OUTCOMES[outcome].fetch_add(1, Ordering::Relaxed);
 }

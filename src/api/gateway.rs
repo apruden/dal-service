@@ -264,6 +264,18 @@ impl ClientGateway {
 
         match req {
             ClientRequest::Mutate(data) => {
+                match node.recovery_epoch() {
+                    Ok(expected) if expected != data.recovery_epoch => {
+                        return ClientReply::RecoveryEpochMismatch {
+                            expected,
+                            got: data.recovery_epoch,
+                        };
+                    }
+                    Err(error) => {
+                        return ClientReply::Error(format!("recovery epoch unavailable: {error}"));
+                    }
+                    Ok(_) => {}
+                }
                 if self
                     .maintenance
                     .as_ref()
@@ -778,6 +790,7 @@ mod tests {
             GroupId::Data(0),
             1,
             codec::encode(&ClientRequest::Mutate(crate::types::DataRequest {
+                recovery_epoch: 0,
                 client_id: 2,
                 sequence: 1,
                 op: crate::types::DataOp::Put {

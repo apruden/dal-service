@@ -46,6 +46,7 @@ pub struct MaintenanceRecoveryAckBody {
     pub process_incarnation: u64,
     pub topology_digest: [u8; 32],
     pub policy_digest: [u8; 32],
+    pub recovery_epoch: u128,
 }
 
 /// Operator request to release a verified maintenance operation. Heartbeat
@@ -338,6 +339,7 @@ mod tests {
                 Entry {
                     log_id: log_id(3, 11),
                     payload: EntryPayload::Normal(DataRequest {
+                        recovery_epoch: 0,
                         client_id: 1,
                         sequence: 1,
                         op: DataOp::Put {
@@ -370,6 +372,7 @@ mod tests {
             entries: vec![Entry {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(DataRequest {
+                    recovery_epoch: 0,
                     client_id: 1,
                     sequence: 1,
                     op: DataOp::Put {

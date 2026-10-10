@@ -92,6 +92,7 @@ struct LiveRouting {
 impl LiveRouting {
     fn from_descriptor(
         desc: &BootstrapDescriptor,
+        recovery_epoch: u128,
         meta: MetaHandle,
         control: ZmqTransport,
         addrs: AddrBook,
@@ -125,6 +126,7 @@ impl LiveRouting {
         LiveRouting {
             fallback: RoutingInfo {
                 cluster_id: desc.cluster_id,
+                recovery_epoch,
                 p: desc.config.p,
                 hash_spec: desc.config.hash_spec,
                 directory,
@@ -160,6 +162,7 @@ impl LiveRouting {
         }
         Some(RoutingInfo {
             cluster_id: self.fallback.cluster_id,
+            recovery_epoch: self.fallback.recovery_epoch,
             p: self.fallback.p,
             hash_spec: self.fallback.hash_spec,
             directory,
@@ -449,6 +452,18 @@ impl Node {
             cfg.cluster_id,
             cfg.node_id,
         )?);
+        crate::backup::validate_restored_node(
+            &storage,
+            cfg.cluster_id,
+            cfg.node_id,
+            desc.config.p,
+            secure
+                .as_ref()
+                .map(|security| crate::backup::TrustSnapshot {
+                    generation: security.policy.generation(),
+                    digest: security.policy.fingerprint(),
+                }),
+        )?;
         let make_transport = |lane| -> Result<ZmqTransport> {
             match &secure {
                 Some(security) => Ok(ZmqTransport::new_curve(
@@ -577,6 +592,7 @@ impl Node {
 
         let routing: Arc<dyn RoutingSource> = Arc::new(LiveRouting::from_descriptor(
             &desc,
+            storage.local_recovery_epoch()?,
             meta_handle.clone(),
             control.clone(),
             addrs.clone(),
@@ -2365,7 +2381,7 @@ async fn maintenance_reconciler(
                 .binary_search(&registration.node_id)
                 .is_ok()
                 && !current_process_recovered
-                && let Some(topology_digest) = local_recovery_topology_digest(
+                && let Some((topology_digest, recovery_epoch)) = local_recovery_topology_digest(
                     registration.node_id,
                     &record,
                     &meta,
@@ -2379,6 +2395,7 @@ async fn maintenance_reconciler(
                     process_incarnation,
                     topology_digest,
                     policy_digest,
+                    recovery_epoch,
                     &meta,
                     &preferred_meta_voters,
                     &control,
@@ -2441,11 +2458,12 @@ fn local_recovery_topology_digest(
     partitions: &PartitionMap,
     readiness: &RuntimeReadiness,
     storage: &Storage,
-) -> Option<[u8; 32]> {
+) -> Option<([u8; 32], u128)> {
     if !readiness.is_ready() || storage.require_healthy().is_err() {
         return None;
     }
     let mut groups = Vec::new();
+    let recovery_epoch = storage.local_recovery_epoch().ok()?;
     if let Some(local_meta) = { meta.read().unwrap().clone() } {
         let voters = local_meta.voters();
         if voters.contains(&node_id) {
@@ -2454,6 +2472,7 @@ fn local_recovery_topology_digest(
                 || local_record.operation_id != record.operation_id
                 || local_record.generation != record.generation
                 || local_record.stage != crate::types::MaintenanceStage::Verifying
+                || storage.recovery_epoch(GroupId::Meta).ok()? != recovery_epoch
             {
                 return None;
             }
@@ -2471,12 +2490,13 @@ fn local_recovery_topology_digest(
             || !materialized.recovery_ready
             || materialized.failed.is_some()
             || node.applied_index().is_none()
+            || storage.recovery_epoch(node.group()).ok()? != recovery_epoch
         {
             return None;
         }
         groups.push((node.group(), voters.into_iter().collect()));
     }
-    Some(maintenance_topology_digest(&groups))
+    Some((maintenance_topology_digest(&groups), recovery_epoch))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2522,6 +2542,7 @@ async fn acknowledge_runtime_recovery(
     process_incarnation: u64,
     topology_digest: [u8; 32],
     policy_digest: [u8; 32],
+    recovery_epoch: u128,
     meta: &MetaHandle,
     preferred_meta_voters: &[NodeId],
     control: &ZmqTransport,
@@ -2536,6 +2557,7 @@ async fn acknowledge_runtime_recovery(
         process_incarnation,
         topology_digest,
         policy_digest,
+        recovery_epoch,
     };
     let body = MaintenanceRecoveryAckBody {
         operation_id: record.operation_id,
@@ -2545,6 +2567,7 @@ async fn acknowledge_runtime_recovery(
         process_incarnation,
         topology_digest,
         policy_digest,
+        recovery_epoch,
     };
     submit_runtime_maintenance_command(
         registration,

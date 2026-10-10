@@ -298,6 +298,7 @@ impl MetaStateMachine {
                 process_incarnation,
                 topology_digest,
                 policy_digest,
+                recovery_epoch,
             } => self.acknowledge_maintenance_recovery(
                 s,
                 *operation_id,
@@ -307,6 +308,7 @@ impl MetaStateMachine {
                 *process_incarnation,
                 *topology_digest,
                 *policy_digest,
+                *recovery_epoch,
             ),
         }
     }
@@ -396,6 +398,7 @@ impl MetaStateMachine {
             recovery_processes: Vec::new(),
             recovery_policy_digests: Vec::new(),
             verification_policy_digest: None,
+            verification_recovery_epoch: None,
             stage: MaintenanceStage::Preparing,
         };
         Ok((
@@ -432,6 +435,9 @@ impl MetaStateMachine {
             {
                 if record.verification_policy_digest != Some(policy_digest) {
                     return Ok((reject(MetaReject::MaintenancePolicyMismatch), vec![]));
+                }
+                if record.verification_recovery_epoch != Some(s.recovery_epoch(GroupId::Meta)?) {
+                    return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
                 }
                 if record.recovery_processes != live_processes {
                     return Ok((reject(MetaReject::MaintenanceLivenessMismatch), vec![]));
@@ -550,6 +556,7 @@ impl MetaStateMachine {
         record.recovery_processes.clear();
         record.recovery_policy_digests.clear();
         record.verification_policy_digest = None;
+        record.verification_recovery_epoch = None;
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],
@@ -567,6 +574,7 @@ impl MetaStateMachine {
         process_incarnation: u64,
         topology_digest: [u8; 32],
         policy_digest: [u8; 32],
+        recovery_epoch: u128,
     ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
         let Some(mut record) = self.maintenance(s)? else {
             return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
@@ -600,6 +608,9 @@ impl MetaStateMachine {
                 invalid("maintenance trust-policy digest is required"),
                 vec![],
             ));
+        }
+        if recovery_epoch != s.recovery_epoch(GroupId::Meta)? {
+            return Ok((reject(MetaReject::MaintenanceMismatch), vec![]));
         }
         if let Ok(index) = record
             .recovery_processes
@@ -668,6 +679,8 @@ impl MetaStateMachine {
         } else {
             None
         };
+        record.verification_recovery_epoch =
+            (record.recovered == record.participants).then_some(recovery_epoch);
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_maintenance_key(), &record)],

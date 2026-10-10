@@ -23,6 +23,25 @@ const FORMAT: u32 = 1;
 const NODE_MANIFEST: &str = "node.json";
 const STORAGE_MARKER: &str = "DAL_FORMAT.json";
 
+fn canonical_parent(path: &Path) -> Result<PathBuf> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .map_err(Into::into)
+}
+
+fn ensure_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(Error::Config(format!(
+            "destination {} already exists",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDigest {
@@ -78,7 +97,49 @@ pub struct PackageManifest {
     pub generation: u64,
     pub positions: Vec<GroupPosition>,
     pub meta: MetaInventory,
+    pub trust_generation: u64,
+    pub trust_policy_digest: String,
     pub nodes: Vec<PackageNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustSnapshot {
+    pub generation: u64,
+    pub digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FencingEvidence {
+    pub cluster_id: String,
+    pub backup_id: String,
+    pub checked_by: String,
+    pub old_processes_stopped: bool,
+    pub automatic_restart_disabled: bool,
+    pub old_peer_and_client_routes_isolated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPlan {
+    pub format: u32,
+    pub cluster_id: u128,
+    pub backup_id: u128,
+    pub recovery_epoch: u128,
+    pub minimum_trust_generation: u64,
+    pub prior_trust_policy_digest: String,
+    pub package_manifest_sha256: String,
+    pub fencing_evidence_sha256: String,
+    pub nodes: Vec<NodeId>,
+    pub recovery_point: Vec<GroupPosition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreInventory {
+    pub node_id: NodeId,
+    pub files: usize,
+    pub bytes: u64,
+    pub recovery_epoch: u128,
 }
 
 fn sha256_file(path: &Path) -> Result<(u64, String)> {
@@ -217,16 +278,14 @@ pub fn export_node(
     generation: u64,
     destination: &Path,
 ) -> Result<NodeArtifact> {
-    if backup_id == 0 || operation_id == 0 || generation == 0 || destination.exists() {
+    if backup_id == 0 || operation_id == 0 || generation == 0 {
         return Err(Error::Config(
             "backup IDs must be nonzero and destination must be new".into(),
         ));
     }
+    ensure_absent(destination)?;
     let source = data_dir.canonicalize()?;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::Config("backup destination has no parent".into()))?
-        .canonicalize()?;
+    let parent = canonical_parent(destination)?;
     if parent.starts_with(&source) {
         return Err(Error::Config(
             "backup destination must be outside the node data directory".into(),
@@ -268,7 +327,7 @@ pub fn export_node(
     let stage = parent.join(format!(
         ".dal-backup-{backup_id:032x}-node-{node_id}.partial"
     ));
-    if stage.exists() {
+    if fs::symlink_metadata(&stage).is_ok() {
         return Err(Error::Config(format!(
             "partial backup already exists: {}",
             stage.display()
@@ -500,8 +559,14 @@ pub fn assemble(
     desc: &BootstrapDescriptor,
     source_artifacts: &[PathBuf],
     destination: &Path,
+    trust: TrustSnapshot,
 ) -> Result<PackageManifest> {
-    if destination.exists() {
+    if trust.generation == 0 || trust.digest == [0; 32] {
+        return Err(Error::Config(
+            "backup requires a current trust-policy snapshot".into(),
+        ));
+    }
+    if fs::symlink_metadata(destination).is_ok() {
         return Err(Error::Config(
             "backup package destination already exists".into(),
         ));
@@ -513,10 +578,7 @@ pub fn assemble(
     let (meta, positions) = validate_cluster_artifacts(desc, &artifacts)?;
     let backup_id = artifacts[0].backup_id;
     let fence = &artifacts[0].maintenance;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::Config("backup destination has no parent".into()))?
-        .canonicalize()?;
+    let parent = canonical_parent(destination)?;
     for source in source_artifacts {
         let source = source.canonicalize()?;
         if parent.starts_with(&source) {
@@ -526,7 +588,7 @@ pub fn assemble(
         }
     }
     let stage = parent.join(format!(".dal-package-{backup_id:032x}.partial"));
-    if stage.exists() {
+    if fs::symlink_metadata(&stage).is_ok() {
         return Err(Error::Config(
             "partial backup package already exists".into(),
         ));
@@ -555,6 +617,12 @@ pub fn assemble(
             generation: fence.generation,
             positions,
             meta,
+            trust_generation: trust.generation,
+            trust_policy_digest: trust
+                .digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
             nodes,
         };
         let bytes = serde_json::to_vec_pretty(&package).map_err(Error::codec)?;
@@ -585,7 +653,15 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
     }
     let package: PackageManifest =
         serde_json::from_slice(&fs::read(path.join("manifest.json"))?).map_err(Error::codec)?;
-    if package.format != FORMAT || package.backup_id == 0 {
+    if package.format != FORMAT
+        || package.backup_id == 0
+        || package.trust_generation == 0
+        || package.trust_policy_digest.len() != 64
+        || !package
+            .trust_policy_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err(Error::Config("unsupported backup package format".into()));
     }
     let mut expected = vec!["manifest.json".to_string()];
@@ -629,4 +705,285 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
         ));
     }
     Ok(package)
+}
+
+/// Create the one external recovery record shared by every restored node. The
+/// evidence is an explicit operator attestation of checks made outside DAL;
+/// this function validates its identity and records its digest, but cannot
+/// inspect the old deployment's network or process manager itself.
+pub fn initialize_restore(
+    package_path: &Path,
+    evidence_path: &Path,
+    plan_path: &Path,
+) -> Result<RecoveryPlan> {
+    let package = verify_package(package_path)?;
+    let evidence_bytes = fs::read(evidence_path)?;
+    let evidence: FencingEvidence =
+        serde_json::from_slice(&evidence_bytes).map_err(Error::codec)?;
+    if evidence.cluster_id != format!("{:#x}", package.descriptor.cluster_id)
+        || evidence.backup_id != format!("{:#x}", package.backup_id)
+        || evidence.checked_by.trim().is_empty()
+        || !evidence.old_processes_stopped
+        || !evidence.automatic_restart_disabled
+        || !evidence.old_peer_and_client_routes_isolated
+    {
+        return Err(Error::Config(
+            "old deployment fencing attestation is incomplete".into(),
+        ));
+    }
+    let mut random = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let recovery_epoch = u128::from_be_bytes(random);
+    if recovery_epoch == 0 {
+        return Err(Error::Config("generated an invalid recovery epoch".into()));
+    }
+    let plan = RecoveryPlan {
+        format: FORMAT,
+        cluster_id: package.descriptor.cluster_id,
+        backup_id: package.backup_id,
+        recovery_epoch,
+        minimum_trust_generation: package
+            .trust_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Config("trust generation exhausted".into()))?,
+        prior_trust_policy_digest: package.trust_policy_digest,
+        package_manifest_sha256: sha256_file(&package_path.join("manifest.json"))?.1,
+        fencing_evidence_sha256: format!("{:x}", Sha256::digest(&evidence_bytes)),
+        nodes: package.nodes.iter().map(|node| node.node_id).collect(),
+        recovery_point: package.positions,
+    };
+    let bytes = serde_json::to_vec_pretty(&plan).map_err(Error::codec)?;
+    let parent = canonical_parent(plan_path)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(plan_path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(plan)
+}
+
+fn checked_recovery_plan(
+    package_path: &Path,
+    plan_path: &Path,
+) -> Result<(PackageManifest, RecoveryPlan)> {
+    if !fs::symlink_metadata(plan_path)?.file_type().is_file() {
+        return Err(Error::Config("unsafe recovery record path".into()));
+    }
+    let package = verify_package(package_path)?;
+    let plan: RecoveryPlan = serde_json::from_slice(&fs::read(plan_path)?).map_err(Error::codec)?;
+    if plan.format != FORMAT
+        || plan.cluster_id != package.descriptor.cluster_id
+        || plan.backup_id != package.backup_id
+        || plan.recovery_epoch == 0
+        || plan.minimum_trust_generation
+            != package
+                .trust_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("trust generation exhausted".into()))?
+        || plan.prior_trust_policy_digest != package.trust_policy_digest
+        || plan.package_manifest_sha256 != sha256_file(&package_path.join("manifest.json"))?.1
+        || plan.nodes
+            != package
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>()
+        || plan.recovery_point != package.positions
+    {
+        return Err(Error::Config(
+            "recovery record does not match backup package".into(),
+        ));
+    }
+    Ok((package, plan))
+}
+
+#[cfg(unix)]
+fn available_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Config("invalid restore destination path".into()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// Validate all artifacts, package identity, capacity, and an empty target
+/// before a restore writes anything. A caller may display this inventory as a
+/// dry run, then invoke `restore_node` with the same recovery plan.
+pub fn restore_inventory(
+    package_path: &Path,
+    plan_path: &Path,
+    node_id: NodeId,
+    destination: &Path,
+) -> Result<RestoreInventory> {
+    let (package, plan) = checked_recovery_plan(package_path, plan_path)?;
+    let node = package
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .ok_or_else(|| Error::Config("node is absent from the recovery package".into()))?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(Error::Config("restore destination already exists".into()));
+    }
+    let parent = canonical_parent(destination)?;
+    if parent.starts_with(&package_path.canonicalize()?) {
+        return Err(Error::Config(
+            "restore destination cannot be inside the package".into(),
+        ));
+    }
+    let artifact = verify_node(&package_path.join(format!("node-{}", node.node_id)))?;
+    let bytes = artifact.files.iter().try_fold(0u64, |sum, file| {
+        sum.checked_add(file.bytes)
+            .ok_or_else(|| Error::Config("restore size overflow".into()))
+    })?;
+    #[cfg(unix)]
+    if available_bytes(&parent)? < bytes.saturating_add(bytes / 10) {
+        return Err(Error::Config(
+            "insufficient free space for restored database".into(),
+        ));
+    }
+    Ok(RestoreInventory {
+        node_id,
+        files: artifact.files.len(),
+        bytes,
+        recovery_epoch: plan.recovery_epoch,
+    })
+}
+
+/// Stage one node database from a verified package and publish it atomically.
+/// Search files are omitted; every restored consumer is marked for full rebuild.
+pub fn restore_node(
+    package_path: &Path,
+    plan_path: &Path,
+    node_id: NodeId,
+    destination: &Path,
+) -> Result<RestoreInventory> {
+    let inventory = restore_inventory(package_path, plan_path, node_id, destination)?;
+    let (package, plan) = checked_recovery_plan(package_path, plan_path)?;
+    let parent = canonical_parent(destination)?;
+    let stage = parent.join(format!(
+        ".dal-restore-{:032x}-node-{node_id}.partial",
+        plan.recovery_epoch
+    ));
+    if fs::symlink_metadata(&stage).is_ok() {
+        return Err(Error::Config(
+            "partial restore directory already exists".into(),
+        ));
+    }
+    let source = package_path.join(format!("node-{node_id}")).join("db");
+    let result = (|| {
+        copy_regular_tree(&source, &stage)?;
+        let expected = verify_node(&package_path.join(format!("node-{node_id}")))?;
+        let mut copied = regular_files(&stage)?
+            .iter()
+            .map(|file| relative_file_digest(&stage, file))
+            .collect::<Result<Vec<_>>>()?;
+        copied.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut expected_files = expected.files.clone();
+        for file in &mut expected_files {
+            file.path = file
+                .path
+                .strip_prefix("db/")
+                .ok_or_else(|| Error::Config("unsafe node artifact path".into()))?
+                .to_string();
+        }
+        expected_files.sort_by(|left, right| left.path.cmp(&right.path));
+        if copied != expected_files {
+            return Err(Error::Config(
+                "restored database copy failed checksum verification".into(),
+            ));
+        }
+        let storage = Storage::open(&stage)?;
+        let identity = storage
+            .identity()?
+            .ok_or_else(|| Error::Config("restored node identity missing".into()))?;
+        if identity.cluster_id != plan.cluster_id || identity.node_id != node_id {
+            return Err(Error::Config("restored node identity mismatch".into()));
+        }
+        let fence: MaintenanceRecord = storage
+            .get_local(&keyspace::maintenance_fence_key())?
+            .ok_or_else(|| Error::Config("restored maintenance fence missing".into()))?;
+        if fence.operation_id != package.operation_id
+            || fence.generation != package.generation
+            || fence.stage != MaintenanceStage::Quiesced
+        {
+            return Err(Error::Config("restored maintenance fence mismatch".into()));
+        }
+        storage.install_restored_epoch_offline(plan.recovery_epoch, package.descriptor.config.p)?;
+        drop(storage);
+        let mut marker = File::create(stage.join("DAL_RESTORE.json"))?;
+        marker.write_all(&serde_json::to_vec_pretty(&plan).map_err(Error::codec)?)?;
+        marker.sync_all()?;
+        File::open(&stage)?.sync_all()?;
+        fs::rename(&stage, destination)?;
+        File::open(&parent)?.sync_all()?;
+        Ok(inventory)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result
+}
+
+/// Refuse to start a restored database if its external recovery marker is
+/// absent, its epoch differs from any hosted state machine, or the installed
+/// trust policy has not advanced beyond the backup's policy snapshot.
+pub fn validate_restored_node(
+    storage: &Storage,
+    cluster_id: u128,
+    node_id: NodeId,
+    partition_count: u16,
+    trust: Option<TrustSnapshot>,
+) -> Result<()> {
+    let epoch = storage.local_recovery_epoch()?;
+    let marker_path = storage.path().join("DAL_RESTORE.json");
+    if epoch == 0 {
+        if fs::symlink_metadata(&marker_path).is_ok() {
+            return Err(Error::Config(
+                "restore marker exists without a recovery epoch".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if !fs::symlink_metadata(&marker_path)?.file_type().is_file() {
+        return Err(Error::Config("unsafe restore marker path".into()));
+    }
+    let plan: RecoveryPlan =
+        serde_json::from_slice(&fs::read(marker_path)?).map_err(Error::codec)?;
+    if plan.format != FORMAT
+        || plan.cluster_id != cluster_id
+        || !plan.nodes.contains(&node_id)
+        || plan.recovery_epoch != epoch
+    {
+        return Err(Error::Config(
+            "restored node marker identity or epoch mismatch".into(),
+        ));
+    }
+    for group in std::iter::once(GroupId::Meta).chain((0..partition_count).map(GroupId::Data)) {
+        if storage.group_exists(group) && storage.recovery_epoch(group)? != epoch {
+            return Err(Error::Config(format!(
+                "restored {group:?} recovery epoch mismatch"
+            )));
+        }
+    }
+    if let Some(trust) = trust {
+        let digest: String = trust
+            .digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if trust.generation < plan.minimum_trust_generation
+            || digest == plan.prior_trust_policy_digest
+        {
+            return Err(Error::Config(
+                "restored node requires a newer trust policy excluding old credentials".into(),
+            ));
+        }
+    }
+    Ok(())
 }

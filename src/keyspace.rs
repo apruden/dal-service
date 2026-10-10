@@ -46,6 +46,17 @@ pub fn raft_applied_key() -> Vec<u8> {
     vec![TAG_INTERNAL, b'R']
 }
 
+/// Disaster restore installs a new epoch into every hosted state CF. A normal
+/// cluster has no record and uses epoch zero.
+pub fn recovery_epoch_key() -> Vec<u8> {
+    vec![TAG_INTERNAL, b'E']
+}
+
+/// Node-local mirror for routing-only runtimes and startup diagnostics.
+pub fn local_recovery_epoch_key() -> Vec<u8> {
+    b"local/recovery_epoch".to_vec()
+}
+
 /// Encode a user key record key.
 pub fn user_key(key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(1 + key.len());

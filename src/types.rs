@@ -304,6 +304,9 @@ impl DataOp {
 /// data-group Raft log entry carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataRequest {
+    /// Zero for the original cluster history; each disaster restore installs
+    /// a new nonzero epoch. The epoch is part of the replicated command.
+    pub recovery_epoch: u128,
     pub client_id: ClientId,
     pub sequence: Sequence,
     pub op: DataOp,
@@ -515,6 +518,8 @@ pub struct MaintenanceRecord {
     pub recovery_policy_digests: Vec<(NodeId, [u8; 32])>,
     /// Common public trust-policy snapshot once all participants agree.
     pub verification_policy_digest: Option<[u8; 32]>,
+    /// Common epoch proved by every participant in this verification pass.
+    pub verification_recovery_epoch: Option<u128>,
     pub stage: MaintenanceStage,
 }
 
@@ -654,6 +659,7 @@ pub enum MetaCommand {
         process_incarnation: u64,
         topology_digest: [u8; 32],
         policy_digest: [u8; 32],
+        recovery_epoch: u128,
     },
 }
 
@@ -768,6 +774,7 @@ enum MetaCommandV1 {
         process_incarnation: u64,
         topology_digest: [u8; 32],
         policy_digest: [u8; 32],
+        recovery_epoch: u128,
     },
 }
 

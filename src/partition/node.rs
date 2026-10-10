@@ -231,6 +231,10 @@ impl PartitionNode {
         self.group
     }
 
+    pub fn recovery_epoch(&self) -> Result<u128> {
+        self.storage.recovery_epoch(self.group)
+    }
+
     pub fn raft(&self) -> &Raft {
         &self.raft
     }
@@ -816,6 +820,7 @@ mod tests {
 
     fn request(client_id: u128, sequence: u64, op: DataOp) -> DataRequest {
         DataRequest {
+            recovery_epoch: 0,
             client_id,
             sequence,
             op,

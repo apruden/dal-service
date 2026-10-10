@@ -254,6 +254,7 @@ async fn data_read(c: &Cluster, key: &[u8]) -> Option<Vec<u8>> {
 
 fn put(seq: u64, key: &[u8], val: &[u8]) -> DataRequest {
     DataRequest {
+        recovery_epoch: 0,
         client_id: 0xC0,
         sequence: seq,
         op: DataOp::Put {
