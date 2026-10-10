@@ -2,7 +2,7 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dal::api::ops::{ClientReply, ClientRequest};
@@ -21,17 +21,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CID: u128 = 0xDA1_5A7E;
 const OPERATION: u128 = 0xA51;
 const ALL: [u64; 7] = [1, 2, 3, 4, 5, 6, 7];
-static PEER_ADDRESSES: OnceLock<Vec<(String, String)>> = OnceLock::new();
-
-fn control(id: u64) -> String {
-    PEER_ADDRESSES.get().unwrap()[(id - 1) as usize].0.clone()
+struct PeerAddresses {
+    addresses: Vec<(String, String)>,
+    reservations: Vec<Option<TcpListener>>,
 }
 
-fn bulk(id: u64) -> String {
-    PEER_ADDRESSES.get().unwrap()[(id - 1) as usize].1.clone()
+impl PeerAddresses {
+    fn control(&self, id: u64) -> String {
+        self.addresses[(id - 1) as usize].0.clone()
+    }
+
+    fn bulk(&self, id: u64) -> String {
+        self.addresses[(id - 1) as usize].1.clone()
+    }
+
+    fn release(&mut self, id: u64) {
+        let index = (id - 1) as usize;
+        drop(self.reservations[index * 2].take());
+        drop(self.reservations[index * 2 + 1].take());
+    }
 }
 
-fn peer_addresses() -> Vec<Option<TcpListener>> {
+fn peer_addresses() -> PeerAddresses {
     // A DEALER connected to an inproc endpoint does not reconnect after its
     // ROUTER is rebound. TCP models the process restart exercised here.
     let listeners = (0..ALL.len() * 2)
@@ -46,8 +57,10 @@ fn peer_addresses() -> Vec<Option<TcpListener>> {
             )
         })
         .collect();
-    PEER_ADDRESSES.set(addresses).unwrap();
-    listeners.into_iter().map(Some).collect()
+    PeerAddresses {
+        addresses,
+        reservations: listeners.into_iter().map(Some).collect(),
+    }
 }
 
 fn http_addresses() -> (Vec<String>, Vec<Option<TcpListener>>) {
@@ -61,7 +74,7 @@ fn http_addresses() -> (Vec<String>, Vec<Option<TcpListener>>) {
     (addresses, listeners.into_iter().map(Some).collect())
 }
 
-fn descriptor() -> BootstrapDescriptor {
+fn descriptor(peers: &PeerAddresses) -> BootstrapDescriptor {
     BootstrapDescriptor {
         cluster_id: CID,
         config: ClusterConfig {
@@ -76,25 +89,25 @@ fn descriptor() -> BootstrapDescriptor {
             .iter()
             .map(|&id| DirEntry {
                 node_id: id,
-                control_addr: control(id),
-                bulk_addr: bulk(id),
+                control_addr: peers.control(id),
+                bulk_addr: peers.bulk(id),
             })
             .collect(),
         data_placements: vec![(0, vec![4, 5, 6])],
     }
 }
 
-fn config(id: u64, dir: PathBuf, http: &str) -> NodeConfig {
+fn config(id: u64, dir: PathBuf, http: &str, peers: &PeerAddresses) -> NodeConfig {
     NodeConfig {
         cluster_id: CID,
         node_id: id,
-        control_addr: control(id),
-        bulk_addr: bulk(id),
+        control_addr: peers.control(id),
+        bulk_addr: peers.bulk(id),
         http_addr: Some(http.into()),
         seeds: ALL
             .iter()
             .filter(|&&peer| peer != id)
-            .map(|&peer| control(peer))
+            .map(|&peer| peers.control(peer))
             .collect(),
         data_dir: dir,
         timeouts: Timeouts::default(),
@@ -167,13 +180,14 @@ async fn wait_ready(address: &str) {
 
 async fn submit(
     transport: &ZmqTransport,
+    peers: &PeerAddresses,
     leader: u64,
     kind: MsgType,
     body: Vec<u8>,
 ) -> SubmitReply {
     let reply = transport
         .call(
-            &control(leader),
+            &peers.control(leader),
             Envelope::new(CID, kind, GroupId::Meta, 1, body),
         )
         .await
@@ -181,7 +195,7 @@ async fn submit(
     dal::codec::decode(&reply.payload).unwrap()
 }
 
-async fn assert_fenced(transport: &ZmqTransport, id: u64) {
+async fn assert_fenced(transport: &ZmqTransport, peers: &PeerAddresses, id: u64) {
     let request = ClientRequest::Mutate(DataRequest {
         recovery_epoch: 0,
         client_id: 0x70,
@@ -194,7 +208,7 @@ async fn assert_fenced(transport: &ZmqTransport, id: u64) {
     });
     let reply = transport
         .call(
-            &control(id),
+            &peers.control(id),
             Envelope::new(
                 CID,
                 MsgType::ClientOp,
@@ -215,21 +229,20 @@ async fn assert_fenced(transport: &ZmqTransport, id: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_leader_and_routing_only_restart_stay_fenced_through_verification() {
     let ctx = zmq::Context::new();
-    let mut peer_reservations = peer_addresses();
-    let desc = descriptor();
+    let mut peers = peer_addresses();
+    let desc = descriptor(&peers);
     let dirs = (0..ALL.len())
         .map(|_| tempfile::tempdir().unwrap())
         .collect::<Vec<_>>();
     let (http, mut reservations) = http_addresses();
     let mut nodes = Vec::new();
     for (index, &id) in ALL.iter().enumerate() {
-        drop(peer_reservations[index * 2].take());
-        drop(peer_reservations[index * 2 + 1].take());
+        peers.release(id);
         drop(reservations[index].take());
         nodes.push(Some(Arc::new(
             Node::start_insecure_for_tests(
                 ctx.clone(),
-                config(id, dirs[index].path().to_path_buf(), &http[index]),
+                config(id, dirs[index].path().to_path_buf(), &http[index], &peers),
                 desc.clone(),
             )
             .await
@@ -259,6 +272,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
     assert_eq!(
         submit(
             &transport,
+            &peers,
             meta_leader,
             MsgType::MaintenanceBegin,
             dal::codec::encode(&MaintenanceBeginBody {
@@ -292,29 +306,36 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         // Each planned stop exceeds the configured Down timeout. A spare
         // Active node exists, but the maintenance fence must suppress failure
         // transitions and replacement moves throughout the stopped interval.
-        tokio::time::sleep(Duration::from_secs(17)).await;
+        tokio::time::sleep(Timeouts::default().down + Duration::from_secs(2)).await;
         if id == data_leader {
             let other_voters = [4u64, 5, 6]
                 .into_iter()
                 .filter(|&voter| voter != data_leader)
                 .collect::<Vec<_>>();
-            assert!(
-                other_voters.iter().any(|&voter| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if other_voters.iter().any(|&voter| {
                     nodes[(voter - 1) as usize]
                         .as_ref()
                         .unwrap()
                         .partition_leader(0)
                         == Some(voter)
-                }),
-                "surviving data quorum lost leadership: {:?}",
-                other_voters
-                    .iter()
-                    .map(|&voter| nodes[(voter - 1) as usize]
-                        .as_ref()
-                        .unwrap()
-                        .partition_leader(0))
-                    .collect::<Vec<_>>()
-            );
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "surviving data quorum lost leadership: {:?}",
+                    other_voters
+                        .iter()
+                        .map(|&voter| nodes[(voter - 1) as usize]
+                            .as_ref()
+                            .unwrap()
+                            .partition_leader(0))
+                        .collect::<Vec<_>>()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
         for meta in nodes.iter().take(3) {
             let meta = meta.as_ref().unwrap();
@@ -335,7 +356,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         let node = Arc::new(
             Node::start_insecure_for_tests(
                 ctx.clone(),
-                config(id, dirs[index].path().to_path_buf(), &http[index]),
+                config(id, dirs[index].path().to_path_buf(), &http[index], &peers),
                 desc.clone(),
             )
             .await
@@ -348,7 +369,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         })
         .await;
         assert!(!ready(&http[index]).await);
-        assert_fenced(&transport, id).await;
+        assert_fenced(&transport, &peers, id).await;
         assert_eq!(
             status(&http[0]).await.unwrap()["directory"],
             frozen_directory
@@ -359,6 +380,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
     assert_eq!(
         submit(
             &transport,
+            &peers,
             meta_leader,
             MsgType::MaintenanceVerify,
             dal::codec::encode(&MaintenanceReleaseBody {
@@ -403,7 +425,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         assert!(!ready(address).await);
     }
     for id in [data_leader, 7] {
-        assert_fenced(&transport, id).await;
+        assert_fenced(&transport, &peers, id).await;
     }
     for node in nodes.into_iter().flatten() {
         Arc::try_unwrap(node)
