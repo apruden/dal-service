@@ -606,23 +606,24 @@ to be exercised.
    configuration with secrets excluded; do not regenerate genesis from the
    current placement map.
    Reject incomplete packages and artifacts from different backup runs.
-6. Transfer the complete immutable package outside the cluster's failure domain
-   using the configured backup destination. Apply access control, encryption,
-   and authenticated manifest protection through established tooling. Verify
-   the uploaded objects before marking success; an on-disk checkpoint or hard
-   link on the source volume alone is not a disaster backup.
-7. Persist completion in the backup catalog. For a normal backup, restart through
-   the ordinary recovery gates, enter `Verifying`, and explicitly release
-   maintenance after validation. Start all peers independently of client
-   readiness. A failed
-   backup leaves a clear resumable or abortable maintenance state. Retention
-   cannot delete the last verified usable backup.
+6. Record the locally verified package in the backup catalog. This record proves
+   package integrity, not external disaster-backup transfer. For a normal backup,
+   restart through the ordinary recovery gates, enter `Verifying`, and
+   explicitly release maintenance after validation. Start all peers independently
+   of client readiness. A failed backup leaves a clear resumable or abortable
+   maintenance state. The service has no backup deletion or retention API;
+   external catalog/package retention must preserve the last verified usable
+   backup.
 
 A [RocksDB checkpoint](https://github.com/facebook/rocksdb/wiki/Checkpoints)
 captures one database. The cluster fence, inventory, manifest, and recovery
 verification above supply the additional DAL guarantees. Record per-group
 positions; the service does not otherwise offer a cross-partition transaction
 snapshot. This initial backup intentionally requires a write-maintenance window.
+Transfer of the published package outside the source failure domain is external
+to this service. External package storage owns access control, encryption, and
+authenticated transfer. The service verifies the identity, format, checksums,
+and recovery record of the package it is given.
 
 ### Restore procedure
 
@@ -630,16 +631,16 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
   Verify format support, all artifacts, checksums, free space, and destination
   identities before writing. Restore into fresh staged directories and refuse
   to overwrite a live or nonempty destination implicitly.
-- Verify out-of-band fencing of the old deployment before any restored node
-  connects: stop and disable its processes or isolate its peer and client
-  networks, and prevent automatic restart or old endpoint routing. Record the
-  checks and retain that isolation throughout recovery. Restore the documented
-  topology and same node identities into an isolated environment; provision new
-  server/node keys through a current trust generation that excludes old keys.
-  Confirm convergence on the remaining authorized nodes and clients. Key
-  rotation alone cannot prevent old servers from serving old clients. The normal
-  restart/admission and quorum recovery paths must succeed without weakening
-  amnesia or reclamation fences, while client readiness remains closed.
+- Require a recorded external fencing attestation before restore initialization.
+  Restore the documented topology and same node identities, and require a newer
+  trust generation that excludes old server/node keys. Confirm convergence on
+  authorized nodes and clients. The normal restart/admission and quorum recovery
+  paths must succeed without weakening amnesia or reclamation fences, while
+  client readiness remains closed. Process and network isolation of an old
+  deployment is external to this service and must continue through recovery.
+  The service cannot stop an old deployment from answering clients that retain
+  its old routes and credentials; the fencing attestation records the external
+  assertion that this path remains isolated.
 - The first supported procedure preserves the recorded node/address topology,
   using equivalent network configuration if hosts are replaced. Changing node
   identities, rewriting cluster IDs, or importing into a new topology requires
@@ -686,7 +687,7 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
 
 ### Tests and completion gate
 
-Test interrupted export/upload/publication, truncated and tampered artifacts,
+Test interrupted export/publication, truncated and tampered artifacts,
 mixed backup IDs, unrecognized format markers, absent meta or partition artifacts,
 disk exhaustion, and an active destination. Restore a populated cluster after
 removing every original test data directory. Verify all writes acknowledged
@@ -712,9 +713,8 @@ The test must exercise the CLI and exported artifacts, not an in-memory shortcut
   sequence 21 and its pending retry by epoch, without applying either. Exercise
   explicit application reconciliation and fresh streams; inspect retained
   outcomes for pre-backup writes through the authorized recovery path.
-- Keep an old deployment running inside an isolated test network. Verify restore
-  cannot proceed without fencing evidence, old endpoints remain unreachable to
-  production clients, and old credentials cannot join the restored deployment.
+- Verify restore initialization rejects missing fencing evidence, and restored
+  nodes reject credentials retained in the backup trust generation.
 - Cold-start every voter with the maintenance fence installed. Start peers
   without waiting for client readiness, form quorums, and verify that client
   readiness stays closed until recovery checks and explicit release succeed.
