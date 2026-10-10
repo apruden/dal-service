@@ -495,6 +495,14 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     for address in &fixture.http {
         assert!(!ready(address).await);
     }
+    let fenced_write = client
+        .put(b"during-fence", b"must-not-commit", None)
+        .await
+        .unwrap_err();
+    assert!(
+        fenced_write.to_string().contains("write unavailable"),
+        "unexpected maintenance write outcome: {fenced_write}"
+    );
     for node in &mut nodes {
         stop(node).await;
     }
@@ -730,6 +738,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         restored.get(b"before-backup").await.unwrap().unwrap().1,
         b"retained"
     );
+    assert!(restored.get(b"during-fence").await.unwrap().is_none());
     assert!(matches!(
         restored.put(b"after-restore", b"new", None).await.unwrap(),
         WriteReply::Applied { .. }

@@ -457,8 +457,9 @@ loss, and restored-cluster release path. It passed with the system's CURVE-enabl
 libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
 positions, rejection of an incomplete assembly and tampered package, old-policy
 startup refusal, restored maintenance fencing, explicit verification and release,
-old-epoch rejection, and retained data after complete loss. The repository now
-links the system libzmq because the dependency's vendored build disabled CURVE;
+live client-write rejection during quiescence, old-epoch rejection, and retained
+data after complete loss. The repository now links the system libzmq because the
+dependency's vendored build disabled CURVE;
 this drill requires CURVE and runs in the normal test build. The remaining
 failure and recovery checks below still need evidence before Phase 5 can be
 declared verified.
