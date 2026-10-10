@@ -5,6 +5,10 @@
 
 use dal::keyspace;
 use dal::meta::state_machine::{MetaApplyResult, MetaReject, MetaStateMachine};
+use dal::search::{
+    FieldKind, PathSegment, SEARCH_ENGINE_REVISION, SearchField, SearchIndexDefinition,
+    SearchIndexReady,
+};
 use dal::storage::Storage;
 use dal::types::{
     ClusterConfig, DataConfigObservation, GroupId, HashSpec, LogId, MetaCommand,
@@ -22,6 +26,26 @@ fn config(p: u16, r: u8) -> ClusterConfig {
         p,
         r,
         hash_spec: HashSpec::CANONICAL,
+    }
+}
+
+fn search_definition() -> SearchIndexDefinition {
+    SearchIndexDefinition {
+        document_type: "article".into(),
+        fields: vec![SearchField {
+            name: "body".into(),
+            source_path: vec![PathSegment::Key("body".into())],
+            kind: FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            required: true,
+            multi_valued: false,
+            indexed: true,
+            stored: false,
+            fast: false,
+        }],
+        default_search_fields: vec!["body".into()],
     }
 }
 
@@ -634,4 +658,194 @@ fn set_node_state_guards_incarnation() {
         }),
         MetaApplyResult::Applied
     );
+}
+
+fn maintenance_meta() -> Meta {
+    let mut meta = Meta::new();
+    meta.bootstrap(1, 3, &[1, 2, 3], &[1, 2, 3, 4]);
+    assert_eq!(
+        meta.seed(GroupId::Data(0), &[1, 2, 3]),
+        MetaApplyResult::Applied
+    );
+    meta
+}
+
+fn begin_maintenance(meta: &mut Meta) -> MetaApplyResult {
+    meta.apply(MetaCommand::BeginMaintenance {
+        operation_id: 0x51,
+        generation: 1,
+        participants: vec![1, 2, 3, 4],
+    })
+}
+
+#[test]
+fn maintenance_waits_for_inflight_move_and_search_build() {
+    let mut moving = maintenance_meta();
+    assert_eq!(
+        moving.create_plan(GroupId::Data(0), &[1, 2, 4]).0,
+        MetaApplyResult::Applied
+    );
+    assert_eq!(
+        begin_maintenance(&mut moving),
+        MetaApplyResult::Rejected(MetaReject::MaintenanceBusy)
+    );
+    assert!(moving.placement(GroupId::Data(0)).unwrap().r#move.is_some());
+
+    let mut building = maintenance_meta();
+    assert_eq!(
+        building.apply(MetaCommand::CreateSearchIndexWithRevision {
+            name: "articles".into(),
+            definition: search_definition(),
+            engine_revision: SEARCH_ENGINE_REVISION,
+        }),
+        MetaApplyResult::Applied
+    );
+    assert_eq!(
+        begin_maintenance(&mut building),
+        MetaApplyResult::Rejected(MetaReject::MaintenanceBusy)
+    );
+    let record: dal::search::SearchIndexRecord = building
+        .storage
+        .get_state_record(GroupId::Meta, &keyspace::meta_search_index_key("articles"))
+        .unwrap()
+        .unwrap();
+    assert!(record.building.is_some());
+}
+
+#[test]
+fn queued_search_and_move_commands_cannot_cross_maintenance_fence() {
+    let mut meta = maintenance_meta();
+    let placement = meta.placement(GroupId::Data(0)).unwrap();
+    let definition = search_definition();
+    let definition_hash = definition.definition_hash().unwrap();
+    assert_eq!(
+        meta.apply(MetaCommand::CreateSearchIndexWithRevision {
+            name: "articles".into(),
+            definition: definition.clone(),
+            engine_revision: SEARCH_ENGINE_REVISION,
+        }),
+        MetaApplyResult::Applied
+    );
+    let generation = meta.idx;
+    let ready = |node_id| SearchIndexReady {
+        generation,
+        definition_hash,
+        engine_revision: SEARCH_ENGINE_REVISION,
+        group: GroupId::Data(0),
+        node_id,
+        voters_log_id: placement.voters_log_id,
+        projection_epoch: 1,
+        source_log_id: LogId::new(3, 20),
+    };
+    for node_id in 1..=3 {
+        assert_eq!(
+            meta.apply(MetaCommand::ReportSearchIndexReady {
+                name: "articles".into(),
+                observation: ready(node_id),
+            }),
+            MetaApplyResult::Applied
+        );
+    }
+    assert_eq!(
+        meta.apply(MetaCommand::ActivateSearchIndexGeneration {
+            name: "articles".into(),
+            generation,
+        }),
+        MetaApplyResult::Applied
+    );
+    assert_eq!(begin_maintenance(&mut meta), MetaApplyResult::Applied);
+
+    let queued = vec![
+        MetaCommand::CreatePlan {
+            group: GroupId::Data(0),
+            plan_id: 0,
+            target_voters: vec![1, 2, 4],
+        },
+        MetaCommand::MarkAborting {
+            group: GroupId::Data(0),
+            plan_id: 99,
+        },
+        MetaCommand::FinalizePlan {
+            group: GroupId::Data(0),
+            plan_id: 99,
+            observation: obs(GroupId::Data(0), 99, &[1, 2, 4]),
+        },
+        MetaCommand::AbortReport {
+            group: GroupId::Data(0),
+            plan_id: 99,
+            observation: obs(GroupId::Data(0), 99, &[1, 2, 3]),
+        },
+        MetaCommand::CreateSearchIndexWithRevision {
+            name: "other".into(),
+            definition: definition.clone(),
+            engine_revision: SEARCH_ENGINE_REVISION,
+        },
+        MetaCommand::CreateSearchIndexGenerationWithRevision {
+            name: "articles".into(),
+            definition,
+            engine_revision: SEARCH_ENGINE_REVISION,
+        },
+        MetaCommand::ReportSearchIndexReady {
+            name: "articles".into(),
+            observation: ready(1),
+        },
+        MetaCommand::ActivateSearchIndexGeneration {
+            name: "articles".into(),
+            generation,
+        },
+        MetaCommand::DropSearchIndex {
+            name: "articles".into(),
+        },
+        MetaCommand::FinalizeSearchIndexDrop {
+            name: "articles".into(),
+            generation,
+        },
+    ];
+    let meta_records = |meta: &Meta| {
+        meta.storage
+            .scan_state(GroupId::Meta)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| key.first() == Some(&keyspace::TAG_META))
+            .collect::<Vec<_>>()
+    };
+    let assert_fenced = |meta: &mut Meta| {
+        let before = meta_records(meta);
+        for command in &queued {
+            assert_eq!(
+                meta.apply(command.clone()),
+                MetaApplyResult::Rejected(MetaReject::MaintenanceActive),
+                "queued command crossed maintenance fence: {command:?}"
+            );
+        }
+        assert_eq!(meta_records(meta), before);
+    };
+    assert_fenced(&mut meta);
+    for node_id in 1..=4 {
+        assert_eq!(
+            meta.apply(MetaCommand::AcknowledgeMaintenance {
+                operation_id: 0x51,
+                generation: 1,
+                node_id,
+                incarnation: 1,
+            }),
+            MetaApplyResult::Applied
+        );
+    }
+    assert_eq!(
+        meta.apply(MetaCommand::QuiesceMaintenance {
+            operation_id: 0x51,
+            generation: 1,
+        }),
+        MetaApplyResult::Applied
+    );
+    assert_fenced(&mut meta);
+    assert_eq!(
+        meta.apply(MetaCommand::EnterMaintenanceVerification {
+            operation_id: 0x51,
+            generation: 1,
+        }),
+        MetaApplyResult::Applied
+    );
+    assert_fenced(&mut meta);
 }

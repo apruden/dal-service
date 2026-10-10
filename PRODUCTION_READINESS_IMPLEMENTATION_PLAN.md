@@ -492,6 +492,12 @@ also stops a meta/data voter longer than its configured Down timeout while
 quiesced, confirms the directory remains fixed, restarts it under the fence,
 and checks the directory and readiness again after release and another Down
 timeout. No delayed failure transition appears.
+The log-order matrix in `tests/meta_m5.rs` now checks both sides of the search
+and placement fence: a building index or active move makes maintenance begin
+wait, while search and move commands already queued behind a committed begin
+are rejected in `Preparing`, `Quiesced`, and `Verifying` without changing meta
+records. A runtime scheduling race of automatic search and move writers remains
+to be exercised.
 
 ### Maintenance protocol
 
