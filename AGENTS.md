@@ -16,3 +16,15 @@ formats from earlier development revisions as disposable.
   is disposable.
 - If a plan or older document calls for migration or backward compatibility,
   follow this policy for current implementation work.
+
+## Project scope
+
+Focus this repository's work on service implementation: correctness, durability,
+security, runtime diagnostics, and backup/restore behavior. Runtime health and
+authenticated administration are part of the service implementation.
+
+Shipping and operations are outside this project's scope. Do not treat release
+packaging, deployment assets, production rollout, pilot programs, operational
+handoff, dashboards, paging rules, or operating runbooks as planned follow-up
+work unless the user explicitly requests them. Historical plans and profiles
+that mention those activities are context, not active project requirements.
