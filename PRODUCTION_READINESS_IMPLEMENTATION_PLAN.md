@@ -481,7 +481,8 @@ fence. Authenticated release is covered by the secure process drill above.
 The scripted client retry test in `src/api/client.rs` hides the first decided reply,
 returns maintenance admission failures, and then returns the saved outcome. It
 checks that the pending operation keeps the same sequence and bytes until that
-outcome is observed, and that a different mutation cannot reuse its sequence.
+outcome is observed, and that the client holds back a different mutation while
+the first remains unresolved.
 The secure process drill `committed_reply_lost_before_maintenance_replays_after_release`
 also withholds a real committed reply until the cluster is quiesced. The same
 client sees the fence, cannot send a different operation, then retrieves the
