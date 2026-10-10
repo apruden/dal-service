@@ -45,3 +45,6 @@ tower = { version = "0.5", features = ["util"] }
 # Enables the `fail` crate's runtime-toggleable crash points. Off in normal
 # builds so `fail_point!` compiles to nothing; tests enable it explicitly.
 failpoints = ["fail/failpoints"]
+
+[patch.crates-io]
+zmq-sys = { path = "vendor/zmq-sys" }

@@ -436,15 +436,11 @@ impl Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_cli_backup_restore_remains_fenced_until_verified() {
-    if zmq::has("curve") != Some(true) {
-        assert_ne!(
-            std::env::var("DAL_REQUIRE_CURVE_TESTS").as_deref(),
-            Ok("1"),
-            "CURVE-enabled libzmq is required for this drill"
-        );
-        eprintln!("skipping: libzmq has no CURVE support");
-        return;
-    }
+    assert_eq!(
+        zmq::has("curve"),
+        Some(true),
+        "Phase 5 restore verification requires CURVE-enabled libzmq"
+    );
     let temp = tempfile::tempdir().unwrap();
     let fixture = Fixture::new(temp.path());
     let old_curve = fixture.security(1);
