@@ -757,6 +757,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let ids = vec![1, 2, 3];
+    let meta_index = 2 * ids.len() as u64 + 4;
     let descriptor = BootstrapDescriptor {
         cluster_id: CID,
         config: ClusterConfig {
@@ -825,6 +826,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             operation_id: 0xabc51,
             generation: 1,
         });
+        assert_eq!(commands.len() as u64, meta_index);
         for (index, command) in commands.iter().enumerate() {
             assert_eq!(
                 meta.apply(&storage, command, LogId::new(1, index as u64 + 1))
@@ -850,10 +852,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .unwrap();
         // The running Raft adapter writes this record. The direct state-machine
         // setup above does not, so install its equivalent before offline export.
-        for (group, index) in [
-            (GroupId::Meta, commands.len() as u64),
-            (GroupId::Data(0), 10),
-        ] {
+        for (group, index) in [(GroupId::Meta, meta_index), (GroupId::Data(0), 10)] {
             // Keep the Raft term distinct from apply_state's direct-apply term
             // so a regression to last_applied_key fails this export fixture.
             let applied = openraft::LogId::new(openraft::CommittedLeaderId::new(2, 1), index);
@@ -908,8 +907,14 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .unwrap();
         let exported: backup::NodeArtifact =
             serde_json::from_slice(&std::fs::read(artifact.join("node.json")).unwrap()).unwrap();
+        assert_eq!(exported.positions.len(), 2);
         for position in &exported.positions {
-            assert_eq!(position.applied.term, 2);
+            let index = match position.group {
+                GroupId::Meta => meta_index,
+                GroupId::Data(0) => 10,
+                other => panic!("unexpected exported group: {other:?}"),
+            };
+            assert_eq!(position.applied, LogId::new(2, index));
         }
     }
     let package = root.join("package");
@@ -1033,6 +1038,16 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         cli(&args, true);
         cli(&args, false);
         let storage = Storage::open_checked(source, CID, *id).unwrap();
+        for (group, index) in [(GroupId::Meta, meta_index), (GroupId::Data(0), 10)] {
+            assert_eq!(
+                storage.last_applied(group).unwrap(),
+                Some(LogId::new(1, index))
+            );
+            assert_eq!(
+                storage.raft_applied_position(group).unwrap(),
+                Some(LogId::new(2, index))
+            );
+        }
         assert_eq!(storage.local_recovery_epoch().unwrap(), plan.recovery_epoch);
         assert_eq!(
             storage.recovery_epoch(GroupId::Meta).unwrap(),
