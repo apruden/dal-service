@@ -485,8 +485,9 @@ The same process drill now creates a populated search index before export and
 adds a second indexed document after the backup point. It confirms source index
 files are absent from the package and restored directories, then verifies a
 strict search after recovery finds the retained document and excludes the lost
-document. Maintenance recovery acknowledgement and release complete only after
-the restored active generation has rebuilt a valid checkpoint.
+document. Before release, rebuilt index files exist on every voter and each
+voter's diagnostics reports a valid checkpoint while maintenance remains in
+`Verifying`.
 
 The live drill also interrupts fence installation by restarting a missing
 participant while the operation is `Preparing`, changes meta leadership while
@@ -514,8 +515,10 @@ original result after authenticated release without changing the stored value
 or version. Its next mutation succeeds on the following sequence. That drill
 also stops a meta/data voter longer than its configured Down timeout while
 quiesced, confirms the directory remains fixed, restarts it under the fence,
-and checks the directory and readiness again after release and another Down
-timeout. No delayed failure transition appears.
+then stops the whole quorum together for CLI node export, package assembly, and
+package verification. It restarts the original data directories before maintenance
+verification and release, then checks the directory and readiness again after
+another Down timeout. No delayed failure transition appears.
 The log-order matrix in `tests/meta_m5.rs` now checks both sides of the search
 and placement fence: a building index or active move makes maintenance begin
 wait, while search and move commands already queued behind a committed begin

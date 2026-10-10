@@ -74,6 +74,33 @@ fn search_request(query: &str) -> SearchRequest {
     }
 }
 
+async fn wait_for_search_hits<T: Transport>(
+    client: &Client<T>,
+    query: &str,
+    expected: u64,
+    key: Option<&[u8]>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Ok(reply) = client.search_active(&search_request(query)).await
+            && reply.total_hits == expected
+            && key.is_none_or(|key| {
+                reply
+                    .hits
+                    .first()
+                    .is_some_and(|hit| hit.key.as_slice() == key)
+            })
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "search {query:?} did not return {expected} hits"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 struct Process {
     child: Child,
     log: PathBuf,
@@ -612,20 +639,26 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
             .unwrap(),
         WriteReply::Applied { .. }
     ));
+    let mut indexed_version = None;
     for sequence in 2..=10 {
         let value = if sequence == 10 {
             indexed_value("retained searchable")
         } else {
             format!("retained-{sequence}").into_bytes()
         };
-        assert!(matches!(
-            client
-                .put(format!("before-backup-{sequence}").as_bytes(), &value, None,)
-                .await
-                .unwrap(),
-            WriteReply::Applied { .. }
-        ));
+        let outcome = client
+            .put(format!("before-backup-{sequence}").as_bytes(), &value, None)
+            .await
+            .unwrap();
+        let version = match outcome {
+            WriteReply::Applied { version } => version,
+            other => panic!("pre-backup write {sequence} was not applied: {other:?}"),
+        };
+        if sequence == 10 {
+            indexed_version = Some(version);
+        }
     }
+    let indexed_version = indexed_version.unwrap();
     let definition = fixture.root.join("articles.json");
     std::fs::write(
         &definition,
@@ -646,23 +679,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         ],
         true,
     );
-    let search_deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        if let Ok(reply) = client.search_active(&search_request("retained")).await
-            && reply.total_hits == 1
-            && reply
-                .hits
-                .first()
-                .is_some_and(|hit| hit.key == b"before-backup-10")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < search_deadline,
-            "search index did not activate before backup"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    wait_for_search_hits(&client, "retained", 1, Some(b"before-backup-10")).await;
     let mut interrupted = nodes.remove(2);
     interrupted.child.kill().unwrap();
     interrupted.child.wait().unwrap();
@@ -781,7 +798,9 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         stop(node).await;
     }
     drop(nodes);
-    assert!(fixture.dirs[0].join("search").exists());
+    for source in &fixture.dirs {
+        assert!(source.join("search").exists());
+    }
 
     let artifacts = (0..3)
         .map(|i| fixture.root.join(format!("artifact-{}", i + 1)))
@@ -1125,6 +1144,33 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
             && value["maintenance"]["recovery_processes"] != prior_processes
     })
     .await;
+    for address in &fixture.http {
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "verifying"
+                && value["maintenance"]["recovered"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.len() == 3)
+                && value["partitions"].as_array().is_some_and(|partitions| {
+                    !partitions.is_empty()
+                        && partitions.iter().all(|partition| {
+                            partition["search"].as_array().is_some_and(|indexes| {
+                                indexes.iter().any(|index| {
+                                    index["name"] == "articles"
+                                        && index["searchable_through"]
+                                            .as_u64()
+                                            .is_some_and(|position| position >= indexed_version)
+                                        && (index["state"] == "Active"
+                                            || index["state"] == "Building")
+                                })
+                            })
+                        })
+                })
+        })
+        .await;
+    }
+    for source in &fixture.dirs {
+        assert!(source.join("search").exists());
+    }
     assert!(!ready(&fixture.http[interrupted_index]).await);
     cli(
         &[
@@ -1220,17 +1266,8 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         );
     }
     assert!(restored.get(b"during-fence").await.unwrap().is_none());
-    let retained_search = restored
-        .search_active(&search_request("retained"))
-        .await
-        .unwrap();
-    assert_eq!(retained_search.total_hits, 1);
-    assert_eq!(retained_search.hits[0].key, b"before-backup-10");
-    let lost_search = restored
-        .search_active(&search_request("lost"))
-        .await
-        .unwrap();
-    assert_eq!(lost_search.total_hits, 0);
+    wait_for_search_hits(&restored, "retained", 1, Some(b"before-backup-10")).await;
+    wait_for_search_hits(&restored, "lost", 0, None).await;
     assert!(matches!(
         restored.put(b"after-restore", b"new", None).await.unwrap(),
         WriteReply::Applied { .. }
@@ -1366,6 +1403,73 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
     })
     .await;
     assert!(!ready(&fixture.http[stopped_index]).await);
+    wait_for_meta_convergence(&fixture.http, &mut nodes).await;
+    // Stop the quorum before waiting on any child: stopping sequentially can
+    // elect a new leader and advance one replica beyond the backup barrier.
+    for node in &mut nodes {
+        node.child.kill().unwrap();
+    }
+    for node in &mut nodes {
+        node.child.wait().unwrap();
+    }
+    drop(nodes);
+    let artifacts = (0..3)
+        .map(|index| fixture.root.join(format!("resume-artifact-{}", index + 1)))
+        .collect::<Vec<_>>();
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let node_id = (index + 1).to_string();
+        cli(
+            &[
+                "backup-export-node",
+                "--config",
+                fixture.configs[index].to_str().unwrap(),
+                "--cluster",
+                fixture.cluster.to_str().unwrap(),
+                "--backup",
+                BACKUP,
+                "--operation",
+                OPERATION,
+                "--generation",
+                &generation,
+                "--destination",
+                artifact.to_str().unwrap(),
+            ],
+            true,
+        );
+        assert!(
+            artifact.join("node.json").exists(),
+            "node {node_id} did not export"
+        );
+    }
+    let package = fixture.root.join("resume-package");
+    let catalog = fixture.root.join("resume-catalog.json");
+    let mut assembly = vec![
+        "backup-assemble",
+        "--auth",
+        fixture.auth.to_str().unwrap(),
+        "--cluster",
+        fixture.cluster.to_str().unwrap(),
+        "--destination",
+        package.to_str().unwrap(),
+        "--catalog",
+        catalog.to_str().unwrap(),
+    ];
+    for artifact in &artifacts {
+        assembly.extend(["--artifact", artifact.to_str().unwrap()]);
+    }
+    cli(&assembly, true);
+    cli(
+        &["backup-verify", "--package", package.to_str().unwrap()],
+        true,
+    );
+    let mut nodes = fixture.start();
+    for address in &fixture.http {
+        wait_for(address, &mut nodes, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+        assert!(!ready(address).await);
+    }
     cli(
         &[
             "maintenance-verify",
