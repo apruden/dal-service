@@ -469,7 +469,11 @@ participant while the operation is `Preparing`, changes meta leadership while
 `Quiesced`, and confirms a release attempt fails when a verified participant
 stops. Release succeeds only after that participant restarts and records a new
 recovery process proof. The separate non-meta data-leader and routing-only
-restart cases remain to be exercised.
+restart cases now run in `tests/maintenance_restart.rs`: both start with
+admission open, restart after quiescence, reject direct mutations, and remain
+closed through recovery verification. That drill exposed and fixed a gateway
+path that redirected routing-only mutations before checking the maintenance
+fence. Authenticated release is covered by the secure process drill above.
 
 ### Maintenance protocol
 

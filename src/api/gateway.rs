@@ -252,6 +252,17 @@ impl ClientGateway {
             Err(e) => return ClientReply::Refused(e.to_string()),
         };
 
+        // Gate mutations before the local-host lookup. A routing-only runtime
+        // must refuse fenced work instead of redirecting it to a data voter.
+        if matches!(&req, ClientRequest::Mutate(_))
+            && self
+                .maintenance
+                .as_ref()
+                .is_some_and(|gate| !gate.is_open())
+        {
+            return ClientReply::Unavailable("maintenance admission is closed".into());
+        }
+
         let node = self.partitions.read().unwrap().get(&partition).cloned();
         let Some(node) = node else {
             // We do not host this partition: redirect to its candidate voters.
