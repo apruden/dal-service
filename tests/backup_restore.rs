@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CID: u128 = 0xDA1_BACC;
 const OPERATION: &str = "0xabc51";
 const BACKUP: &str = "0xabc52";
+const BACKUP_ID: u128 = 0xabc52;
 
 struct Process {
     child: Child,
@@ -894,22 +895,21 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .iter()
         .map(|id| root.join(format!("artifact-{id}")))
         .collect::<Vec<_>>();
-    let export_partial = root.join(format!(".dal-backup-{:032x}-node-1.partial", 0xabc52));
+    let export_partial = root.join(format!(".dal-backup-{BACKUP_ID:032x}-node-1.partial"));
     std::fs::create_dir(&export_partial).unwrap();
     std::fs::write(export_partial.join("interrupted"), b"incomplete").unwrap();
-    assert!(
-        backup::export_node(
-            &descriptor,
-            ids[0],
-            &sources[0],
-            0xabc52,
-            0xabc51,
-            1,
-            &artifacts[0],
-            trust.clone(),
-        )
-        .is_err()
-    );
+    let error = backup::export_node(
+        &descriptor,
+        ids[0],
+        &sources[0],
+        BACKUP_ID,
+        0xabc51,
+        1,
+        &artifacts[0],
+        trust.clone(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("partial backup already exists"));
     assert!(!artifacts[0].exists());
     assert!(export_partial.join("interrupted").exists());
     std::fs::remove_dir_all(&export_partial).unwrap();
@@ -918,7 +918,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             &descriptor,
             *id,
             source,
-            0xabc52,
+            BACKUP_ID,
             0xabc51,
             1,
             artifact,
@@ -966,10 +966,15 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .is_err()
     );
     std::fs::write(&third_manifest, third_bytes).unwrap();
-    let package_partial = root.join(format!(".dal-package-{:032x}.partial", 0xabc52));
+    let package_partial = root.join(format!(".dal-package-{BACKUP_ID:032x}.partial"));
     std::fs::create_dir(&package_partial).unwrap();
     std::fs::write(package_partial.join("interrupted"), b"incomplete").unwrap();
-    assert!(backup::assemble(&descriptor, &artifacts, &package, trust.clone()).is_err());
+    let error = backup::assemble(&descriptor, &artifacts, &package, trust.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("partial backup package already exists")
+    );
     assert!(!package.exists());
     assert!(package_partial.join("interrupted").exists());
     std::fs::remove_dir_all(&package_partial).unwrap();
@@ -991,6 +996,12 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
     let mut unknown: backup::PackageManifest = serde_json::from_slice(&manifest_bytes).unwrap();
     unknown.format = u32::MAX;
     std::fs::write(&package_manifest, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    let error = backup::verify_package(&package).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported backup package format")
+    );
     cli(
         &["backup-verify", "--package", package.to_str().unwrap()],
         false,
