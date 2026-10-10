@@ -1029,6 +1029,7 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
     for address in &fixture.http {
         wait_for(address, &mut nodes, |value| {
             value["maintenance"]["stage"] == "quiesced"
+                && value["maintenance"]["generation"] == quiesced["maintenance"]["generation"]
         })
         .await;
         assert!(!ready(address).await);
@@ -1037,19 +1038,21 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
     withheld.resume.notify_one();
     let first_error = first.await.unwrap().unwrap_err();
     assert!(
-        first_error
-            .to_string()
-            .contains("maintenance admission is closed"),
+        matches!(
+            first_error,
+            dal::Error::Raft(ref message)
+                if message == "write unavailable: maintenance admission is closed"
+        ),
         "unexpected first write error: {first_error}"
     );
-    assert!(
-        client
-            .put(b"different", b"blocked", None)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("is unresolved")
-    );
+    let different_error = client
+        .put(b"different", b"blocked", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        different_error,
+        dal::Error::Raft(ref message) if message.contains("is unresolved")
+    ));
     let frozen_directory = status(&fixture.http[0]).await.unwrap()["directory"].clone();
     let stopped_index = (wait_for_meta_leader(&fixture.http, &mut nodes).await + 1) % 3;
     let mut stopped = nodes.remove(stopped_index);
@@ -1099,7 +1102,7 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
         value["maintenance"]["stage"] == "verifying"
             && value["maintenance"]["recovered"]
                 .as_array()
-                .is_some_and(|recovered| recovered.len() == 3)
+                .is_some_and(|recovered| recovered.len() == fixture.http.len())
     })
     .await;
     cli(
