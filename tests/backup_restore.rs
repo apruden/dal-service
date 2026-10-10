@@ -854,7 +854,9 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             (GroupId::Meta, commands.len() as u64),
             (GroupId::Data(0), 10),
         ] {
-            let applied = openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index);
+            // Keep the Raft term distinct from apply_state's direct-apply term
+            // so a regression to last_applied_key fails this export fixture.
+            let applied = openraft::LogId::new(openraft::CommittedLeaderId::new(2, 1), index);
             let record: (
                 Option<openraft::LogId<u64>>,
                 openraft::StoredMembership<u64, openraft::BasicNode>,
@@ -869,6 +871,14 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
                     LogId::new(1, index),
                 )
                 .unwrap();
+            assert_eq!(
+                storage.last_applied(group).unwrap(),
+                Some(LogId::new(1, index))
+            );
+            assert_eq!(
+                storage.raft_applied_position(group).unwrap(),
+                Some(LogId::new(2, index))
+            );
         }
         let fence: MaintenanceRecord = storage
             .get_state_record(GroupId::Meta, &dal::keyspace::meta_maintenance_key())
@@ -896,6 +906,11 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             trust.clone(),
         )
         .unwrap();
+        let exported: backup::NodeArtifact =
+            serde_json::from_slice(&std::fs::read(artifact.join("node.json")).unwrap()).unwrap();
+        for position in &exported.positions {
+            assert_eq!(position.applied.term, 2);
+        }
     }
     let package = root.join("package");
     assert!(
