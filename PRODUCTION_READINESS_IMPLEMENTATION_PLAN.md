@@ -461,8 +461,11 @@ exercise client acknowledgement or reply loss over the network; the live drill
 below covers those paths.
 Restore free-space preflight now checks the manifest byte count plus ten percent
 headroom with overflow-safe arithmetic. A focused unit test covers sufficient
-space, shortfall, and size overflow; failure during a copy after preflight still
-needs separate fault-injection evidence.
+space, shortfall, and size overflow. A deterministic `ENOSPC` injection after the
+first restored file exercises the same staging and copy path used by
+`restore_node`: the partial stage is removed, no destination is published, and
+a retry from the same source succeeds. The injected failure does not depend on
+filling the host filesystem.
 
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled

@@ -645,16 +645,27 @@ fn validate_cluster_artifacts(
 }
 
 fn copy_regular_tree(source: &Path, destination: &Path) -> Result<()> {
+    copy_regular_tree_with(source, destination, &mut |source, target| {
+        fs::copy(source, target)?;
+        File::open(target)?.sync_all()?;
+        Ok(())
+    })
+}
+
+fn copy_regular_tree_with(
+    source: &Path,
+    destination: &Path,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<()>,
+) -> Result<()> {
     fs::create_dir(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let target = destination.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            copy_regular_tree(&entry.path(), &target)?;
+            copy_regular_tree_with(&entry.path(), &target, copy_file)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), &target)?;
-            File::open(&target)?.sync_all()?;
+            copy_file(&entry.path(), &target)?;
         } else {
             return Err(Error::Config("backup contains a nonregular file".into()));
         }
@@ -1142,7 +1153,10 @@ pub fn restore_inventory(
 
 #[cfg(all(test, unix))]
 mod restore_space_tests {
-    use super::check_restore_space;
+    use super::{
+        check_restore_space, copy_regular_tree, copy_regular_tree_with, with_restore_stage,
+    };
+    use std::fs;
 
     #[test]
     fn restore_space_admission_rejects_shortfall_and_overflow() {
@@ -1158,6 +1172,44 @@ mod restore_space_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("restore size overflow")
+        );
+    }
+
+    #[test]
+    fn disk_full_during_restore_copy_removes_partial_stage_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("first"), b"first file").unwrap();
+        fs::write(source.join("second"), b"second file").unwrap();
+        let stage = root.path().join(".dal-restore-test.partial");
+        let destination = root.path().join("restored");
+        let mut copies = 0;
+        let error = with_restore_stage(&stage, &destination, root.path(), |stage| {
+            copy_regular_tree_with(&source, stage, &mut |source, target| {
+                copies += 1;
+                if copies == 2 {
+                    fs::write(target, b"partial copy")?;
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+                }
+                fs::copy(source, target)?;
+                Ok(())
+            })
+        })
+        .unwrap_err();
+        assert_eq!(copies, 2);
+        assert!(matches!(error, super::Error::Io(io) if io.raw_os_error() == Some(libc::ENOSPC)));
+        assert!(!stage.exists());
+        assert!(!destination.exists());
+
+        with_restore_stage(&stage, &destination, root.path(), |stage| {
+            copy_regular_tree(&source, stage)
+        })
+        .unwrap();
+        assert_eq!(fs::read(destination.join("first")).unwrap(), b"first file");
+        assert_eq!(
+            fs::read(destination.join("second")).unwrap(),
+            b"second file"
         );
     }
 }
@@ -1177,13 +1229,8 @@ pub fn restore_node(
         ".dal-restore-{:032x}-node-{node_id}.partial",
         plan.recovery_epoch
     ));
-    if fs::symlink_metadata(&stage).is_ok() {
-        return Err(Error::Config(
-            "partial restore directory already exists".into(),
-        ));
-    }
     let source = package_path.join(format!("node-{node_id}")).join("db");
-    let result = (|| {
+    with_restore_stage(&stage, destination, &parent, |stage| {
         copy_regular_tree(&source, &stage)?;
         let expected = verify_node(&package_path.join(format!("node-{node_id}")))?;
         let mut copied = regular_files(&stage)?
@@ -1227,12 +1274,29 @@ pub fn restore_node(
         marker.write_all(&serde_json::to_vec_pretty(&plan).map_err(Error::codec)?)?;
         marker.sync_all()?;
         File::open(&stage)?.sync_all()?;
-        publish_directory(&stage, destination)?;
-        File::open(&parent)?.sync_all()?;
         Ok(inventory)
+    })
+}
+
+fn with_restore_stage<T>(
+    stage: &Path,
+    destination: &Path,
+    parent: &Path,
+    build: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    if fs::symlink_metadata(stage).is_ok() {
+        return Err(Error::Config(
+            "partial restore directory already exists".into(),
+        ));
+    }
+    let result = (|| {
+        let value = build(stage)?;
+        publish_directory(stage, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(value)
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&stage);
+        let _ = fs::remove_dir_all(stage);
     }
     result
 }
