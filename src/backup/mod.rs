@@ -1088,6 +1088,19 @@ fn available_bytes(path: &Path) -> Result<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+#[cfg(unix)]
+fn check_restore_space(bytes: u64, available: u64) -> Result<()> {
+    let required = bytes
+        .checked_add(bytes / 10)
+        .ok_or_else(|| Error::Config("restore size overflow".into()))?;
+    if available < required {
+        return Err(Error::Config(
+            "insufficient free space for restored database".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate all artifacts, package identity, capacity, and an empty target
 /// before a restore writes anything. A caller may display this inventory as a
 /// dry run, then invoke `restore_node` with the same recovery plan.
@@ -1118,17 +1131,35 @@ pub fn restore_inventory(
             .ok_or_else(|| Error::Config("restore size overflow".into()))
     })?;
     #[cfg(unix)]
-    if available_bytes(&parent)? < bytes.saturating_add(bytes / 10) {
-        return Err(Error::Config(
-            "insufficient free space for restored database".into(),
-        ));
-    }
+    check_restore_space(bytes, available_bytes(&parent)?)?;
     Ok(RestoreInventory {
         node_id,
         files: artifact.files.len(),
         bytes,
         recovery_epoch: plan.recovery_epoch,
     })
+}
+
+#[cfg(all(test, unix))]
+mod restore_space_tests {
+    use super::check_restore_space;
+
+    #[test]
+    fn restore_space_admission_rejects_shortfall_and_overflow() {
+        check_restore_space(100, 110).unwrap();
+        assert!(
+            check_restore_space(100, 109)
+                .unwrap_err()
+                .to_string()
+                .contains("insufficient free space")
+        );
+        assert!(
+            check_restore_space(u64::MAX, u64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("restore size overflow")
+        );
+    }
 }
 
 /// Stage one node database from a verified package and publish it atomically.

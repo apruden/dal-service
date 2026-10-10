@@ -459,6 +459,11 @@ later writes, and applies the same epoch rejection to two sequence-21 payloads:
 a new old-stream request and a retry of the lost request. This fixture does not
 exercise client acknowledgement or reply loss over the network; the live drill
 below covers those paths.
+Restore free-space preflight now checks the manifest byte count plus ten percent
+headroom with overflow-safe arithmetic. A focused unit test covers sufficient
+space, shortfall, and size overflow; failure during a copy after preflight still
+needs separate fault-injection evidence.
+
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled
 libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
@@ -689,9 +694,10 @@ and recovery record of the package it is given.
 
 Test interrupted export/publication, truncated and tampered artifacts,
 mixed backup IDs, unrecognized format markers, absent meta or partition artifacts,
-disk exhaustion, and an active destination. Restore a populated cluster after
-removing every original test data directory. Verify all writes acknowledged
-before the backup fence, preserved sequence outcomes, and eventual index rebuild.
+disk exhaustion, and an occupied restore destination. Restore a populated
+cluster after removing every original test data directory. Verify all writes
+acknowledged before the backup fence, preserved sequence outcomes, and eventual
+index rebuild.
 The test must exercise the CLI and exported artifacts, not an in-memory shortcut.
 
 - Interrupt fence installation and release, change meta leadership, and restart
