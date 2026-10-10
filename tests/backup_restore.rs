@@ -500,7 +500,11 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         .await
         .unwrap_err();
     assert!(
-        fenced_write.to_string().contains("write unavailable"),
+        matches!(
+        fenced_write,
+        dal::error::Error::Raft(ref message)
+            if message == "write unavailable: maintenance admission is closed"
+        ),
         "unexpected maintenance write outcome: {fenced_write}"
     );
     for node in &mut nodes {
