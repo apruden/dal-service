@@ -1334,6 +1334,101 @@ mod tests {
         assert_eq!(client.pending.lock().unwrap().get(&0).unwrap().sequence, 1);
     }
 
+    #[derive(Clone, Copy)]
+    enum ReplyLossPhase {
+        HideReply,
+        Fenced,
+        Open,
+    }
+
+    struct ReplyLossState {
+        phase: ReplyLossPhase,
+        first: Option<DataRequest>,
+        received: Vec<DataRequest>,
+    }
+
+    struct ReplyLossServer(Mutex<ReplyLossState>);
+
+    impl Server for ReplyLossServer {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            let ClientRequest::Mutate(mutation) = codec::decode(&request.payload).unwrap() else {
+                panic!("expected a client mutation");
+            };
+            let mut state = self.0.lock().unwrap();
+            state.received.push(mutation.clone());
+            let payload = match state.phase {
+                ReplyLossPhase::HideReply => {
+                    if let Some(first) = &state.first {
+                        assert_eq!(&mutation, first);
+                    } else {
+                        state.first = Some(mutation);
+                    }
+                    Vec::new()
+                }
+                ReplyLossPhase::Fenced => codec::encode(&ClientReply::Unavailable(
+                    "maintenance admission is closed".into(),
+                )),
+                ReplyLossPhase::Open => {
+                    let first = state.first.as_ref().unwrap();
+                    let version = if &mutation == first {
+                        1
+                    } else {
+                        assert_eq!(mutation.client_id, first.client_id);
+                        assert_eq!(mutation.sequence, first.sequence + 1);
+                        2
+                    };
+                    codec::encode(&ClientReply::Mutation(WriteReply::Applied { version }))
+                }
+            };
+            Envelope::new(
+                1,
+                request.msg_type,
+                request.group_id,
+                request.request_id,
+                payload,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_committed_reply_survives_maintenance_and_retries_same_sequence() {
+        let transport = InProcess::new();
+        let server = Arc::new(ReplyLossServer(Mutex::new(ReplyLossState {
+            phase: ReplyLossPhase::HideReply,
+            first: None,
+            received: Vec::new(),
+        })));
+        transport.register("node-1", server.clone());
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(routing(vec![1], LogId::new(1, 1)));
+
+        assert!(client.put(b"key", b"value", None).await.is_err());
+        let first = server.0.lock().unwrap().first.clone().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(client.pending.lock().unwrap().get(&0).unwrap().sequence, 1);
+
+        server.0.lock().unwrap().phase = ReplyLossPhase::Fenced;
+        assert!(client.put(b"key", b"value", None).await.is_err());
+        let received_before_other = server.0.lock().unwrap().received.len();
+        assert!(client.put(b"other", b"value", None).await.is_err());
+        let state = server.0.lock().unwrap();
+        assert_eq!(state.received.len(), received_before_other);
+        assert!(state.received.iter().all(|request| request == &first));
+        drop(state);
+        assert_eq!(client.pending.lock().unwrap().get(&0).unwrap().sequence, 1);
+
+        server.0.lock().unwrap().phase = ReplyLossPhase::Open;
+        assert_eq!(
+            client.put(b"key", b"value", None).await.unwrap(),
+            WriteReply::Applied { version: 1 }
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert_eq!(
+            client.put(b"other", b"value", None).await.unwrap(),
+            WriteReply::Applied { version: 2 }
+        );
+    }
+
     #[tokio::test]
     async fn a_newer_placement_snapshot_retires_redirect_candidates() {
         let transport = InProcess::new();

@@ -478,6 +478,12 @@ without changing membership. The test uses TCP peer endpoints so existing
 ZeroMQ clients reconnect when a node's router restarts. That drill exposed and fixed a gateway
 path that redirected routing-only mutations before checking the maintenance
 fence. Authenticated release is covered by the secure process drill above.
+The scripted client retry test in `src/api/client.rs` hides the first decided reply,
+returns maintenance admission failures, and then returns the saved outcome. It
+checks that the pending operation keeps the same sequence and bytes until that
+outcome is observed, and that a different mutation cannot reuse its sequence.
+The full live-cluster retry after an ordinary maintenance release remains to be
+exercised.
 
 ### Maintenance protocol
 
