@@ -487,7 +487,11 @@ The secure process drill `committed_reply_lost_before_maintenance_replays_after_
 also withholds a real committed reply until the cluster is quiesced. The same
 client sees the fence, cannot send a different operation, then retrieves the
 original result after authenticated release without changing the stored value
-or version. Its next mutation succeeds on the following sequence.
+or version. Its next mutation succeeds on the following sequence. That drill
+also stops a meta/data voter longer than its configured Down timeout while
+quiesced, confirms the directory remains fixed, restarts it under the fence,
+and checks the directory and readiness again after release and another Down
+timeout. No delayed failure transition appears.
 
 ### Maintenance protocol
 

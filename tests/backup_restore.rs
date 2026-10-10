@@ -497,6 +497,16 @@ impl Fixture {
         CurveClientConfig::new(app.public_key, app.secret_key, keys).unwrap()
     }
 
+    fn set_failure_timeouts(&self, suspect_ms: u64, down_ms: u64) {
+        for path in &self.configs {
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            config["timeouts"]["suspect_ms"] = serde_json::json!(suspect_ms);
+            config["timeouts"]["down_ms"] = serde_json::json!(down_ms);
+            std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+    }
+
     fn start(&self) -> Vec<Process> {
         (0..3)
             .map(|i| {
@@ -951,9 +961,11 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_reply_lost_before_maintenance_replays_after_release() {
     assert_eq!(zmq::has("curve"), Some(true));
+    const DOWN_MS: u64 = 8_000;
     let temp = tempfile::tempdir().unwrap();
     let fixture = Fixture::new(temp.path());
     let curve = fixture.security(1);
+    fixture.set_failure_timeouts(3_000, DOWN_MS);
     let mut nodes = fixture.start();
     for address in &fixture.http {
         wait_until_ready(address, &mut nodes).await;
@@ -1038,6 +1050,37 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
             .to_string()
             .contains("is unresolved")
     );
+    let frozen_directory = status(&fixture.http[0]).await.unwrap()["directory"].clone();
+    let stopped_index = (wait_for_meta_leader(&fixture.http, &mut nodes).await + 1) % 3;
+    let mut stopped = nodes.remove(stopped_index);
+    stop(&mut stopped).await;
+    drop(stopped);
+    tokio::time::sleep(Duration::from_millis(DOWN_MS + 2_000)).await;
+    for (index, address) in fixture.http.iter().enumerate() {
+        if index == stopped_index {
+            continue;
+        }
+        assert_eq!(
+            status(address).await.unwrap()["directory"],
+            frozen_directory
+        );
+        assert!(!ready(address).await);
+    }
+    nodes.insert(
+        stopped_index,
+        spawn(
+            &fixture.configs[stopped_index],
+            &fixture.cluster,
+            &fixture
+                .root
+                .join(format!("node-{}-long-stop.log", stopped_index + 1)),
+        ),
+    );
+    wait_for(&fixture.http[stopped_index], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "quiesced"
+    })
+    .await;
+    assert!(!ready(&fixture.http[stopped_index]).await);
     cli(
         &[
             "maintenance-verify",
@@ -1077,6 +1120,14 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
     );
     for address in &fixture.http {
         wait_until_ready(address, &mut nodes).await;
+    }
+    tokio::time::sleep(Duration::from_millis(DOWN_MS + 2_000)).await;
+    for address in &fixture.http {
+        assert_eq!(
+            status(address).await.unwrap()["directory"],
+            frozen_directory
+        );
+        assert!(ready(address).await);
     }
     assert_eq!(
         client.put(b"reply-lost", b"saved", None).await.unwrap(),
