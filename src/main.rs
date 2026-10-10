@@ -7,7 +7,7 @@
 //! this is thin argument plumbing.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -41,7 +41,10 @@ fn usage() -> &'static str {
        maintenance-begin --auth <operator.json> --cluster <init.json> --operation <hex> [--seed <addr>]   install a new maintenance fence\n\
        maintenance-quiesce --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   commit the drain barrier\n\
        maintenance-verify --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   begin recovery verification\n\
-       maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n"
+       maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n\
+       backup-export-node --cluster <init.json> --node <id> --data-dir <dir> --backup <hex> --operation <hex> --generation <n> --destination <dir>   export a stopped node\n\
+       backup-assemble --cluster <init.json> --artifact <dir> [--artifact <dir> ...] --destination <dir>   assemble a full package\n\
+       backup-verify --package <dir>   verify every package artifact\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -49,6 +52,13 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
+}
+
+fn flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].as_str())
+        .collect()
 }
 
 fn main() -> ExitCode {
@@ -228,9 +238,134 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "backup-export-node" => backup_export_node(rest),
+        "backup-assemble" => backup_assemble(rest),
+        "backup-verify" => match flag(rest, "--package") {
+            Some(package) => match dal::backup::verify_package(Path::new(package)) {
+                Ok(manifest) => {
+                    println!(
+                        "backup {:#x} verified: {} nodes, {} groups",
+                        manifest.backup_id,
+                        manifest.nodes.len(),
+                        manifest.positions.len()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("backup-verify: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("backup-verify: --package required");
+                ExitCode::FAILURE
+            }
+        },
         other => {
             eprintln!("unknown command: {other}\n");
             eprint!("{}", usage());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn parse_nonzero_hex(value: &str, name: &str) -> Result<u128, String> {
+    value
+        .strip_prefix("0x")
+        .and_then(|hex| u128::from_str_radix(hex, 16).ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| format!("{name} must be a nonzero 0x-prefixed hex ID"))
+}
+
+fn backup_export_node(args: &[String]) -> ExitCode {
+    let (
+        Some(cluster),
+        Some(node),
+        Some(data_dir),
+        Some(backup),
+        Some(operation),
+        Some(generation),
+        Some(destination),
+    ) = (
+        flag(args, "--cluster"),
+        flag(args, "--node"),
+        flag(args, "--data-dir"),
+        flag(args, "--backup"),
+        flag(args, "--operation"),
+        flag(args, "--generation"),
+        flag(args, "--destination"),
+    )
+    else {
+        eprintln!(
+            "backup-export-node: --cluster, --node, --data-dir, --backup, --operation, --generation, and --destination required"
+        );
+        return ExitCode::FAILURE;
+    };
+    let result = (|| -> dal::error::Result<_> {
+        let desc = load_init_descriptor(Path::new(cluster))?;
+        let node = node
+            .parse::<u64>()
+            .map_err(|_| dal::error::Error::Config("invalid --node".into()))?;
+        let backup = parse_nonzero_hex(backup, "--backup").map_err(dal::error::Error::Config)?;
+        let operation =
+            parse_nonzero_hex(operation, "--operation").map_err(dal::error::Error::Config)?;
+        let generation = generation
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| dal::error::Error::Config("invalid --generation".into()))?;
+        dal::backup::export_node(
+            &desc,
+            node,
+            Path::new(data_dir),
+            backup,
+            operation,
+            generation,
+            Path::new(destination),
+        )
+    })();
+    match result {
+        Ok(artifact) => {
+            println!(
+                "backup-export-node: node {} exported for backup {:#x}",
+                artifact.node_id, artifact.backup_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("backup-export-node: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn backup_assemble(args: &[String]) -> ExitCode {
+    let (Some(cluster), Some(destination)) = (flag(args, "--cluster"), flag(args, "--destination"))
+    else {
+        eprintln!("backup-assemble: --cluster and --destination required");
+        return ExitCode::FAILURE;
+    };
+    let artifacts: Vec<PathBuf> = flags(args, "--artifact")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    if artifacts.is_empty() {
+        eprintln!("backup-assemble: at least one --artifact required");
+        return ExitCode::FAILURE;
+    }
+    let result = load_init_descriptor(Path::new(cluster))
+        .and_then(|desc| dal::backup::assemble(&desc, &artifacts, Path::new(destination)));
+    match result {
+        Ok(package) => {
+            println!(
+                "backup-assemble: backup {:#x} verified with {} nodes",
+                package.backup_id,
+                package.nodes.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("backup-assemble: {error}");
             ExitCode::FAILURE
         }
     }

@@ -585,6 +585,22 @@ impl Storage {
         &self.path
     }
 
+    /// Capture every column family and replay-required RocksDB file. The caller
+    /// must own the node's database exclusively and keep its maintenance fence
+    /// closed throughout this call. Checkpoint may hard-link source SST files;
+    /// a published backup must copy the checkpoint to independent storage.
+    pub fn checkpoint_offline(&self, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            return Err(Error::Config(format!(
+                "checkpoint destination {} already exists",
+                destination.display()
+            )));
+        }
+        self.db.flush_wal(true)?;
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(destination)?;
+        Ok(())
+    }
+
     // ---- identity ----------------------------------------------------------
 
     pub fn identity(&self) -> Result<Option<Identity>> {

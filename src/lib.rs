@@ -5,6 +5,7 @@
 //! M1 foundation (types, config, storage).
 
 pub mod api;
+pub mod backup;
 pub mod codec;
 pub mod config;
 pub mod error;
