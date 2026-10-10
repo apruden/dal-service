@@ -42,11 +42,13 @@ fn usage() -> &'static str {
        maintenance-quiesce --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   commit the drain barrier\n\
        maintenance-verify --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>]   begin recovery verification\n\
        maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n\
-       backup-export-node --cluster <init.json> --node <id> --data-dir <dir> --backup <hex> --operation <hex> --generation <n> --destination <dir>   export a stopped node\n\
-       backup-assemble --auth <operator.json> --cluster <init.json> --artifact <dir> [--artifact <dir> ...] --destination <dir>   assemble a full package\n\
+       backup-export-node --config <node.json> --cluster <init.json> --backup <hex> --operation <hex> --generation <n> --destination <dir>   export a stopped node\n\
+       backup-assemble --auth <operator.json> --cluster <init.json> --artifact <dir> [--artifact <dir> ...] --destination <dir> --catalog <json>   assemble and catalog a full package\n\
        backup-verify --package <dir>   verify every package artifact\n\
-       restore-init --package <dir> --fencing-evidence <json> --record <json>   create a shared recovery epoch\n\
-       restore --package <dir> --record <json> --node <id> --destination <dir> [--dry-run]   restore one fenced node\n"
+       backup-catalog-add --package <dir> --catalog <json>   record an already verified package\n\
+       restore-init --package <dir> --catalog <json> --fencing-evidence <json> --record <json>   create a shared recovery epoch\n\
+       restore --config <node.json> --package <dir> --record <json> --node <id> --destination <dir> [--dry-run]   restore one fenced node\n\
+       sequence-inspect --auth <operator.json> --cluster <init.json> --partition <n> --client <hex> [--seed <addr>]   inspect retained client outcome\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -263,8 +265,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "backup-catalog-add" => match (flag(rest, "--package"), flag(rest, "--catalog")) {
+            (Some(package), Some(catalog)) => {
+                match dal::backup::record_backup(Path::new(package), Path::new(catalog)) {
+                    Ok(entry) => {
+                        println!("backup-catalog-add: recorded backup {:#x}", entry.backup_id);
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("backup-catalog-add: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("backup-catalog-add: --package and --catalog required");
+                ExitCode::FAILURE
+            }
+        },
         "restore-init" => restore_init(rest),
         "restore" => restore(rest),
+        "sequence-inspect" => sequence_inspect(rest),
         other => {
             eprintln!("unknown command: {other}\n");
             eprint!("{}", usage());
@@ -283,17 +304,15 @@ fn parse_nonzero_hex(value: &str, name: &str) -> Result<u128, String> {
 
 fn backup_export_node(args: &[String]) -> ExitCode {
     let (
+        Some(config),
         Some(cluster),
-        Some(node),
-        Some(data_dir),
         Some(backup),
         Some(operation),
         Some(generation),
         Some(destination),
     ) = (
+        flag(args, "--config"),
         flag(args, "--cluster"),
-        flag(args, "--node"),
-        flag(args, "--data-dir"),
         flag(args, "--backup"),
         flag(args, "--operation"),
         flag(args, "--generation"),
@@ -301,15 +320,20 @@ fn backup_export_node(args: &[String]) -> ExitCode {
     )
     else {
         eprintln!(
-            "backup-export-node: --cluster, --node, --data-dir, --backup, --operation, --generation, and --destination required"
+            "backup-export-node: --config, --cluster, --backup, --operation, --generation, and --destination required"
         );
         return ExitCode::FAILURE;
     };
     let result = (|| -> dal::error::Result<_> {
         let desc = load_init_descriptor(Path::new(cluster))?;
-        let node = node
-            .parse::<u64>()
-            .map_err(|_| dal::error::Error::Config("invalid --node".into()))?;
+        let cfg = load_node_config(Path::new(config))?;
+        if cfg.cluster_id != desc.cluster_id {
+            return Err(dal::error::Error::Config(
+                "node and cluster identity differ".into(),
+            ));
+        }
+        let security = load_node_security(Path::new(config), &cfg)?;
+        security.validate_descriptor(&desc, cfg.node_id)?;
         let backup = parse_nonzero_hex(backup, "--backup").map_err(dal::error::Error::Config)?;
         let operation =
             parse_nonzero_hex(operation, "--operation").map_err(dal::error::Error::Config)?;
@@ -320,12 +344,17 @@ fn backup_export_node(args: &[String]) -> ExitCode {
             .ok_or_else(|| dal::error::Error::Config("invalid --generation".into()))?;
         dal::backup::export_node(
             &desc,
-            node,
-            Path::new(data_dir),
+            cfg.node_id,
+            &cfg.data_dir,
             backup,
             operation,
             generation,
             Path::new(destination),
+            dal::backup::TrustSnapshot {
+                generation: security.policy.generation(),
+                digest: security.policy.fingerprint(),
+                key_fingerprints: security.policy.public_key_fingerprints(),
+            },
         )
     })();
     match result {
@@ -344,12 +373,13 @@ fn backup_export_node(args: &[String]) -> ExitCode {
 }
 
 fn backup_assemble(args: &[String]) -> ExitCode {
-    let (Some(auth), Some(cluster), Some(destination)) = (
+    let (Some(auth), Some(cluster), Some(destination), Some(catalog)) = (
         flag(args, "--auth"),
         flag(args, "--cluster"),
         flag(args, "--destination"),
+        flag(args, "--catalog"),
     ) else {
-        eprintln!("backup-assemble: --auth, --cluster, and --destination required");
+        eprintln!("backup-assemble: --auth, --cluster, --destination, and --catalog required");
         return ExitCode::FAILURE;
     };
     let artifacts: Vec<PathBuf> = flags(args, "--artifact")
@@ -363,15 +393,18 @@ fn backup_assemble(args: &[String]) -> ExitCode {
     let result = load_init_descriptor(Path::new(cluster)).and_then(|desc| {
         let security = load_operator_security(Path::new(auth), desc.cluster_id)?;
         security.validate_descriptor(&desc)?;
-        dal::backup::assemble(
+        let package = dal::backup::assemble(
             &desc,
             &artifacts,
             Path::new(destination),
             dal::backup::TrustSnapshot {
                 generation: security.policy.generation(),
                 digest: security.policy.fingerprint(),
+                key_fingerprints: security.policy.public_key_fingerprints(),
             },
-        )
+        )?;
+        dal::backup::record_backup(Path::new(destination), Path::new(catalog))?;
+        Ok(package)
     });
     match result {
         Ok(package) => {
@@ -390,16 +423,18 @@ fn backup_assemble(args: &[String]) -> ExitCode {
 }
 
 fn restore_init(args: &[String]) -> ExitCode {
-    let (Some(package), Some(evidence), Some(record)) = (
+    let (Some(package), Some(catalog), Some(evidence), Some(record)) = (
         flag(args, "--package"),
+        flag(args, "--catalog"),
         flag(args, "--fencing-evidence"),
         flag(args, "--record"),
     ) else {
-        eprintln!("restore-init: --package, --fencing-evidence, and --record required");
+        eprintln!("restore-init: --package, --catalog, --fencing-evidence, and --record required");
         return ExitCode::FAILURE;
     };
     match dal::backup::initialize_restore(
         Path::new(package),
+        Path::new(catalog),
         Path::new(evidence),
         Path::new(record),
     ) {
@@ -418,19 +453,45 @@ fn restore_init(args: &[String]) -> ExitCode {
 }
 
 fn restore(args: &[String]) -> ExitCode {
-    let (Some(package), Some(record), Some(node), Some(destination)) = (
+    let (Some(config), Some(package), Some(record), Some(node), Some(destination)) = (
+        flag(args, "--config"),
         flag(args, "--package"),
         flag(args, "--record"),
         flag(args, "--node"),
         flag(args, "--destination"),
     ) else {
-        eprintln!("restore: --package, --record, --node, and --destination required");
+        eprintln!("restore: --config, --package, --record, --node, and --destination required");
         return ExitCode::FAILURE;
     };
     let Ok(node) = node.parse::<u64>() else {
         eprintln!("restore: --node must be a numeric node ID");
         return ExitCode::FAILURE;
     };
+    let preflight = (|| -> dal::error::Result<()> {
+        let cfg = load_node_config(Path::new(config))?;
+        let package = dal::backup::verify_package(Path::new(package))?;
+        let entry = package
+            .meta
+            .directory
+            .iter()
+            .find(|entry| entry.node_id == node)
+            .ok_or_else(|| dal::error::Error::Config("node absent from backup topology".into()))?;
+        if cfg.cluster_id != package.descriptor.cluster_id
+            || cfg.node_id != node
+            || cfg.data_dir != Path::new(destination)
+            || cfg.control_addr != entry.control_addr
+            || cfg.bulk_addr != entry.bulk_addr
+        {
+            return Err(dal::error::Error::Config(
+                "restore config differs from recorded node identity or endpoint topology".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = preflight {
+        eprintln!("restore: {error}");
+        return ExitCode::FAILURE;
+    }
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let result = if dry_run {
         dal::backup::restore_inventory(
@@ -464,6 +525,72 @@ fn restore(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn sequence_inspect(args: &[String]) -> ExitCode {
+    let (Some(auth), Some(cluster), Some(partition), Some(client)) = (
+        flag(args, "--auth"),
+        flag(args, "--cluster"),
+        flag(args, "--partition"),
+        flag(args, "--client"),
+    ) else {
+        eprintln!("sequence-inspect: --auth, --cluster, --partition, and --client required");
+        return ExitCode::FAILURE;
+    };
+    let Ok(partition) = partition.parse::<u16>() else {
+        eprintln!("sequence-inspect: invalid --partition");
+        return ExitCode::FAILURE;
+    };
+    let client_id = match parse_nonzero_hex(client, "--client") {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sequence-inspect: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(desc) => desc,
+        Err(error) => {
+            eprintln!("sequence-inspect: cluster: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let curve = match load_cli_curve(auth, &desc) {
+        Ok(curve) => curve,
+        Err(error) => {
+            eprintln!("sequence-inspect: security: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = flag(args, "--seed").map(str::to_string);
+    with_runtime(async move {
+        match admin::sequence_inspect_secure(
+            zmq::Context::new(),
+            &desc,
+            partition,
+            client_id,
+            seed.as_deref(),
+            curve,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                println!("client: {client_id:#x}, partition: {partition}");
+                println!("highest sequence: {}", outcome.highest);
+                println!("command digest: {:#x}", outcome.digest);
+                println!("result: {:?}", outcome.result);
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("no retained sequence for client {client_id:#x} on partition {partition}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("sequence-inspect: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 /// Validate the node, cluster descriptor, credentials, trust policy, and pins

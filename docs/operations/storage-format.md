@@ -1,13 +1,13 @@
 # Storage format preflight
 
 Every data directory carries `DAL_FORMAT.json` with a
-`storage_format_version`. The current binary supports storage version `1`,
-durable record version `1`, application snapshot version `1`, and search engine
+`storage_format_version`. The current binary supports storage version `2`,
+durable record version `2`, application snapshot version `2`, and search engine
 revision `2`. New markers record each requirement separately. All four fields
 are required; incomplete markers from earlier development builds are rejected.
-The application snapshot stream identifies version 1 with the `DALSNP01`
+The application snapshot stream identifies version 2 with the `DALSNP02`
 magic. The wire envelope uses `PROTOCOL_VERSION` independently of these disk
-versions. Backup format versioning begins when a backup artifact exists.
+versions. The coordinated offline backup package uses format version `1`.
 
 A new empty data directory receives the manifest before RocksDB opens. The
 manifest and its directory entry are synced before startup proceeds. Startup

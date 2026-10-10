@@ -36,7 +36,7 @@ macro_rules! frozen_serde {
 
 /// Wire/protocol version. Bumped only on an incompatible envelope or command
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Protocol-wide bounds used to keep the complete routing snapshot representable
 /// in one `MetaQuery` frame. They are enforced both at configuration admission

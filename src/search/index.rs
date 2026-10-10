@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
+
+static QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
@@ -856,10 +859,20 @@ fn quarantine_index_dir(path: &Path, reason: &str) -> Result<()> {
         .file_name()
         .ok_or_else(|| Error::Search("index path has no directory name".into()))?;
     let mut quarantined = name.to_os_string();
-    quarantined.push(".quarantined");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::Search(error.to_string()))?
+        .as_nanos();
+    quarantined.push(format!(
+        ".quarantined-{stamp}-{}-{}",
+        std::process::id(),
+        QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let quarantined = path.with_file_name(quarantined);
-    if quarantined.exists() {
-        fs::remove_dir_all(&quarantined)?;
+    if fs::symlink_metadata(&quarantined).is_ok() {
+        return Err(Error::Search(
+            "quarantine destination already exists".into(),
+        ));
     }
     fs::rename(path, &quarantined)?;
     tracing::warn!(

@@ -412,7 +412,7 @@ changes [failure detection](src/runtime/node.rs),
 [rebalancing](src/runtime/rebalance.rs),
 [automatic search transitions](src/runtime/search.rs), and both state machines.
 
-Implementation in progress: the replicated `Preparing` record pauses automatic
+Implementation status: the replicated `Preparing` record pauses automatic
 meta writers and failure transitions. Participant runtimes start with client
 admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
 writes, and persist the local generation fence before submitting an authenticated
@@ -434,8 +434,22 @@ the typed operator RPC after recovery proofs are complete. The
 [missing-participant recovery procedure](docs/operations/maintenance-recovery.md)
 keeps the operation fenced until the same node returns with durable state and
 reproves recovery. Permanent loss still requires the planned verified restore
-path; no participant-removal or force-release path exists. Next, implement
-backup/restore and the remaining maintenance phase-transition commands.
+path; no participant-removal or force-release path exists. Authenticated begin,
+quiesce, verify, and release commands are implemented. Offline export checks a
+stopped node's fence and recovery epoch, then packages full database checkpoints
+from every Active participant only when voter applied positions and frozen meta
+inventory agree. The package records versions, search definitions, trust state,
+checksums, and the recovery point; verification precedes catalog publication.
+Restore requires a cataloged package and operator fencing attestation, stages
+each node under its recorded identity and topology, installs a fresh epoch, and
+invalidates derived search checkpoints. Restored nodes require a newer trust
+policy that excludes the backed-up credentials. Recovery acknowledgement waits
+for active local search generations to have valid checkpoints, and an operator
+can inspect retained client sequence outcomes under maintenance.
+
+The implementation is compile-checked. The Phase 5 completion gate below still
+requires an exported-artifact restore drill and the listed failure and recovery
+tests before Phase 5 can be declared verified.
 
 ### Maintenance protocol
 

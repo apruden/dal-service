@@ -118,6 +118,16 @@ struct SeqRecord {
     result: MutationResult,
 }
 
+/// Read-only operator view of a retained client stream at the backup recovery
+/// point. A missing record means this partition has no decided sequence for
+/// the requested client identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceOutcome {
+    pub highest: Sequence,
+    pub digest: u128,
+    pub result: MutationResult,
+}
+
 /// The outcome of applying one committed entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplyResult {
@@ -223,6 +233,20 @@ impl DataStateMachine {
         client_id: ClientId,
     ) -> Result<Option<SeqRecord>> {
         reader.read_state(self.group, &keyspace::seq_key(client_id))
+    }
+
+    pub fn inspect_sequence<R: StateRead>(
+        &self,
+        reader: &R,
+        client_id: ClientId,
+    ) -> Result<Option<SequenceOutcome>> {
+        Ok(self
+            .seq_record(reader, client_id)?
+            .map(|record| SequenceOutcome {
+                highest: record.highest,
+                digest: record.digest,
+                result: record.result,
+            }))
     }
 
     /// Public linearizable-read helper: the current value/version of a key.

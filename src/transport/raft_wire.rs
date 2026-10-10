@@ -64,6 +64,18 @@ pub struct MaintenanceBeginBody {
     pub operation_id: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceInspectBody {
+    pub client_id: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SequenceInspectReply {
+    Value(Option<crate::partition::state_machine::SequenceOutcome>),
+    NotLeader { leader: Option<NodeId> },
+    Unavailable(String),
+}
+
 /// Reply payload for `RaftAppend` frames. Responses are generic over the node
 /// id only, so one alias serves both the meta and data type configs.
 pub type AppendReply = Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;

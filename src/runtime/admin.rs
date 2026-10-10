@@ -24,7 +24,8 @@ use crate::transport::codec::{Envelope, Lane, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
     AbortPlanBody, JoinBody, LeaveBody, MaintenanceBeginBody, MaintenanceQueryReply,
-    MaintenanceReleaseBody, SearchIndexAdminBody, SubmitReply,
+    MaintenanceReleaseBody, PlacementQueryBody, PlacementQueryReply, SearchIndexAdminBody,
+    SequenceInspectBody, SequenceInspectReply, SubmitReply,
 };
 use crate::transport::security::CurveClientConfig;
 use crate::types::{ClusterId, GroupId, MaintenanceRecord, NodeId};
@@ -426,6 +427,105 @@ pub async fn maintenance_stage_secure(
         }),
     )
     .await
+}
+
+/// Inspect the retained sequence outcome through the current data leader's
+/// ReadIndex barrier. This read remains available while maintenance is fenced.
+pub async fn sequence_inspect_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    partition: u16,
+    client_id: u128,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+) -> Result<Option<crate::partition::state_machine::SequenceOutcome>> {
+    if partition >= desc.config.p || client_id == 0 {
+        return Err(Error::Config(
+            "valid partition and nonzero client ID required".into(),
+        ));
+    }
+    let transport = secure_transport(ctx, curve, seed)?;
+    let contact_ids: Vec<_> = desc.directory.iter().map(|entry| entry.node_id).collect();
+    let targets = Targets::from_descriptor(desc, seed, &contact_ids)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    let mut queue = VecDeque::new();
+    for address in &targets.candidates {
+        let request = Envelope::new(
+            desc.cluster_id,
+            MsgType::PlacementQuery,
+            GroupId::Meta,
+            0,
+            codec::encode(&PlacementQueryBody {
+                group: GroupId::Data(partition),
+            }),
+        );
+        let Ok(reply) = transport.call(address, request).await else {
+            continue;
+        };
+        if reply.cluster_id != desc.cluster_id || reply.msg_type != MsgType::PlacementQuery {
+            continue;
+        }
+        if let Ok(PlacementQueryReply {
+            placement: Some(placement),
+        }) = codec::decode(&reply.payload)
+        {
+            for voter in placement.voters {
+                if let Some(address) = targets.directory.get(&voter) {
+                    queue.push_back(address.clone());
+                }
+            }
+            break;
+        }
+    }
+    queue.extend(targets.candidates.iter().cloned());
+    let mut tried = HashSet::new();
+    let mut last_error = None;
+    while let Some(address) = queue.pop_front() {
+        if tried.len() >= MAX_ATTEMPTS {
+            break;
+        }
+        if !tried.insert(address.clone()) {
+            continue;
+        }
+        let request = Envelope::new(
+            desc.cluster_id,
+            MsgType::SequenceInspect,
+            GroupId::Data(partition),
+            tried.len() as u64,
+            codec::encode(&SequenceInspectBody { client_id }),
+        );
+        let reply = match transport.call(&address, request).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        if reply.cluster_id != desc.cluster_id
+            || reply.msg_type != MsgType::SequenceInspect
+            || reply.group_id != GroupId::Data(partition)
+        {
+            last_error = Some("unexpected sequence inspection reply".into());
+            continue;
+        }
+        match codec::decode::<SequenceInspectReply>(&reply.payload) {
+            Ok(SequenceInspectReply::Value(value)) => return Ok(value),
+            Ok(SequenceInspectReply::NotLeader { leader }) => {
+                if let Some(leader) = leader
+                    && let Some(hint) = targets.directory.get(&leader)
+                    && !tried.contains(hint)
+                {
+                    queue.push_front(hint.clone());
+                }
+            }
+            Ok(SequenceInspectReply::Unavailable(reason)) => last_error = Some(reason),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(Error::Raft(last_error.unwrap_or_else(|| {
+        "no data leader answered sequence inspection".into()
+    })))
 }
 
 /// `dal join`: register this node with the cluster it is configured for, using

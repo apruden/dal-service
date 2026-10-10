@@ -175,6 +175,23 @@ impl TrustPolicy {
         self.generation
     }
 
+    /// Public-key identities to exclude when recovering an isolated copy of
+    /// this cluster. Only digests enter a backup; policy contents stay external.
+    pub fn public_key_fingerprints(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self
+            .principals
+            .values()
+            .map(|principal| {
+                format!(
+                    "{:x}",
+                    Sha256::digest(principal.curve_public_key.as_bytes())
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Stable digest of the effective public trust policy. Input ordering and
     /// JSON formatting do not affect this identity.
     pub fn fingerprint(&self) -> [u8; 32] {

@@ -13,6 +13,7 @@ use crate::codec;
 use crate::error::{Error, Result};
 use crate::keyspace;
 use crate::meta::bootstrap::BootstrapDescriptor;
+use crate::search::SearchIndexRecord;
 use crate::storage::Storage;
 use crate::types::{
     ClusterConfig, GroupId, LogId, MaintenanceRecord, MaintenanceStage, NodeDirectoryEntry, NodeId,
@@ -42,6 +43,35 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::Config("invalid backup staging path".into()))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| Error::Config("invalid backup destination path".into()))?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
+    ensure_absent(destination)?;
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDigest {
@@ -63,6 +93,7 @@ pub struct MetaInventory {
     pub cluster: ClusterConfig,
     pub directory: Vec<NodeDirectoryEntry>,
     pub placements: Vec<(GroupId, Placement)>,
+    pub search_definitions: Vec<SearchIndexRecord>,
     pub search_state_sha256: String,
     pub state_sha256: String,
 }
@@ -74,6 +105,9 @@ pub struct NodeArtifact {
     pub backup_id: u128,
     pub cluster_id: u128,
     pub node_id: NodeId,
+    pub recovery_epoch: u128,
+    pub trust_generation: u64,
+    pub trust_policy_digest: String,
     pub maintenance: MaintenanceRecord,
     pub positions: Vec<GroupPosition>,
     pub meta: Option<MetaInventory>,
@@ -91,7 +125,14 @@ pub struct PackageNode {
 #[serde(deny_unknown_fields)]
 pub struct PackageManifest {
     pub format: u32,
+    pub binary_version: String,
+    pub protocol_version: u32,
+    pub storage_format_version: u32,
+    pub durable_record_version: u32,
+    pub snapshot_format_version: u32,
+    pub search_engine_revision: u32,
     pub backup_id: u128,
+    pub recovery_epoch: u128,
     pub descriptor: BootstrapDescriptor,
     pub operation_id: u128,
     pub generation: u64,
@@ -99,6 +140,7 @@ pub struct PackageManifest {
     pub meta: MetaInventory,
     pub trust_generation: u64,
     pub trust_policy_digest: String,
+    pub prior_key_fingerprints: Vec<String>,
     pub nodes: Vec<PackageNode>,
 }
 
@@ -106,6 +148,7 @@ pub struct PackageManifest {
 pub struct TrustSnapshot {
     pub generation: u64,
     pub digest: [u8; 32],
+    pub key_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +171,7 @@ pub struct RecoveryPlan {
     pub recovery_epoch: u128,
     pub minimum_trust_generation: u64,
     pub prior_trust_policy_digest: String,
+    pub prior_key_fingerprints: Vec<String>,
     pub package_manifest_sha256: String,
     pub fencing_evidence_sha256: String,
     pub nodes: Vec<NodeId>,
@@ -140,6 +184,22 @@ pub struct RestoreInventory {
     pub files: usize,
     pub bytes: u64,
     pub recovery_epoch: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogEntry {
+    pub backup_id: u128,
+    pub package_path: PathBuf,
+    pub manifest_sha256: String,
+    pub verified_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCatalog {
+    pub format: u32,
+    pub entries: Vec<CatalogEntry>,
 }
 
 fn sha256_file(path: &Path) -> Result<(u64, String)> {
@@ -257,10 +317,16 @@ fn meta_inventory(
             .filter(|(key, _)| key.starts_with(&keyspace::meta_search_index_prefix()))
             .cloned(),
     );
+    let search_definitions = rows
+        .iter()
+        .filter(|(key, _)| key.starts_with(&keyspace::meta_search_index_prefix()))
+        .map(|(_, value)| codec::decode::<SearchIndexRecord>(value))
+        .collect::<Result<Vec<_>>>()?;
     Ok(MetaInventory {
         cluster,
         directory,
         placements,
+        search_definitions,
         search_state_sha256,
         state_sha256: digest_rows(rows),
     })
@@ -277,8 +343,14 @@ pub fn export_node(
     operation_id: u128,
     generation: u64,
     destination: &Path,
+    trust: TrustSnapshot,
 ) -> Result<NodeArtifact> {
-    if backup_id == 0 || operation_id == 0 || generation == 0 {
+    if backup_id == 0
+        || operation_id == 0
+        || generation == 0
+        || trust.generation == 0
+        || trust.digest == [0; 32]
+    {
         return Err(Error::Config(
             "backup IDs must be nonzero and destination must be new".into(),
         ));
@@ -311,8 +383,14 @@ pub fn export_node(
         ));
     }
     let mut positions = Vec::new();
+    let recovery_epoch = storage.local_recovery_epoch()?;
     for group in std::iter::once(GroupId::Meta).chain((0..desc.config.p).map(GroupId::Data)) {
         if storage.group_exists(group) {
+            if storage.recovery_epoch(group)? != recovery_epoch {
+                return Err(Error::Config(format!(
+                    "{group:?} recovery epoch differs from local epoch"
+                )));
+            }
             let applied = storage
                 .last_applied(group)?
                 .ok_or_else(|| Error::Config(format!("{group:?} has no applied position")))?;
@@ -353,6 +431,13 @@ pub fn export_node(
             backup_id,
             cluster_id: desc.cluster_id,
             node_id,
+            recovery_epoch,
+            trust_generation: trust.generation,
+            trust_policy_digest: trust
+                .digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
             maintenance,
             positions,
             meta,
@@ -363,7 +448,7 @@ pub fn export_node(
         output.write_all(&bytes)?;
         output.sync_all()?;
         File::open(&stage)?.sync_all()?;
-        fs::rename(&stage, destination)?;
+        publish_directory(&stage, destination)?;
         File::open(&parent)?.sync_all()?;
         Ok(manifest)
     })();
@@ -399,6 +484,15 @@ pub fn verify_node(path: &Path) -> Result<NodeArtifact> {
         serde_json::from_slice(&fs::read(path.join(NODE_MANIFEST))?).map_err(Error::codec)?;
     if manifest.format != FORMAT || manifest.backup_id == 0 || manifest.cluster_id == 0 {
         return Err(Error::Config("unsupported or invalid node artifact".into()));
+    }
+    if manifest.trust_generation == 0
+        || manifest.trust_policy_digest.len() != 64
+        || !manifest
+            .trust_policy_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::Config("invalid node artifact trust snapshot".into()));
     }
     let mut actual = regular_files(&path.join("db"))?
         .iter()
@@ -450,6 +544,9 @@ fn validate_cluster_artifacts(
         if artifact.format != FORMAT
             || artifact.backup_id != first.backup_id
             || artifact.cluster_id != desc.cluster_id
+            || artifact.recovery_epoch != first.recovery_epoch
+            || artifact.trust_generation != first.trust_generation
+            || artifact.trust_policy_digest != first.trust_policy_digest
             || artifact.maintenance.operation_id != fence.operation_id
             || artifact.maintenance.generation != fence.generation
             || artifact.maintenance.participants != fence.participants
@@ -561,7 +658,7 @@ pub fn assemble(
     destination: &Path,
     trust: TrustSnapshot,
 ) -> Result<PackageManifest> {
-    if trust.generation == 0 || trust.digest == [0; 32] {
+    if trust.generation == 0 || trust.digest == [0; 32] || trust.key_fingerprints.is_empty() {
         return Err(Error::Config(
             "backup requires a current trust-policy snapshot".into(),
         ));
@@ -576,6 +673,18 @@ pub fn assemble(
         artifacts.push(verify_node(source)?);
     }
     let (meta, positions) = validate_cluster_artifacts(desc, &artifacts)?;
+    let trust_digest: String = trust
+        .digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if artifacts[0].trust_generation != trust.generation
+        || artifacts[0].trust_policy_digest != trust_digest
+    {
+        return Err(Error::Config(
+            "operator and node backup trust snapshots differ".into(),
+        ));
+    }
     let backup_id = artifacts[0].backup_id;
     let fence = &artifacts[0].maintenance;
     let parent = canonical_parent(destination)?;
@@ -611,7 +720,14 @@ pub fn assemble(
         nodes.sort_by_key(|node| node.node_id);
         let package = PackageManifest {
             format: FORMAT,
+            binary_version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: crate::types::PROTOCOL_VERSION,
+            storage_format_version: crate::storage::rocks::STORAGE_FORMAT_VERSION,
+            durable_record_version: crate::storage::rocks::DURABLE_RECORD_FORMAT_VERSION,
+            snapshot_format_version: crate::snapshot::FORMAT_VERSION,
+            search_engine_revision: crate::search::SEARCH_ENGINE_REVISION,
             backup_id,
+            recovery_epoch: artifacts[0].recovery_epoch,
             descriptor: desc.clone(),
             operation_id: fence.operation_id,
             generation: fence.generation,
@@ -623,6 +739,7 @@ pub fn assemble(
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            prior_key_fingerprints: trust.key_fingerprints,
             nodes,
         };
         let bytes = serde_json::to_vec_pretty(&package).map_err(Error::codec)?;
@@ -631,7 +748,7 @@ pub fn assemble(
         output.sync_all()?;
         File::open(&stage)?.sync_all()?;
         let verified = verify_package(&stage)?;
-        fs::rename(&stage, destination)?;
+        publish_directory(&stage, destination)?;
         File::open(&parent)?.sync_all()?;
         Ok(verified)
     })();
@@ -654,6 +771,12 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
     let package: PackageManifest =
         serde_json::from_slice(&fs::read(path.join("manifest.json"))?).map_err(Error::codec)?;
     if package.format != FORMAT
+        || package.binary_version != env!("CARGO_PKG_VERSION")
+        || package.protocol_version != crate::types::PROTOCOL_VERSION
+        || package.storage_format_version != crate::storage::rocks::STORAGE_FORMAT_VERSION
+        || package.durable_record_version != crate::storage::rocks::DURABLE_RECORD_FORMAT_VERSION
+        || package.snapshot_format_version != crate::snapshot::FORMAT_VERSION
+        || package.search_engine_revision != crate::search::SEARCH_ENGINE_REVISION
         || package.backup_id == 0
         || package.trust_generation == 0
         || package.trust_policy_digest.len() != 64
@@ -661,6 +784,14 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
             .trust_policy_digest
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+        || package.prior_key_fingerprints.is_empty()
+        || package
+            .prior_key_fingerprints
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || package.prior_key_fingerprints.iter().any(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     {
         return Err(Error::Config("unsupported backup package format".into()));
     }
@@ -695,6 +826,9 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
     }
     let (meta, positions) = validate_cluster_artifacts(&package.descriptor, &artifacts)?;
     if package.backup_id != artifacts[0].backup_id
+        || package.recovery_epoch != artifacts[0].recovery_epoch
+        || package.trust_generation != artifacts[0].trust_generation
+        || package.trust_policy_digest != artifacts[0].trust_policy_digest
         || package.operation_id != artifacts[0].maintenance.operation_id
         || package.generation != artifacts[0].maintenance.generation
         || package.meta != meta
@@ -707,16 +841,140 @@ pub fn verify_package(path: &Path) -> Result<PackageManifest> {
     Ok(package)
 }
 
+fn read_catalog(path: &Path) -> Result<BackupCatalog> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BackupCatalog {
+            format: FORMAT,
+            entries: Vec::new(),
+        }),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            Err(Error::Config("unsafe backup catalog path".into()))
+        }
+        Ok(_) => {
+            let catalog: BackupCatalog =
+                serde_json::from_slice(&fs::read(path)?).map_err(Error::codec)?;
+            if catalog.format != FORMAT
+                || catalog
+                    .entries
+                    .windows(2)
+                    .any(|pair| pair[0].backup_id >= pair[1].backup_id)
+            {
+                return Err(Error::Config("invalid backup catalog".into()));
+            }
+            Ok(catalog)
+        }
+    }
+}
+
+/// Record a package only after a full independent verification. The catalog
+/// is outside node data directories and has no deletion operation, so the
+/// service cannot prune its last verified recovery point.
+pub fn record_backup(package_path: &Path, catalog_path: &Path) -> Result<CatalogEntry> {
+    let package = verify_package(package_path)?;
+    let package_path = package_path.canonicalize()?;
+    let parent = canonical_parent(catalog_path)?;
+    if parent.starts_with(&package_path) {
+        return Err(Error::Config(
+            "backup catalog cannot be inside a package".into(),
+        ));
+    }
+    let lock_path = parent.join(format!(
+        ".{}.lock",
+        catalog_path
+            .file_name()
+            .ok_or_else(|| Error::Config("backup catalog has no file name".into()))?
+            .to_string_lossy()
+    ));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let mut catalog = read_catalog(catalog_path)?;
+    let checksum = sha256_file(&package_path.join("manifest.json"))?.1;
+    if let Some(existing) = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.backup_id == package.backup_id)
+    {
+        if existing.package_path == package_path && existing.manifest_sha256 == checksum {
+            return Ok(existing.clone());
+        }
+        return Err(Error::Config(
+            "backup ID already has a different catalog entry".into(),
+        ));
+    }
+    let verified_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::Config(error.to_string()))?
+        .as_secs();
+    let entry = CatalogEntry {
+        backup_id: package.backup_id,
+        package_path,
+        manifest_sha256: checksum,
+        verified_unix_seconds,
+    };
+    catalog.entries.push(entry.clone());
+    catalog.entries.sort_by_key(|entry| entry.backup_id);
+    let temporary = parent.join(format!(
+        ".{}.{}.partial",
+        catalog_path.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    ));
+    ensure_absent(&temporary)?;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(&catalog).map_err(Error::codec)?)?;
+        file.sync_all()?;
+        fs::rename(&temporary, catalog_path)?;
+        File::open(&parent)?.sync_all()?;
+        Ok(entry)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    drop(lock);
+    result
+}
+
+fn require_cataloged_package(package_path: &Path, catalog_path: &Path) -> Result<PackageManifest> {
+    let package = verify_package(package_path)?;
+    let canonical = package_path.canonicalize()?;
+    let checksum = sha256_file(&canonical.join("manifest.json"))?.1;
+    if !read_catalog(catalog_path)?.entries.iter().any(|entry| {
+        entry.backup_id == package.backup_id
+            && entry.package_path == canonical
+            && entry.manifest_sha256 == checksum
+    }) {
+        return Err(Error::Config(
+            "backup has no matching verified catalog entry".into(),
+        ));
+    }
+    Ok(package)
+}
+
 /// Create the one external recovery record shared by every restored node. The
 /// evidence is an explicit operator attestation of checks made outside DAL;
 /// this function validates its identity and records its digest, but cannot
 /// inspect the old deployment's network or process manager itself.
 pub fn initialize_restore(
     package_path: &Path,
+    catalog_path: &Path,
     evidence_path: &Path,
     plan_path: &Path,
 ) -> Result<RecoveryPlan> {
-    let package = verify_package(package_path)?;
+    let package = require_cataloged_package(package_path, catalog_path)?;
     let evidence_bytes = fs::read(evidence_path)?;
     let evidence: FencingEvidence =
         serde_json::from_slice(&evidence_bytes).map_err(Error::codec)?;
@@ -732,11 +990,14 @@ pub fn initialize_restore(
         ));
     }
     let mut random = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let recovery_epoch = u128::from_be_bytes(random);
-    if recovery_epoch == 0 {
-        return Err(Error::Config("generated an invalid recovery epoch".into()));
-    }
+    let mut entropy = File::open("/dev/urandom")?;
+    let recovery_epoch = loop {
+        entropy.read_exact(&mut random)?;
+        let candidate = u128::from_be_bytes(random);
+        if candidate != 0 && candidate != package.recovery_epoch {
+            break candidate;
+        }
+    };
     let plan = RecoveryPlan {
         format: FORMAT,
         cluster_id: package.descriptor.cluster_id,
@@ -747,6 +1008,7 @@ pub fn initialize_restore(
             .checked_add(1)
             .ok_or_else(|| Error::Config("trust generation exhausted".into()))?,
         prior_trust_policy_digest: package.trust_policy_digest,
+        prior_key_fingerprints: package.prior_key_fingerprints,
         package_manifest_sha256: sha256_file(&package_path.join("manifest.json"))?.1,
         fencing_evidence_sha256: format!("{:x}", Sha256::digest(&evidence_bytes)),
         nodes: package.nodes.iter().map(|node| node.node_id).collect(),
@@ -783,6 +1045,7 @@ fn checked_recovery_plan(
                 .checked_add(1)
                 .ok_or_else(|| Error::Config("trust generation exhausted".into()))?
         || plan.prior_trust_policy_digest != package.trust_policy_digest
+        || plan.prior_key_fingerprints != package.prior_key_fingerprints
         || plan.package_manifest_sha256 != sha256_file(&package_path.join("manifest.json"))?.1
         || plan.nodes
             != package
@@ -920,7 +1183,7 @@ pub fn restore_node(
         marker.write_all(&serde_json::to_vec_pretty(&plan).map_err(Error::codec)?)?;
         marker.sync_all()?;
         File::open(&stage)?.sync_all()?;
-        fs::rename(&stage, destination)?;
+        publish_directory(&stage, destination)?;
         File::open(&parent)?.sync_all()?;
         Ok(inventory)
     })();
@@ -971,19 +1234,23 @@ pub fn validate_restored_node(
             )));
         }
     }
-    if let Some(trust) = trust {
-        let digest: String = trust
-            .digest
+    let trust =
+        trust.ok_or_else(|| Error::Config("restored node requires secure startup".into()))?;
+    let digest: String = trust
+        .digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if trust.generation < plan.minimum_trust_generation
+        || digest == plan.prior_trust_policy_digest
+        || trust
+            .key_fingerprints
             .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        if trust.generation < plan.minimum_trust_generation
-            || digest == plan.prior_trust_policy_digest
-        {
-            return Err(Error::Config(
-                "restored node requires a newer trust policy excluding old credentials".into(),
-            ));
-        }
+            .any(|digest| plan.prior_key_fingerprints.binary_search(digest).is_ok())
+    {
+        return Err(Error::Config(
+            "restored node requires a newer trust policy excluding old credentials".into(),
+        ));
     }
     Ok(())
 }

@@ -43,11 +43,10 @@ type RaftApplied = (
 );
 
 const STORAGE_FORMAT_FILE: &str = "DAL_FORMAT.json";
-const STORAGE_FORMAT_VERSION: u32 = 1;
-/// Version 1 covers the bincode representation of Raft log entries, state
-/// records, identities, and idempotency digests. A change requires a fresh
-/// development data directory.
-const DURABLE_RECORD_FORMAT_VERSION: u32 = 1;
+pub const STORAGE_FORMAT_VERSION: u32 = 2;
+/// Version 2 covers the current Raft command and state records, including
+/// recovery epochs. A change requires a fresh development data directory.
+pub const DURABLE_RECORD_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -205,6 +204,8 @@ pub struct Storage {
     /// Serializes consumer registration with outbox pruning so a new backfill
     /// cannot lose a mutation between registration and its source snapshot.
     search_lifecycle: std::sync::Mutex<()>,
+    /// One full search rebuild at a time per node, across all partitions.
+    search_rebuild: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A point-in-time RocksDB view whose iterator remains valid after the Raft
@@ -506,6 +507,7 @@ impl Storage {
             active_state_cfs: std::sync::Mutex::new(HashMap::new()),
             snapshot_lifecycle: std::sync::Mutex::new(()),
             search_lifecycle: std::sync::Mutex::new(()),
+            search_rebuild: Arc::new(tokio::sync::Mutex::new(())),
         };
         storage.cleanup_snapshot_cfs(&existing)?;
         storage.cleanup_reclaimed_groups()?;
@@ -611,6 +613,54 @@ impl Storage {
         Ok(self
             .get_local(&keyspace::local_recovery_epoch_key())?
             .unwrap_or(0))
+    }
+
+    /// Admit one full derived-index rebuild after accounting for the current
+    /// source and all disk already occupied by active, retired, or quarantined
+    /// generations. The guard spans the rebuild and checkpoint publication.
+    pub async fn reserve_search_rebuild(
+        &self,
+        group: GroupId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self.search_rebuild.clone().lock_owned().await;
+        let cf = self.state_cf(group)?;
+        let prefix = [keyspace::TAG_USER];
+        let mut source_bytes = 0u64;
+        for item in self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        ) {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            source_bytes = source_bytes
+                .checked_add(key.len() as u64)
+                .and_then(|sum| sum.checked_add(value.len() as u64))
+                .ok_or_else(|| Error::Search("search source size overflow".into()))?;
+        }
+        let required = source_bytes
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(512 * 1024 * 1024))
+            .ok_or_else(|| Error::Search("search rebuild size overflow".into()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(self.path.as_os_str().as_bytes())
+                .map_err(|_| Error::Search("invalid search data path".into()))?;
+            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            if unsafe { libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stat = unsafe { stat.assume_init() };
+            let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+            if free < required {
+                return Err(Error::Search(format!(
+                    "search rebuild needs approximately {required} free bytes; {free} available"
+                )));
+            }
+        }
+        Ok(guard)
     }
 
     /// Offline restore step under exclusive RocksDB ownership. Install the
@@ -2061,11 +2111,11 @@ mod tests {
         let marker = db.join(STORAGE_FORMAT_FILE);
 
         for bytes in [
-            br#"{"storage_format_version":1}"#.as_slice(),
-            br#"{"storage_format_version":1,"durable_record_version":2,"snapshot_format_version":1,"search_engine_revision":2}"#.as_slice(),
-            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
-            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":1,"search_engine_revision":3}"#.as_slice(),
-            br#"{"storage_format_version":1,"durable_record_version":1,"snapshot_format_version":1,"search_engine_revision":2,"future_requirement":1}"#.as_slice(),
+            br#"{"storage_format_version":2}"#.as_slice(),
+            br#"{"storage_format_version":2,"durable_record_version":1,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":1,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":2,"search_engine_revision":3}"#.as_slice(),
+            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":2,"search_engine_revision":2,"future_requirement":1}"#.as_slice(),
         ] {
             fs::write(&marker, bytes).unwrap();
             assert!(check_storage_format(&db).is_err());

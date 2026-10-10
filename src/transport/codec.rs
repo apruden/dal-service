@@ -128,6 +128,8 @@ pub enum MsgType {
     MaintenanceQuiesce = 30,
     /// Operator-control: begin fresh recovery verification after capture.
     MaintenanceVerify = 31,
+    /// Operator-control: inspect a retained partition client sequence result.
+    SequenceInspect = 32,
 }
 
 impl MsgType {
@@ -165,6 +167,7 @@ impl MsgType {
             29 => MsgType::MaintenanceBegin,
             30 => MsgType::MaintenanceQuiesce,
             31 => MsgType::MaintenanceVerify,
+            32 => MsgType::SequenceInspect,
             _ => return None,
         })
     }
@@ -214,6 +217,7 @@ impl MsgType {
             | MsgType::MaintenanceBegin
             | MsgType::MaintenanceQuiesce
             | MsgType::MaintenanceVerify => 4 * KIB,
+            MsgType::SequenceInspect => 4 * KIB,
         }
     }
 
@@ -271,6 +275,7 @@ impl MsgType {
                 | MsgType::MaintenanceBegin
                 | MsgType::MaintenanceQuiesce
                 | MsgType::MaintenanceVerify
+                | MsgType::SequenceInspect
         )
     }
 }

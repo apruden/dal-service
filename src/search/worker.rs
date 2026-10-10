@@ -113,6 +113,7 @@ impl SearchIndexWorker {
             self.incremental_position()?
         };
         let Some(_after) = hint else {
+            let _reservation = self.storage.reserve_search_rebuild(self.group).await?;
             self.begin_rebuild()?;
             return self.rebuild_streaming().await;
         };
@@ -196,6 +197,7 @@ impl SearchIndexWorker {
         if let Some(result) = result {
             return Ok(result);
         }
+        let _reservation = self.storage.reserve_search_rebuild(self.group).await?;
         self.begin_rebuild()?;
         self.rebuild_streaming().await
     }

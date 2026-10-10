@@ -462,6 +462,7 @@ impl Node {
                 .map(|security| crate::backup::TrustSnapshot {
                     generation: security.policy.generation(),
                     digest: security.policy.fingerprint(),
+                    key_fingerprints: security.policy.public_key_fingerprints(),
                 }),
         )?;
         let make_transport = |lane| -> Result<ZmqTransport> {
@@ -817,6 +818,8 @@ impl Node {
                 readiness.clone(),
                 storage.clone(),
                 partitions.clone(),
+                catalog.clone(),
+                search.clone(),
                 identity_gate.clone(),
             ),
         )));
@@ -2336,6 +2339,8 @@ async fn maintenance_reconciler(
     readiness: RuntimeReadiness,
     storage: Arc<Storage>,
     partitions: PartitionMap,
+    catalog: Arc<dyn SearchCatalogSource>,
+    search: Arc<crate::search::SearchService>,
     identity_gate: ProcessIdentityGate,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -2389,6 +2394,7 @@ async fn maintenance_reconciler(
                     &readiness,
                     &storage,
                 )
+                && active_search_ready(registration.node_id, &partitions, &catalog, &search).await
                 && let Err(error) = acknowledge_runtime_recovery(
                     &registration,
                     &record,
@@ -2449,6 +2455,51 @@ async fn maintenance_reconciler(
             }
         }
     }
+}
+
+async fn active_search_ready(
+    node_id: NodeId,
+    partitions: &PartitionMap,
+    catalog: &Arc<dyn SearchCatalogSource>,
+    search: &crate::search::SearchService,
+) -> bool {
+    let Ok(records) = catalog.catalog(false).await else {
+        return false;
+    };
+    let hosted: Vec<_> = partitions
+        .read()
+        .unwrap()
+        .values()
+        .filter(|node| node.committed_voter_set().contains(&node_id))
+        .filter_map(|node| match node.group() {
+            GroupId::Data(partition) => Some(partition),
+            GroupId::Meta => None,
+        })
+        .collect();
+    for partition in hosted {
+        for record in &records {
+            let Some(active) = &record.active else {
+                continue;
+            };
+            if search
+                .catch_up_generation(partition, &record.name, active.id)
+                .await
+                .is_err()
+                || search
+                    .generation_readiness(
+                        partition,
+                        &record.name,
+                        active.id,
+                        active.definition_hash,
+                    )
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn local_recovery_topology_digest(

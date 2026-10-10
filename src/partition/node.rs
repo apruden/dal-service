@@ -18,7 +18,9 @@ use crate::partition::log_store::RocksLogStore;
 use crate::partition::network::{ChannelNetworkFactory, Faults, Registry};
 use crate::partition::raft_types::{Node, NodeId, Raft, TypeConfig};
 use crate::partition::sm::RocksStateMachine;
-use crate::partition::state_machine::{ApplyObserver, ApplyResult, DataStateMachine};
+use crate::partition::state_machine::{
+    ApplyObserver, ApplyResult, DataStateMachine, SequenceOutcome,
+};
 use crate::perf::WriteStage;
 use crate::storage::Storage;
 use crate::transport::raft_wire::{RecoveryFence, RecoveryFenceReply};
@@ -49,6 +51,12 @@ pub enum ReadOutcome {
     TooStale {
         leader: Option<NodeId>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceInspection {
+    Value(Option<SequenceOutcome>),
+    NotLeader { leader: Option<NodeId> },
 }
 
 /// ReadIndex outcome used to fence a strict derived-index read.
@@ -712,6 +720,28 @@ impl PartitionNode {
         Ok(ReadOutcome::Value(
             self.data.get(self.storage.as_ref(), key)?,
         ))
+    }
+
+    /// Authenticated operator inspection without admitting any client write.
+    /// The current leader passes ReadIndex and the same materialized-state gate
+    /// used by linearizable reads before exposing a sequence record.
+    pub async fn inspect_sequence(&self, client_id: u128) -> Result<SequenceInspection> {
+        self.storage.require_serving(self.group)?;
+        match self.raft.ensure_linearizable().await {
+            Ok(target) => {
+                self.open_state_recovery(target)?;
+                Ok(SequenceInspection::Value(
+                    self.data
+                        .inspect_sequence(self.storage.as_ref(), client_id)?,
+                ))
+            }
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                Ok(SequenceInspection::NotLeader {
+                    leader: forward.leader_id,
+                })
+            }
+            Err(error) => Err(Error::Raft(error.to_string())),
+        }
     }
 
     /// Read this node's *local* applied value for a key, bypassing the serving

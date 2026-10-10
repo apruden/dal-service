@@ -28,7 +28,7 @@ use crate::transport::raft_wire::{
     MaintenanceAckBody, MaintenanceBeginBody, MaintenanceQueryReply, MaintenanceRecoveryAckBody,
     MaintenanceReleaseBody, ObservationBody, PlacementQueryBody, PlacementQueryReply,
     RecoveryFenceReply, RecoveryFenceRequest, SearchIndexAdminBody, SearchIndexStatusBody,
-    SearchIndexStatusReply, SubmitReply,
+    SearchIndexStatusReply, SequenceInspectBody, SequenceInspectReply, SubmitReply,
 };
 use crate::transport::security::{Permission, TrustPolicy};
 use crate::types::{ClusterId, GroupId, MetaCommand, NodeId, NodeState, ProcessIdentityGate};
@@ -175,6 +175,7 @@ impl RootDispatch {
             MsgType::MaintenanceBegin => self.serve_maintenance_begin(req).await,
             MsgType::MaintenanceQuiesce => self.serve_maintenance_stage(req, false).await,
             MsgType::MaintenanceVerify => self.serve_maintenance_stage(req, true).await,
+            MsgType::SequenceInspect => self.serve_sequence_inspect(req).await,
             MsgType::DataRecoveryFence => self.serve_recovery_fence(req, &context).await,
             MsgType::Heartbeat => self.serve_heartbeat(req, &context),
             MsgType::BecomeLearner => self.serve_become_learner(req).await,
@@ -798,6 +799,33 @@ impl RootDispatch {
         self.reply(&req, codec::encode(&reply))
     }
 
+    async fn serve_sequence_inspect(&self, req: Envelope) -> Envelope {
+        let reply = match (
+            req.group_id,
+            codec::decode::<SequenceInspectBody>(&req.payload),
+        ) {
+            (GroupId::Data(partition), Ok(body)) => {
+                let node = self.partitions.read().unwrap().get(&partition).cloned();
+                match node {
+                    Some(node) => match node.inspect_sequence(body.client_id).await {
+                        Ok(crate::partition::node::SequenceInspection::Value(value)) => {
+                            SequenceInspectReply::Value(value)
+                        }
+                        Ok(crate::partition::node::SequenceInspection::NotLeader { leader }) => {
+                            SequenceInspectReply::NotLeader { leader }
+                        }
+                        Err(error) => SequenceInspectReply::Unavailable(error.to_string()),
+                    },
+                    None => {
+                        SequenceInspectReply::Unavailable("partition is not hosted here".into())
+                    }
+                }
+            }
+            _ => SequenceInspectReply::Unavailable("invalid sequence inspection request".into()),
+        };
+        self.reply(&req, codec::encode(&reply))
+    }
+
     async fn serve_maintenance_begin(&self, req: Envelope) -> Envelope {
         let respond = |reply: SubmitReply| self.reply(&req, codec::encode(&reply));
         let Ok(body) = codec::decode::<MaintenanceBeginBody>(&req.payload) else {
@@ -1173,7 +1201,8 @@ impl Server for RootDispatch {
                     | MsgType::MaintenanceRelease
                     | MsgType::MaintenanceBegin
                     | MsgType::MaintenanceQuiesce
-                    | MsgType::MaintenanceVerify => Permission::Operator,
+                    | MsgType::MaintenanceVerify
+                    | MsgType::SequenceInspect => Permission::Operator,
                     _ => Permission::PeerRpc,
                 };
                 let authorized = context
@@ -1183,6 +1212,14 @@ impl Server for RootDispatch {
                     .is_some();
                 if !authorized {
                     crate::perf::record_authorization_denial();
+                    if request.msg_type == MsgType::SequenceInspect {
+                        return self.reply(
+                            &request,
+                            codec::encode(&SequenceInspectReply::Unavailable(
+                                "authorization denied".into(),
+                            )),
+                        );
+                    }
                     return if matches!(
                         request.msg_type,
                         MsgType::JoinRequest
@@ -1217,6 +1254,7 @@ impl Server for RootDispatch {
                     | MsgType::MaintenanceBegin
                     | MsgType::MaintenanceQuiesce
                     | MsgType::MaintenanceVerify
+                    | MsgType::SequenceInspect
             ) {
                 tracing::info!(
                     principal = principal.as_deref().unwrap_or("unknown"),
