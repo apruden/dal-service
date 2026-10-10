@@ -22,4 +22,4 @@ libc = "0.2.15"
 system-deps = "6"
 
 [package.metadata.system-deps]
-libzmq = "4.1"
+libzmq = "4.3"

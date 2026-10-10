@@ -4,5 +4,5 @@ fn main() {
     // support at startup before opening its authenticated transport.
     system_deps::Config::new()
         .probe()
-        .expect("libzmq development files are required (with CURVE support)");
+        .expect("libzmq 4.3 development files are required");
 }
