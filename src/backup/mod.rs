@@ -65,11 +65,24 @@ fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
-    ensure_absent(destination)?;
-    fs::rename(source, destination)?;
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::Config("invalid backup staging path".into()))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| Error::Config("invalid backup destination path".into()))?;
+    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_directory(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(Error::Config(
+        "atomic no-replace backup publication is unsupported on this platform".into(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1246,7 +1259,7 @@ pub fn validate_restored_node(
         || trust
             .key_fingerprints
             .iter()
-            .any(|digest| plan.prior_key_fingerprints.binary_search(digest).is_ok())
+            .any(|digest| plan.prior_key_fingerprints.contains(digest))
     {
         return Err(Error::Config(
             "restored node requires a newer trust policy excluding old credentials".into(),

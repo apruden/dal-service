@@ -623,43 +623,53 @@ impl Storage {
         group: GroupId,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         let guard = self.search_rebuild.clone().lock_owned().await;
-        let cf = self.state_cf(group)?;
-        let prefix = [keyspace::TAG_USER];
-        let mut source_bytes = 0u64;
-        for item in self.db.iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
-        ) {
-            let (key, value) = item?;
-            if !key.starts_with(&prefix) {
-                break;
+        let db = self.db.clone();
+        let cf_name = self.active_state_cf_name(group)?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let cf = db
+                .cf_handle(&cf_name)
+                .ok_or_else(|| Error::Search("search source column family disappeared".into()))?;
+            let prefix = [keyspace::TAG_USER];
+            let mut source_bytes = 0u64;
+            for item in db.iterator_cf(
+                &cf,
+                rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            ) {
+                let (key, value) = item?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                source_bytes = source_bytes
+                    .checked_add(key.len() as u64)
+                    .and_then(|sum| sum.checked_add(value.len() as u64))
+                    .ok_or_else(|| Error::Search("search source size overflow".into()))?;
             }
-            source_bytes = source_bytes
-                .checked_add(key.len() as u64)
-                .and_then(|sum| sum.checked_add(value.len() as u64))
-                .ok_or_else(|| Error::Search("search source size overflow".into()))?;
-        }
-        let required = source_bytes
-            .checked_mul(8)
-            .and_then(|bytes| bytes.checked_add(512 * 1024 * 1024))
-            .ok_or_else(|| Error::Search("search rebuild size overflow".into()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let name = std::ffi::CString::new(self.path.as_os_str().as_bytes())
-                .map_err(|_| Error::Search("invalid search data path".into()))?;
-            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-            if unsafe { libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
+            let required = source_bytes
+                .checked_mul(8)
+                .and_then(|bytes| bytes.checked_add(512 * 1024 * 1024))
+                .ok_or_else(|| Error::Search("search rebuild size overflow".into()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| Error::Search("invalid search data path".into()))?;
+                let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                if unsafe { libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                let stat = unsafe { stat.assume_init() };
+                let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+                if free < required {
+                    return Err(Error::Search(format!(
+                        "search rebuild needs approximately {required} free bytes; {free} available"
+                    )));
+                }
             }
-            let stat = unsafe { stat.assume_init() };
-            let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
-            if free < required {
-                return Err(Error::Search(format!(
-                    "search rebuild needs approximately {required} free bytes; {free} available"
-                )));
-            }
-        }
+            Ok(())
+        })
+        .await
+        .map_err(|error| Error::Search(format!("search rebuild admission failed: {error}")))??;
         Ok(guard)
     }
 
