@@ -281,6 +281,10 @@ pub fn export_node(
             source.join(STORAGE_MARKER),
             stage.join("db").join(STORAGE_MARKER),
         )?;
+        for file in regular_files(&stage.join("db"))? {
+            File::open(file)?.sync_all()?;
+        }
+        File::open(stage.join("db"))?.sync_all()?;
         let files = regular_files(&stage.join("db"))?
             .iter()
             .map(|path| relative_file_digest(&stage, path))
@@ -405,12 +409,13 @@ fn validate_cluster_artifacts(
             "backup cluster config differs from descriptor".into(),
         ));
     }
-    let active: Vec<_> = meta
+    let mut active: Vec<_> = meta
         .directory
         .iter()
         .filter(|entry| entry.state == crate::types::NodeState::Active)
         .map(|entry| entry.node_id)
         .collect();
+    active.sort_unstable();
     if active != ids {
         return Err(Error::Config(
             "backup participants differ from frozen directory".into(),
