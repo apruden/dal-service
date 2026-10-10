@@ -24,7 +24,7 @@ pub(crate) const CLIENT_OP_BUCKET_LABELS: [&str; 9] = [
 const CLIENT_OP_BUCKET_MICROS: [u64; 8] = [
     10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
 ];
-pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 9] = [
+pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 10] = [
     "applied",
     "condition_failed",
     "rejected",
@@ -34,17 +34,18 @@ pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 9] = [
     "error",
     "unavailable",
     "denied",
+    "recovery_epoch_mismatch",
 ];
 static CLIENT_OP_DURATION_BUCKETS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 static CLIENT_OP_DURATION_SUM_MICROS: AtomicU64 = AtomicU64::new(0);
-static CLIENT_REPLY_OUTCOMES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static CLIENT_REPLY_OUTCOMES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientOpMetrics {
     pub duration_sum_microseconds: u64,
     /// Exclusive counts, converted to cumulative buckets during exposition.
     pub duration_buckets: [u64; 9],
-    pub reply_outcomes: [u64; 9],
+    pub reply_outcomes: [u64; 10],
 }
 
 pub(crate) fn client_op_metrics() -> ClientOpMetrics {
@@ -89,6 +90,26 @@ pub(crate) fn record_client_reply(reply: &ClientReply) {
         ClientReply::RecoveryEpochMismatch { .. } => 9,
     };
     CLIENT_REPLY_OUTCOMES[outcome].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod client_reply_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_epoch_mismatch_has_a_metric_slot() {
+        let before = client_op_metrics().reply_outcomes[9];
+        record_client_reply(&ClientReply::RecoveryEpochMismatch {
+            expected: 2,
+            got: 1,
+        });
+        assert!(client_op_metrics().reply_outcomes[9] > before);
+        assert_eq!(CLIENT_REPLY_OUTCOME_LABELS[9], "recovery_epoch_mismatch");
+        assert_eq!(
+            client_op_metrics().reply_outcomes.len(),
+            CLIENT_REPLY_OUTCOME_LABELS.len()
+        );
+    }
 }
 
 /// Count rejected authenticated requests without recording principal identity.

@@ -457,9 +457,8 @@ discarded source state through sequence 21, then verifies the restored package
 contains the first ten writes and the cached result for sequence 10, excludes
 later writes, and applies the same epoch rejection to two sequence-21 payloads:
 a new old-stream request and a retry of the lost request. This fixture does not
-exercise client acknowledgement or
-reply loss over the network; the live end-to-end reconciliation drill remains
-open.
+exercise client acknowledgement or reply loss over the network; the live drill
+below covers those paths.
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled
 libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
@@ -471,6 +470,17 @@ dependency's vendored build disabled CURVE;
 this drill requires CURVE and runs in the normal test build. The remaining
 failure and recovery checks below still need evidence before Phase 5 can be
 declared verified.
+
+The live drill now writes sequences 1–10 before export, resumes and releases
+the original cluster, acknowledges sequences 11–20, and commits sequence 21
+while withholding its reply. After deleting every original node directory and
+restoring the package, it checks that only the first ten writes remain, the old
+client's pending sequence-21 retry receives an explicit recovery-epoch mismatch,
+a different old-stream mutation stays blocked, and a fresh identity under the
+new epoch can write. This drill exposed a metrics counter with nine slots for
+ten client reply outcomes; recording an epoch mismatch panicked a gateway task
+and made the client time out. The counter and its exported label now include the
+epoch-mismatch outcome, with a focused regression test.
 
 The live drill also interrupts fence installation by restarting a missing
 participant while the operation is `Preparing`, changes meta leadership while

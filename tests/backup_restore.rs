@@ -31,7 +31,7 @@ struct Process {
 
 #[derive(Clone)]
 struct WithheldWriteReply {
-    inner: ZmqTransport,
+    inner: Arc<Mutex<ZmqTransport>>,
     hide_first_decision: Arc<AtomicBool>,
     decided: Arc<Notify>,
     resume: Arc<Notify>,
@@ -45,7 +45,8 @@ impl Transport for WithheldWriteReply {
                 dal::codec::decode::<ClientRequest>(&request.payload),
                 Ok(ClientRequest::Mutate(_))
             );
-        let reply = self.inner.call(addr, request).await?;
+        let inner = self.inner.lock().unwrap().clone();
+        let reply = inner.call(addr, request).await?;
         if mutation
             && let Ok(ClientReply::Mutation(outcome @ WriteReply::Applied { .. })) =
                 dal::codec::decode::<ClientReply>(&reply.payload)
@@ -536,17 +537,24 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     for address in &fixture.http {
         wait_until_ready(address, &mut nodes).await;
     }
-    let client = Client::new(
-        CID,
-        0x50,
-        fixture.controls.clone(),
-        ZmqTransport::new_curve(
+    let withheld = WithheldWriteReply {
+        inner: Arc::new(Mutex::new(ZmqTransport::new_curve(
             zmq::Context::new(),
             Duration::from_secs(2),
             Lane::Control,
             old_curve,
-        ),
-    );
+        ))),
+        hide_first_decision: Arc::new(AtomicBool::new(false)),
+        decided: Arc::new(Notify::new()),
+        resume: Arc::new(Notify::new()),
+        original: Arc::new(Mutex::new(None)),
+    };
+    let client = Arc::new(Client::new(
+        CID,
+        0x50,
+        fixture.controls.clone(),
+        withheld.clone(),
+    ));
     assert!(matches!(
         client
             .put(b"before-backup", b"retained", None)
@@ -554,6 +562,19 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
             .unwrap(),
         WriteReply::Applied { .. }
     ));
+    for sequence in 2..=10 {
+        assert!(matches!(
+            client
+                .put(
+                    format!("before-backup-{sequence}").as_bytes(),
+                    format!("retained-{sequence}").as_bytes(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            WriteReply::Applied { .. }
+        ));
+    }
     let mut interrupted = nodes.remove(2);
     interrupted.child.kill().unwrap();
     interrupted.child.wait().unwrap();
@@ -652,7 +673,11 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     .await;
     assert!(!ready(&fixture.http[old_leader]).await);
     wait_for_meta_convergence(&fixture.http, &mut nodes).await;
-    let fenced_write = client
+    // A fenced attempt remains pending; use another identity so the backup
+    // client's next successful mutation still has sequence 11.
+    let fence_transport = withheld.inner.lock().unwrap().clone();
+    let fenced_client = Client::new(CID, 0x60, fixture.controls.clone(), fence_transport);
+    let fenced_write = fenced_client
         .put(b"during-fence", b"must-not-commit", None)
         .await
         .unwrap_err();
@@ -723,6 +748,101 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         false,
     );
     std::fs::write(&node_manifest, original).unwrap();
+
+    // Resume the original cluster after the backup so its later acknowledged
+    // history can diverge from the immutable recovery point.
+    let mut resumed = fixture.start();
+    for address in &fixture.http {
+        wait_for(address, &mut resumed, |value| {
+            value["maintenance"]["stage"] == "quiesced"
+        })
+        .await;
+    }
+    cli(
+        &[
+            "maintenance-verify",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+            "--generation",
+            &generation,
+        ],
+        true,
+    );
+    wait_for(&fixture.http[0], &mut resumed, |value| {
+        value["maintenance"]["stage"] == "verifying"
+            && value["maintenance"]["recovered"]
+                .as_array()
+                .is_some_and(|nodes| nodes.len() == 3)
+    })
+    .await;
+    cli(
+        &[
+            "maintenance-release",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            OPERATION,
+            "--generation",
+            &generation,
+            "--wait-seconds",
+            "30",
+        ],
+        true,
+    );
+    for address in &fixture.http {
+        wait_until_ready(address, &mut resumed).await;
+    }
+    for sequence in 11..=20 {
+        assert!(matches!(
+            client
+                .put(
+                    format!("after-backup-{sequence}").as_bytes(),
+                    format!("lost-{sequence}").as_bytes(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            WriteReply::Applied { .. }
+        ));
+    }
+    withheld.hide_first_decision.store(true, Ordering::Release);
+    let pending_client = client.clone();
+    let pending = tokio::spawn(async move {
+        pending_client
+            .put(b"after-backup-21", b"lost-21", None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(15), withheld.decided.notified())
+        .await
+        .expect("sequence 21 did not commit before its reply was withheld");
+    assert!(matches!(
+        withheld.original.lock().unwrap().as_ref(),
+        Some(WriteReply::Applied { .. })
+    ));
+    let observer = Client::new(
+        CID,
+        0x60,
+        fixture.controls.clone(),
+        withheld.inner.lock().unwrap().clone(),
+    );
+    assert_eq!(
+        observer.get(b"after-backup-21").await.unwrap().unwrap().1,
+        b"lost-21"
+    );
+    // Dropping the in-flight call leaves Client::pending intact: mutate stores
+    // the exact sequence and operation before awaiting the transport reply.
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    for node in &mut resumed {
+        stop(node).await;
+    }
+    drop(resumed);
 
     let evidence = fixture.root.join("fencing.json");
     let record = fixture.root.join("recovery.json");
@@ -937,6 +1057,7 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         Lane::Control,
         new_curve,
     );
+    *withheld.inner.lock().unwrap() = transport.clone();
     let old_epoch = Client::new(CID, 0x60, fixture.controls.clone(), transport.clone());
     assert!(
         old_epoch
@@ -950,6 +1071,55 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         restored.get(b"before-backup").await.unwrap().unwrap().1,
         b"retained"
     );
+    let wrapper_probe = Client::new(CID, 0x60, fixture.controls.clone(), withheld.clone());
+    assert_eq!(
+        wrapper_probe
+            .get(b"before-backup")
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        b"retained"
+    );
+    let retry_error = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.put(b"after-backup-21", b"lost-21", None),
+    )
+    .await
+    .expect("old-stream retry did not complete")
+    .unwrap_err();
+    assert!(
+        matches!(retry_error, dal::Error::Raft(ref message) if message.contains("recovery epoch mismatch")),
+        "unexpected old-stream retry outcome: {retry_error}"
+    );
+    let different_error = client
+        .put(b"different-old-stream", b"blocked", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(different_error, dal::Error::Raft(ref message) if message.contains("mutation sequence 21") && message.contains("is unresolved")),
+        "unexpected old-stream pending outcome: {different_error}"
+    );
+    for sequence in 2..=10 {
+        assert_eq!(
+            restored
+                .get(format!("before-backup-{sequence}").as_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            format!("retained-{sequence}").as_bytes()
+        );
+    }
+    for sequence in 11..=21 {
+        assert!(
+            restored
+                .get(format!("after-backup-{sequence}").as_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     assert!(restored.get(b"during-fence").await.unwrap().is_none());
     assert!(matches!(
         restored.put(b"after-restore", b"new", None).await.unwrap(),
@@ -980,7 +1150,7 @@ async fn committed_reply_lost_before_maintenance_replays_after_release() {
         curve,
     );
     let withheld = WithheldWriteReply {
-        inner: transport.clone(),
+        inner: Arc::new(Mutex::new(transport.clone())),
         hide_first_decision: Arc::new(AtomicBool::new(true)),
         decided: Arc::new(Notify::new()),
         resume: Arc::new(Notify::new()),
