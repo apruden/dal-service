@@ -436,10 +436,14 @@ trust-policy digest. Release requires all digests to agree with the current
 meta leader's policy, and an authenticated operator release request waits for
 a new heartbeat from every exact recovery process before submitting its
 directory and process bindings to replicated apply. An operator can inspect
-the ReadIndex-confirmed record with `dal maintenance-status`; release currently
-has a typed operator RPC but no CLI subcommand. Next, provide an explicit
-missing-participant recovery procedure, expose the maintenance CLI commands,
-then implement backup/restore.
+the ReadIndex-confirmed record with `dal maintenance-status`. The
+`maintenance-release` CLI addresses an exact operation and generation and uses
+the typed operator RPC after recovery proofs are complete. The
+[missing-participant recovery procedure](docs/operations/maintenance-recovery.md)
+keeps the operation fenced until the same node returns with durable state and
+reproves recovery. Permanent loss still requires the planned verified restore
+path; no participant-removal or force-release path exists. Next, implement
+backup/restore and the remaining maintenance phase-transition commands.
 
 ### Maintenance protocol
 

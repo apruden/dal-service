@@ -37,7 +37,8 @@ fn usage() -> &'static str {
        index-rebuild --auth <operator.json> --cluster <init.json> --name <name> --definition <json> [--seed <addr>]\n\
        index-drop    --auth <operator.json> --cluster <init.json> --name <name> [--seed <addr>]\n\
        status      --auth <operator.json> --cluster <init.json> [--seed <addr>]        print the cluster routing snapshot\n\
-       maintenance-status --auth <operator.json> --cluster <init.json> [--seed <addr>]   print maintenance progress\n"
+       maintenance-status --auth <operator.json> --cluster <init.json> [--seed <addr>]   print maintenance progress\n\
+       maintenance-release --auth <operator.json> --cluster <init.json> --operation <hex> --generation <n> [--seed <addr>] [--wait-seconds <n>]   release verified maintenance\n"
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -160,6 +161,27 @@ fn main() -> ExitCode {
             _ => {
                 eprintln!(
                     "maintenance-status: --auth <operator.json> and --cluster <init.json> required"
+                );
+                ExitCode::FAILURE
+            }
+        },
+        "maintenance-release" => match (
+            flag(rest, "--auth"),
+            flag(rest, "--cluster"),
+            flag(rest, "--operation"),
+            flag(rest, "--generation"),
+        ) {
+            (Some(auth), Some(cluster), Some(operation), Some(generation)) => maintenance_release(
+                auth,
+                cluster,
+                operation,
+                generation,
+                flag(rest, "--seed"),
+                flag(rest, "--wait-seconds"),
+            ),
+            _ => {
+                eprintln!(
+                    "maintenance-release: --auth, --cluster, --operation, and --generation required"
                 );
                 ExitCode::FAILURE
             }
@@ -706,6 +728,27 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                 println!("participants: {:?}", record.participants);
                 println!("preparation acknowledged: {:?}", record.acknowledged);
                 println!("recovery acknowledged: {:?}", record.recovered);
+                let pending: Vec<_> = match record.stage {
+                    dal::types::MaintenanceStage::Preparing => record
+                        .participants
+                        .iter()
+                        .copied()
+                        .filter(|node| record.acknowledged.binary_search(node).is_err())
+                        .collect(),
+                    dal::types::MaintenanceStage::Verifying => record
+                        .participants
+                        .iter()
+                        .copied()
+                        .filter(|node| record.recovered.binary_search(node).is_err())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if !pending.is_empty() {
+                    println!(
+                        "participants awaiting {:?} acknowledgement: {:?}",
+                        record.stage, pending
+                    );
+                }
                 println!("recovery processes: {:?}", record.recovery_processes);
                 for (node, digest) in &record.recovery_policy_digests {
                     let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -721,6 +764,21 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                             .collect::<String>())
                         .unwrap_or_else(|| "pending".into())
                 );
+                if record.stage == dal::types::MaintenanceStage::Verifying {
+                    if !pending.is_empty() {
+                        println!(
+                            "recovery action: restart missing participants with their durable state and recorded identity; if state is lost, keep maintenance fenced"
+                        );
+                    } else if record.verification_policy_digest.is_none() {
+                        println!(
+                            "recovery action: align participant trust policies and restart affected nodes; maintenance remains fenced"
+                        );
+                    } else {
+                        println!(
+                            "recovery proofs complete; maintenance-release checks the leader policy and fresh heartbeats before release"
+                        );
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Ok(None) => {
@@ -732,6 +790,71 @@ fn maintenance_status(auth: &str, cluster: &str, seed: Option<&str>) -> ExitCode
                 ExitCode::FAILURE
             }
         }
+    })
+}
+
+fn maintenance_release(
+    auth: &str,
+    cluster: &str,
+    operation: &str,
+    generation: &str,
+    seed: Option<&str>,
+    wait_seconds: Option<&str>,
+) -> ExitCode {
+    let Some(operation_id) = operation
+        .strip_prefix("0x")
+        .and_then(|hex| u128::from_str_radix(hex, 16).ok())
+        .filter(|value| *value != 0)
+    else {
+        eprintln!(
+            "maintenance-release: --operation must be a nonzero 0x-prefixed hex ID from maintenance-status"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Ok(generation) = generation.parse::<u64>() else {
+        eprintln!("maintenance-release: --generation must be a positive integer");
+        return ExitCode::FAILURE;
+    };
+    if generation == 0 {
+        eprintln!("maintenance-release: --generation must be a positive integer");
+        return ExitCode::FAILURE;
+    }
+    let wait_seconds = match wait_seconds.unwrap_or("60").parse::<u64>() {
+        Ok(seconds) if (1..=3600).contains(&seconds) => seconds,
+        _ => {
+            eprintln!("maintenance-release: --wait-seconds must be between 1 and 3600");
+            return ExitCode::FAILURE;
+        }
+    };
+    let desc = match load_init_descriptor(Path::new(cluster)) {
+        Ok(desc) => desc,
+        Err(error) => {
+            eprintln!("maintenance-release: cluster: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let curve = match load_cli_curve(auth, &desc) {
+        Ok(curve) => curve,
+        Err(error) => {
+            eprintln!("maintenance-release: security: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = seed.map(str::to_string);
+    with_runtime(async move {
+        report(
+            "maintenance-release",
+            admin::maintenance_release_secure(
+                zmq::Context::new(),
+                &desc,
+                operation_id,
+                generation,
+                seed.as_deref(),
+                curve,
+                Duration::from_secs(wait_seconds),
+            )
+            .await,
+        )
     })
 }
 

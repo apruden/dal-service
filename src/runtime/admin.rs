@@ -23,7 +23,8 @@ use crate::transport::Transport;
 use crate::transport::codec::{Envelope, Lane, MsgType};
 use crate::transport::dealer::ZmqTransport;
 use crate::transport::raft_wire::{
-    AbortPlanBody, JoinBody, LeaveBody, MaintenanceQueryReply, SearchIndexAdminBody, SubmitReply,
+    AbortPlanBody, JoinBody, LeaveBody, MaintenanceQueryReply, MaintenanceReleaseBody,
+    SearchIndexAdminBody, SubmitReply,
 };
 use crate::transport::security::CurveClientConfig;
 use crate::types::{ClusterId, GroupId, MaintenanceRecord, NodeId};
@@ -223,15 +224,19 @@ fn secure_transport(
     curve: CurveClientConfig,
     seed: Option<&str>,
 ) -> Result<ZmqTransport> {
+    secure_transport_with_timeout(ctx, curve, seed, ADMIN_TIMEOUT)
+}
+
+fn secure_transport_with_timeout(
+    ctx: zmq::Context,
+    curve: CurveClientConfig,
+    seed: Option<&str>,
+    timeout: Duration,
+) -> Result<ZmqTransport> {
     if let Some(seed) = seed {
         curve.server_key(seed)?;
     }
-    Ok(ZmqTransport::new_curve(
-        ctx,
-        ADMIN_TIMEOUT,
-        Lane::Control,
-        curve,
-    ))
+    Ok(ZmqTransport::new_curve(ctx, timeout, Lane::Control, curve))
 }
 
 async fn status_with_transport(
@@ -324,6 +329,39 @@ pub async fn maintenance_status_secure(
     Err(Error::Raft(last_error.unwrap_or_else(|| {
         "no meta leader answered the maintenance status query".into()
     })))
+}
+
+/// Request release of the exact verified operation. The leader gathers fresh
+/// heartbeat evidence; callers cannot supply or bypass that evidence.
+pub async fn maintenance_release_secure(
+    ctx: zmq::Context,
+    desc: &BootstrapDescriptor,
+    operation_id: u128,
+    generation: u64,
+    seed: Option<&str>,
+    curve: CurveClientConfig,
+    timeout: Duration,
+) -> Result<MetaApplyResult> {
+    if operation_id == 0 || generation == 0 || timeout.is_zero() {
+        return Err(Error::Config(
+            "maintenance release identity and timeout are required".into(),
+        ));
+    }
+    let transport = secure_transport_with_timeout(ctx, curve, seed, timeout)?;
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
+    submit(
+        &transport,
+        desc.cluster_id,
+        &targets,
+        MsgType::MaintenanceRelease,
+        codec::encode(&MaintenanceReleaseBody {
+            operation_id,
+            generation,
+        }),
+    )
+    .await
 }
 
 /// `dal join`: register this node with the cluster it is configured for, using
