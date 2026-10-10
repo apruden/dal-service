@@ -527,12 +527,17 @@ then stops the whole quorum together for CLI node export, package assembly, and
 package verification. It restarts the original data directories before maintenance
 verification and release, then checks the directory and readiness again after
 another Down timeout. No delayed failure transition appears.
-The log-order matrix in `tests/meta_m5.rs` now checks both sides of the search
-and placement fence: a building index or active move makes maintenance begin
-wait, while search and move commands already queued behind a committed begin
-are rejected in `Preparing`, `Quiesced`, and `Verifying` without changing meta
-records. A runtime scheduling race of automatic search and move writers remains
-to be exercised.
+The log-order matrix in `tests/meta_m5.rs` checks both sides of the search and
+placement fence: a building index or active move makes maintenance begin wait,
+while search and move commands already queued behind a committed begin are
+rejected in `Preparing`, `Quiesced`, and `Verifying` without changing meta
+records. The running meta Raft test in `tests/meta_group_m5.rs` now pauses the
+proposal forms used by automatic search and rebalance drivers, commits
+maintenance begin, and releases them together. Readiness, activation, search
+drop finalization, move creation, abort, completion, and abort-report proposals
+all receive `MaintenanceActive`; every voter retains the same catalog and
+placement, and its automatic-change gate closes. This schedules the race at the
+Raft proposal boundary; the driver loops themselves are not paused by the test.
 
 ### Maintenance protocol
 

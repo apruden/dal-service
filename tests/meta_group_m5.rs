@@ -10,11 +10,16 @@ use std::time::Duration;
 use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::meta::node::{MetaNode, MetaRead, ProposeOutcome};
 use dal::meta::raft_types::MetaTypeConfig;
-use dal::meta::state_machine::MetaApplyResult;
+use dal::meta::state_machine::{MetaApplyResult, MetaReject};
 use dal::partition::network::{Faults, Registry};
+use dal::search::{
+    FieldKind, PathSegment, SEARCH_ENGINE_REVISION, SearchField, SearchIndexDefinition,
+    SearchIndexReady,
+};
 use dal::storage::Storage;
 use dal::types::{
-    BootstrapGroup, ClusterConfig, GroupId, HashSpec, MetaCommand, NodeId, PROTOCOL_VERSION,
+    BootstrapGroup, ClusterConfig, DataConfigObservation, GroupId, HashSpec, LogId, MetaCommand,
+    NodeId, PROTOCOL_VERSION,
 };
 
 use tempfile::TempDir;
@@ -111,11 +116,20 @@ async fn bootstrapped() -> (Harness, Vec<Arc<MetaNode>>) {
 /// Drive a full bootstrap: init the cluster, register the voter nodes, and seed
 /// one data partition's placement.
 async fn init_register_seed(nodes: &[Arc<MetaNode>], partition: u16, voters: &[NodeId]) {
+    init_register_seed_with_config(nodes, partition, voters, config()).await;
+}
+
+async fn init_register_seed_with_config(
+    nodes: &[Arc<MetaNode>],
+    partition: u16,
+    voters: &[NodeId],
+    cluster_config: ClusterConfig,
+) {
     assert!(matches!(
         propose_to_leader(
             nodes,
             MetaCommand::ClusterInit {
-                config: config(),
+                config: cluster_config,
                 meta_voters: VOTERS.to_vec(),
             }
         )
@@ -144,6 +158,192 @@ async fn init_register_seed(nodes: &[Arc<MetaNode>], partition: u16, voters: &[N
         .await,
         MetaApplyResult::Applied
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_search_and_move_proposals_stay_behind_committed_maintenance() {
+    let (_h, nodes) = bootstrapped().await;
+    let mut cluster_config = config();
+    cluster_config.p = 1;
+    init_register_seed_with_config(&nodes, 0, &VOTERS, cluster_config).await;
+    assert_eq!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::RegisterNode {
+                node_id: 4,
+                control_addr: "c4".into(),
+                bulk_addr: "b4".into(),
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+    let definition = SearchIndexDefinition {
+        document_type: "article".into(),
+        fields: vec![SearchField {
+            name: "body".into(),
+            source_path: vec![PathSegment::Key("body".into())],
+            kind: FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            required: true,
+            multi_valued: false,
+            indexed: true,
+            stored: false,
+            fast: false,
+        }],
+        default_search_fields: vec!["body".into()],
+    };
+    assert_eq!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition: definition.clone(),
+                engine_revision: SEARCH_ENGINE_REVISION,
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+    let leader = &nodes[leader_idx(&nodes).unwrap()];
+    let placement = leader.local_placement(GroupId::Data(0)).unwrap().unwrap();
+    let catalog = leader.local_search_catalog().unwrap();
+    let generation = catalog[0].building.as_ref().unwrap().id;
+    let observation = |node_id| SearchIndexReady {
+        generation,
+        definition_hash: definition.definition_hash().unwrap(),
+        engine_revision: SEARCH_ENGINE_REVISION,
+        group: GroupId::Data(0),
+        node_id,
+        voters_log_id: placement.voters_log_id,
+        projection_epoch: 1,
+        source_log_id: LogId::new(3, 20),
+    };
+    for node_id in VOTERS {
+        assert_eq!(
+            propose_to_leader(
+                &nodes,
+                MetaCommand::ReportSearchIndexReady {
+                    name: "articles".into(),
+                    observation: observation(node_id),
+                }
+            )
+            .await,
+            MetaApplyResult::Applied
+        );
+    }
+    assert_eq!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::ActivateSearchIndexGeneration {
+                name: "articles".into(),
+                generation,
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+
+    // These are the proposal shapes emitted by the automatic search and
+    // rebalance drivers. Hold them after the producer's observation, so the
+    // maintenance command can commit before their Raft submissions.
+    let queued = [
+        MetaCommand::ReportSearchIndexReady {
+            name: "articles".into(),
+            observation: observation(1),
+        },
+        MetaCommand::ActivateSearchIndexGeneration {
+            name: "articles".into(),
+            generation,
+        },
+        MetaCommand::FinalizeSearchIndexDrop {
+            name: "articles".into(),
+            generation,
+        },
+        MetaCommand::CreatePlan {
+            group: GroupId::Data(0),
+            plan_id: 0,
+            target_voters: vec![1, 2, 4],
+        },
+        MetaCommand::MarkAborting {
+            group: GroupId::Data(0),
+            plan_id: 0,
+        },
+        MetaCommand::FinalizePlan {
+            group: GroupId::Data(0),
+            plan_id: 0,
+            observation: DataConfigObservation {
+                group: GroupId::Data(0),
+                plan_id: 0,
+                voter_set: vec![1, 2, 4],
+                config_log_id: LogId::new(3, 30),
+            },
+        },
+        MetaCommand::AbortReport {
+            group: GroupId::Data(0),
+            plan_id: 0,
+            observation: DataConfigObservation {
+                group: GroupId::Data(0),
+                plan_id: 0,
+                voter_set: vec![1, 2, 3],
+                config_log_id: LogId::new(3, 31),
+            },
+        },
+    ];
+    let ready = Arc::new(tokio::sync::Barrier::new(queued.len() + 1));
+    let release = Arc::new(tokio::sync::Barrier::new(queued.len() + 1));
+    let mut writers = Vec::new();
+    for command in queued {
+        let nodes = nodes.clone();
+        let ready = ready.clone();
+        let release = release.clone();
+        writers.push(tokio::spawn(async move {
+            ready.wait().await;
+            release.wait().await;
+            propose_to_leader(&nodes, command).await
+        }));
+    }
+    ready.wait().await;
+    assert_eq!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::BeginMaintenance {
+                operation_id: 0x51,
+                generation: 1,
+                participants: vec![1, 2, 3, 4],
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+    eventually("maintenance producer gate closes on every voter", || {
+        nodes
+            .iter()
+            .all(|node| !node.automatic_meta_changes_allowed())
+    })
+    .await;
+    let before_placement = nodes[leader_idx(&nodes).unwrap()]
+        .local_placement(GroupId::Data(0))
+        .unwrap();
+    let before_catalog = nodes[leader_idx(&nodes).unwrap()]
+        .local_search_catalog()
+        .unwrap();
+    release.wait().await;
+    for writer in writers {
+        assert_eq!(
+            writer.await.unwrap(),
+            MetaApplyResult::Rejected(MetaReject::MaintenanceActive)
+        );
+    }
+    eventually("rejected proposals leave every voter unchanged", || {
+        nodes.iter().all(|node| {
+            node.local_placement(GroupId::Data(0)).unwrap() == before_placement
+                && node.local_search_catalog().unwrap() == before_catalog
+        })
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
