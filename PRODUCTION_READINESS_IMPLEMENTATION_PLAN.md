@@ -450,6 +450,8 @@ can inspect retained client sequence outcomes under maintenance.
 The offline exported-artifact drill in `tests/backup_restore.rs` verifies CLI
 package inspection, catalog publication, restore initialization, dry-run and
 restore, retained data and sequence state, epoch rejection, and trust exclusion.
+It also rejects leftover partial export and publication stages, an incomplete
+participant set, mixed artifacts, tampering, and an unknown package format.
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled
 libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied

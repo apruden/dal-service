@@ -894,6 +894,25 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .iter()
         .map(|id| root.join(format!("artifact-{id}")))
         .collect::<Vec<_>>();
+    let export_partial = root.join(format!(".dal-backup-{:032x}-node-1.partial", 0xabc52));
+    std::fs::create_dir(&export_partial).unwrap();
+    std::fs::write(export_partial.join("interrupted"), b"incomplete").unwrap();
+    assert!(
+        backup::export_node(
+            &descriptor,
+            ids[0],
+            &sources[0],
+            0xabc52,
+            0xabc51,
+            1,
+            &artifacts[0],
+            trust.clone(),
+        )
+        .is_err()
+    );
+    assert!(!artifacts[0].exists());
+    assert!(export_partial.join("interrupted").exists());
+    std::fs::remove_dir_all(&export_partial).unwrap();
     for (id, (source, artifact)) in ids.iter().zip(sources.iter().zip(&artifacts)) {
         backup::export_node(
             &descriptor,
@@ -947,6 +966,13 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         .is_err()
     );
     std::fs::write(&third_manifest, third_bytes).unwrap();
+    let package_partial = root.join(format!(".dal-package-{:032x}.partial", 0xabc52));
+    std::fs::create_dir(&package_partial).unwrap();
+    std::fs::write(package_partial.join("interrupted"), b"incomplete").unwrap();
+    assert!(backup::assemble(&descriptor, &artifacts, &package, trust.clone()).is_err());
+    assert!(!package.exists());
+    assert!(package_partial.join("interrupted").exists());
+    std::fs::remove_dir_all(&package_partial).unwrap();
     backup::assemble(&descriptor, &artifacts, &package, trust.clone()).unwrap();
     cli(
         &["backup-verify", "--package", package.to_str().unwrap()],
@@ -960,6 +986,16 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         false,
     );
     std::fs::write(&node_manifest, bytes).unwrap();
+    let package_manifest = package.join("manifest.json");
+    let manifest_bytes = std::fs::read(&package_manifest).unwrap();
+    let mut unknown: backup::PackageManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    unknown.format = u32::MAX;
+    std::fs::write(&package_manifest, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    cli(
+        &["backup-verify", "--package", package.to_str().unwrap()],
+        false,
+    );
+    std::fs::write(&package_manifest, manifest_bytes).unwrap();
     let catalog = root.join("catalog.json");
     cli(
         &[
