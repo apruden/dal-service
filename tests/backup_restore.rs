@@ -1191,6 +1191,22 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
     for address in &fixture.http {
         wait_until_ready(address, &mut nodes).await;
     }
+    let retained_sequence = cli(
+        &[
+            "sequence-inspect",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--partition",
+            "0",
+            "--client",
+            "0x50",
+        ],
+        true,
+    );
+    assert!(retained_sequence.contains("highest sequence: 10"));
+    assert!(retained_sequence.contains("result: Applied"));
     let transport = ZmqTransport::new_curve(
         zmq::Context::new(),
         Duration::from_secs(2),

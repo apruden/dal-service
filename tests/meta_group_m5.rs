@@ -160,6 +160,197 @@ async fn init_register_seed_with_config(
     ));
 }
 
+fn search_definition() -> SearchIndexDefinition {
+    SearchIndexDefinition {
+        document_type: "article".into(),
+        fields: vec![SearchField {
+            name: "body".into(),
+            source_path: vec![PathSegment::Key("body".into())],
+            kind: FieldKind::Text {
+                tokenizer: "default".into(),
+                positions: true,
+            },
+            required: true,
+            multi_valued: false,
+            indexed: true,
+            stored: false,
+            fast: false,
+        }],
+        default_search_fields: vec!["body".into()],
+    }
+}
+
+async fn ready_search_index(nodes: &[Arc<MetaNode>]) -> (u64, SearchIndexReady) {
+    let definition = search_definition();
+    assert_eq!(
+        propose_to_leader(
+            nodes,
+            MetaCommand::CreateSearchIndexWithRevision {
+                name: "articles".into(),
+                definition: definition.clone(),
+                engine_revision: SEARCH_ENGINE_REVISION,
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+    let leader = &nodes[leader_idx(nodes).unwrap()];
+    let placement = leader.local_placement(GroupId::Data(0)).unwrap().unwrap();
+    let catalog = leader.local_search_catalog().unwrap();
+    let generation = catalog[0].building.as_ref().unwrap().id;
+    let observation = |node_id| SearchIndexReady {
+        generation,
+        definition_hash: definition.definition_hash().unwrap(),
+        engine_revision: SEARCH_ENGINE_REVISION,
+        group: GroupId::Data(0),
+        node_id,
+        voters_log_id: placement.voters_log_id,
+        projection_epoch: 1,
+        source_log_id: LogId::new(3, 20),
+    };
+    for node_id in VOTERS {
+        assert_eq!(
+            propose_to_leader(
+                nodes,
+                MetaCommand::ReportSearchIndexReady {
+                    name: "articles".into(),
+                    observation: observation(node_id),
+                }
+            )
+            .await,
+            MetaApplyResult::Applied
+        );
+    }
+    (generation, observation(1))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_move_and_maintenance_begin_follow_log_order() {
+    let (_h, nodes) = bootstrapped().await;
+    init_register_seed(&nodes, 0, &VOTERS).await;
+    assert_eq!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::RegisterNode {
+                node_id: 4,
+                control_addr: "c4".into(),
+                bulk_addr: "b4".into(),
+            }
+        )
+        .await,
+        MetaApplyResult::Applied
+    );
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let move_nodes = nodes.clone();
+    let move_start = start.clone();
+    let move_writer = tokio::spawn(async move {
+        move_start.wait().await;
+        propose_to_leader(
+            &move_nodes,
+            MetaCommand::CreatePlan {
+                group: GroupId::Data(0),
+                plan_id: 0,
+                target_voters: vec![1, 2, 4],
+            },
+        )
+        .await
+    });
+    let begin_nodes = nodes.clone();
+    let begin_start = start.clone();
+    let begin_writer = tokio::spawn(async move {
+        begin_start.wait().await;
+        propose_to_leader(
+            &begin_nodes,
+            MetaCommand::BeginMaintenance {
+                operation_id: 0x51,
+                generation: 1,
+                participants: vec![1, 2, 3, 4],
+            },
+        )
+        .await
+    });
+    start.wait().await;
+    let move_result = move_writer.await.unwrap();
+    let begin_result = begin_writer.await.unwrap();
+    let leader = &nodes[leader_idx(&nodes).unwrap()];
+    match (move_result, begin_result) {
+        (MetaApplyResult::Applied, MetaApplyResult::Rejected(MetaReject::MaintenanceBusy)) => {
+            assert!(
+                leader
+                    .local_placement(GroupId::Data(0))
+                    .unwrap()
+                    .unwrap()
+                    .r#move
+                    .is_some()
+            );
+            assert!(leader.automatic_meta_changes_allowed());
+        }
+        (MetaApplyResult::Rejected(MetaReject::MaintenanceActive), MetaApplyResult::Applied) => {
+            assert!(
+                leader
+                    .local_placement(GroupId::Data(0))
+                    .unwrap()
+                    .unwrap()
+                    .r#move
+                    .is_none()
+            );
+            assert!(!leader.automatic_meta_changes_allowed());
+        }
+        other => panic!("move and maintenance violated log order: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_search_activation_and_maintenance_begin_follow_log_order() {
+    let (_h, nodes) = bootstrapped().await;
+    let mut cluster_config = config();
+    cluster_config.p = 1;
+    init_register_seed_with_config(&nodes, 0, &VOTERS, cluster_config).await;
+    let (generation, _) = ready_search_index(&nodes).await;
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let search_nodes = nodes.clone();
+    let search_start = start.clone();
+    let search_writer = tokio::spawn(async move {
+        search_start.wait().await;
+        propose_to_leader(
+            &search_nodes,
+            MetaCommand::ActivateSearchIndexGeneration {
+                name: "articles".into(),
+                generation,
+            },
+        )
+        .await
+    });
+    let begin_nodes = nodes.clone();
+    let begin_start = start.clone();
+    let begin_writer = tokio::spawn(async move {
+        begin_start.wait().await;
+        propose_to_leader(
+            &begin_nodes,
+            MetaCommand::BeginMaintenance {
+                operation_id: 0x51,
+                generation: 1,
+                participants: VOTERS.to_vec(),
+            },
+        )
+        .await
+    });
+    start.wait().await;
+    let search_result = search_writer.await.unwrap();
+    let begin_result = begin_writer.await.unwrap();
+    assert_eq!(search_result, MetaApplyResult::Applied);
+    let leader = &nodes[leader_idx(&nodes).unwrap()];
+    let catalog = leader.local_search_catalog().unwrap();
+    assert_eq!(catalog[0].active.as_ref().unwrap().id, generation);
+    match begin_result {
+        MetaApplyResult::Applied => assert!(!leader.automatic_meta_changes_allowed()),
+        MetaApplyResult::Rejected(MetaReject::MaintenanceBusy) => {
+            assert!(leader.automatic_meta_changes_allowed())
+        }
+        other => panic!("search activation and maintenance violated log order: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queued_search_and_move_proposals_stay_behind_committed_maintenance() {
     let (_h, nodes) = bootstrapped().await;
@@ -178,62 +369,7 @@ async fn queued_search_and_move_proposals_stay_behind_committed_maintenance() {
         .await,
         MetaApplyResult::Applied
     );
-    let definition = SearchIndexDefinition {
-        document_type: "article".into(),
-        fields: vec![SearchField {
-            name: "body".into(),
-            source_path: vec![PathSegment::Key("body".into())],
-            kind: FieldKind::Text {
-                tokenizer: "default".into(),
-                positions: true,
-            },
-            required: true,
-            multi_valued: false,
-            indexed: true,
-            stored: false,
-            fast: false,
-        }],
-        default_search_fields: vec!["body".into()],
-    };
-    assert_eq!(
-        propose_to_leader(
-            &nodes,
-            MetaCommand::CreateSearchIndexWithRevision {
-                name: "articles".into(),
-                definition: definition.clone(),
-                engine_revision: SEARCH_ENGINE_REVISION,
-            }
-        )
-        .await,
-        MetaApplyResult::Applied
-    );
-    let leader = &nodes[leader_idx(&nodes).unwrap()];
-    let placement = leader.local_placement(GroupId::Data(0)).unwrap().unwrap();
-    let catalog = leader.local_search_catalog().unwrap();
-    let generation = catalog[0].building.as_ref().unwrap().id;
-    let observation = |node_id| SearchIndexReady {
-        generation,
-        definition_hash: definition.definition_hash().unwrap(),
-        engine_revision: SEARCH_ENGINE_REVISION,
-        group: GroupId::Data(0),
-        node_id,
-        voters_log_id: placement.voters_log_id,
-        projection_epoch: 1,
-        source_log_id: LogId::new(3, 20),
-    };
-    for node_id in VOTERS {
-        assert_eq!(
-            propose_to_leader(
-                &nodes,
-                MetaCommand::ReportSearchIndexReady {
-                    name: "articles".into(),
-                    observation: observation(node_id),
-                }
-            )
-            .await,
-            MetaApplyResult::Applied
-        );
-    }
+    let (generation, observation) = ready_search_index(&nodes).await;
     assert_eq!(
         propose_to_leader(
             &nodes,
@@ -252,7 +388,7 @@ async fn queued_search_and_move_proposals_stay_behind_committed_maintenance() {
     let queued = [
         MetaCommand::ReportSearchIndexReady {
             name: "articles".into(),
-            observation: observation(1),
+            observation,
         },
         MetaCommand::ActivateSearchIndexGeneration {
             name: "articles".into(),

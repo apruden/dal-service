@@ -485,7 +485,9 @@ while withholding its reply. After deleting every original node directory and
 restoring the package, it checks that only the first ten writes remain, the old
 client's pending sequence-21 retry receives an explicit recovery-epoch mismatch,
 a different old-stream mutation stays blocked, and a fresh identity under the
-new epoch can write. This drill exposed a metrics counter with nine slots for
+new epoch can write. The same drill invokes the authenticated `sequence-inspect`
+CLI against the restored cluster and confirms that the retained outcome is the
+applied sequence-10 result. This drill exposed a metrics counter with nine slots for
 ten client reply outcomes; recording an epoch mismatch panicked a gateway task
 and made the client time out. The counter and its exported label now include the
 epoch-mismatch outcome, with a focused regression test.
@@ -531,13 +533,19 @@ The log-order matrix in `tests/meta_m5.rs` checks both sides of the search and
 placement fence: a building index or active move makes maintenance begin wait,
 while search and move commands already queued behind a committed begin are
 rejected in `Preparing`, `Quiesced`, and `Verifying` without changing meta
-records. The running meta Raft test in `tests/meta_group_m5.rs` now pauses the
-proposal forms used by automatic search and rebalance drivers, commits
-maintenance begin, and releases them together. Readiness, activation, search
-drop finalization, move creation, abort, completion, and abort-report proposals
-all receive `MaintenanceActive`; every voter retains the same catalog and
-placement, and its automatic-change gate closes. This schedules the race at the
-Raft proposal boundary; the driver loops themselves are not paused by the test.
+records. The running meta Raft tests in `tests/meta_group_m5.rs` submit a move
+proposal and maintenance begin concurrently, then separately submit search
+activation and maintenance begin concurrently. Each outcome follows the
+committed log order: a move that wins makes begin return `MaintenanceBusy`,
+while begin that wins rejects the move with `MaintenanceActive`. For search,
+begin returns `MaintenanceBusy` if the generation is still building, and applies
+if activation commits first. A separate deterministic test
+holds the proposal forms used by automatic search and rebalance drivers until
+after begin commits. Readiness, activation, search drop finalization, move
+creation, abort, completion, and abort-report proposals then all receive
+`MaintenanceActive`; every voter retains the same catalog and placement, and
+its automatic-change gate closes. The tests exercise the live Raft proposal
+boundary; they do not pause the driver loops themselves.
 
 ### Maintenance protocol
 
