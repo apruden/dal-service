@@ -123,7 +123,9 @@ format work can proceed before the full fence.
 ### Completion gate
 
 The implementation assumptions state the workload and recovery boundaries
-used by later phases. Unspecified deployment targets do not block service work.
+used by later phases, including explicit latency, backup, and restore targets
+or an explicit record that those targets remain unknown. Unspecified deployment
+targets do not block service work.
 
 ## Phase 1 Implement lifecycle and health reporting
 
@@ -290,6 +292,8 @@ new transport security modules.
    upstream is unreachable externally. Separate access to minimal probes from
    detailed status and metrics. An insecure non-loopback admin bind fails
    production configuration validation.
+9. Keep `dal check-config` non-mutating. It rejects unknown, inconsistent, or
+   insecure service configuration before any storage or socket mutation.
 
 [CURVE](https://libzmq.readthedocs.io/en/latest/zmq_curve.html) supplies transport
 authentication and confidentiality. [ZAP](https://rfc.zeromq.org/spec/27/)
@@ -351,6 +355,11 @@ metrics and audit modules.
 - Bound diagnostic queues. Logging or a metrics backend outage cannot block
   Raft or make buffers grow indefinitely. Expose dropped-log counts; keep
   critical shutdown/fatal failures visible through a fallback output.
+- Audit aggregate resource limits, not only individual queue bounds. Account
+  for total peer connections and in-flight RPCs, pending reply bytes,
+  concurrent snapshots, loaded index writers, and retained logs. Bound each
+  total against the assumed resource envelope; a bounded send queue alone
+  does not bound requests already in flight.
 
 ### Tests and completion gate
 
@@ -359,6 +368,9 @@ runtime error, and a shutdown outcome reach its configured output. Verify
 redaction, bounded label cardinality, and continued progress when the collector
 is unavailable. Induce a stalled flush, disk-pressure signal, and search backlog
 and verify the corresponding diagnostic signals.
+
+The diagnostics identify the affected node and group, serving state, and
+recovery blocker without requiring an expensive or authoritative HTTP read.
 
 ## Phase 4 Define the current format and restore metadata
 
@@ -380,6 +392,10 @@ Primary changes: [codec](src/codec.rs), [types](src/types.rs),
    the current binary. Update or replace them when the current format
    deliberately changes. Do not build a source-to-target version matrix or
    migration path.
+4. Bound client idempotency-record growth. Enforce a client-identity admission
+   cap suited to the assumed workload, or define a durable session/expiry
+   protocol that cannot turn an old retry into a fresh write. Arbitrary TTL
+   deletion of sequence records is unsafe.
 
 ### Completion gate
 
@@ -544,6 +560,13 @@ snapshot. This initial backup intentionally requires a write-maintenance window.
   restored authoritative source; stale consumer metadata cannot authorize
   incremental catch-up across a missing index. Verify strict search before
   opening search readiness.
+- Use a node-wide search rebuild coordinator and disk-space admission check
+  for automatic recovery, corrupt-index quarantine, explicit rebuilds, and
+  restore reconstruction. Account for active, building, retiring, and
+  quarantined generations. Keep a rebuild's reservation through retiring
+  generation reclamation, serialize restore rebuilds through the same path,
+  and never silently delete a quarantine to make room. Refuse a rebuild that
+  cannot fit the assumed disk and memory limits.
 - Validate the recorded data, versions, client sequence results, placements,
   Raft recovery, and index counts before reopening ingress. Measure elapsed
   restore time and the actual recovered point against Phase 0 objectives.
@@ -603,6 +626,9 @@ The test must exercise the CLI and exported artifacts, not an in-memory shortcut
 - Keep an old deployment running inside an isolated test network. Verify restore
   cannot proceed without fencing evidence, old endpoints remain unreachable to
   production clients, and old credentials cannot join the restored deployment.
+- Cold-start every voter with the maintenance fence installed. Start peers
+  without waiting for client readiness, form quorums, and verify that client
+  readiness stays closed until recovery checks and explicit release succeed.
 
 Exercise restore from exported artifacts with the command-line tools and verify
 that the restored cluster remains fenced until its recovery checks pass.
@@ -650,7 +676,9 @@ cargo test --locked --all-targets --all-features
 
 Keep security, lifecycle, format, and restore checks tied to the current
 revision and configuration. Record workload parameters for performance
-measurements.
+measurements. Run performance measurements on an optimized binary and a
+verified durable filesystem; record `DAL_BENCH_DIR` and every workload
+parameter when ignored measurement cases are run.
 
 Track each phase as proposed, in progress, or implemented, with the exact
 revision and evidence when changing status. Update the applicable sections of
