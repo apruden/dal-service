@@ -471,7 +471,11 @@ stops. Release succeeds only after that participant restarts and records a new
 recovery process proof. The separate non-meta data-leader and routing-only
 restart cases now run in `tests/maintenance_restart.rs`: both start with
 admission open, restart after quiescence, reject direct mutations, and remain
-closed through recovery verification. That drill exposed and fixed a gateway
+closed through recovery verification. Each stop exceeds the normal Down timeout
+while another Active node is available; meta voters retain the original Active
+directory entries and data placement, and the data quorum elects a new leader
+without changing membership. The test uses TCP peer endpoints so existing
+ZeroMQ clients reconnect when a node's router restarts. That drill exposed and fixed a gateway
 path that redirected routing-only mutations before checking the maintenance
 fence. Authenticated release is covered by the secure process drill above.
 

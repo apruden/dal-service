@@ -2,7 +2,7 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dal::api::ops::{ClientReply, ClientRequest};
@@ -21,13 +21,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CID: u128 = 0xDA1_5A7E;
 const OPERATION: u128 = 0xA51;
 const ALL: [u64; 7] = [1, 2, 3, 4, 5, 6, 7];
+static PEER_ADDRESSES: OnceLock<Vec<(String, String)>> = OnceLock::new();
 
 fn control(id: u64) -> String {
-    format!("inproc://maintenance-restart-control-{id}")
+    PEER_ADDRESSES.get().unwrap()[(id - 1) as usize].0.clone()
 }
 
 fn bulk(id: u64) -> String {
-    format!("inproc://maintenance-restart-bulk-{id}")
+    PEER_ADDRESSES.get().unwrap()[(id - 1) as usize].1.clone()
+}
+
+fn peer_addresses() -> Vec<Option<TcpListener>> {
+    // A DEALER connected to an inproc endpoint does not reconnect after its
+    // ROUTER is rebound. TCP models the process restart exercised here.
+    let listeners = (0..ALL.len() * 2)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+    let addresses = listeners
+        .chunks_exact(2)
+        .map(|pair| {
+            (
+                format!("tcp://{}", pair[0].local_addr().unwrap()),
+                format!("tcp://{}", pair[1].local_addr().unwrap()),
+            )
+        })
+        .collect();
+    PEER_ADDRESSES.set(addresses).unwrap();
+    listeners.into_iter().map(Some).collect()
 }
 
 fn http_addresses() -> (Vec<String>, Vec<Option<TcpListener>>) {
@@ -195,6 +215,7 @@ async fn assert_fenced(transport: &ZmqTransport, id: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn data_leader_and_routing_only_restart_stay_fenced_through_verification() {
     let ctx = zmq::Context::new();
+    let mut peer_reservations = peer_addresses();
     let desc = descriptor();
     let dirs = (0..ALL.len())
         .map(|_| tempfile::tempdir().unwrap())
@@ -202,6 +223,8 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
     let (http, mut reservations) = http_addresses();
     let mut nodes = Vec::new();
     for (index, &id) in ALL.iter().enumerate() {
+        drop(peer_reservations[index * 2].take());
+        drop(peer_reservations[index * 2 + 1].take());
         drop(reservations[index].take());
         nodes.push(Some(Arc::new(
             Node::start_insecure_for_tests(
@@ -253,6 +276,7 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         .await;
         assert!(!ready(address).await);
     }
+    let frozen_directory = status(&http[0]).await.unwrap()["directory"].clone();
 
     let data_leader = nodes[3].as_ref().unwrap().partition_leader(0).unwrap();
     assert!((4..=6).contains(&data_leader));
@@ -265,9 +289,49 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
             .shutdown()
             .await
             .unwrap();
-    }
-    for id in [data_leader, 7] {
-        let index = (id - 1) as usize;
+        // Each planned stop exceeds the configured Down timeout. A spare
+        // Active node exists, but the maintenance fence must suppress failure
+        // transitions and replacement moves throughout the stopped interval.
+        tokio::time::sleep(Duration::from_secs(17)).await;
+        if id == data_leader {
+            let other_voters = [4u64, 5, 6]
+                .into_iter()
+                .filter(|&voter| voter != data_leader)
+                .collect::<Vec<_>>();
+            assert!(
+                other_voters.iter().any(|&voter| {
+                    nodes[(voter - 1) as usize]
+                        .as_ref()
+                        .unwrap()
+                        .partition_leader(0)
+                        == Some(voter)
+                }),
+                "surviving data quorum lost leadership: {:?}",
+                other_voters
+                    .iter()
+                    .map(|&voter| nodes[(voter - 1) as usize]
+                        .as_ref()
+                        .unwrap()
+                        .partition_leader(0))
+                    .collect::<Vec<_>>()
+            );
+        }
+        for meta in nodes.iter().take(3) {
+            let meta = meta.as_ref().unwrap();
+            assert_eq!(
+                meta.local_node_state(id).unwrap(),
+                Some(dal::types::NodeState::Active)
+            );
+            assert_eq!(
+                meta.local_placement_voters(0).unwrap(),
+                Some((vec![4, 5, 6], false))
+            );
+            assert_eq!(meta.meta_voters_of(), Some(vec![1, 2, 3]));
+        }
+        assert_eq!(
+            status(&http[0]).await.unwrap()["directory"],
+            frozen_directory
+        );
         let node = Arc::new(
             Node::start_insecure_for_tests(
                 ctx.clone(),
@@ -285,6 +349,10 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         .await;
         assert!(!ready(&http[index]).await);
         assert_fenced(&transport, id).await;
+        assert_eq!(
+            status(&http[0]).await.unwrap()["directory"],
+            frozen_directory
+        );
     }
 
     let meta_leader = nodes[0].as_ref().unwrap().meta_leader().unwrap();
@@ -301,13 +369,36 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
         .await,
         SubmitReply::Outcome(MetaApplyResult::Applied)
     );
-    wait_for_status(&http[0], |value| {
-        value["maintenance"]["stage"] == "verifying"
-            && value["maintenance"]["recovered"]
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let meta = status(&http[0]).await.unwrap();
+        if meta["maintenance"]["stage"] == "verifying"
+            && meta["maintenance"]["recovered"]
                 .as_array()
                 .is_some_and(|nodes| nodes.len() == ALL.len())
-    })
-    .await;
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let mut voter_statuses = Vec::new();
+            for id in [4u64, 5, 6] {
+                voter_statuses.push((
+                    id,
+                    status(&http[(id - 1) as usize])
+                        .await
+                        .map(|status| status["partitions"].clone()),
+                ));
+            }
+            panic!(
+                "recovery proofs stalled: recovered={:?}, data voter statuses={voter_statuses:?}, router status={:?}",
+                meta["maintenance"]["recovered"],
+                status(&http[6])
+                    .await
+                    .map(|status| status["partitions"].clone()),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     for address in &http {
         assert!(!ready(address).await);
     }
