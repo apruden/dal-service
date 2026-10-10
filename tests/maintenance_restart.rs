@@ -30,14 +30,15 @@ fn bulk(id: u64) -> String {
     format!("inproc://maintenance-restart-bulk-{id}")
 }
 
-fn http_addresses() -> Vec<String> {
+fn http_addresses() -> (Vec<String>, Vec<Option<TcpListener>>) {
     let listeners = (0..ALL.len())
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>();
-    listeners
+    let addresses = listeners
         .iter()
         .map(|listener| listener.local_addr().unwrap().to_string())
-        .collect()
+        .collect();
+    (addresses, listeners.into_iter().map(Some).collect())
 }
 
 fn descriptor() -> BootstrapDescriptor {
@@ -198,9 +199,10 @@ async fn data_leader_and_routing_only_restart_stay_fenced_through_verification()
     let dirs = (0..ALL.len())
         .map(|_| tempfile::tempdir().unwrap())
         .collect::<Vec<_>>();
-    let http = http_addresses();
+    let (http, mut reservations) = http_addresses();
     let mut nodes = Vec::new();
     for (index, &id) in ALL.iter().enumerate() {
+        drop(reservations[index].take());
         nodes.push(Some(Arc::new(
             Node::start_insecure_for_tests(
                 ctx.clone(),
