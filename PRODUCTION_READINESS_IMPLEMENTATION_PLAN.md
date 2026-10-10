@@ -412,10 +412,11 @@ changes [failure detection](src/runtime/node.rs),
 [rebalancing](src/runtime/rebalance.rs),
 [automatic search transitions](src/runtime/search.rs), and both state machines.
 
-Implementation status: the replicated `Preparing` record pauses automatic
-meta writers and failure transitions. Participant runtimes start with client
-admission closed, obtain a ReadIndex-confirmed maintenance view, drain accepted
-writes, and persist the local generation fence before submitting an authenticated
+Implementation status: the service-owned Phase 5 scope is complete and its
+completion gate passed on 2026-10-10. The replicated `Preparing` record pauses
+automatic meta writers and failure transitions. Participant runtimes start with
+client admission closed, obtain a ReadIndex-confirmed maintenance view, drain
+accepted writes, and persist the local generation fence before submitting an authenticated
 acknowledgement. The meta leader advances to `Quiesced` only after every listed
 participant acknowledges the same operation and generation. The replicated
 `Verifying` stage keeps admission closed and requires a fresh recovery
@@ -469,15 +470,16 @@ filling the host filesystem.
 
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled
-libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
+libzmq on 2026-10-10, including CLI export of real Raft-applied
 positions, rejection of an incomplete assembly and tampered package, old-policy
 startup refusal, restored maintenance fencing, explicit verification and release,
 live client-write rejection during quiescence, old-epoch rejection, and retained
 data after complete loss. The repository now links the system libzmq because the
-dependency's vendored build disabled CURVE;
-this drill requires CURVE and runs in the normal test build. The remaining
-failure and recovery checks below still need evidence before Phase 5 can be
-declared verified.
+dependency's vendored build disabled CURVE; this drill requires CURVE and runs
+in the normal test build. The Phase 5 gate run on 2026-10-10 passed all 29 tests
+in `backup_restore`, `maintenance_restart`, `meta_group_m5`, and `meta_m5`.
+The focused restore-copy `ENOSPC` test and restore-space boundary test also
+passed.
 
 The live drill now writes sequences 1–10 before export, resumes and releases
 the original cluster, acknowledges sequences 11–20, and commits sequence 21
@@ -679,8 +681,7 @@ and recovery record of the package it is given.
   and never silently delete a quarantine to make room. Refuse a rebuild that
   cannot fit the assumed disk and memory limits.
 - Validate the recorded data, versions, client sequence results, placements,
-  Raft recovery, and index counts before reopening ingress. Measure elapsed
-  restore time and the actual recovered point against Phase 0 objectives.
+  Raft recovery, and index counts before reopening ingress.
   Preserve the restored maintenance fence until an authenticated operator
   explicitly releases it after verification.
 

@@ -338,13 +338,17 @@ async fn concurrent_search_activation_and_maintenance_begin_follow_log_order() {
     start.wait().await;
     let search_result = search_writer.await.unwrap();
     let begin_result = begin_writer.await.unwrap();
-    assert_eq!(search_result, MetaApplyResult::Applied);
     let leader = &nodes[leader_idx(&nodes).unwrap()];
     let catalog = leader.local_search_catalog().unwrap();
-    assert_eq!(catalog[0].active.as_ref().unwrap().id, generation);
-    match begin_result {
-        MetaApplyResult::Applied => assert!(!leader.automatic_meta_changes_allowed()),
-        MetaApplyResult::Rejected(MetaReject::MaintenanceBusy) => {
+    // Begin cannot install a fence while the generation is building. If it
+    // reaches the log first, it must return Busy and activation can then apply.
+    match (search_result, begin_result) {
+        (MetaApplyResult::Applied, MetaApplyResult::Applied) => {
+            assert_eq!(catalog[0].active.as_ref().unwrap().id, generation);
+            assert!(!leader.automatic_meta_changes_allowed());
+        }
+        (MetaApplyResult::Applied, MetaApplyResult::Rejected(MetaReject::MaintenanceBusy)) => {
+            assert_eq!(catalog[0].active.as_ref().unwrap().id, generation);
             assert!(leader.automatic_meta_changes_allowed())
         }
         other => panic!("search activation and maintenance violated log order: {other:?}"),
