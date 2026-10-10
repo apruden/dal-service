@@ -855,10 +855,14 @@ fn maintenance_release(
         {
             Ok(outcome) => report("maintenance-release", Ok(outcome)),
             Err(error) => {
-                eprintln!(
-                    "maintenance-release: {error}; outcome may be pending; check maintenance-status before retrying"
-                );
-                ExitCode::FAILURE
+                let might_have_sent = !matches!(&error, dal::error::Error::Config(_));
+                let code = report("maintenance-release", Err(error));
+                if might_have_sent {
+                    eprintln!(
+                        "If the request may have reached the leader, check maintenance-status before retrying."
+                    );
+                }
+                code
             }
         }
     })

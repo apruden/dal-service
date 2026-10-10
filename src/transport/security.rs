@@ -350,7 +350,6 @@ pub fn authentication_denials() -> u64 {
 /// Outbound CURVE identity and the pinned server public keys for destination
 /// endpoints. Missing pins are configuration errors; secure transports never
 /// fall back to plaintext for an unknown address.
-#[derive(Clone)]
 pub struct CurveClientConfig {
     public_key: [u8; 32],
     secret_key: [u8; 32],

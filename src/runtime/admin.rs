@@ -103,7 +103,10 @@ impl Targets {
         for addr in self.candidates.clone() {
             let request =
                 Envelope::new(cluster_id, MsgType::MetaQuery, GroupId::Meta, 0, Vec::new());
-            let Ok(reply) = transport.call(&addr, request).await else {
+            let Ok(reply) = transport
+                .call_with_timeout(&addr, request, Some(ADMIN_TIMEOUT))
+                .await
+            else {
                 continue;
             };
             if reply.cluster_id != cluster_id || reply.msg_type != MsgType::MetaQuery {
@@ -347,12 +350,10 @@ pub async fn maintenance_release_secure(
             "maintenance release identity and timeout are required".into(),
         ));
     }
-    let discovery = secure_transport(ctx.clone(), curve.clone(), seed)?;
-    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
-        .discover_live(&discovery, desc.cluster_id)
-        .await;
-    drop(discovery);
     let transport = secure_transport_with_timeout(ctx, curve, seed, timeout)?;
+    let targets = Targets::from_descriptor(desc, seed, &desc.meta_voters)
+        .discover_live(&transport, desc.cluster_id)
+        .await;
     submit(
         &transport,
         desc.cluster_id,

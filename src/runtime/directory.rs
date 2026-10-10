@@ -32,7 +32,7 @@ pub async fn fetch_authoritative_directory<T: Transport>(
         let mut attempts = FuturesUnordered::new();
         for address in seeds {
             if tried.insert(address.clone()) {
-                attempts.push(query_one(transport, cluster_id, address));
+                attempts.push(query_one(transport, cluster_id, address, timeout));
             }
         }
 
@@ -60,7 +60,7 @@ pub async fn fetch_authoritative_directory<T: Transport>(
                     // authoritative `Value` response.
                     for address in leader_address.into_iter().chain(hints.into_values()) {
                         if tried.insert(address.clone()) {
-                            attempts.push(query_one(transport, cluster_id, address));
+                            attempts.push(query_one(transport, cluster_id, address, timeout));
                         }
                     }
                 }
@@ -81,6 +81,7 @@ async fn query_one<T: Transport>(
     transport: &T,
     cluster_id: ClusterId,
     address: String,
+    timeout: Duration,
 ) -> (String, Result<Envelope>) {
     let request = Envelope::new(
         cluster_id,
@@ -89,7 +90,9 @@ async fn query_one<T: Transport>(
         0,
         Vec::new(),
     );
-    let response = transport.call(&address, request).await;
+    let response = transport
+        .call_with_timeout(&address, request, Some(timeout))
+        .await;
     (address, response)
 }
 
