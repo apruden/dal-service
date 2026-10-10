@@ -1167,7 +1167,7 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
     let root = temp.path();
     let ids = vec![1, 2, 3];
     let meta_index = 2 * ids.len() as u64 + 4;
-    let data_index = meta_index + 1;
+    let data_index = meta_index + 10;
     let descriptor = BootstrapDescriptor {
         cluster_id: CID,
         config: ClusterConfig {
@@ -1245,21 +1245,44 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             );
         }
         let data = DataStateMachine::new(GroupId::Data(0));
-        data.apply(
-            &storage,
-            &DataRequest {
-                recovery_epoch: 0,
-                client_id: 0x50,
-                sequence: 1,
-                op: DataOp::Put {
-                    key: b"before-backup".to_vec(),
-                    value: b"retained".to_vec(),
-                    if_version: None,
+        assert!(matches!(
+            data.apply(
+                &storage,
+                &DataRequest {
+                    recovery_epoch: 0,
+                    client_id: 0x50,
+                    sequence: 1,
+                    op: DataOp::Put {
+                        key: b"before-backup".to_vec(),
+                        value: b"retained".to_vec(),
+                        if_version: None,
+                    },
                 },
-            },
-            data_index,
-        )
-        .unwrap();
+                meta_index + 1,
+            )
+            .unwrap(),
+            ApplyResult::Decided(_)
+        ));
+        for sequence in 2..=10 {
+            assert!(matches!(
+                data.apply(
+                    &storage,
+                    &DataRequest {
+                        recovery_epoch: 0,
+                        client_id: 0x50,
+                        sequence,
+                        op: DataOp::Put {
+                            key: format!("before-backup-{sequence}").into_bytes(),
+                            value: format!("retained-{sequence}").into_bytes(),
+                            if_version: None,
+                        },
+                    },
+                    meta_index + sequence,
+                )
+                .unwrap(),
+                ApplyResult::Decided(_)
+            ));
+        }
         // The running Raft adapter writes this record. The direct state-machine
         // setup above does not, so install its equivalent before offline export.
         for (group, index) in [(GroupId::Meta, meta_index), (GroupId::Data(0), data_index)] {
@@ -1391,6 +1414,45 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
         &["backup-verify", "--package", package.to_str().unwrap()],
         true,
     );
+    // Model the later source history after the immutable package's sequence-10
+    // recovery point. Sequences 11–20 stand for acknowledged writes, and 21
+    // stands for a decided write whose reply was lost. The direct state-machine
+    // fixture does not exercise admission or client reply delivery.
+    for (id, source) in ids.iter().zip(&sources) {
+        let storage = Storage::open_checked(source, CID, *id).unwrap();
+        let data = DataStateMachine::new(GroupId::Data(0));
+        for sequence in 11..=21 {
+            assert!(matches!(
+                data.apply(
+                    &storage,
+                    &DataRequest {
+                        recovery_epoch: 0,
+                        client_id: 0x50,
+                        sequence,
+                        op: DataOp::Put {
+                            key: format!("after-backup-{sequence}").into_bytes(),
+                            value: format!("lost-{sequence}").into_bytes(),
+                            if_version: None,
+                        },
+                    },
+                    data_index + sequence - 10,
+                )
+                .unwrap(),
+                ApplyResult::Decided(_)
+            ));
+        }
+        assert_eq!(
+            data.inspect_sequence(&storage, 0x50)
+                .unwrap()
+                .unwrap()
+                .highest,
+            21
+        );
+        assert_eq!(
+            data.get(&storage, b"after-backup-21").unwrap().unwrap().1,
+            b"lost-21"
+        );
+    }
     let node_manifest = package.join("node-2/node.json");
     let bytes = std::fs::read(&node_manifest).unwrap();
     std::fs::write(&node_manifest, b"truncated").unwrap();
@@ -1518,13 +1580,30 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             data.get(&storage, b"before-backup").unwrap().unwrap().1,
             b"retained"
         );
+        let retained = data.inspect_sequence(&storage, 0x50).unwrap().unwrap();
+        assert_eq!(retained.highest, 10);
         assert_eq!(
-            data.inspect_sequence(&storage, 0x50)
-                .unwrap()
-                .unwrap()
-                .highest,
-            1
+            retained.result,
+            dal::types::MutationResult::Applied {
+                version: data_index
+            }
         );
+        for sequence in 2..=10 {
+            assert_eq!(
+                data.get(&storage, format!("before-backup-{sequence}").as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                format!("retained-{sequence}").as_bytes()
+            );
+        }
+        for sequence in 11..=21 {
+            assert!(
+                data.get(&storage, format!("after-backup-{sequence}").as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
         assert!(
             backup::validate_restored_node(&storage, CID, *id, 1, Some(trust.clone())).is_err()
         );
@@ -1554,24 +1633,36 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
             }),
         )
         .unwrap();
-        assert!(matches!(
-            data.apply(
-                &storage,
-                &DataRequest {
-                    recovery_epoch: 0,
-                    client_id: 0x50,
-                    sequence: 2,
-                    op: DataOp::Put {
-                        key: b"old-epoch".to_vec(),
-                        value: b"rejected".to_vec(),
-                        if_version: None,
+        for (offset, (key, value)) in [
+            (b"old-next".as_slice(), b"rejected".as_slice()),
+            (b"after-backup-21".as_slice(), b"lost-21".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                data.apply(
+                    &storage,
+                    &DataRequest {
+                        recovery_epoch: 0,
+                        client_id: 0x50,
+                        sequence: 21,
+                        op: DataOp::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                            if_version: None,
+                        },
                     },
-                },
-                11,
-            )
-            .unwrap(),
-            ApplyResult::Rejected(RejectReason::RecoveryEpochMismatch { .. })
-        ));
-        assert!(data.get(&storage, b"old-epoch").unwrap().is_none());
+                    data_index + offset as u64 + 1,
+                )
+                .unwrap(),
+                ApplyResult::Rejected(RejectReason::RecoveryEpochMismatch { .. })
+            ));
+            assert!(data.get(&storage, key).unwrap().is_none());
+        }
+        assert_eq!(
+            data.inspect_sequence(&storage, 0x50).unwrap().unwrap(),
+            retained
+        );
     }
 }

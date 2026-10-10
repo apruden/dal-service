@@ -452,6 +452,14 @@ package inspection, catalog publication, restore initialization, dry-run and
 restore, retained data and sequence state, epoch rejection, and trust exclusion.
 It also rejects leftover partial export and publication stages, an incomplete
 participant set, mixed artifacts, tampering, and an unknown package format.
+Its direct state-machine fixture now exports at client sequence 10, advances the
+discarded source state through sequence 21, then verifies the restored package
+contains the first ten writes and the cached result for sequence 10, excludes
+later writes, and applies the same epoch rejection to two sequence-21 payloads:
+a new old-stream request and a retry of the lost request. This fixture does not
+exercise client acknowledgement or
+reply loss over the network; the live end-to-end reconciliation drill remains
+open.
 A second drill exercises the secure three-process maintenance, backup, complete
 loss, and restored-cluster release path. It passed with the system's CURVE-enabled
 libzmq on 2026-10-10 (112 seconds), including CLI export of real Raft-applied
