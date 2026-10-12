@@ -453,6 +453,17 @@ impl RootDispatch {
         let incarnation = match meta.local_node(body.node_id) {
             Ok(Some(entry)) => entry.incarnation,
             Ok(None) => {
+                if let Ok(Some(incarnation)) = meta.local_retired_incarnation(body.node_id) {
+                    return self
+                        .submit(
+                            &req,
+                            MetaCommand::RetireNode {
+                                node_id: body.node_id,
+                                incarnation,
+                            },
+                        )
+                        .await;
+                }
                 return self.reply(
                     &req,
                     codec::encode(&SubmitReply::Error(format!(
@@ -763,10 +774,8 @@ impl RootDispatch {
                     directory_hint: meta.local_directory().unwrap_or_default(),
                 }
             }
-            Some(meta) => match meta.read_directory().await {
-                Ok(crate::meta::node::MetaRead::Value(directory)) => {
-                    DirectoryQueryReply::Value(directory)
-                }
+            Some(meta) => match meta.read_directory_state().await {
+                Ok(crate::meta::node::MetaRead::Value(state)) => DirectoryQueryReply::Value(state),
                 Ok(crate::meta::node::MetaRead::NotLeader { leader }) => {
                     DirectoryQueryReply::NotLeader {
                         leader,
@@ -1122,6 +1131,16 @@ impl RootDispatch {
             if !self.authenticated_as_node(context, body.node_id) {
                 return self.reply(&req, Vec::new());
             }
+            // Retired and unregistered identities must not consume one of the
+            // eight liveness slots, even if their old credential remains valid.
+            if !self.meta().is_some_and(|meta| {
+                meta.local_node(body.node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| entry.incarnation == body.incarnation)
+            }) {
+                return self.reply(&req, Vec::new());
+            }
             self.heartbeats.lock().unwrap().observe(
                 body.node_id,
                 body.incarnation,
@@ -1208,8 +1227,14 @@ impl Server for RootDispatch {
                 let authorized = context
                     .authenticated_user_id
                     .as_deref()
-                    .and_then(|user_id| policy.authorize(user_id, required))
-                    .is_some();
+                    .is_some_and(|user_id| {
+                        policy.authorize(user_id, required).is_some()
+                            // Enrollment preflight needs the same authoritative
+                            // directory as runtime peers. Operator access is
+                            // limited to this read, not other peer RPCs.
+                            || (request.msg_type == MsgType::DirectoryQuery
+                                && policy.authorize(user_id, Permission::Operator).is_some())
+                    });
                 if !authorized {
                     crate::perf::record_authorization_denial();
                     if request.msg_type == MsgType::SequenceInspect {
@@ -1497,6 +1522,37 @@ mod tests {
         let context = crate::transport::RequestContext {
             authenticated_user_id: Some("ops:join".into()),
         };
+        let directory = Envelope::new(7, MsgType::DirectoryQuery, GroupId::Meta, 11, Vec::new());
+        for user in ["ops:join", "node:9"] {
+            let reply = dispatch
+                .serve_with_context(
+                    directory.clone(),
+                    crate::transport::RequestContext {
+                        authenticated_user_id: Some(user.into()),
+                    },
+                )
+                .await;
+            assert_eq!(
+                codec::decode::<DirectoryQueryReply>(&reply.payload).unwrap(),
+                DirectoryQueryReply::Unavailable
+            );
+        }
+        let denied = dispatch
+            .serve_with_context(
+                directory,
+                crate::transport::RequestContext {
+                    authenticated_user_id: None,
+                },
+            )
+            .await;
+        assert!(denied.payload.is_empty());
+        let denied = dispatch
+            .serve_with_context(
+                Envelope::new(7, MsgType::MaintenanceQuery, GroupId::Meta, 11, Vec::new()),
+                context.clone(),
+            )
+            .await;
+        assert!(denied.payload.is_empty());
         let ready = dispatch
             .serve_with_context(preflight(4), context.clone())
             .await;

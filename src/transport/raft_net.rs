@@ -138,6 +138,15 @@ impl AddrBook {
         Ok(())
     }
 
+    /// Forget retired endpoints after a complete authoritative directory read.
+    /// Bootstrap discovery seeds remain available independently of membership.
+    pub fn retain_directory(&self, directory: &[NodeDirectoryEntry]) {
+        let mut inner = self.inner.write().unwrap();
+        let mut incarnations = self.incarnations.write().unwrap();
+        inner.retain(|id, _| directory.iter().any(|entry| entry.node_id == *id));
+        incarnations.retain(|id, _| directory.iter().any(|entry| entry.node_id == *id));
+    }
+
     /// Every currently known control endpoint, in node-id order. Control-plane
     /// discovery may contact non-meta nodes harmlessly; current meta hosts are
     /// the ones that return authoritative replies.

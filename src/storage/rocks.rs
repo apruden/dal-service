@@ -43,10 +43,10 @@ type RaftApplied = (
 );
 
 const STORAGE_FORMAT_FILE: &str = "DAL_FORMAT.json";
-pub const STORAGE_FORMAT_VERSION: u32 = 2;
-/// Version 2 covers the current Raft command and state records, including
-/// recovery epochs. A change requires a fresh development data directory.
-pub const DURABLE_RECORD_FORMAT_VERSION: u32 = 2;
+pub const STORAGE_FORMAT_VERSION: u32 = 3;
+/// Version 3 adds permanent node retirement to the replicated command/state
+/// records. A change requires a fresh development data directory.
+pub const DURABLE_RECORD_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,12 +378,32 @@ impl StateInstaller<'_> {
         )));
 
         let _lifecycle = self.storage.snapshot_lifecycle.lock().unwrap();
+        let cf = self.storage.db.cf_handle(&self.name).ok_or_else(|| {
+            Error::Corrupt(self.name.clone(), "snapshot staging CF disappeared".into())
+        })?;
+        let epoch: u128 = self
+            .storage
+            .db
+            .get_cf(&cf, keyspace::recovery_epoch_key())?
+            .map(|bytes| codec::decode(&bytes))
+            .transpose()?
+            .unwrap_or(0);
+        let local_epoch = self.storage.local_recovery_epoch()?;
+        if local_epoch != 0 && epoch != local_epoch {
+            return Err(Error::Config(
+                "snapshot recovery epoch differs from local epoch".into(),
+            ));
+        }
         let mut active = self.storage.active_state_cfs.lock().unwrap();
         let old_name = self
             .storage
             .active_state_cf_name_locked(self.group, &mut active)?;
         let old_cf = self.storage.db.cf_handle(&old_name);
         let mut pointer = rocksdb::WriteBatch::default();
+        // New learners adopt the cluster epoch with the state-CF switch, so
+        // routing, recovery acknowledgements, and later backups agree after
+        // a crash as well as during this process. Restore provenance is local.
+        pointer.put(keyspace::local_recovery_epoch_key(), codec::encode(&epoch));
         pointer.put(
             keyspace::state_cf_pointer_key(self.group),
             codec::encode(&self.name),
@@ -615,6 +635,33 @@ impl Storage {
             .unwrap_or(0))
     }
 
+    /// Adopt the epoch from an authoritative meta read before serving, even
+    /// when this node hosts no groups. Existing state from another lineage may
+    /// not be relabelled: it requires an offline restore or a fresh directory.
+    pub fn adopt_recovery_epoch(&self, epoch: u128, partition_count: u16) -> Result<()> {
+        let _lifecycle = self.snapshot_lifecycle.lock().unwrap();
+        let local = self.local_recovery_epoch()?;
+        if local == epoch {
+            return Ok(());
+        }
+        if local != 0 {
+            return Err(Error::Config(
+                "authoritative recovery epoch differs from local epoch".into(),
+            ));
+        }
+        for group in std::iter::once(GroupId::Meta).chain((0..partition_count).map(GroupId::Data)) {
+            if self.group_exists(group)
+                && self.recovered_raft_applied(group)?.is_some()
+                && self.recovery_epoch(group)? != epoch
+            {
+                return Err(Error::Config(format!(
+                    "{group:?} belongs to another recovery epoch; use an offline restore or fresh data directory"
+                )));
+            }
+        }
+        self.put_local(&keyspace::local_recovery_epoch_key(), &epoch)
+    }
+
     /// Admit one full derived-index rebuild after accounting for the current
     /// source and all disk already occupied by active, retired, or quarantined
     /// generations. The guard spans the rebuild and checkpoint publication.
@@ -674,8 +721,9 @@ impl Storage {
     }
 
     /// Offline restore step under exclusive RocksDB ownership. Install the
-    /// epoch in every hosted state machine and invalidate all derived search
-    /// checkpoints in one sync-durable batch. The package omits Tantivy files.
+    /// epoch in every hosted state machine, establish a snapshot-only recovery
+    /// boundary, and invalidate derived search checkpoints in one sync-durable
+    /// batch. The package omits Tantivy files.
     pub fn install_restored_epoch_offline(&self, epoch: u128, partition_count: u16) -> Result<()> {
         if epoch == 0 || epoch == self.local_recovery_epoch()? {
             return Err(Error::Config(
@@ -684,10 +732,15 @@ impl Storage {
         }
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(keyspace::local_recovery_epoch_key(), codec::encode(&epoch));
+        batch.put(keyspace::local_restored_epoch_key(), codec::encode(&epoch));
         for group in std::iter::once(GroupId::Meta).chain((0..partition_count).map(GroupId::Data)) {
             if !self.group_exists(group) {
                 continue;
             }
+            let applied = self.recovered_raft_applied(group)?.ok_or_else(|| {
+                Error::Config(format!("restored {group:?} has no Raft applied position"))
+            })?;
+            crate::partition::log_store::rebase_restored_log(self, group, applied, &mut batch)?;
             let cf = self.state_cf(group)?;
             batch.put_cf(&cf, keyspace::recovery_epoch_key(), codec::encode(&epoch));
             if matches!(group, GroupId::Data(_)) {
@@ -2098,6 +2151,90 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn authoritative_epoch_adoption_is_durable_without_hosted_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.adopt_recovery_epoch(99, 1).unwrap();
+        storage.adopt_recovery_epoch(99, 1).unwrap();
+        assert!(storage.adopt_recovery_epoch(100, 1).is_err());
+        assert!(storage.adopt_recovery_epoch(0, 1).is_err());
+        drop(storage);
+        let storage = Storage::open(dir.path()).unwrap();
+        assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+        assert!(!storage.group_exists(GroupId::Meta));
+        assert!(!storage.group_exists(GroupId::Data(0)));
+        assert_eq!(
+            storage
+                .get_local::<u128>(&keyspace::local_restored_epoch_key())
+                .unwrap(),
+            None
+        );
+        crate::backup::validate_restored_node(&storage, 1, 4, 1, None).unwrap();
+    }
+
+    #[test]
+    fn authoritative_epoch_cannot_relabel_existing_group_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.ensure_group(GroupId::Data(0)).unwrap();
+        let applied: RaftApplied = (
+            Some(openraft::LogId::new(CommittedLeaderId::new(1, 1), 1)),
+            Default::default(),
+        );
+        storage
+            .install_state(GroupId::Data(0), &[], &codec::encode(&applied))
+            .unwrap();
+        assert!(storage.adopt_recovery_epoch(99, 1).is_err());
+        assert_eq!(storage.local_recovery_epoch().unwrap(), 0);
+        assert_eq!(storage.recovery_epoch(GroupId::Data(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn snapshot_epoch_adoption_is_durable_and_does_not_claim_offline_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let applied: RaftApplied = (None, openraft::StoredMembership::default());
+        let record = codec::encode(&applied);
+        storage.ensure_group(GroupId::Meta).unwrap();
+        storage.ensure_group(GroupId::Data(0)).unwrap();
+        storage
+            .install_state(
+                GroupId::Meta,
+                &[(keyspace::recovery_epoch_key(), codec::encode(&99u128))],
+                &record,
+            )
+            .unwrap();
+        assert_eq!(storage.recovery_epoch(GroupId::Meta).unwrap(), 99);
+        assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+        // Another group cannot install state from a different recovery lineage.
+        assert!(
+            storage
+                .install_state(GroupId::Data(0), &[], &record)
+                .is_err()
+        );
+        assert_eq!(storage.recovery_epoch(GroupId::Data(0)).unwrap(), 0);
+        storage
+            .install_state(
+                GroupId::Data(0),
+                &[(keyspace::recovery_epoch_key(), codec::encode(&99u128))],
+                &record,
+            )
+            .unwrap();
+        drop(storage);
+        let storage = Storage::open(dir.path()).unwrap();
+        assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+        assert_eq!(storage.recovery_epoch(GroupId::Meta).unwrap(), 99);
+        assert_eq!(storage.recovery_epoch(GroupId::Data(0)).unwrap(), 99);
+        assert_eq!(
+            storage
+                .get_local::<u128>(&keyspace::local_restored_epoch_key())
+                .unwrap(),
+            None
+        );
+        crate::backup::validate_restored_node(&storage, 1, 4, 1, None).unwrap();
+    }
+
+    #[test]
     fn fresh_storage_gets_durable_format_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
@@ -2131,11 +2268,12 @@ mod tests {
         let marker = db.join(STORAGE_FORMAT_FILE);
 
         for bytes in [
-            br#"{"storage_format_version":2}"#.as_slice(),
-            br#"{"storage_format_version":2,"durable_record_version":1,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
-            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":1,"search_engine_revision":2}"#.as_slice(),
-            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":2,"search_engine_revision":3}"#.as_slice(),
-            br#"{"storage_format_version":2,"durable_record_version":2,"snapshot_format_version":2,"search_engine_revision":2,"future_requirement":1}"#.as_slice(),
+            br#"{"storage_format_version":3}"#.as_slice(),
+            br#"{"storage_format_version":2,"durable_record_version":3,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":3,"durable_record_version":1,"snapshot_format_version":2,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":3,"durable_record_version":3,"snapshot_format_version":1,"search_engine_revision":2}"#.as_slice(),
+            br#"{"storage_format_version":3,"durable_record_version":3,"snapshot_format_version":2,"search_engine_revision":3}"#.as_slice(),
+            br#"{"storage_format_version":3,"durable_record_version":3,"snapshot_format_version":2,"search_engine_revision":2,"future_requirement":1}"#.as_slice(),
         ] {
             fs::write(&marker, bytes).unwrap();
             assert!(check_storage_format(&db).is_err());

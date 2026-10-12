@@ -316,7 +316,7 @@ pub enum RecoveryFenceReply {
 /// that follower can resolve the current leader id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectoryQueryReply {
-    Value(Vec<NodeDirectoryEntry>),
+    Value(crate::types::DirectoryState),
     NotLeader {
         leader: Option<NodeId>,
         directory_hint: Vec<NodeDirectoryEntry>,

@@ -19,7 +19,7 @@ argument.
 
 ### Goals
 - Linearizable `get` / `put` / `delete` on a single key.
-- Horizontal scaling by adding nodes; graceful shrink by removing them.
+- Horizontal scaling up to eight nodes; graceful shrink by removing them.
 - No data loss and no stale reads across node add/remove and node failure,
   provided a majority of each partition's replicas survives.
 - Availability of unaffected partitions while other partitions rebalance.
@@ -189,9 +189,8 @@ Why fixed partitions? Hashing keys directly to nodes would make every key its
 own placement decision — impossible to replicate with Raft. A fixed `P` bounds
 the number of Raft groups and makes placement a small explicit table. `P = 128`
 with `R = 3` keeps per-node Raft-instance and RocksDB column-family counts low
-(§6) while still giving ~1% rebalance granularity for clusters into the tens
-of nodes. Larger clusters need a larger `P` chosen at creation; dynamic
-splitting is future work (§15).
+(§6) while giving fine rebalance granularity within the eight-node cluster
+limit. Bootstrap and replicated registration enforce this limit.
 
 `R` and `P` are cluster constants stored in the meta group.
 
@@ -392,11 +391,14 @@ Two flavors:
    3), let it catch up, then `change_membership` to swap the draining node out
    for the replacement. Leadership is transferred away first if the draining
    node was the leader (`openraft` leadership transfer).
-3. When the node appears in no partition record's `voters` or `move.target_voters`,
-   meta group removes it from the membership list. If the node is also a
-   meta-group voter, an operator-driven, learner-first meta-Raft membership
-   change (§3.1) must remove it from the meta voter set before this step. The
-   operator can then power it off. Its RocksDB can be deleted.
+3. When the node appears in no data or meta placement's `voters` or
+   `move.target_voters`, the meta leader commits retirement. Apply checks the
+   exact directory incarnation and all placement references again, then removes
+   the live directory entry and records a permanent identity tombstone. The
+   old node fences itself when it observes retirement. Retired IDs cannot be
+   reused; replacements use fresh IDs and may reuse the released slot within
+   the eight-node limit. A Down node continues to count until an explicit leave
+   and completed evacuation retire it.
 
 Draining is the **safe** path: no partition ever drops below majority because
 the replacement joins *before* the old replica leaves (joint consensus moves

@@ -1312,14 +1312,20 @@ pub fn validate_restored_node(
     trust: Option<TrustSnapshot>,
 ) -> Result<()> {
     let epoch = storage.local_recovery_epoch()?;
+    let restored_epoch: Option<u128> = storage.get_local(&keyspace::local_restored_epoch_key())?;
     let marker_path = storage.path().join("DAL_RESTORE.json");
-    if epoch == 0 {
+    if restored_epoch.is_none() {
         if fs::symlink_metadata(&marker_path).is_ok() {
             return Err(Error::Config(
-                "restore marker exists without a recovery epoch".into(),
+                "restore marker exists without offline restore provenance".into(),
             ));
         }
+        // A newly admitted replica can learn a nonzero epoch from a snapshot;
+        // it was not restored from a package and has no external restore plan.
         return Ok(());
+    }
+    if epoch == 0 || restored_epoch != Some(epoch) {
+        return Err(Error::Config("offline restore epoch mismatch".into()));
     }
     if !fs::symlink_metadata(&marker_path)?.file_type().is_file() {
         return Err(Error::Config("unsafe restore marker path".into()));
@@ -1336,7 +1342,10 @@ pub fn validate_restored_node(
         ));
     }
     for group in std::iter::once(GroupId::Meta).chain((0..partition_count).map(GroupId::Data)) {
-        if storage.group_exists(group) && storage.recovery_epoch(group)? != epoch {
+        if storage.group_exists(group)
+            && storage.raft_applied_position(group)?.is_some()
+            && storage.recovery_epoch(group)? != epoch
+        {
             return Err(Error::Config(format!(
                 "restored {group:?} recovery epoch mismatch"
             )));

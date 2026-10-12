@@ -103,7 +103,7 @@ layers, async-trait sugar beyond what openraft requires.
   `P > 0`, `P <= u16::MAX`, `R >= 3`, ≥ `R` distinct bootstrap nodes, an
   odd meta-voter set of ≥ 3 distinct nodes, and a worst-case `P`/`R` routing
   snapshot that fits the 4 MiB `MetaQuery` frame. The directory is bounded to
-  1,024 nodes with 256-byte endpoints. `ClusterInit` persists a canonical hash
+  8 nodes with 256-byte endpoints. `ClusterInit` persists a canonical hash
   specification (`xxh64`, seed 0, raw key bytes) along with `P`; this is a
   protocol constant, not a crate-version default.
 - Storage: open DB; create/drop `cf_log_<group>` / `cf_state_<group>` pairs;

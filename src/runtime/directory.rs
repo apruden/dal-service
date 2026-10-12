@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::transport::codec::{Envelope, MsgType};
 use crate::transport::raft_wire::DirectoryQueryReply;
-use crate::types::{ClusterId, GroupId, NodeDirectoryEntry, NodeId};
+use crate::types::{ClusterId, DirectoryState, GroupId, NodeDirectoryEntry, NodeId};
 
 /// Fetch the current directory from the meta leader. Every round contacts all
 /// newly discovered endpoints concurrently; follower hints may add the leader's
@@ -27,6 +27,19 @@ pub async fn fetch_authoritative_directory<T: Transport>(
     seeds: impl IntoIterator<Item = String>,
     timeout: Duration,
 ) -> Result<Vec<NodeDirectoryEntry>> {
+    Ok(
+        fetch_authoritative_directory_state(transport, cluster_id, seeds, timeout)
+            .await?
+            .directory,
+    )
+}
+
+pub async fn fetch_authoritative_directory_state<T: Transport>(
+    transport: &T,
+    cluster_id: ClusterId,
+    seeds: impl IntoIterator<Item = String>,
+    timeout: Duration,
+) -> Result<DirectoryState> {
     let run = async {
         let mut tried = HashSet::new();
         let mut attempts = FuturesUnordered::new();
@@ -44,7 +57,11 @@ pub async fn fetch_authoritative_directory<T: Transport>(
                 continue;
             }
             match codec::decode::<DirectoryQueryReply>(&envelope.payload) {
-                Ok(DirectoryQueryReply::Value(directory)) => return Ok(directory),
+                Ok(DirectoryQueryReply::Value(state)) => {
+                    if state.directory.len() <= crate::types::MAX_CLUSTER_NODES {
+                        return Ok(state);
+                    }
+                }
                 Ok(DirectoryQueryReply::NotLeader {
                     leader,
                     directory_hint,
@@ -119,7 +136,11 @@ mod tests {
                     leader: *leader,
                     directory_hint: hint.clone(),
                 },
-                DirectoryServer::Leader(directory) => DirectoryQueryReply::Value(directory.clone()),
+                DirectoryServer::Leader(directory) => DirectoryQueryReply::Value(DirectoryState {
+                    directory: directory.clone(),
+                    recovery_epoch: 99,
+                    bootstrap_complete: true,
+                }),
             };
             Envelope::new(
                 request.cluster_id,
@@ -157,7 +178,7 @@ mod tests {
             Arc::new(DirectoryServer::Leader(directory.clone())),
         );
 
-        let result = fetch_authoritative_directory(
+        let result = fetch_authoritative_directory_state(
             &transport,
             7,
             ["follower".to_string()],
@@ -165,7 +186,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result, directory);
+        assert_eq!(result.directory, directory);
+        assert_eq!(result.recovery_epoch, 99);
+        assert!(result.bootstrap_complete);
     }
 
     #[tokio::test]

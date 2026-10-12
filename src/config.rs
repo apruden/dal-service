@@ -205,6 +205,9 @@ pub fn parse_partition_count(n: u64) -> Result<u16> {
 /// partition. The estimate intentionally includes encoding headroom so later
 /// metadata additions cannot silently consume the entire wire frame.
 pub(crate) fn validate_routing_shape(p: u16, r: u8) -> Result<()> {
+    if r as usize > MAX_CLUSTER_NODES {
+        return Err(Error::Config(format!("R must be <= {MAX_CLUSTER_NODES}")));
+    }
     const ROUTING_FIXED_HEADROOM: usize = 64 * 1024;
     const DIRECTORY_ENTRY_BUDGET: usize = 64 + 2 * MAX_ENDPOINT_BYTES;
     const PLACEMENT_FIXED_BUDGET: usize = 64;
@@ -305,6 +308,15 @@ mod tests {
     #[test]
     fn valid_init_passes() {
         base_init().validate().unwrap();
+    }
+
+    #[test]
+    fn cluster_size_is_limited_to_eight_nodes() {
+        let mut config = base_init();
+        config.bootstrap_nodes = (1..=8).collect();
+        config.validate().unwrap();
+        config.bootstrap_nodes.push(9);
+        assert!(config.validate().unwrap_err().to_string().contains("<= 8"));
     }
 
     #[test]

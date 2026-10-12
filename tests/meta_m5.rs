@@ -212,6 +212,214 @@ fn init_validates_config_and_meta_voters() {
 }
 
 #[test]
+fn node_registration_enforces_eight_node_limit_but_allows_rejoin() {
+    let mut m = Meta::new();
+    m.bootstrap(8, 3, &[1, 2, 3], &[1, 2, 3]);
+    for node_id in 4..=8 {
+        assert_eq!(
+            m.apply(MetaCommand::RegisterNode {
+                node_id,
+                control_addr: format!("c{node_id}"),
+                bulk_addr: format!("b{node_id}"),
+            }),
+            MetaApplyResult::Applied
+        );
+    }
+    assert!(matches!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 9,
+            control_addr: "c9".into(),
+            bulk_addr: "b9".into(),
+        }),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(message)) if message.contains("<= 8")
+    ));
+    assert!(m.node(9).is_none());
+    assert_eq!(
+        m.apply(MetaCommand::RegisterNode {
+            node_id: 8,
+            control_addr: "c8-new".into(),
+            bulk_addr: "b8-new".into(),
+        }),
+        MetaApplyResult::Applied
+    );
+}
+
+#[test]
+fn retirement_frees_capacity_and_tombstones_survive_snapshot_and_restart() {
+    let mut m = Meta::new();
+    m.bootstrap(1, 3, &[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        m.seed(GroupId::Data(0), &[1, 2, 3]),
+        MetaApplyResult::Applied
+    );
+    assert_eq!(
+        m.apply(MetaCommand::SetNodeState {
+            node_id: 8,
+            state: NodeState::Down,
+            incarnation: 1
+        }),
+        MetaApplyResult::Applied
+    );
+    let register = |id| MetaCommand::RegisterNode {
+        node_id: id,
+        control_addr: format!("c{id}"),
+        bulk_addr: format!("b{id}"),
+    };
+    assert!(matches!(
+        m.apply(register(9)),
+        MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+    ));
+    assert_eq!(
+        m.apply(MetaCommand::RetireNode {
+            node_id: 8,
+            incarnation: 1
+        }),
+        MetaApplyResult::Rejected(MetaReject::IneligibleTarget)
+    );
+
+    // More than eight lifetime identities, never more than eight current ones.
+    for id in 8..=16 {
+        assert_eq!(
+            m.apply(MetaCommand::SetNodeState {
+                node_id: id,
+                state: NodeState::Draining,
+                incarnation: 1
+            }),
+            MetaApplyResult::Applied
+        );
+        assert_eq!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: id,
+                incarnation: 2
+            }),
+            MetaApplyResult::Rejected(MetaReject::StaleIncarnation)
+        );
+        assert_eq!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: id,
+                incarnation: 1
+            }),
+            MetaApplyResult::Applied
+        );
+        assert_eq!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: id,
+                incarnation: 1
+            }),
+            MetaApplyResult::NoOp
+        );
+        assert!(m.node(id).is_none());
+        assert_eq!(m.apply(register(id + 1)), MetaApplyResult::Applied);
+        assert!(matches!(
+            m.apply(register(id + 2)),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            m.apply(register(id)),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+    }
+    let snapshot_dir = tempfile::tempdir().unwrap();
+    let snapshot = Storage::open_checked(snapshot_dir.path(), CID, 2).unwrap();
+    snapshot.ensure_group(GroupId::Meta).unwrap();
+    let applied: (
+        Option<openraft::LogId<u64>>,
+        openraft::StoredMembership<u64, openraft::BasicNode>,
+    ) = (None, Default::default());
+    snapshot
+        .install_state(
+            GroupId::Meta,
+            &m.storage.scan_state(GroupId::Meta).unwrap(),
+            &dal::codec::encode(&applied),
+        )
+        .unwrap();
+    drop(snapshot);
+    let snapshot = Storage::open_checked(snapshot_dir.path(), CID, 2).unwrap();
+    for id in 8..=16 {
+        assert_eq!(
+            snapshot
+                .get_state_record::<u64>(GroupId::Meta, &keyspace::meta_retired_node_key(id))
+                .unwrap(),
+            Some(1)
+        );
+        assert!(matches!(
+            m.sm.apply(&snapshot, &register(id), LogId::new(2, m.idx + id))
+                .unwrap(),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+    }
+}
+
+#[test]
+fn retirement_waits_for_all_voters_and_pending_or_aborting_learners() {
+    for group in [GroupId::Meta, GroupId::Data(0)] {
+        let mut m = Meta::new();
+        m.bootstrap(1, 3, &[1, 2, 3], &[1, 2, 3, 4]);
+        m.seed(GroupId::Data(0), &[1, 2, 3]);
+        let (result, plan_id) = m.create_plan(group, &[1, 2, 4]);
+        assert_eq!(result, MetaApplyResult::Applied);
+        assert_eq!(
+            m.apply(MetaCommand::SetNodeState {
+                node_id: 4,
+                state: NodeState::Draining,
+                incarnation: 1
+            }),
+            MetaApplyResult::Applied
+        );
+        assert!(matches!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: 4,
+                incarnation: 1
+            }),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+        assert_eq!(
+            m.apply(MetaCommand::MarkAborting { group, plan_id }),
+            MetaApplyResult::Applied
+        );
+        assert!(matches!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: 4,
+                incarnation: 1
+            }),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+        assert_eq!(
+            m.apply(MetaCommand::AbortReport {
+                group,
+                plan_id,
+                observation: obs(group, plan_id, &[1, 2, 3])
+            }),
+            MetaApplyResult::Applied
+        );
+        assert_eq!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: 4,
+                incarnation: 1
+            }),
+            MetaApplyResult::Applied
+        );
+    }
+    for (id, voters) in [(1, vec![1, 2, 3]), (4, vec![1, 2, 4])] {
+        let mut m = Meta::new();
+        m.bootstrap(1, 3, &[1, 2, 3], &[1, 2, 3, 4]);
+        m.seed(GroupId::Data(0), &voters);
+        m.apply(MetaCommand::SetNodeState {
+            node_id: id,
+            state: NodeState::Draining,
+            incarnation: 1,
+        });
+        assert!(matches!(
+            m.apply(MetaCommand::RetireNode {
+                node_id: id,
+                incarnation: 1
+            }),
+            MetaApplyResult::Rejected(MetaReject::InvalidConfig(_))
+        ));
+    }
+}
+
+#[test]
 fn commands_before_init_are_rejected() {
     let mut m = Meta::new();
     assert_eq!(

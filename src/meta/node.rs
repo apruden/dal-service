@@ -408,6 +408,40 @@ impl MetaNode {
         self.linearizable(move || scan_directory(&storage)).await
     }
 
+    pub async fn read_directory_state(&self) -> Result<MetaRead<crate::types::DirectoryState>> {
+        let storage = self.storage.clone();
+        self.linearizable(move || {
+            // One RocksDB iterator snapshot keeps identity, epoch, and genesis
+            // completion consistent with concurrent meta apply.
+            let records = storage.scan_state(GroupId::Meta)?;
+            let mut directory = Vec::new();
+            let mut recovery_epoch = 0;
+            let mut cluster: Option<ClusterConfig> = None;
+            let keys: std::collections::BTreeSet<_> =
+                records.iter().map(|(key, _)| key.as_slice()).collect();
+            for (key, value) in &records {
+                if key.starts_with(&keyspace::meta_node_prefix()) {
+                    directory.push(crate::codec::decode(value)?);
+                } else if *key == keyspace::recovery_epoch_key() {
+                    recovery_epoch = crate::codec::decode(value)?;
+                } else if *key == keyspace::meta_cluster_key() {
+                    cluster = Some(crate::codec::decode(value)?);
+                }
+            }
+            let bootstrap_complete = cluster.is_some_and(|config| {
+                (0..config.p).all(|p| {
+                    keys.contains(keyspace::meta_placement_key(GroupId::Data(p)).as_slice())
+                })
+            });
+            Ok(crate::types::DirectoryState {
+                directory,
+                recovery_epoch,
+                bootstrap_complete,
+            })
+        })
+        .await
+    }
+
     /// Local (non-linearizable) reads for tests and startup reconciliation.
     pub fn local_placement(&self, group: GroupId) -> Result<Option<Placement>> {
         self.storage
@@ -417,6 +451,11 @@ impl MetaNode {
     pub fn local_node(&self, node_id: NodeId) -> Result<Option<NodeDirectoryEntry>> {
         self.storage
             .get_state_record(GroupId::Meta, &keyspace::meta_node_key(node_id))
+    }
+
+    pub fn local_retired_incarnation(&self, node_id: NodeId) -> Result<Option<u64>> {
+        self.storage
+            .get_state_record(GroupId::Meta, &keyspace::meta_retired_node_key(node_id))
     }
 
     pub fn local_maintenance(&self) -> Result<Option<MaintenanceRecord>> {

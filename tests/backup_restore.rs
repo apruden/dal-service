@@ -397,11 +397,12 @@ struct Fixture {
     http: Vec<String>,
     auth: PathBuf,
     root: PathBuf,
+    spare: [String; 3],
 }
 
 impl Fixture {
     fn new(root: &Path) -> Self {
-        let addrs = addresses(9);
+        let addrs = addresses(12);
         let controls = addrs[0..3].to_vec();
         let bulks = addrs[3..6].to_vec();
         let http = addrs[6..9]
@@ -441,11 +442,16 @@ impl Fixture {
             http,
             auth: root.join("operator.json"),
             root: root.to_path_buf(),
+            spare: [
+                addrs[9].clone(),
+                addrs[10].clone(),
+                addrs[11].trim_start_matches("tcp://").to_string(),
+            ],
         }
     }
 
     fn security(&self, generation: u64) -> CurveClientConfig {
-        let node_keys = (0..3)
+        let node_keys = (0..4)
             .map(|_| zmq::CurveKeyPair::new().unwrap())
             .collect::<Vec<_>>();
         let app = zmq::CurveKeyPair::new().unwrap();
@@ -502,7 +508,27 @@ impl Fixture {
                 serde_json::json!(format!("node:{}", i + 1)),
             );
         }
-        for i in 0..3 {
+        for address in &self.spare[..2] {
+            pins.insert(address.clone(), serde_json::json!("node:4"));
+        }
+        for i in 0..4 {
+            let (config, data, control, bulk, http) = if i < 3 {
+                (
+                    self.configs[i].clone(),
+                    self.dirs[i].clone(),
+                    &self.controls[i],
+                    &bulks[i],
+                    &self.http[i],
+                )
+            } else {
+                (
+                    self.root.join("node-4.json"),
+                    self.root.join("node-4-data"),
+                    &self.spare[0],
+                    &self.spare[1],
+                    &self.spare[2],
+                )
+            };
             let public = self.root.join(format!("node-{}-public.key", i + 1));
             let secret = self.root.join(format!("node-{}-secret.key", i + 1));
             protected_write(
@@ -517,14 +543,14 @@ impl Fixture {
                     .unwrap()
                     .as_bytes(),
             );
-            std::fs::write(&self.configs[i], serde_json::to_vec(&serde_json::json!({
+            std::fs::write(&config, serde_json::to_vec(&serde_json::json!({
                 "cluster_id": format!("{CID:#x}"), "node_id": i + 1,
-                "control_addr": self.controls[i], "bulk_addr": bulks[i],
-                "http_addr": self.http[i],
+                "control_addr": control, "bulk_addr": bulk,
+                "http_addr": http,
                 "seeds": self.controls.iter().enumerate().filter_map(|(peer, addr)|
                     (peer != i).then_some(addr)
                 ).collect::<Vec<_>>(),
-                "data_dir": self.dirs[i],
+                "data_dir": data,
                 "security": {
                     "trust_policy_file": policy,
                     "trust_generation_file": self.root.join(format!("node-{}-generation", i + 1)),
@@ -1288,9 +1314,117 @@ async fn full_cli_backup_restore_remains_fenced_until_verified() {
         restored.put(b"after-restore", b"new", None).await.unwrap(),
         WriteReply::Applied { .. }
     ));
+
+    // A post-restore join that never hosts a group cannot learn the recovery
+    // epoch from a snapshot. It must still participate in maintenance, including
+    // after restarting while admission is closed.
+    let spare_config = fixture.root.join("node-4.json");
+    cli(
+        &[
+            "join",
+            "--config",
+            spare_config.to_str().unwrap(),
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+        ],
+        true,
+    );
+    nodes.push(spawn(
+        &spare_config,
+        &fixture.cluster,
+        &fixture.root.join("node-4.log"),
+    ));
+    wait_until_ready(&fixture.spare[2], &mut nodes).await;
+    let spare_status = status(&fixture.spare[2]).await.unwrap();
+    assert!(spare_status["partitions"].as_array().unwrap().is_empty());
+    assert!(spare_status["meta"].is_null());
+    cli(
+        &[
+            "maintenance-begin",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            "0x992",
+            "--wait-seconds",
+            "30",
+        ],
+        true,
+    );
+    let closed = wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["stage"] == "quiesced"
+    })
+    .await;
+    let next_generation = closed["maintenance"]["generation"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        closed["maintenance"]["participants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    stop(&mut nodes[3]).await;
+    nodes[3] = spawn(
+        &spare_config,
+        &fixture.cluster,
+        &fixture.root.join("node-4-restarted.log"),
+    );
+    wait_for(&fixture.spare[2], &mut nodes, |value| {
+        value["maintenance_admission_open"] == false
+    })
+    .await;
+    cli(
+        &[
+            "maintenance-verify",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            "0x992",
+            "--generation",
+            &next_generation,
+            "--wait-seconds",
+            "30",
+        ],
+        true,
+    );
+    let verified = wait_for(&fixture.http[0], &mut nodes, |value| {
+        value["maintenance"]["recovered"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == 4)
+    })
+    .await;
+    assert_eq!(verified["maintenance"]["stage"], "verifying");
+    cli(
+        &[
+            "maintenance-release",
+            "--auth",
+            fixture.auth.to_str().unwrap(),
+            "--cluster",
+            fixture.cluster.to_str().unwrap(),
+            "--operation",
+            "0x992",
+            "--generation",
+            &next_generation,
+            "--wait-seconds",
+            "30",
+        ],
+        true,
+    );
+    wait_until_ready(&fixture.spare[2], &mut nodes).await;
     for node in &mut nodes {
         stop(node).await;
     }
+    let spare =
+        dal::storage::Storage::open_checked(&fixture.root.join("node-4-data"), CID, 4).unwrap();
+    assert_eq!(spare.local_recovery_epoch().unwrap(), epoch);
+    assert!(!spare.group_exists(dal::types::GroupId::Meta));
+    assert!(!spare.group_exists(dal::types::GroupId::Data(0)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

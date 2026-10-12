@@ -52,9 +52,15 @@ pub fn recovery_epoch_key() -> Vec<u8> {
     vec![TAG_INTERNAL, b'E']
 }
 
-/// Node-local mirror for routing-only runtimes and startup diagnostics.
+/// Node-local mirror, installed by offline restore or Raft snapshot catch-up.
 pub fn local_recovery_epoch_key() -> Vec<u8> {
     b"local/recovery_epoch".to_vec()
+}
+
+/// Offline restore provenance. Unlike the epoch mirror, snapshot catch-up must
+/// never set this: only nodes restored from a package require its trust marker.
+pub fn local_restored_epoch_key() -> Vec<u8> {
+    b"local/restored_epoch".to_vec()
 }
 
 /// Encode a user key record key.
@@ -101,6 +107,17 @@ pub fn meta_node_key(node_id: crate::types::NodeId) -> Vec<u8> {
 /// The scan prefix covering every node-directory entry.
 pub fn meta_node_prefix() -> [u8; 2] {
     [TAG_META, b'N']
+}
+
+/// Permanent retirement tombstones are outside the bounded live directory.
+pub fn meta_retired_node_key(node_id: crate::types::NodeId) -> Vec<u8> {
+    let mut key = vec![TAG_META, b'X'];
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key
+}
+
+pub fn local_retired_key() -> Vec<u8> {
+    b"local/retired".to_vec()
 }
 
 /// One partition/meta placement record, keyed by group token.

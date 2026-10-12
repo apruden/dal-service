@@ -38,7 +38,7 @@ use crate::types::{
 };
 
 use crate::api::gateway::{PartitionMap, SearchCatalogSource};
-use crate::runtime::directory::fetch_authoritative_directory;
+use crate::runtime::directory::fetch_authoritative_directory_state;
 use crate::runtime::node::{MetaHandle, MetaStarter, PartitionStarter};
 use crate::runtime::readiness::RuntimeReadiness;
 
@@ -55,6 +55,7 @@ const DIRECTORY_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 /// runs wherever a partition is led, reading the plan locally when this node is
 /// a meta voter and over the network otherwise.
 pub struct RebalanceDriver {
+    storage: Arc<crate::storage::Storage>,
     node_id: NodeId,
     cluster_id: ClusterId,
     partition_count: u16,
@@ -78,6 +79,7 @@ pub struct RebalanceDriver {
 impl RebalanceDriver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        storage: Arc<crate::storage::Storage>,
         node_id: NodeId,
         cluster_id: ClusterId,
         partition_count: u16,
@@ -95,6 +97,7 @@ impl RebalanceDriver {
         readiness: RuntimeReadiness,
     ) -> RebalanceDriver {
         RebalanceDriver {
+            storage,
             node_id,
             cluster_id,
             partition_count,
@@ -161,16 +164,16 @@ impl RebalanceDriver {
     /// Advisory `MetaQuery` snapshots are intentionally excluded here.
     async fn refresh_addr_book(&self) {
         if let Some(meta) = self.meta() {
-            match meta.read_directory().await {
-                Ok(MetaRead::Value(directory)) if !directory.is_empty() => {
-                    self.merge_authoritative_directory(&directory);
+            match meta.read_directory_state().await {
+                Ok(MetaRead::Value(state)) if !state.directory.is_empty() => {
+                    self.merge_authoritative_directory(&state).await;
                     return;
                 }
                 Ok(MetaRead::Value(_)) | Ok(MetaRead::NotLeader { .. }) | Err(_) => {}
             }
         }
 
-        if let Ok(directory) = fetch_authoritative_directory(
+        if let Ok(state) = fetch_authoritative_directory_state(
             &self.control,
             self.cluster_id,
             self.addrs.control_addrs(),
@@ -178,12 +181,37 @@ impl RebalanceDriver {
         )
         .await
         {
-            self.merge_authoritative_directory(&directory);
+            self.merge_authoritative_directory(&state).await;
         }
     }
 
-    fn merge_authoritative_directory(&self, directory: &[crate::types::NodeDirectoryEntry]) {
-        if let Some(entry) = directory.iter().find(|entry| entry.node_id == self.node_id)
+    async fn merge_authoritative_directory(&self, state: &crate::types::DirectoryState) {
+        let directory = &state.directory;
+        let entry = directory.iter().find(|entry| entry.node_id == self.node_id);
+        if entry.is_none() && state.bootstrap_complete {
+            // Persist the identity fence before shutting down any remaining
+            // local groups. A restart without meta cannot revive retirement.
+            if let Err(error) = self
+                .storage
+                .put_local(&crate::keyspace::local_retired_key(), &true)
+            {
+                tracing::error!(%error, "failed to persist node retirement");
+                self.readiness.mark_failed();
+            } else {
+                // The identity fence deliberately stops background drivers.
+                // Mark graceful draining before those exits can be mistaken
+                // for a runtime failure by their supervisors.
+                self.readiness.begin_draining();
+            }
+            self.identity_gate.fence();
+            let partitions: Vec<_> = self.partitions.read().unwrap().keys().copied().collect();
+            for partition in partitions {
+                let _ = self.starter.reclaim_partition(partition).await;
+            }
+            let _ = self.meta_starter.reclaim_meta().await;
+            return;
+        }
+        if let Some(entry) = entry
             && (entry.incarnation != self.registration.directory_incarnation
                 || !self
                     .registration
@@ -192,7 +220,18 @@ impl RebalanceDriver {
             self.identity_gate.fence();
             return;
         }
+        if let Err(error) = self
+            .storage
+            .adopt_recovery_epoch(state.recovery_epoch, self.partition_count)
+        {
+            tracing::error!(%error, "authoritative recovery epoch rejected");
+            self.identity_gate.fence();
+            return;
+        }
         let _ = self.addrs.update_directory(directory);
+        if state.bootstrap_complete {
+            self.addrs.retain_directory(directory);
+        }
     }
 
     // -- meta-leader role ---------------------------------------------------
@@ -279,7 +318,10 @@ impl RebalanceDriver {
                 let current = voter_set(placement.voters.clone());
                 let target_set = voter_set(plan.target_voters.clone());
                 if let Some(&learner) = target_set.difference(&current).next()
-                    && state_of(learner) == Some(NodeState::Down)
+                    && matches!(
+                        state_of(learner),
+                        Some(NodeState::Down | NodeState::Draining)
+                    )
                 {
                     let _ = meta
                         .propose(MetaCommand::MarkAborting {
@@ -290,6 +332,28 @@ impl RebalanceDriver {
                 }
             }
             placements.insert(partition, placement);
+        }
+
+        // Leave is complete only after every data and meta voter/learner has
+        // been evacuated. Apply rechecks this against the current topology.
+        if let Ok(Some(meta_placement)) = meta.local_placement(GroupId::Meta) {
+            for entry in directory
+                .iter()
+                .filter(|entry| entry.state == NodeState::Draining)
+            {
+                if !meta_placement.references_node(entry.node_id)
+                    && placements
+                        .values()
+                        .all(|placement| !placement.references_node(entry.node_id))
+                {
+                    let _ = meta
+                        .propose(MetaCommand::RetireNode {
+                            node_id: entry.node_id,
+                            incarnation: entry.incarnation,
+                        })
+                        .await;
+                }
+            }
         }
 
         // Keep one data migration active cluster-wide. Besides bounding the
@@ -345,7 +409,10 @@ impl RebalanceDriver {
                     let current = voter_set(placement.voters.clone());
                     let target_set = voter_set(plan.target_voters.clone());
                     if let Some(&learner) = target_set.difference(&current).next()
-                        && state_of(learner) == Some(NodeState::Down)
+                        && matches!(
+                            state_of(learner),
+                            Some(NodeState::Down | NodeState::Draining)
+                        )
                     {
                         let _ = meta
                             .propose(MetaCommand::MarkAborting {

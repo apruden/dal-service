@@ -220,6 +220,10 @@ async fn draining_a_node_migrates_its_partition() {
     }
     let leader = leader.expect("partition 0 never elected a leader");
     let victim = *[1u64, 2, 3].iter().find(|&&v| v != leader).unwrap();
+    let survivor = nodes
+        .iter()
+        .find(|node| node.node_id() != victim && node.hosts_meta())
+        .unwrap();
 
     let transport = ZmqTransport::new(ctx.clone(), Duration::from_secs(2), Lane::Control);
     let leave = Envelope::new(
@@ -238,7 +242,7 @@ async fn draining_a_node_migrates_its_partition() {
 
     let mut migrated = false;
     for _ in 0..200 {
-        let placement = nodes[0].local_placement_voters(0).unwrap();
+        let placement = survivor.local_placement_voters(0).unwrap();
         if placement == Some((expected.clone(), false)) && nodes[3].hosts_partition(0) {
             migrated = true;
             break;
@@ -282,6 +286,49 @@ async fn draining_a_node_migrates_its_partition() {
     assert!(
         reclaimed,
         "drained node {victim} never reclaimed its removed partition"
+    );
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if survivor.local_node_state(victim).unwrap().is_none()
+                && !victim_node.hosts_meta()
+                && victim_node.bootstrap().await.is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("evacuated node did not retire and fence its identity");
+    let retired = nodes.remove((victim - 1) as usize);
+    Arc::try_unwrap(retired)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let cfg = NodeConfig {
+        cluster_id: CID,
+        node_id: victim,
+        control_addr: format!("inproc://m8dr-ctrl-{victim}"),
+        bulk_addr: format!("inproc://m8dr-bulk-{victim}"),
+        http_addr: None,
+        seeds: Vec::new(),
+        data_dir: dirs[(victim - 1) as usize].path().to_path_buf(),
+        timeouts: Timeouts::default(),
+    };
+    assert!(
+        matches!(Node::start_insecure_for_tests(ctx.clone(), cfg.clone(), desc.clone()).await,
+        Err(dal::Error::Config(message)) if message.contains("retired"))
+    );
+    // Even deleting local state cannot make an old genesis identity eligible.
+    let fresh = tempfile::tempdir().unwrap();
+    let mut fresh_cfg = cfg;
+    fresh_cfg.data_dir = fresh.path().to_path_buf();
+    assert!(
+        matches!(Node::start_insecure_for_tests(ctx.clone(), fresh_cfg, desc.clone()).await,
+        Err(dal::Error::Config(message)) if message.contains("not present in the authoritative directory"))
     );
 
     for n in nodes {

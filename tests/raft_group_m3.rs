@@ -132,6 +132,141 @@ async fn fence_follower(nodes: &[PartitionNode], target: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_cluster_snapshot_catches_up_a_new_voter_and_survives_restart() {
+    use dal::partition::state_machine::DataStateMachine;
+    use dal::types::LearnerAdmission;
+
+    let (h, nodes) = bootstrapped().await;
+    write_to_leader(&nodes, put(10, 1, b"before", b"retained")).await;
+    eventually("original write on every replica", || {
+        nodes
+            .iter()
+            .all(|node| node.local_get(b"before").unwrap().is_some())
+    })
+    .await;
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+        h.registry.remove(node.node_id());
+    }
+    drop(nodes);
+    for dir in &h.dirs {
+        let storage = Storage::open(dir.path()).unwrap();
+        storage.install_restored_epoch_offline(99, 1).unwrap();
+    }
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        nodes.push(h.start(i).await);
+    }
+    let after = DataRequest {
+        recovery_epoch: 99,
+        ..put(20, 1, b"after", b"acknowledged")
+    };
+    let result = write_to_leader(&nodes, after.clone()).await;
+    assert!(matches!(
+        result,
+        ApplyResult::Decided(MutationResult::Applied { .. })
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open_checked(dir.path(), 1, 4).unwrap());
+    storage
+        .record_verified_learner_admission(&LearnerAdmission {
+            cluster_id: 1,
+            group: G,
+            plan_id: 100,
+        })
+        .unwrap();
+    let learner = PartitionNode::start(4, G, storage.clone(), h.registry.clone(), h.faults.clone())
+        .await
+        .unwrap();
+    let leader = &nodes[leader_idx(&nodes).unwrap()];
+    leader.add_learner(4).await.unwrap();
+    let target = leader.applied_index().unwrap();
+    eventually("restored learner catch-up", || {
+        learner.applied_index().is_some_and(|index| index >= target)
+    })
+    .await;
+    assert_eq!(storage.recovery_epoch(G).unwrap(), 99);
+    assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+    assert!(
+        learner.raft().metrics().borrow().snapshot.is_some(),
+        "catch-up must install a snapshot"
+    );
+    for key in [b"before".as_slice(), b"after".as_slice()] {
+        assert_eq!(
+            learner.local_get(key).unwrap(),
+            leader.local_get(key).unwrap()
+        );
+    }
+    assert_eq!(
+        DataStateMachine::new(G)
+            .inspect_sequence(storage.as_ref(), 10)
+            .unwrap()
+            .unwrap()
+            .highest,
+        1
+    );
+
+    let other = nodes
+        .iter()
+        .find(|node| node.node_id() != leader.node_id())
+        .unwrap()
+        .node_id();
+    leader
+        .change_voters(&[leader.node_id(), other, 4])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if learner.current_leader() == Some(4) {
+            break;
+        }
+        learner.raft().trigger().elect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(learner.current_leader(), Some(4));
+    for (key, value) in [
+        (b"before".as_slice(), b"retained".as_slice()),
+        (b"after".as_slice(), b"acknowledged".as_slice()),
+    ] {
+        assert!(
+            matches!(learner.read(key, Consistency::Linearizable).await.unwrap(), ReadOutcome::Value(Some((_, got))) if got == value)
+        );
+    }
+    // Deduplication state must survive the restored base and the new suffix.
+    let ApplyResult::Decided(expected) = result else {
+        unreachable!()
+    };
+    assert_eq!(
+        learner.write(after).await.unwrap(),
+        WriteOutcome::Applied(ApplyResult::Replayed(expected))
+    );
+    learner.shutdown().await.unwrap();
+    h.registry.remove(4);
+    drop(learner);
+    drop(storage);
+    let storage = Arc::new(Storage::open_checked(dir.path(), 1, 4).unwrap());
+    assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+    assert!(
+        storage
+            .get_local::<u128>(&dal::keyspace::local_restored_epoch_key())
+            .unwrap()
+            .is_none()
+    );
+    dal::backup::validate_restored_node(&storage, 1, 4, 1, None).unwrap();
+    let learner = PartitionNode::start(4, G, storage, h.registry.clone(), h.faults.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        learner.local_get(b"after").unwrap().unwrap().1,
+        b"acknowledged"
+    );
+    learner.shutdown().await.unwrap();
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_write_and_linearizable_read() {
     let (_h, nodes) = bootstrapped().await;
 

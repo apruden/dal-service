@@ -2,7 +2,7 @@
 
 The four `meta-*.bin` files were captured from the derived `MetaCommand`
 bincode encoding at commit `d7ea563`, before its versioned remote serialization
-type was added. They cover command tags 0, 3, 4, and 12 with nested cluster,
+type was added. The ClusterInit protocol field is updated to current version 7. They cover command tags 0, 3, 4, and 12 with nested cluster,
 directory-state, group, and search-name fields. The
 `version_one_meta_commands_replay_from_archived_bytes` regression compares new
 encodings with these files and decodes each archived command.

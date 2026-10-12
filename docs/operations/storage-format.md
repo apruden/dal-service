@@ -1,13 +1,22 @@
 # Storage format preflight
 
 Every data directory carries `DAL_FORMAT.json` with a
-`storage_format_version`. The current binary supports storage version `2`,
-durable record version `2`, application snapshot version `2`, and search engine
+`storage_format_version`. The current binary supports storage version `3`,
+durable record version `3`, application snapshot version `2`, and search engine
 revision `2`. New markers record each requirement separately. All four fields
 are required; incomplete markers from earlier development builds are rejected.
 The application snapshot stream identifies version 2 with the `DALSNP02`
 magic. The wire envelope uses `PROTOCOL_VERSION` independently of these disk
 versions. The coordinated offline backup package uses format version `1`.
+
+Storage version 3 records offline restore provenance separately from the epoch
+learned by snapshot catch-up. Restore atomically removes each group's retained
+logs and marks its applied position as purged, so new replicas must receive the
+restored state and epoch in a snapshot before replaying subsequent commands.
+Nodes hosting no groups learn and persist that epoch from an authoritative
+directory read. Durable record version 3 adds retirement commands and permanent
+node identity tombstones; these survive meta snapshots and restarts while
+retired nodes no longer consume one of the eight current membership slots.
 
 A new empty data directory receives the manifest before RocksDB opens. The
 manifest and its directory entry are synced before startup proceeds. Startup

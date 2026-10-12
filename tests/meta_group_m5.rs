@@ -180,6 +180,107 @@ fn search_definition() -> SearchIndexDefinition {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_meta_learner_receives_epoch_and_maintenance_state() {
+    let (h, nodes) = bootstrapped().await;
+    let mut cluster_config = config();
+    cluster_config.p = 1;
+    init_register_seed_with_config(&nodes, 0, &VOTERS, cluster_config).await;
+    assert!(matches!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::BeginMaintenance {
+                operation_id: 77,
+                generation: 1,
+                participants: VOTERS.to_vec(),
+            },
+        )
+        .await,
+        MetaApplyResult::Applied | MetaApplyResult::NoOp
+    ));
+    eventually("maintenance state on every replica", || {
+        nodes
+            .iter()
+            .all(|node| node.local_maintenance().unwrap().is_some())
+    })
+    .await;
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+        h.registry.remove(node.node_id());
+    }
+    drop(nodes);
+    for dir in &h.dirs {
+        Storage::open(dir.path())
+            .unwrap()
+            .install_restored_epoch_offline(99, 8)
+            .unwrap();
+    }
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        nodes.push(h.start(i).await);
+    }
+    // Include a suffix after the offline recovery boundary.
+    assert!(matches!(
+        propose_to_leader(
+            &nodes,
+            MetaCommand::AcknowledgeMaintenance {
+                operation_id: 77,
+                generation: 1,
+                node_id: 1,
+                incarnation: 1,
+            }
+        )
+        .await,
+        MetaApplyResult::Applied | MetaApplyResult::NoOp
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open_checked(dir.path(), CID, 4).unwrap());
+    storage
+        .record_verified_learner_admission(&dal::types::LearnerAdmission {
+            cluster_id: CID,
+            group: GroupId::Meta,
+            plan_id: 100,
+        })
+        .unwrap();
+    let learner = MetaNode::start(4, storage.clone(), h.registry.clone(), h.faults.clone())
+        .await
+        .unwrap();
+    let leader = &nodes[leader_idx(&nodes).unwrap()];
+    leader.add_learner(4).await.unwrap();
+    let dal::meta::node::MetaRead::Value(directory_state) =
+        leader.read_directory_state().await.unwrap()
+    else {
+        panic!("leader lost authority");
+    };
+    assert_eq!(directory_state.recovery_epoch, 99);
+    assert!(directory_state.bootstrap_complete);
+    assert_eq!(directory_state.directory, leader.local_directory().unwrap());
+    eventually("meta learner catch-up", || {
+        learner.local_maintenance().unwrap() == leader.local_maintenance().unwrap()
+    })
+    .await;
+    assert_eq!(storage.recovery_epoch(GroupId::Meta).unwrap(), 99);
+    assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+    assert_eq!(
+        learner.local_placement(GroupId::Data(0)).unwrap(),
+        leader.local_placement(GroupId::Data(0)).unwrap()
+    );
+    assert_eq!(
+        learner.local_directory().unwrap(),
+        leader.local_directory().unwrap()
+    );
+    learner.shutdown().await.unwrap();
+    h.registry.remove(4);
+    drop(learner);
+    drop(storage);
+    let storage = Storage::open_checked(dir.path(), CID, 4).unwrap();
+    assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+    dal::backup::validate_restored_node(&storage, CID, 4, 8, None).unwrap();
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 async fn ready_search_index(nodes: &[Arc<MetaNode>]) -> (u64, SearchIndexReady) {
     let definition = search_definition();
     assert_eq!(

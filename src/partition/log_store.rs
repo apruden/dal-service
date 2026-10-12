@@ -46,6 +46,24 @@ const ENTRY_PREFIX: u8 = 0x01;
 /// One past the entry prefix, used to seek the reverse iterator to the end.
 const ENTRY_PREFIX_END: u8 = 0x02;
 
+/// Rebase an offline restored group on its materialized recovery point. The
+/// restored state (including its new epoch) cannot be reproduced by old logs,
+/// so every replica behind this boundary must install a snapshot. Discard any
+/// unapplied suffix too: the package's applied position defines the restore.
+/// The caller commits this batch atomically with the restored epoch.
+pub(crate) fn rebase_restored_log(
+    storage: &Storage,
+    group: GroupId,
+    applied: LogId,
+    batch: &mut WriteBatch,
+) -> crate::error::Result<()> {
+    let cf = storage.log_cf(group)?;
+    batch.delete_range_cf(&cf, [ENTRY_PREFIX], [ENTRY_PREFIX_END]);
+    batch.put_cf(&cf, KEY_PURGED, codec::encode(&applied));
+    batch.put_cf(&cf, KEY_COMMITTED, codec::encode(&Some(applied)));
+    Ok(())
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PurgeTestCut {
@@ -426,6 +444,88 @@ mod tests {
 
     fn log_id(index: u64) -> LogId {
         LogId::new(CommittedLeaderId::new(1, 1), index)
+    }
+
+    #[tokio::test]
+    async fn offline_restore_rebases_all_logs_at_the_durable_applied_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let group = GroupId::Data(0);
+        storage.ensure_group(group).unwrap();
+        let target = log_id(6);
+        let applied = (
+            Some(target),
+            openraft::StoredMembership::<u64, BasicNode>::default(),
+        );
+        let vote = Vote::new_committed(2, 3);
+        {
+            let log_cf = storage.log_cf(group).unwrap();
+            for index in 0..=8 {
+                let entry = Entry {
+                    log_id: log_id(index),
+                    payload: openraft::EntryPayload::Blank,
+                };
+                storage
+                    .db()
+                    .put_cf(&log_cf, entry_key(index), codec::encode(&entry))
+                    .unwrap();
+            }
+            storage
+                .db()
+                .put_cf(&log_cf, KEY_VOTE, codec::encode(&vote))
+                .unwrap();
+            storage
+                .db()
+                .put_cf(&log_cf, KEY_COMMITTED, codec::encode(&Some(log_id(8))))
+                .unwrap();
+            let state_cf = storage.state_cf(group).unwrap();
+            storage
+                .db()
+                .put_cf(
+                    &state_cf,
+                    crate::keyspace::raft_applied_key(),
+                    codec::encode(&applied),
+                )
+                .unwrap();
+        }
+        storage.install_restored_epoch_offline(99, 1).unwrap();
+        drop(storage);
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let mut log = RocksLogStore::new(storage.clone(), group);
+        let state = <RocksLogStore as RaftLogStorage<TypeConfig>>::get_log_state(&mut log)
+            .await
+            .unwrap();
+        assert_eq!(state.last_log_id, Some(target));
+        assert_eq!(state.last_purged_log_id, Some(target));
+        assert!(
+            <RocksLogStore as RaftLogReader<TypeConfig>>::try_get_log_entries(&mut log, ..)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::read_committed(&mut log)
+                .await
+                .unwrap(),
+            Some(target)
+        );
+        assert_eq!(
+            <RocksLogStore as RaftLogStorage<TypeConfig>>::read_vote(&mut log)
+                .await
+                .unwrap(),
+            Some(vote)
+        );
+        assert_eq!(storage.recovery_epoch(group).unwrap(), 99);
+        assert_eq!(storage.local_recovery_epoch().unwrap(), 99);
+        assert_eq!(
+            storage
+                .get_local::<u128>(&crate::keyspace::local_restored_epoch_key())
+                .unwrap(),
+            Some(99)
+        );
+        // Deleting the external restore plan must still fail startup, even
+        // though ordinary snapshot learners do not need such a plan.
+        assert!(crate::backup::validate_restored_node(&storage, 1, 1, 1, None).is_err());
     }
 
     /// OpenRaft's generic suite invokes `purge()` independently of state apply.

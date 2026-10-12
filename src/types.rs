@@ -36,13 +36,13 @@ macro_rules! frozen_serde {
 
 /// Wire/protocol version. Bumped only on an incompatible envelope or command
 /// change; receivers reject anything they do not recognise (DESIGN §10.2).
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Protocol-wide bounds used to keep the complete routing snapshot representable
 /// in one `MetaQuery` frame. They are enforced both at configuration admission
 /// and by the replicated node-directory state machine.
 pub const MAX_ROUTING_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_CLUSTER_NODES: usize = 1024;
+pub const MAX_CLUSTER_NODES: usize = 8;
 pub const MAX_ENDPOINT_BYTES: usize = 256;
 /// Fixed project-wide value limit: 1 MiB (1,048,576 bytes). Transport frames
 /// reserve additional bytes for keys and request metadata, but that headroom
@@ -428,6 +428,16 @@ pub struct Placement {
     pub r#move: Option<MovePlan>,
 }
 
+impl Placement {
+    pub fn references_node(&self, node_id: NodeId) -> bool {
+        self.voters.contains(&node_id)
+            || self
+                .r#move
+                .as_ref()
+                .is_some_and(|plan| plan.target_voters.contains(&node_id))
+    }
+}
+
 /// The single canonical way any code derives a comparable voter set from a
 /// voter list: sets, not raw configs (IMPLEMENTATION ground rule 5). The
 /// openraft `Membership` overload arrives in M3 and delegates here.
@@ -496,6 +506,16 @@ pub struct NodeDirectoryEntry {
     /// Durable incarnation; bumped on rejoin so stale heartbeats can't
     /// reactivate a `Down` node (DESIGN §9.1).
     pub incarnation: u64,
+}
+
+/// A ReadIndex-fenced meta view used to bind runtime identity and recovery
+/// lineage. Missing genesis registrations are tolerated only before seeding
+/// every data placement; afterwards absence fences a retired runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryState {
+    pub directory: Vec<NodeDirectoryEntry>,
+    pub recovery_epoch: u128,
+    pub bootstrap_complete: bool,
 }
 
 /// The replicated cluster-wide maintenance operation. A released record remains
@@ -661,6 +681,11 @@ pub enum MetaCommand {
         policy_digest: [u8; 32],
         recovery_epoch: u128,
     },
+    /// Permanently retire an explicitly drained, fully evacuated identity.
+    RetireNode {
+        node_id: NodeId,
+        incarnation: u64,
+    },
 }
 
 /// Current bincode variant indices for replicated meta commands. This remote
@@ -775,6 +800,10 @@ enum MetaCommandV1 {
         topology_digest: [u8; 32],
         policy_digest: [u8; 32],
         recovery_epoch: u128,
+    },
+    RetireNode {
+        node_id: NodeId,
+        incarnation: u64,
     },
 }
 

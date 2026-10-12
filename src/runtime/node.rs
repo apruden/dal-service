@@ -34,7 +34,7 @@ use crate::meta::node::{MetaNode, MetaRead, ProposeOutcome};
 use crate::meta::state_machine::MetaApplyResult;
 use crate::partition::node::PartitionNode;
 use crate::runtime::config_file::{LoadedNodeSecurity, cluster_id_hex};
-use crate::runtime::directory::fetch_authoritative_directory;
+use crate::runtime::directory::fetch_authoritative_directory_state;
 use crate::runtime::dispatch::{RootDispatch, now_ms};
 use crate::runtime::http::{
     ClusterStatus, MetaStatus, PartitionStatus, PlanStatus, Role, StatusCache, StatusSource,
@@ -83,6 +83,7 @@ pub type MetaHandle = Arc<RwLock<Option<Arc<MetaNode>>>>;
 /// descriptor remains only a bootstrap fallback while meta is unavailable.
 struct LiveRouting {
     fallback: RoutingInfo,
+    storage: Arc<Storage>,
     meta: MetaHandle,
     control: ZmqTransport,
     addrs: AddrBook,
@@ -92,12 +93,12 @@ struct LiveRouting {
 impl LiveRouting {
     fn from_descriptor(
         desc: &BootstrapDescriptor,
-        recovery_epoch: u128,
+        storage: Arc<Storage>,
         meta: MetaHandle,
         control: ZmqTransport,
         addrs: AddrBook,
         local_control: String,
-    ) -> LiveRouting {
+    ) -> Result<LiveRouting> {
         let directory = desc
             .directory
             .iter()
@@ -123,20 +124,21 @@ impl LiveRouting {
                 )
             })
             .collect();
-        LiveRouting {
+        Ok(LiveRouting {
             fallback: RoutingInfo {
                 cluster_id: desc.cluster_id,
-                recovery_epoch,
+                recovery_epoch: storage.local_recovery_epoch()?,
                 p: desc.config.p,
                 hash_spec: desc.config.hash_spec,
                 directory,
                 placements,
             },
+            storage,
             meta,
             control,
             addrs,
             local_control,
-        }
+        })
     }
 
     fn local(&self) -> Option<RoutingInfo> {
@@ -162,7 +164,7 @@ impl LiveRouting {
         }
         Some(RoutingInfo {
             cluster_id: self.fallback.cluster_id,
-            recovery_epoch: self.fallback.recovery_epoch,
+            recovery_epoch: self.storage.recovery_epoch(GroupId::Meta).ok()?,
             p: self.fallback.p,
             hash_spec: self.fallback.hash_spec,
             directory,
@@ -210,7 +212,9 @@ impl RoutingSource for LiveRouting {
                     return Some(info);
                 }
             }
-            Some(self.fallback.clone())
+            let mut fallback = self.fallback.clone();
+            fallback.recovery_epoch = self.storage.local_recovery_epoch().ok()?;
+            Some(fallback)
         })
     }
 }
@@ -593,12 +597,12 @@ impl Node {
 
         let routing: Arc<dyn RoutingSource> = Arc::new(LiveRouting::from_descriptor(
             &desc,
-            storage.local_recovery_epoch()?,
+            storage.clone(),
             meta_handle.clone(),
             control.clone(),
             addrs.clone(),
             cfg.control_addr.clone(),
-        ));
+        )?);
         let gateway = ClientGateway::new(
             cfg.cluster_id,
             cluster.p,
@@ -827,6 +831,7 @@ impl Node {
         // wherever a partition is led, including on non-meta-voter nodes (which
         // read the plan and report observations over the network).
         let driver = RebalanceDriver::new(
+            storage.clone(),
             cfg.node_id,
             cfg.cluster_id,
             cluster.p,
@@ -2853,6 +2858,12 @@ async fn resolve_registration_binding(
     storage: &Storage,
     control: &ZmqTransport,
 ) -> Result<RegistrationBinding> {
+    if storage
+        .get_local::<bool>(&crate::keyspace::local_retired_key())?
+        .unwrap_or(false)
+    {
+        return Err(Error::Config("node identity has been retired".into()));
+    }
     let previous = storage.registration_binding()?;
     let endpoints_match = previous
         .as_ref()
@@ -2869,13 +2880,21 @@ async fn resolve_registration_binding(
                 .iter()
                 .map(|entry| entry.control_addr.clone()),
         );
-        let Ok(directory) =
-            fetch_authoritative_directory(control, cfg.cluster_id, seeds, cfg.timeouts.request)
-                .await
+        let Ok(state) = fetch_authoritative_directory_state(
+            control,
+            cfg.cluster_id,
+            seeds,
+            cfg.timeouts.request,
+        )
+        .await
         else {
             return Ok(previous);
         };
-        if !directory.iter().any(|entry| entry.node_id == cfg.node_id)
+        if !state.bootstrap_complete
+            && !state
+                .directory
+                .iter()
+                .any(|entry| entry.node_id == cfg.node_id)
             && previous.directory_incarnation == 1
             && desc.directory.iter().any(|entry| {
                 entry.node_id == cfg.node_id
@@ -2887,7 +2906,7 @@ async fn resolve_registration_binding(
             // node's deterministic RegisterNode entry has been applied.
             return Ok(previous);
         }
-        return bind_authoritative_registration(cfg, storage, directory);
+        return bind_authoritative_registration(cfg, desc, storage, state);
     }
 
     // Fresh genesis data directories may start before a meta leader exists.
@@ -2899,6 +2918,28 @@ async fn resolve_registration_binding(
                 && entry.bulk_addr == cfg.bulk_addr
         })
     {
+        // Consult live authority when available, including retirement and a
+        // restored epoch. Offline genesis remains possible before a quorum exists.
+        let seeds = cfg.seeds.iter().cloned().chain(
+            desc.directory
+                .iter()
+                .map(|entry| entry.control_addr.clone()),
+        );
+        if let Ok(state) = fetch_authoritative_directory_state(
+            control,
+            cfg.cluster_id,
+            seeds,
+            cfg.timeouts.request,
+        )
+        .await
+            && (state.bootstrap_complete
+                || state
+                    .directory
+                    .iter()
+                    .any(|entry| entry.node_id == cfg.node_id))
+        {
+            return bind_authoritative_registration(cfg, desc, storage, state);
+        }
         let binding = RegistrationBinding {
             cluster_id: cfg.cluster_id,
             node_id: cfg.node_id,
@@ -2915,17 +2956,20 @@ async fn resolve_registration_binding(
             .iter()
             .map(|entry| entry.control_addr.clone()),
     );
-    let directory =
-        fetch_authoritative_directory(control, cfg.cluster_id, seeds, cfg.timeouts.request).await?;
-    bind_authoritative_registration(cfg, storage, directory)
+    let state =
+        fetch_authoritative_directory_state(control, cfg.cluster_id, seeds, cfg.timeouts.request)
+            .await?;
+    bind_authoritative_registration(cfg, desc, storage, state)
 }
 
 fn bind_authoritative_registration(
     cfg: &NodeConfig,
+    desc: &BootstrapDescriptor,
     storage: &Storage,
-    directory: Vec<NodeDirectoryEntry>,
+    state: crate::types::DirectoryState,
 ) -> Result<RegistrationBinding> {
-    let entry = directory
+    let entry = state
+        .directory
         .into_iter()
         .find(|entry| entry.node_id == cfg.node_id)
         .ok_or_else(|| {
@@ -2940,6 +2984,7 @@ fn bind_authoritative_registration(
             cfg.node_id
         )));
     }
+    storage.adopt_recovery_epoch(state.recovery_epoch, desc.config.p)?;
     let binding = RegistrationBinding {
         cluster_id: cfg.cluster_id,
         node_id: cfg.node_id,
@@ -3073,6 +3118,75 @@ mod tests {
         cfg.control_addr = "tcp://node-9-control".into();
         cfg.bulk_addr = "tcp://node-9-bulk".into();
         assert!(validate_node_descriptor(&cfg, &descriptor()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn routing_uses_the_epoch_learned_after_runtime_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_checked(dir.path(), 7, 4).unwrap());
+        storage
+            .record_verified_learner_admission(&LearnerAdmission {
+                cluster_id: 7,
+                group: GroupId::Meta,
+                plan_id: 1,
+            })
+            .unwrap();
+        let meta = Arc::new(
+            MetaNode::start(
+                4,
+                storage.clone(),
+                crate::partition::network::Registry::default(),
+                crate::partition::network::Faults::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let handle = Arc::new(RwLock::new(Some(meta.clone())));
+        let routing = LiveRouting::from_descriptor(
+            &descriptor(),
+            storage.clone(),
+            handle.clone(),
+            ZmqTransport::new(
+                zmq::Context::new(),
+                Duration::from_millis(10),
+                Lane::Control,
+            ),
+            AddrBook::new(),
+            "local".into(),
+        )
+        .unwrap();
+        assert_eq!(routing.routing(false).await.unwrap().recovery_epoch, 0);
+
+        // Install a caught-up meta view after the routing object exists. The
+        // idle learner has no network peers; this test exercises the view only.
+        let mut pairs = vec![
+            (
+                crate::keyspace::recovery_epoch_key(),
+                crate::codec::encode(&99u128),
+            ),
+            (
+                crate::keyspace::meta_placement_key(GroupId::Data(0)),
+                crate::codec::encode(&routing.fallback.placements[0].1),
+            ),
+        ];
+        for entry in &routing.fallback.directory {
+            pairs.push((
+                crate::keyspace::meta_node_key(entry.node_id),
+                crate::codec::encode(entry),
+            ));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let applied: (
+            Option<openraft::LogId<u64>>,
+            openraft::StoredMembership<u64, openraft::BasicNode>,
+        ) = (None, openraft::StoredMembership::default());
+        storage
+            .install_state(GroupId::Meta, &pairs, &crate::codec::encode(&applied))
+            .unwrap();
+        assert_eq!(routing.routing(true).await.unwrap().recovery_epoch, 99);
+        *handle.write().unwrap() = None;
+        assert_eq!(routing.routing(false).await.unwrap().recovery_epoch, 99);
+        meta.shutdown().await.unwrap();
     }
 
     #[test]

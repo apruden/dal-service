@@ -202,6 +202,10 @@ impl MetaStateMachine {
                 state,
                 incarnation,
             } => self.set_node_state(s, *node_id, *state, *incarnation),
+            MetaCommand::RetireNode {
+                node_id,
+                incarnation,
+            } => self.retire_node(s, *node_id, *incarnation),
             MetaCommand::CreatePlan {
                 group,
                 plan_id: _,
@@ -785,6 +789,11 @@ impl MetaStateMachine {
         if control_addr == bulk_addr {
             return Ok((invalid("control_addr and bulk_addr must differ"), vec![]));
         }
+        if s.get_state_record::<u64>(GroupId::Meta, &keyspace::meta_retired_node_key(node_id))?
+            .is_some()
+        {
+            return Ok((invalid("retired node ids cannot be reused"), vec![]));
+        }
         // Endpoint ownership is part of the replicated identity fence. Reject
         // both same-lane and cross-lane collisions so two node ids can never be
         // routed to the same socket.
@@ -874,12 +883,13 @@ impl MetaStateMachine {
             return Ok((reject(MetaReject::StaleIncarnation), vec![]));
         }
         // A node declared Down must not be revived by ordinary liveness
-        // evidence. Leaving Down is an explicit rejoin, which only
-        // `RegisterNode` performs (advancing the incarnation) — any state
-        // transition out of Down proposed here is stale or forged. Guarding
-        // only Down -> Active would let a replayed/stale command revive the
-        // node through a Down -> Suspect -> Active two-step.
-        if entry.state == NodeState::Down && state != NodeState::Down {
+        // evidence. RegisterNode alone can revive it at a new incarnation.
+        // An explicit leave may move Down to Draining, but liveness transitions
+        // cannot undo that operator intent or revive a drained process.
+        if (entry.state == NodeState::Down
+            && !matches!(state, NodeState::Down | NodeState::Draining))
+            || (entry.state == NodeState::Draining && state != NodeState::Draining)
+        {
             return Ok((reject(MetaReject::StaleIncarnation), vec![]));
         }
         if entry.state == state {
@@ -889,6 +899,60 @@ impl MetaStateMachine {
         Ok((
             MetaApplyResult::Applied,
             vec![put(keyspace::meta_node_key(node_id), &entry)],
+        ))
+    }
+
+    fn retire_node(
+        &self,
+        s: &Storage,
+        node_id: NodeId,
+        incarnation: u64,
+    ) -> Result<(MetaApplyResult, Vec<StateMutation>)> {
+        if let Some(retired) =
+            s.get_state_record::<u64>(GroupId::Meta, &keyspace::meta_retired_node_key(node_id))?
+        {
+            return Ok((
+                if retired == incarnation {
+                    MetaApplyResult::NoOp
+                } else {
+                    reject(MetaReject::StaleIncarnation)
+                },
+                vec![],
+            ));
+        }
+        let Some(entry) = self.node(s, node_id)? else {
+            return Ok((reject(MetaReject::UnknownNode), vec![]));
+        };
+        if entry.incarnation != incarnation {
+            return Ok((reject(MetaReject::StaleIncarnation), vec![]));
+        }
+        // Failure alone is never retirement. An explicit leave must have
+        // committed Draining, and every voter/learner reference must be gone.
+        if entry.state != NodeState::Draining {
+            return Ok((reject(MetaReject::IneligibleTarget), vec![]));
+        }
+        let Some(cluster) = self.cluster(s)? else {
+            return Ok((reject(MetaReject::ClusterNotInitialized), vec![]));
+        };
+        for group in std::iter::once(GroupId::Meta).chain((0..cluster.p).map(GroupId::Data)) {
+            let Some(placement) = self.placement(s, group)? else {
+                return Ok((reject(MetaReject::NoPlacement), vec![]));
+            };
+            if placement.references_node(node_id) {
+                return Ok((
+                    invalid("node is still referenced by a placement or move"),
+                    vec![],
+                ));
+            }
+        }
+        Ok((
+            MetaApplyResult::Applied,
+            vec![
+                put(keyspace::meta_retired_node_key(node_id), &incarnation),
+                StateMutation::Delete {
+                    key: keyspace::meta_node_key(node_id),
+                },
+            ],
         ))
     }
 

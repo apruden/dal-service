@@ -459,9 +459,39 @@ mod tests {
         )
     }
 
-    /// The socket-level caps are hand-written constants while `max_payload` is
-    /// per-type; a new or widened type must not silently exceed the cap for
-    /// the lane it lands on, or the socket would drop legal traffic.
+    /// Every participant contributes recovery evidence to a maintenance reply.
+    #[test]
+    fn maximum_cluster_maintenance_replies_fit_their_frames() {
+        use crate::transport::raft_wire::MaintenanceQueryReply;
+        use crate::types::{MAX_CLUSTER_NODES, MaintenanceRecord, MaintenanceStage};
+
+        let nodes: Vec<u64> = (1..=MAX_CLUSTER_NODES as u64).collect();
+        let record = MaintenanceRecord {
+            operation_id: u128::MAX,
+            generation: u64::MAX,
+            participants: nodes.clone(),
+            acknowledged: nodes.clone(),
+            recovered: nodes.clone(),
+            recovery_processes: nodes.iter().map(|&node| (node, u64::MAX)).collect(),
+            recovery_policy_digests: nodes.iter().map(|&node| (node, [255; 32])).collect(),
+            verification_policy_digest: Some([255; 32]),
+            verification_recovery_epoch: Some(u128::MAX),
+            stage: MaintenanceStage::Verifying,
+        };
+        let reply = MaintenanceQueryReply::Value(Some(record));
+        for msg_type in [MsgType::MaintenanceQuery, MsgType::MaintenanceStatus] {
+            let frame = env(msg_type, GroupId::Meta, crate::codec::encode(&reply))
+                .encode()
+                .unwrap();
+            let decoded = Envelope::decode(&frame).unwrap();
+            assert_eq!(
+                crate::codec::decode::<MaintenanceQueryReply>(&decoded.payload).unwrap(),
+                reply
+            );
+        }
+    }
+
+    /// Socket caps must cover every message permitted on the corresponding lane.
     #[test]
     fn lane_limits_cover_every_msg_type() {
         let mut seen = 0;
