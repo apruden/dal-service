@@ -706,7 +706,9 @@ impl Storage {
                     return Err(std::io::Error::last_os_error().into());
                 }
                 let stat = unsafe { stat.assume_init() };
-                let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+                // Widen platform-dependent libc fields before multiplying.
+                let bytes = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
+                let free = u64::try_from(bytes).unwrap_or(u64::MAX);
                 if free < required {
                     return Err(Error::Search(format!(
                         "search rebuild needs approximately {required} free bytes; {free} available"

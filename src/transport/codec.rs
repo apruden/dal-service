@@ -478,7 +478,7 @@ mod tests {
             verification_recovery_epoch: Some(u128::MAX),
             stage: MaintenanceStage::Verifying,
         };
-        let reply = MaintenanceQueryReply::Value(Some(record));
+        let reply = MaintenanceQueryReply::Value(Some(Box::new(record)));
         for msg_type in [MsgType::MaintenanceQuery, MsgType::MaintenanceStatus] {
             let frame = env(msg_type, GroupId::Meta, crate::codec::encode(&reply))
                 .encode()

@@ -19,7 +19,7 @@ use crate::types::{
 /// An absent maintenance record is a valid authoritative value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaintenanceQueryReply {
-    Value(Option<MaintenanceRecord>),
+    Value(Option<Box<MaintenanceRecord>>),
     NotLeader,
     Unavailable,
 }

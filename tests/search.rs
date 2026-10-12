@@ -1168,7 +1168,22 @@ fn corrupt_index_directory_is_quarantined_and_recreated() {
     let reopened = LocalSearchIndex::open_or_create(&path, GroupId::Data(2), generation).unwrap();
     // The recreated index is empty and unprojected: it must rebuild.
     assert!(reopened.validate_checkpoint(3).unwrap().is_none());
-    assert!(dir.path().join("9.quarantined").is_dir());
+    let quarantined = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("9.quarantined-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantined.len(), 1);
+    assert!(quarantined[0].is_dir());
+    assert_eq!(
+        std::fs::read(quarantined[0].join("meta.json")).unwrap(),
+        b"not tantivy metadata"
+    );
 }
 
 #[tokio::test]

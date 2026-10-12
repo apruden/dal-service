@@ -342,20 +342,20 @@ fn backup_export_node(args: &[String]) -> ExitCode {
             .ok()
             .filter(|value| *value > 0)
             .ok_or_else(|| dal::error::Error::Config("invalid --generation".into()))?;
-        dal::backup::export_node(
-            &desc,
-            cfg.node_id,
-            &cfg.data_dir,
-            backup,
-            operation,
+        dal::backup::export_node(dal::backup::ExportRequest {
+            descriptor: &desc,
+            node_id: cfg.node_id,
+            data_dir: &cfg.data_dir,
+            backup_id: backup,
+            operation_id: operation,
             generation,
-            Path::new(destination),
-            dal::backup::TrustSnapshot {
+            destination: Path::new(destination),
+            trust: dal::backup::TrustSnapshot {
                 generation: security.policy.generation(),
                 digest: security.policy.fingerprint(),
                 key_fingerprints: security.policy.public_key_fingerprints(),
             },
-        )
+        })
     })();
     match result {
         Ok(artifact) => {

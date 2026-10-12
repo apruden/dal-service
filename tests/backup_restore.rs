@@ -1863,32 +1863,32 @@ fn offline_artifacts_survive_cli_verification_and_restore() {
     let export_partial = root.join(format!(".dal-backup-{BACKUP_ID:032x}-node-1.partial"));
     std::fs::create_dir(&export_partial).unwrap();
     std::fs::write(export_partial.join("interrupted"), b"incomplete").unwrap();
-    let error = backup::export_node(
-        &descriptor,
-        ids[0],
-        &sources[0],
-        BACKUP_ID,
-        0xabc51,
-        1,
-        &artifacts[0],
-        trust.clone(),
-    )
+    let error = backup::export_node(backup::ExportRequest {
+        descriptor: &descriptor,
+        node_id: ids[0],
+        data_dir: &sources[0],
+        backup_id: BACKUP_ID,
+        operation_id: 0xabc51,
+        generation: 1,
+        destination: &artifacts[0],
+        trust: trust.clone(),
+    })
     .unwrap_err();
     assert!(error.to_string().contains("partial backup already exists"));
     assert!(!artifacts[0].exists());
     assert!(export_partial.join("interrupted").exists());
     std::fs::remove_dir_all(&export_partial).unwrap();
     for (id, (source, artifact)) in ids.iter().zip(sources.iter().zip(&artifacts)) {
-        backup::export_node(
-            &descriptor,
-            *id,
-            source,
-            BACKUP_ID,
-            0xabc51,
-            1,
-            artifact,
-            trust.clone(),
-        )
+        backup::export_node(backup::ExportRequest {
+            descriptor: &descriptor,
+            node_id: *id,
+            data_dir: source,
+            backup_id: BACKUP_ID,
+            operation_id: 0xabc51,
+            generation: 1,
+            destination: artifact,
+            trust: trust.clone(),
+        })
         .unwrap();
         let exported: backup::NodeArtifact =
             serde_json::from_slice(&std::fs::read(artifact.join("node.json")).unwrap()).unwrap();

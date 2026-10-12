@@ -17,6 +17,7 @@ use dal::transport::dealer::ZmqTransport;
 use dal::transport::security::CurveClientConfig;
 
 const CID: u128 = 0xDA1_51A1;
+const CLIENT_ID: u128 = 91;
 
 struct Process {
     child: Child,
@@ -191,7 +192,8 @@ fn write_cluster(
     principals.push(serde_json::json!({
         "user_id": "app:lifecycle",
         "curve_public_key": zmq::z85_encode(&client_keys.public_key).unwrap(),
-        "permissions": ["client_read", "client_write"]
+        "permissions": ["client_read", "client_write"],
+        "client_ids": [format!("{CLIENT_ID:#x}")]
     }));
     protected_write(
         &policy_path,
@@ -350,7 +352,7 @@ async fn sigterm_and_sigint_stop_and_restart_a_running_cluster() {
 
     let client = Client::new(
         CID,
-        91,
+        CLIENT_ID,
         controls.clone(),
         ZmqTransport::new_curve(
             zmq::Context::new(),

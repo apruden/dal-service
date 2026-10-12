@@ -345,19 +345,32 @@ fn meta_inventory(
     })
 }
 
+/// Identity, maintenance fence, and paths for one offline node export.
+pub struct ExportRequest<'a> {
+    pub descriptor: &'a BootstrapDescriptor,
+    pub node_id: NodeId,
+    pub data_dir: &'a Path,
+    pub backup_id: u128,
+    pub operation_id: u128,
+    pub generation: u64,
+    pub destination: &'a Path,
+    pub trust: TrustSnapshot,
+}
+
 /// Export one stopped node. Opening RocksDB takes its process lock; a running
 /// node therefore cannot be exported. The checkpoint includes all column
 /// families and logs, while derived Tantivy files are intentionally omitted.
-pub fn export_node(
-    desc: &BootstrapDescriptor,
-    node_id: NodeId,
-    data_dir: &Path,
-    backup_id: u128,
-    operation_id: u128,
-    generation: u64,
-    destination: &Path,
-    trust: TrustSnapshot,
-) -> Result<NodeArtifact> {
+pub fn export_node(request: ExportRequest<'_>) -> Result<NodeArtifact> {
+    let ExportRequest {
+        descriptor: desc,
+        node_id,
+        data_dir,
+        backup_id,
+        operation_id,
+        generation,
+        destination,
+        trust,
+    } = request;
     if backup_id == 0
         || operation_id == 0
         || generation == 0
@@ -914,6 +927,7 @@ pub fn record_backup(package_path: &Path, catalog_path: &Path) -> Result<Catalog
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)?;
     #[cfg(unix)]
     {
@@ -1096,7 +1110,10 @@ fn available_bytes(path: &Path) -> Result<u64> {
         return Err(std::io::Error::last_os_error().into());
     }
     let stat = unsafe { stat.assume_init() };
-    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    // libc field widths vary by Unix target; widen before multiplying and
+    // retain the u64 saturation used by callers.
+    let bytes = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 #[cfg(unix)]
@@ -1231,11 +1248,11 @@ pub fn restore_node(
     ));
     let source = package_path.join(format!("node-{node_id}")).join("db");
     with_restore_stage(&stage, destination, &parent, |stage| {
-        copy_regular_tree(&source, &stage)?;
+        copy_regular_tree(&source, stage)?;
         let expected = verify_node(&package_path.join(format!("node-{node_id}")))?;
-        let mut copied = regular_files(&stage)?
+        let mut copied = regular_files(stage)?
             .iter()
-            .map(|file| relative_file_digest(&stage, file))
+            .map(|file| relative_file_digest(stage, file))
             .collect::<Result<Vec<_>>>()?;
         copied.sort_by(|left, right| left.path.cmp(&right.path));
         let mut expected_files = expected.files.clone();
@@ -1252,7 +1269,7 @@ pub fn restore_node(
                 "restored database copy failed checksum verification".into(),
             ));
         }
-        let storage = Storage::open(&stage)?;
+        let storage = Storage::open(stage)?;
         let identity = storage
             .identity()?
             .ok_or_else(|| Error::Config("restored node identity missing".into()))?;
@@ -1273,7 +1290,7 @@ pub fn restore_node(
         let mut marker = File::create(stage.join("DAL_RESTORE.json"))?;
         marker.write_all(&serde_json::to_vec_pretty(&plan).map_err(Error::codec)?)?;
         marker.sync_all()?;
-        File::open(&stage)?.sync_all()?;
+        File::open(stage)?.sync_all()?;
         Ok(inventory)
     })
 }

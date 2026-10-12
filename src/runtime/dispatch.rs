@@ -796,7 +796,7 @@ impl RootDispatch {
             }
             Some(meta) => match meta.read_maintenance().await {
                 Ok(crate::meta::node::MetaRead::Value(record)) => {
-                    MaintenanceQueryReply::Value(record)
+                    MaintenanceQueryReply::Value(record.map(Box::new))
                 }
                 Ok(crate::meta::node::MetaRead::NotLeader { .. }) => {
                     MaintenanceQueryReply::NotLeader

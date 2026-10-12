@@ -188,7 +188,7 @@ pub async fn fetch_authoritative_maintenance<T: Transport>(
                 continue;
             }
             if let Ok(MaintenanceQueryReply::Value(record)) = codec::decode(&reply.payload) {
-                return Ok(record);
+                return Ok(record.map(|record| *record));
             }
         }
         Err(Error::Raft(

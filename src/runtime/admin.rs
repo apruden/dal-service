@@ -319,7 +319,7 @@ pub async fn maintenance_status_secure(
             continue;
         }
         match codec::decode::<MaintenanceQueryReply>(&reply.payload) {
-            Ok(MaintenanceQueryReply::Value(record)) => return Ok(record),
+            Ok(MaintenanceQueryReply::Value(record)) => return Ok(record.map(|record| *record)),
             Ok(MaintenanceQueryReply::NotLeader | MaintenanceQueryReply::Unavailable) => {}
             Err(_) => {
                 if let Ok(SubmitReply::Error(error)) = codec::decode(&reply.payload) {
