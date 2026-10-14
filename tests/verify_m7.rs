@@ -103,7 +103,12 @@ async fn do_read(s: &Shared, key: &[u8]) -> Option<Option<(u64, Vec<u8>)>> {
         if let Some(li) = s.leader() {
             match s.nodes[li].read(key, Consistency::Linearizable).await {
                 Ok(ReadOutcome::Value(v)) => return Some(v),
-                Ok(ReadOutcome::NotLeader { .. }) | Ok(ReadOutcome::TooStale { .. }) | Err(_) => {}
+                Ok(
+                    ReadOutcome::NotLeader { .. }
+                    | ReadOutcome::TooStale { .. }
+                    | ReadOutcome::Recovering,
+                )
+                | Err(_) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

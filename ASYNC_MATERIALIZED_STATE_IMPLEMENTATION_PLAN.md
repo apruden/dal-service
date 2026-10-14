@@ -288,7 +288,8 @@ While closed:
 - linearizable reads may perform the barrier and recover normally;
 - writes may proceed through Raft and open readiness only after successful
   apply;
-- stale reads return `TooStale`/redirect;
+- stale reads return `Recovering`; clients try other candidates, then back off
+  within the bounded recovery retry window;
 - node-local diagnostic reads must be labelled non-authoritative;
 - no placement, admission, or reconciliation decision may consume the data as
   authoritative state.

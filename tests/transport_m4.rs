@@ -16,9 +16,10 @@ use dal::api::ops::{ClientReply, ClientRequest, RoutingInfo, WriteReply};
 use dal::codec;
 use dal::meta::bootstrap::ensure_bootstrap_group;
 use dal::partition::network::{Faults, Registry};
-use dal::partition::node::PartitionNode;
+use dal::partition::node::{PartitionNode, ReadOutcome};
 use dal::storage::Storage;
 use dal::transport::codec::{Envelope, FrameError, MsgType};
+use dal::transport::raft_wire::RecoveryFenceReply;
 use dal::transport::{InProcess, Transport};
 use dal::types::{
     BootstrapGroup, ClusterId, Consistency, DataOp, DataRequest, GroupId, HashSpec, IfVersion,
@@ -144,6 +145,7 @@ struct Cluster {
     switch: InProcess<ClientGateway>,
     routing: Arc<StaticRouting>,
     registry: Registry<dal::partition::TypeConfig>,
+    faults: Faults,
 }
 
 impl Cluster {
@@ -199,6 +201,7 @@ impl Cluster {
             switch,
             routing,
             registry,
+            faults,
         };
         cluster.await_leader().await;
         cluster
@@ -290,6 +293,100 @@ async fn client_put_then_get_round_trips() {
 
     let got = client.get(b"alpha").await.unwrap();
     assert_eq!(got.map(|(_, v)| v), Some(b"one".to_vec()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_stale_get_reads_an_isolated_leader_without_peer_access() {
+    let c = Cluster::bootstrap().await;
+    let writer = c.client(0xC1, vec![ctrl_addr(1)]);
+    let version = match writer.put(b"alpha", b"one", None).await.unwrap() {
+        WriteReply::Applied { version } => version,
+        other => panic!("unexpected write result: {other:?}"),
+    };
+    let leader = c.leader().unwrap();
+    let node = c
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == leader)
+        .unwrap();
+    eventually("leader's applied metric reaches the write", || {
+        node.applied_index().unwrap_or(0) >= version
+    })
+    .await;
+
+    let peers: Vec<_> = VOTERS.into_iter().filter(|id| *id != leader).collect();
+    c.faults.isolate(leader, &peers);
+    for peer in peers {
+        // Make every other gateway unavailable too, so client fallback cannot
+        // hide a local-read refusal from the isolated leader.
+        c.switch.deregister(&ctrl_addr(peer));
+    }
+    c.set_voter_order(leader);
+    let reader = c.client(0xC2, vec![ctrl_addr(leader)]);
+    assert_eq!(node.current_leader(), Some(leader));
+    for min_version in [None, Some(version)] {
+        assert_eq!(
+            reader.stale_get(b"alpha", min_version).await.unwrap(),
+            Some((version, b"one".to_vec()))
+        );
+    }
+    assert_eq!(reader.stale_get(b"missing", None).await.unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_stale_get_waits_for_background_recovery_with_a_known_leader() {
+    let c = Cluster::bootstrap().await;
+    let leader = c.leader().unwrap();
+    let node = c
+        .nodes
+        .iter()
+        .find(|node| node.node_id() == leader)
+        .unwrap();
+    eventually("leader's voter membership is applied", || {
+        node.committed_voter_set().contains(&leader)
+    })
+    .await;
+    // This harness has no background recovery driver and no writes have run.
+    // Only the chosen replica is client-accessible, so recovery cannot be
+    // hidden by a successful read on another gateway.
+    for peer in VOTERS.into_iter().filter(|id| *id != leader) {
+        c.switch.deregister(&ctrl_addr(peer));
+    }
+    c.set_voter_order(leader);
+    assert_eq!(
+        node.read(b"empty", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Recovering,
+    );
+    let reader = c.client(0xC7, vec![ctrl_addr(leader)]);
+    let read = reader.stale_get(b"empty", None);
+    tokio::pin!(read);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut read)
+            .await
+            .is_err(),
+        "stale_get completed before background recovery opened the gate"
+    );
+    // Use the same fence protocol as the runtime recovery driver. The read
+    // itself must neither issue this quorum check nor open the gate.
+    assert_eq!(
+        node.read(b"empty", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Recovering,
+    );
+    let RecoveryFenceReply::Fence(fence) = node.issue_recovery_fence(leader).await else {
+        panic!("leader could not issue its recovery fence");
+    };
+    node.apply_recovery_fence(&fence).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .unwrap()
+            .unwrap(),
+        None,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

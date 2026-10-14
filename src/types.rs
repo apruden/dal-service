@@ -94,10 +94,11 @@ pub enum Consistency {
     /// ReadIndex against the current membership, then serve applied state. The
     /// only path that never returns a value older than the last ack'd write.
     Linearizable,
-    /// Serve from any voter's locally-applied state, skipping ReadIndex. May
-    /// return a superseded value. `min_version`, when set, enforces
-    /// read-your-writes / monotonic reads: the replica must have applied at
-    /// least that version or it redirects to fresher candidates.
+    /// Serve any voter's locally applied committed state without ReadIndex or
+    /// a known leader, even during isolation. Data may be arbitrarily old;
+    /// serving, membership, and recovery fences still apply. `min_version`
+    /// requires the replica to have applied at least that partition log index
+    /// or redirect to another candidate; it does not bound the age of the data.
     Stale { min_version: Option<Version> },
 }
 

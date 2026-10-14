@@ -311,8 +311,9 @@ impl ClientGateway {
             }
             ClientRequest::Read { key, consistency } => match node.read(&key, consistency).await {
                 Ok(ReadOutcome::Value(v)) => ClientReply::Value(v),
-                // A stale read refused for freshness reuses the redirect channel,
-                // so the client just walks to a fresher candidate (DESIGN §8.3).
+                Ok(ReadOutcome::Recovering) => ClientReply::Recovering,
+                // A stale read refused by membership or its version
+                // floor reuses the redirect channel to try another candidate.
                 Ok(ReadOutcome::NotLeader { leader }) | Ok(ReadOutcome::TooStale { leader }) => {
                     ClientReply::Redirect(Redirect {
                         cluster_id: self.cluster_id,

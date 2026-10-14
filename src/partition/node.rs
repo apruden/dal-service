@@ -1,10 +1,10 @@
 //! A single partition's Raft runtime and its serving gate (DESIGN §7.4, M3).
 //!
 //! [`PartitionNode`] is the *only* path to the state machine: `write` goes
-//! through `client_write` (durable majority commit), `read` through
-//! `ensure_linearizable` (ReadIndex) then a local get. A removed or
-//! partitioned-away old leader cannot pass the ReadIndex quorum check, so it
-//! cannot serve stale data.
+//! through `client_write` (durable majority commit), linearizable `read` through
+//! `ensure_linearizable` (ReadIndex) then a local get. Stale reads serve locally
+//! applied committed state without contacting peers, including during isolation,
+//! while retaining membership, serving, recovery, and minimum-version gates.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,9 +45,11 @@ pub enum ReadOutcome {
     NotLeader {
         leader: Option<NodeId>,
     },
-    /// A stale read was refused: this replica is not currently attached to a
-    /// leader, or is behind the caller's `min_version`. Retry a fresher
-    /// candidate (DESIGN §8.3, §15).
+    /// The local process epoch is still waiting for its recovery fence.
+    /// Try another candidate, then back off while background recovery runs.
+    Recovering,
+    /// This replica is not a committed voter or is behind `min_version`.
+    /// Retry another candidate (DESIGN §8.3).
     TooStale {
         leader: Option<NodeId>,
     },
@@ -622,8 +624,9 @@ impl PartitionNode {
     }
 
     /// Perform a read at the requested consistency. Linearizable runs ReadIndex
-    /// then a local get; stale skips ReadIndex and serves local applied state,
-    /// still gated by the serving gate and a coarse freshness/version check.
+    /// then a local get; stale serves locally applied committed state without
+    /// contacting peers or requiring a known leader. Both retain serving and
+    /// recovery fences; stale also checks voter membership and `min_version`.
     pub async fn read(&self, key: &[u8], consistency: Consistency) -> Result<ReadOutcome> {
         // The serving gate is authority on both paths (DESIGN §7.4): an
         // amnesiac ex-voter or a node that applied its removal still refuses,
@@ -637,19 +640,16 @@ impl PartitionNode {
                         // Unlike the write path, nothing has been served yet: a
                         // gate that will not open means local applied state is
                         // not yet known to cover the ReadIndex target, so
-                        // serving it could violate linearizability. Redirect
-                        // (TooStale reuses the redirect channel) instead of
-                        // hard-failing — the client walks candidates and reads
-                        // are idempotent (DESIGN §8.1/§8.2).
+                        // serving it could violate linearizability. Report
+                        // recovery so the client tries other candidates and
+                        // backs off if none can serve (DESIGN §8.1/§8.2).
                         if let Err(error) = self.open_state_recovery(target) {
                             tracing::warn!(
                                 group = ?self.group,
                                 %error,
-                                "recovery gate not open for linearizable read; redirecting"
+                                "recovery gate not open for linearizable read"
                             );
-                            return Ok(ReadOutcome::TooStale {
-                                leader: self.current_leader(),
-                            });
+                            return Ok(ReadOutcome::Recovering);
                         }
                         Ok(ReadOutcome::Value(
                             self.data.get(self.storage.as_ref(), key)?,
@@ -666,7 +666,7 @@ impl PartitionNode {
             Consistency::Stale { min_version } => min_version,
         };
 
-        // Only committed voters may serve follower reads. Learner admission opens
+        // Only committed voters may serve stale reads. Learner admission opens
         // the durable process gate before catch-up, and a removed voter is
         // reclaimed asynchronously, so the process gate alone is not authority
         // for this weaker read path.
@@ -676,38 +676,14 @@ impl PartitionNode {
             });
         }
 
-        // An isolated follower eventually starts an election and loses its
-        // committed-leader view. An isolated leader does not, so `Some(self)` is
-        // not freshness evidence: require a quorum barrier before letting the
-        // leader use the stale fast path.
+        // The leader is only a redirect hint. Stale reads accept arbitrarily
+        // old committed state, including on isolated leaders and candidates.
         let leader = self.current_leader();
-        if leader.is_none() {
-            return Ok(ReadOutcome::TooStale { leader: None });
-        }
-        if leader == Some(self.node_id) {
-            match self.raft.ensure_linearizable().await {
-                // A gate that will not open is the same freshness refusal the
-                // `state_recovery_ready` check below expresses: redirect, do
-                // not hard-fail the idempotent read.
-                Ok(target) => {
-                    if self.open_state_recovery(target).is_err() {
-                        return Ok(ReadOutcome::TooStale { leader });
-                    }
-                }
-                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
-                    return Ok(ReadOutcome::TooStale {
-                        leader: f.leader_id,
-                    });
-                }
-                Err(_) => return Ok(ReadOutcome::TooStale { leader }),
-            }
-        }
-        // Async state can recover behind the pre-crash visible prefix. A
-        // follower must observe a post-start committed apply before serving
-        // local state; a leader opens the same gate with the quorum barrier
-        // above.
+        // Async state can recover behind the pre-crash visible prefix. Recovery
+        // must have opened this process epoch's gate before any local read;
+        // stale reads never initiate a quorum check to open it themselves.
         if !self.storage.state_recovery_ready(self.group) {
-            return Ok(ReadOutcome::TooStale { leader });
+            return Ok(ReadOutcome::Recovering);
         }
         // Read-your-writes / monotonic: the replica must have caught up to the
         // version the caller last observed.
@@ -1283,7 +1259,7 @@ mod tests {
                 .read(b"retained", Consistency::Stale { min_version: None })
                 .await
                 .unwrap(),
-            ReadOutcome::TooStale { .. }
+            ReadOutcome::Recovering
         ));
 
         fence_node(&nodes, follower).await;

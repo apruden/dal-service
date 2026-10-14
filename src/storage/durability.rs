@@ -386,8 +386,11 @@ fn run_worker<W, F>(
 
         let deadline = Instant::now() + shared.config.max_batch_delay;
         let collect_profile = crate::perf::timer(WriteStage::WalBatchCollect);
+        // Check time even when the queue stays busy. A write already in progress
+        // may overrun the window, but no further queued write should join it.
         while batch.len() < shared.config.max_pending_requests
             && batch_bytes < shared.config.max_pending_bytes
+            && Instant::now() < deadline
         {
             let command = match receiver.try_recv() {
                 Ok(command) => Some(command),
@@ -662,6 +665,92 @@ mod tests {
             .unwrap();
 
         assert!(rx.recv_timeout(Duration::from_millis(100)).unwrap());
+    }
+
+    fn check_busy_queue_deadline(max_batch_delay: Duration, max_writes_per_flush: usize) {
+        for adaptive_batching in [false, true] {
+            let config = DurabilityConfig {
+                max_batch_delay,
+                ..test_config(adaptive_batching)
+            };
+            let shared = Arc::new(Shared::new(config));
+            let (sender, receiver) = mpsc::sync_channel(config.max_pending_requests);
+            let flushed_writes = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(Mutex::new(Vec::new()));
+
+            // Preload less than either capacity limit so every next request is
+            // available, and only the deadline can force an early flush.
+            const REQUESTS: usize = 4;
+            for id in 0..REQUESTS {
+                let reservation = shared.try_reserve(16).unwrap().expect("capacity");
+                let flushed_writes = flushed_writes.clone();
+                let completed = completed.clone();
+                sender
+                    .send(Command::Write(WriteRequest {
+                        reservation,
+                        batch: batch(),
+                        kind: if id % 2 == 0 {
+                            DurabilityKind::Log
+                        } else {
+                            DurabilityKind::State
+                        },
+                        on_written: None,
+                        on_durable: Box::new(move |result| {
+                            assert!(result.is_ok());
+                            assert!(flushed_writes.load(Ordering::SeqCst) > id);
+                            completed.lock().unwrap().push(id);
+                        }),
+                    }))
+                    .unwrap();
+            }
+            // Also verify shutdown drains the requests left for later groups.
+            sender.send(Command::Shutdown).unwrap();
+            drop(sender);
+
+            let writes = AtomicUsize::new(0);
+            let mut flush_sizes = Vec::new();
+            run_worker(
+                receiver,
+                shared.clone(),
+                |_| {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    if !max_batch_delay.is_zero() {
+                        // One in-progress write may overrun the deadline. The
+                        // worker must flush before starting another queued one.
+                        // Scheduling delays can only make it flush sooner.
+                        thread::sleep(max_batch_delay * 2);
+                    }
+                    Ok(())
+                },
+                || {
+                    let written = writes.load(Ordering::SeqCst);
+                    let previous = flushed_writes.swap(written, Ordering::SeqCst);
+                    flush_sizes.push(written - previous);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(*completed.lock().unwrap(), vec![0, 1, 2, 3]);
+            assert_eq!(flushed_writes.load(Ordering::SeqCst), REQUESTS);
+            assert!(
+                flush_sizes.iter().all(|&size| size <= max_writes_per_flush),
+                "busy queue exceeded the collection deadline: {flush_sizes:?}"
+            );
+            assert_eq!(shared.pending_requests(), 0);
+            assert_eq!(shared.state.lock().unwrap().pending_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn busy_queue_flushes_when_a_write_crosses_the_collection_deadline() {
+        // The first write precedes the collection timer. At most one further
+        // write can join before crossing the deadline, even with a busy queue.
+        check_busy_queue_deadline(Duration::from_millis(1), 2);
+    }
+
+    #[test]
+    fn busy_queue_with_zero_collection_delay_flushes_each_request() {
+        check_busy_queue_deadline(Duration::ZERO, 1);
     }
 
     #[test]

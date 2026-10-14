@@ -32,8 +32,8 @@ back independently. Optimizations must not be accepted from an in-memory or
    holding the state-view lock, creating unbounded memory use and long apply
    stalls as partitions grow.
 6. Every linearizable read starts its own quorum confirmation. Stale reads are
-   rotated across all voters, but a stale request reaching the leader still
-   performs ReadIndex.
+   rotated across voters and serve committed local state on leaders and
+   followers without ReadIndex, subject to recovery and minimum-version gates.
 
 The existing data apply coalescing remains enabled throughout this plan. Its
 recorded ext4 A/B result (approximately 366 to 762 concurrent writes/s and p99
@@ -644,10 +644,9 @@ of the release qualification suite.
   from local state and complete its waiter independently.
 - Bound batch size and maximum queueing delay so throughput batching does not
   create unbounded single-read latency.
-- For stale reads, prefer known followers before the leader. Keep the leader as
-  fallback because its existing stale-read safety check may require ReadIndex.
-- Correct benchmark labels and metrics so stale reads that hit the leader are
-  counted separately from follower fast-path reads.
+- Stale reads already avoid ReadIndex on leaders and followers. Preserve voter
+  spreading and the minimum-version leader preference; distinguish local reads
+  from recovery refusals and minimum-version redirects in benchmark results.
 - Treat a leader lease as a separate future project requiring an explicit
   clock, membership-transition, invalidation, and failover proof. It is not a
   prerequisite for this plan.
@@ -660,15 +659,15 @@ of the release qualification suite.
   group.
 - Change leadership and membership while reads queue; all results must be
   linearizable or explicitly redirected/failed.
-- Isolate followers and leaders and verify stale-read behavior retains the
-  existing serving-gate and freshness rules.
+- Isolate followers and leaders and verify stale reads return only committed
+  local state while retaining serving, membership, recovery, and minimum-version
+  gates. A known leader is not required.
 
 ### Acceptance criteria
 
 - Concurrent linearizable reads require substantially fewer quorum barriers
   than requests while preserving linearizability.
-- Stale traffic uses the follower fast path whenever a suitable follower is
-  available.
+- Stale traffic uses local state on any eligible voter without a quorum check.
 - Added batching delay stays within the configured budget.
 
 ## Phase 8: Remove residual CPU and allocation costs
@@ -748,7 +747,7 @@ Before enabling a phase by default:
 5. Phase 4: committed/apply durable-write reduction.
 6. Phase 5: routing cache and redirect behavior.
 7. Phase 6: bounded snapshot production/install.
-8. Phase 7: ReadIndex batching and follower-first stale reads.
+8. Phase 7: ReadIndex batching and local stale-read validation.
 9. Phase 8: profile-guided allocation, copying, and RocksDB tuning.
 
 Phases 1 and 2 are independent after Phase 0 and may be developed in parallel.

@@ -24,7 +24,7 @@ pub(crate) const CLIENT_OP_BUCKET_LABELS: [&str; 9] = [
 const CLIENT_OP_BUCKET_MICROS: [u64; 8] = [
     10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
 ];
-pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 10] = [
+pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 11] = [
     "applied",
     "condition_failed",
     "rejected",
@@ -35,17 +35,19 @@ pub(crate) const CLIENT_REPLY_OUTCOME_LABELS: [&str; 10] = [
     "unavailable",
     "denied",
     "recovery_epoch_mismatch",
+    "recovering",
 ];
 static CLIENT_OP_DURATION_BUCKETS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 static CLIENT_OP_DURATION_SUM_MICROS: AtomicU64 = AtomicU64::new(0);
-static CLIENT_REPLY_OUTCOMES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static CLIENT_REPLY_OUTCOMES: [AtomicU64; CLIENT_REPLY_OUTCOME_LABELS.len()] =
+    [const { AtomicU64::new(0) }; CLIENT_REPLY_OUTCOME_LABELS.len()];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientOpMetrics {
     pub duration_sum_microseconds: u64,
     /// Exclusive counts, converted to cumulative buckets during exposition.
     pub duration_buckets: [u64; 9],
-    pub reply_outcomes: [u64; 10],
+    pub reply_outcomes: [u64; CLIENT_REPLY_OUTCOME_LABELS.len()],
 }
 
 pub(crate) fn client_op_metrics() -> ClientOpMetrics {
@@ -88,6 +90,7 @@ pub(crate) fn record_client_reply(reply: &ClientReply) {
         ClientReply::Unavailable(_) => 7,
         ClientReply::Denied(_) => 8,
         ClientReply::RecoveryEpochMismatch { .. } => 9,
+        ClientReply::Recovering => 10,
     };
     CLIENT_REPLY_OUTCOMES[outcome].fetch_add(1, Ordering::Relaxed);
 }
@@ -95,6 +98,14 @@ pub(crate) fn record_client_reply(reply: &ClientReply) {
 #[cfg(test)]
 mod client_reply_tests {
     use super::*;
+
+    #[test]
+    fn recovering_has_a_metric_slot() {
+        let before = client_op_metrics().reply_outcomes[10];
+        record_client_reply(&ClientReply::Recovering);
+        assert!(client_op_metrics().reply_outcomes[10] > before);
+        assert_eq!(CLIENT_REPLY_OUTCOME_LABELS[10], "recovering");
+    }
 
     #[test]
     fn recovery_epoch_mismatch_has_a_metric_slot() {

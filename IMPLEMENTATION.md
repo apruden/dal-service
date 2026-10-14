@@ -179,7 +179,11 @@ create-only; malformed/gapped/stale committed entries advance only
   state without a destructive partial-replace window.
 - `PartitionHandle` — the serving gate as an API: `write(cmd)` →
   `MutationResult` or `NotLeader{hint}`; `read(key)` → `ensure_linearizable()`
-  then local get. There is no other path to the state machine.
+  then local get. Explicit stale reads serve locally applied committed state
+  without a quorum check or known leader, retaining local serving, membership,
+  recovery, and minimum-version checks, including during isolation. Recovery
+  refusals have a distinct reply and bounded client backoff, allowing background
+  fencing to complete without making the stale read perform a quorum check.
 - `ChannelNetwork` with per-link, seed-driven fault injection.
 
 **Gate (all on ChannelNetwork, 3 voters):** leader crash/re-election with no
@@ -558,7 +562,7 @@ size-preserving replacement.
 
 ## 4. Explicitly deferred (from DESIGN §15, plus)
 
-Dynamic `P`, load-aware placement, follower reads, multi-key transactions,
+Dynamic `P`, load-aware placement, bounded-staleness reads, multi-key transactions,
 lease reads, idempotency-record GC, compression/TTL, coalesced heartbeats.
 Also deferred: authentication/encryption on the wire — `cluster_id` guards
 against misconfiguration, not adversaries; v1 assumes a trusted network

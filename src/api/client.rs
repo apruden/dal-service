@@ -35,10 +35,10 @@ use crate::types::{
 /// giving up. Bounded so a persistently unreachable target fails rather than
 /// spins.
 const MAX_ROUNDS: usize = 16;
-/// A live cluster can briefly report no leader during election or snapshot
-/// recovery. Fast redirects otherwise exhaust `MAX_ROUNDS` in milliseconds.
-const NO_LEADER_RETRY_WINDOW: Duration = Duration::from_secs(8);
-const NO_LEADER_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Allow elections and local recovery fences time to complete. Fast refusals
+/// otherwise exhaust `MAX_ROUNDS` in milliseconds, even with a known leader.
+const RECOVERY_RETRY_WINDOW: Duration = Duration::from_secs(8);
+const RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn search_deadline(request: &crate::search::SearchRequest) -> Result<tokio::time::Instant> {
     if request.deadline_ms == 0 || request.deadline_ms > 60_000 {
@@ -215,9 +215,14 @@ impl<T: Transport> Client<T> {
         self.get_with(key, Consistency::Linearizable).await
     }
 
-    /// Eventually-consistent read (DESIGN §15): any voter may serve from its
-    /// applied state, skipping ReadIndex. `min_version` opts into
-    /// read-your-writes / monotonic reads; `None` accepts any applied value.
+    /// Read any voter's locally applied committed state without a quorum check
+    /// or a known leader (DESIGN §8.3). An isolated replica may return arbitrarily
+    /// old data. Serving, membership, and recovery fences still apply.
+    /// `min_version` requires the replica to have applied at least that partition
+    /// log index; `None` accepts any recovered committed value. Routing and
+    /// redirects may contact other nodes, but serving the read is fully local.
+    /// If candidates are still recovering, retry rounds back off for a bounded
+    /// window while background recovery opens their local serving fences.
     pub async fn stale_get(
         &self,
         key: &[u8],
@@ -756,12 +761,12 @@ impl<T: Transport> Client<T> {
             .map_err(|error| Error::Config(format!("client request cannot be encoded: {error}")))?;
 
         let mut rounds = 0usize;
-        let mut no_leader_since = None;
+        let mut recovery_since = None;
         loop {
             rounds += 1;
             let candidates = self.candidate_nodes(partition, order);
             let mut redirected = false;
-            let mut leader_unknown = false;
+            let mut waiting_for_recovery = false;
 
             for node in candidates {
                 let Some(addr) = self.resolve_addr(node) else {
@@ -802,10 +807,16 @@ impl<T: Transport> Client<T> {
                     continue;
                 };
                 match reply {
+                    ClientReply::Recovering => {
+                        waiting_for_recovery = true;
+                        recovery_since.get_or_insert_with(Instant::now);
+                        // A ready replica later in this round may serve now.
+                        continue;
+                    }
                     ClientReply::Redirect(r) => {
                         if r.leader.is_none() {
-                            leader_unknown = true;
-                            no_leader_since.get_or_insert_with(Instant::now);
+                            waiting_for_recovery = true;
+                            recovery_since.get_or_insert_with(Instant::now);
                         }
                         if r.cluster_id != self.cluster_id {
                             return Err(Error::Raft(format!(
@@ -828,21 +839,21 @@ impl<T: Transport> Client<T> {
             // Redirects name node ids but carry no addresses. Refresh after one
             // so a newly promoted/joined candidate can actually be resolved;
             // keep the redirect hint when seeds are temporarily unavailable.
-            // With no redirect, exhausting every candidate requires a
-            // successful refresh before another identical round is useful.
-            if redirected {
+            // Recovering candidates can become ready without a routing change,
+            // including while the routing source is unavailable.
+            if redirected || waiting_for_recovery {
                 let _ = self.refresh_routing().await;
             } else {
                 self.refresh_routing().await?;
             }
-            let within_recovery_window = leader_unknown
-                && no_leader_since
-                    .is_some_and(|since: Instant| since.elapsed() < NO_LEADER_RETRY_WINDOW);
+            let within_recovery_window = waiting_for_recovery
+                && recovery_since
+                    .is_some_and(|since: Instant| since.elapsed() < RECOVERY_RETRY_WINDOW);
             if rounds >= MAX_ROUNDS && !within_recovery_window {
                 break;
             }
-            if leader_unknown {
-                tokio::time::sleep(NO_LEADER_RETRY_DELAY).await;
+            if waiting_for_recovery {
+                tokio::time::sleep(RECOVERY_RETRY_DELAY).await;
             }
         }
 
@@ -1239,6 +1250,7 @@ mod tests {
         available_at: Instant,
         routing: RoutingInfo,
         redirects: AtomicU64,
+        refusal: ClientReply,
     }
 
     impl Server for RecoveringLeader {
@@ -1247,11 +1259,7 @@ mod tests {
                 codec::encode(&self.routing)
             } else if Instant::now() < self.available_at {
                 self.redirects.fetch_add(1, Ordering::Relaxed);
-                codec::encode(&ClientReply::Redirect(Redirect {
-                    cluster_id: 1,
-                    leader: None,
-                    candidates: vec![1],
-                }))
+                codec::encode(&self.refusal)
             } else {
                 codec::encode(&ClientReply::Value(Some((7, b"recovered".to_vec()))))
             };
@@ -1272,6 +1280,11 @@ mod tests {
             available_at: Instant::now() + Duration::from_secs(2),
             routing: routing(vec![1], LogId::new(1, 1)),
             redirects: AtomicU64::new(0),
+            refusal: ClientReply::Redirect(Redirect {
+                cluster_id: 1,
+                leader: None,
+                candidates: vec![1],
+            }),
         });
         transport.register("node-1", server.clone());
         transport.register("seed", server.clone());
@@ -1284,6 +1297,123 @@ mod tests {
             .unwrap();
         assert_eq!(read, Some((7, b"recovered".to_vec())));
         assert!(server.redirects.load(Ordering::Relaxed) > MAX_ROUNDS as u64);
+    }
+
+    #[tokio::test]
+    async fn recovering_replicas_outlive_fast_rounds() {
+        let transport = InProcess::new();
+        let server = Arc::new(RecoveringLeader {
+            // Leave scheduling headroom beyond the 16-round baseline while
+            // still recovering well inside the eight-second retry window.
+            available_at: Instant::now() + Duration::from_secs(4),
+            routing: routing(vec![1], LogId::new(1, 1)),
+            redirects: AtomicU64::new(0),
+            refusal: ClientReply::Recovering,
+        });
+        transport.register("node-1", server.clone());
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(server.routing.clone());
+        client.cache.lock().unwrap().leader_hint.insert(0, 1);
+
+        let read = tokio::time::timeout(Duration::from_secs(9), client.stale_get(b"key", None))
+            .await
+            .expect("client did not recover")
+            .unwrap();
+        assert_eq!(read, Some((7, b"recovered".to_vec())));
+        let refusals = server.redirects.load(Ordering::Relaxed);
+        assert!(refusals > MAX_ROUNDS as u64);
+        assert!(
+            refusals <= 41,
+            "recovery retries did not back off: {refusals}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_recovery_refusals_time_out_with_bounded_attempts() {
+        let transport = InProcess::new();
+        let server = Arc::new(RecoveringLeader {
+            available_at: Instant::now() + Duration::from_secs(60),
+            routing: routing(vec![1], LogId::new(1, 1)),
+            redirects: AtomicU64::new(0),
+            refusal: ClientReply::Recovering,
+        });
+        transport.register("node-1", server.clone());
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(server.routing.clone());
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            RECOVERY_RETRY_WINDOW + Duration::from_secs(2),
+            client.stale_get(b"key", None),
+        )
+        .await
+        .expect("recovery retries exceeded their window");
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(started.elapsed() >= RECOVERY_RETRY_WINDOW);
+        let attempts = server.redirects.load(Ordering::Relaxed);
+        let maximum = RECOVERY_RETRY_WINDOW.as_millis() / RECOVERY_RETRY_DELAY.as_millis() + 1;
+        assert!(attempts > MAX_ROUNDS as u64);
+        assert!(
+            u128::from(attempts) <= maximum,
+            "too many recovery attempts: {attempts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_tries_ready_candidates_before_backing_off() {
+        let transport = InProcess::new();
+        let server = Arc::new(RecoveringLeader {
+            available_at: Instant::now() + Duration::from_secs(60),
+            routing: routing(vec![1, 4], LogId::new(1, 1)),
+            redirects: AtomicU64::new(0),
+            refusal: ClientReply::Recovering,
+        });
+        transport.register("node-1", server.clone());
+        transport.register(
+            "node-4",
+            Arc::new(RecoveringLeader {
+                available_at: Instant::now(),
+                routing: server.routing.clone(),
+                redirects: AtomicU64::new(0),
+                refusal: ClientReply::Recovering,
+            }),
+        );
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(server.routing.clone());
+
+        let read = tokio::time::timeout(RECOVERY_RETRY_DELAY / 2, client.stale_get(b"key", None))
+            .await
+            .expect("client backed off before trying the ready replica")
+            .unwrap();
+        assert_eq!(read, Some((7, b"recovered".to_vec())));
+        assert_eq!(server.redirects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn known_leader_redirects_keep_the_normal_round_limit() {
+        let transport = InProcess::new();
+        let server = Arc::new(RecoveringLeader {
+            available_at: Instant::now() + Duration::from_secs(60),
+            routing: routing(vec![1], LogId::new(1, 1)),
+            redirects: AtomicU64::new(0),
+            refusal: ClientReply::Redirect(Redirect {
+                cluster_id: 1,
+                leader: Some(1),
+                candidates: vec![1],
+            }),
+        });
+        transport.register("node-1", server.clone());
+        let client = Client::new(1, 9, Vec::new(), transport);
+        client.cache.lock().unwrap().routing = Some(server.routing.clone());
+
+        // An unmet version floor still redirects; it must not be mistaken for
+        // a closed recovery fence and extend the retry budget.
+        let result = client.stale_get(b"key", Some(8)).await;
+        assert!(
+            matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(server.redirects.load(Ordering::Relaxed), MAX_ROUNDS as u64);
     }
 
     #[tokio::test]

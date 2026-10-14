@@ -125,6 +125,9 @@ pub enum ClientReply {
     Mutation(WriteReply),
     Value(Option<(Version, Vec<u8>)>),
     Redirect(Redirect),
+    /// A read was refused because this replica's recovery fence is closed.
+    /// Try the remaining candidates before a bounded, delayed retry.
+    Recovering,
     /// The gateway refused the operation before proposing it to Raft, based
     /// only on the request bytes and cluster-wide constants (`P`, hash spec) —
     /// so every replica refuses it identically and it cannot have committed

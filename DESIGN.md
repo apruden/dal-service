@@ -20,8 +20,8 @@ argument.
 ### Goals
 - Linearizable `get` / `put` / `delete` on a single key.
 - Horizontal scaling up to eight nodes; graceful shrink by removing them.
-- No data loss and no stale reads across node add/remove and node failure,
-  provided a majority of each partition's replicas survives.
+- No data loss and no stale linearizable reads across node add/remove and node
+  failure, provided a majority of each partition's replicas survives.
 - Availability of unaffected partitions while other partitions rebalance.
 
 ### Non-goals (v1)
@@ -38,7 +38,9 @@ argument.
 - **Consistency:** linearizable per key. A successful `put`/`delete` is durably
   committed by a Raft majority before acknowledgement. A `get` is served only
   by the current Raft leader after a quorum read check, so it never returns a
-  value older than the last acknowledged write.
+  value older than the last acknowledged write. Explicit `stale_get` reads
+  locally applied committed state from any eligible voter without a quorum
+  check, accepting arbitrarily old data, including during isolation (§8.3).
 - **Durability:** a voter acknowledges an append only after its log entry and
   any required hard-state update are fsync-durable. The leader acknowledges the
   client only after a quorum of such durable acknowledgements commits the entry.
@@ -290,16 +292,19 @@ Implementation notes:
   until the snapshot/purge point is at or below the durable-applied watermark;
   group reclamation first rejects new applies and drains all pending state.
   Any WAL write/flush failure poisons the database-scoped tracker and closes
-  client serving. A restarted data group initially refuses follower-local
-  stale reads. The current leader performs a quorum read barrier and returns a
+  client serving. A restarted data group initially refuses local stale reads
+  on every replica. The current leader performs a quorum read barrier and returns a
   recovery target containing its term and committed membership identity; the
   follower opens only after its visible state reaches that target in the same
   local recovery epoch and the identity is revalidated. Snapshot install starts
   a new epoch, so an older in-flight fence cannot open the replacement state.
-  Clients encountering a still-fenced follower are redirected to a fresher
-  candidate.
+  Clients encountering a still-fenced replica receive a distinct `Recovering`
+  reply, try the remaining candidates, then retry with bounded backoff.
 - A lone write flushes immediately; observing concurrency activates a bounded
-  200 microsecond collection window. `DAL_ADAPTIVE_DURABILITY=0` retains the
+  200 microsecond collection window. The worker checks the deadline before
+  dequeuing each additional write, including while the queue remains busy.
+  An in-progress write and the WAL sync may take longer than this window.
+  `DAL_ADAPTIVE_DURABILITY=0` retains the
   fixed-window diagnostic path. On recovery, the folded marker and applied
   state describe exactly the same locally durable prefix; acknowledged entries
   beyond that prefix remain in the majority-durable Raft logs for replay.
@@ -524,8 +529,28 @@ by partition Raft, not by the client cache.
 in its current membership — during joint consensus, in *both* the old and new
 configurations, the same rule as commit — and waits until its state machine has
 applied the returned index before answering. No log write is needed. There is
-no lease-read fast path: ReadIndex is the only read path, which keeps the
-design free of clock-drift assumptions entirely (§15).
+no lease-read fast path: linearizable reads always use ReadIndex, without
+clock-drift assumptions (§15).
+
+`stale_get(key, min_version)` explicitly reads a voter's locally applied
+committed state. The serving replica performs no quorum check and need not
+know a leader. An isolated follower, candidate, or former leader may return
+arbitrarily old data, including an old absence. Uncommitted log entries are
+never exposed. Local serving/identity, committed-voter membership, storage
+health, and process-epoch recovery fences still apply. A stale read cannot
+open its own recovery fence; startup recovery must finish first.
+An unopened recovery fence returns `Recovering`, distinct from a redirect or
+an unmet version floor. The client tries the remaining candidates immediately,
+then backs off 100 ms between retry rounds. Recovery refusals share the
+eight-second election retry window, measured from the first recovery refusal
+or unknown-leader redirect; repeated refusals do not restart that window.
+The normal 16-round limit still applies once that window expires. Individual
+RPC timeouts and routing refreshes can extend total call time beyond the window.
+If `min_version` is supplied, the replica must have applied at least that
+partition log index or redirect to another candidate. This supports
+read-your-writes within the same recovery epoch but does not bound data age.
+Client routing and redirects may contact other nodes; the accepted read itself
+uses only local state.
 
 ### 8.4 Idempotent retries
 Each mutation carries `(client_id, partition_id, sequence)`. The replicated
@@ -577,8 +602,9 @@ turning an old retry into a new write.
 
 ### 9.2 Split brain / network partitions
 - A minority-side leader of any Raft group cannot commit (no majority) and
-  cannot complete ReadIndex, so it stops serving linearizable reads. Clients on
-  the minority side get errors/redirects, not stale data.
+  cannot complete ReadIndex, so it stops serving linearizable reads. Explicit
+  stale reads may still serve its locally applied committed state while local
+  serving and recovery fences remain open.
 - The meta group itself is a Raft group; only its majority side can commit
   placement changes. A minority partition of the cluster cannot rebalance,
   which is correct.
@@ -801,7 +827,7 @@ gate).
 | Node added | Fenced plan → verified learner catch-up → joint-consensus promotion → metadata finalization; only `~R·P/N` partitions move. |
 | Planned learner dies mid-move | Plan marked `aborting`; the data leader's quorum-confirmed report clears or finalizes it (§7.5), then a fresh plan replaces the dead node. |
 | Node gracefully removed | Replacement joins as learner and is promoted *before* old replica leaves; never drops below majority. |
-| Network partition | Only the majority side of each Raft group serves; minority returns errors/redirects, never stale data. |
+| Network partition | Only the majority side commits writes and serves linearizable reads; eligible minority replicas may serve explicit stale reads from committed local state. |
 | Stale client cache | Client retries advertised candidates; partition Raft's serving gate, not the client cache, decides authority. |
 | Duplicate/retried write | Durable client/partition sequence record returns the original result without reapplying. |
 
@@ -816,8 +842,9 @@ gate).
 - **Load-aware placement:** current placement balances replica counts only; a
   future balancer could move partitions off hot/full nodes (the migration
   mechanism already exists; only the *decision* input changes).
-- **Read replicas / follower reads** with bounded staleness for read-heavy
-  workloads.
+- **Bounded-staleness reads / dedicated read replicas** for read-heavy
+  workloads. Existing `stale_get` supports local reads from voters without an
+  age bound.
 - **Multi-key transactions** via a 2PC coordinator layered over per-partition
   Raft groups.
 - **Dynamic `P`** (partition splitting/merging) to avoid choosing `P` up front.

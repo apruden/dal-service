@@ -307,12 +307,11 @@ async fn follower_serves_stale_read() {
     let li = leader_idx(&nodes).unwrap();
     let fi = (li + 1) % 3;
 
-    // The follower must have applied the write and know a leader, so the stale
-    // path's freshness guard passes.
-    eventually("follower applied the write", || {
-        matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v")
-            && nodes[fi].current_leader().is_some()
-    })
+    // The follower must have applied the write and completed recovery.
+    eventually(
+        "follower applied the write",
+        || matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v"),
+    )
     .await;
     fence_follower(&nodes, fi).await;
 
@@ -380,10 +379,10 @@ async fn stale_read_below_min_version_redirects() {
     }
 }
 
-/// The bounded-staleness guard: a replica no longer attached to a leader refuses
-/// a stale read rather than serve unboundedly-old data (DESIGN §15).
+/// Isolation and loss of the leader do not prevent reading committed local
+/// state, but a minimum version still cannot exceed the locally applied prefix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn isolated_replica_refuses_stale_read() {
+async fn isolated_replica_serves_committed_stale_read_without_a_leader() {
     let (h, nodes) = bootstrapped().await;
     write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
 
@@ -394,6 +393,12 @@ async fn isolated_replica_refuses_stale_read() {
         "follower applied the write",
         || matches!(nodes[fi].local_get(b"k").unwrap(), Some((_, ref v)) if v == b"v"),
     )
+    .await;
+    fence_follower(&nodes, fi).await;
+    let retained = nodes[fi].local_get(b"k").unwrap().unwrap();
+    eventually("follower's applied metric reaches the write", || {
+        nodes[fi].applied_index().unwrap_or(0) >= retained.0
+    })
     .await;
 
     let others: Vec<u64> = VOTERS
@@ -408,16 +413,101 @@ async fn isolated_replica_refuses_stale_read() {
     })
     .await;
 
-    // Even though it holds the value locally, no known leader means "not recently
-    // attached to a quorum": refuse.
-    match nodes[fi]
-        .read(b"k", Consistency::Stale { min_version: None })
-        .await
-        .unwrap()
-    {
-        ReadOutcome::TooStale { .. } => {}
-        other => panic!("isolated replica served a stale read: {other:?}"),
+    let newer = match nodes[li].write(put(1, 2, b"k", b"newer")).await.unwrap() {
+        WriteOutcome::Applied(ApplyResult::Decided(MutationResult::Applied { version })) => version,
+        other => panic!("majority did not commit the newer value: {other:?}"),
+    };
+    assert!(newer > retained.0);
+
+    for min_version in [None, Some(retained.0)] {
+        assert_eq!(
+            nodes[fi]
+                .read(b"k", Consistency::Stale { min_version })
+                .await
+                .unwrap(),
+            ReadOutcome::Value(Some(retained.clone()))
+        );
     }
+    assert_eq!(
+        nodes[fi]
+            .read(b"missing", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Value(None)
+    );
+    assert!(matches!(
+        nodes[fi]
+            .read(
+                b"k",
+                Consistency::Stale {
+                    min_version: Some(newer)
+                }
+            )
+            .await
+            .unwrap(),
+        ReadOutcome::TooStale { .. }
+    ));
+}
+
+/// A local read never performs the recovery quorum check implicitly, even on
+/// the leader. Recovery must finish before the local state is exposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_read_does_not_open_the_leader_recovery_gate() {
+    let (_h, nodes) = bootstrapped().await;
+    let li = leader_idx(&nodes).unwrap();
+    eventually("leader's voter membership is applied", || {
+        nodes[li]
+            .committed_voter_set()
+            .contains(&nodes[li].node_id())
+    })
+    .await;
+    assert!(matches!(
+        nodes[li]
+            .read(b"missing", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Recovering
+    ));
+    assert_eq!(
+        nodes[li]
+            .read(b"missing", Consistency::Linearizable)
+            .await
+            .unwrap(),
+        ReadOutcome::Value(None)
+    );
+    assert_eq!(
+        nodes[li]
+            .read(b"missing", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Value(None)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_replica_without_a_leader_keeps_its_recovery_gate_closed() {
+    let (h, nodes) = bootstrapped().await;
+    let follower = (leader_idx(&nodes).unwrap() + 1) % nodes.len();
+    let node = &nodes[follower];
+    eventually("follower's voter membership is applied", || {
+        node.committed_voter_set().contains(&node.node_id())
+    })
+    .await;
+    let peers: Vec<_> = VOTERS
+        .into_iter()
+        .filter(|id| *id != node.node_id())
+        .collect();
+    h.faults.isolate(node.node_id(), &peers);
+    eventually("isolated follower loses its leader", || {
+        node.current_leader().is_none()
+    })
+    .await;
+    assert_eq!(
+        node.read(b"missing", Consistency::Stale { min_version: None })
+            .await
+            .unwrap(),
+        ReadOutcome::Recovering,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -480,7 +570,7 @@ async fn leader_failover_preserves_acknowledged_write() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn isolated_old_leader_cannot_serve_stale_read() {
+async fn isolated_old_leader_serves_only_committed_local_state() {
     let (h, nodes) = bootstrapped().await;
     write_to_leader(&nodes, put(1, 1, b"k", b"v")).await;
 
@@ -492,26 +582,70 @@ async fn isolated_old_leader_cannot_serve_stale_read() {
         .collect();
     h.faults.isolate(nodes[old].node_id(), &others);
 
-    // The stale fast path must not trust an old leader's persistent self-vote;
-    // it performs a quorum barrier for `leader == self` and refuses.
-    let mut safe = false;
-    for _ in 0..200 {
-        match nodes[old]
-            .read(b"k", Consistency::Stale { min_version: None })
-            .await
-        {
-            Ok(ReadOutcome::Value(_)) => {}
-            Ok(ReadOutcome::NotLeader { .. }) | Ok(ReadOutcome::TooStale { .. }) | Err(_) => {
-                safe = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(safe, "isolated old leader served a read without quorum");
+    let retained = nodes[old].local_get(b"k").unwrap().unwrap();
+    eventually("old leader's applied metric reaches the write", || {
+        nodes[old].applied_index().unwrap_or(0) >= retained.0
+    })
+    .await;
 
-    // The linearizable path must refuse for the same reason: ReadIndex cannot
-    // reach a quorum, so a deposed leader can never answer with a value.
+    // A proposal can enter the isolated leader's log without being committed.
+    // Local reads must continue to return the applied value, never that proposal.
+    let last_log = nodes[old].raft().metrics().borrow().last_log_index;
+    let raft = nodes[old].raft().clone();
+    let uncommitted =
+        tokio::spawn(async move { raft.client_write(put(1, 2, b"k", b"uncommitted")).await });
+    eventually("isolated leader appends an uncommitted entry", || {
+        nodes[old].raft().metrics().borrow().last_log_index > last_log
+    })
+    .await;
+    assert!(!uncommitted.is_finished());
+
+    eventually("survivors elect another leader", || {
+        nodes
+            .iter()
+            .enumerate()
+            .any(|(i, node)| i != old && node.current_leader() == Some(node.node_id()))
+    })
+    .await;
+    let new_leader = nodes
+        .iter()
+        .enumerate()
+        .find(|(i, node)| *i != old && node.current_leader() == Some(node.node_id()))
+        .map(|(_, node)| node)
+        .unwrap();
+    let newer = match new_leader.write(put(2, 1, b"k", b"newer")).await.unwrap() {
+        WriteOutcome::Applied(ApplyResult::Decided(MutationResult::Applied { version })) => version,
+        other => panic!("new leader did not commit the newer value: {other:?}"),
+    };
+    assert!(newer > retained.0);
+
+    assert_eq!(nodes[old].current_leader(), Some(nodes[old].node_id()));
+    for min_version in [None, Some(retained.0)] {
+        assert_eq!(
+            nodes[old]
+                .read(b"k", Consistency::Stale { min_version })
+                .await
+                .unwrap(),
+            ReadOutcome::Value(Some(retained.clone()))
+        );
+    }
+    assert!(matches!(
+        nodes[old]
+            .read(
+                b"k",
+                Consistency::Stale {
+                    min_version: Some(newer)
+                }
+            )
+            .await
+            .unwrap(),
+        ReadOutcome::TooStale { .. }
+    ));
+    uncommitted.abort();
+    assert!(uncommitted.await.unwrap_err().is_cancelled());
+
+    // Linearizable reads still require quorum confirmation, so the isolated
+    // leader must refuse them.
     assert!(
         !matches!(
             nodes[old].read(b"k", Consistency::Linearizable).await,
