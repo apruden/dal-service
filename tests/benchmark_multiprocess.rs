@@ -1,4 +1,8 @@
-//! Ignored release benchmark using three `dal run` processes over TCP.
+//! Ignored release benchmarks using independent `dal run` processes over TCP.
+//! `four_process_tcp_stale_get` runs a read-only four-node, R=3 cluster.
+//! It uses DAL_BENCH_KEYS (default 1000), DAL_BENCH_OPS (100000 per phase),
+//! DAL_BENCH_CLIENT_COUNTS (1,4,16,64), and DAL_BENCH_TRIALS (3).
+//! Preload, replica catch-up, and client warm-up are outside measured time.
 //! Set DAL_BENCH_DIR to a durable filesystem and vary DAL_BENCH_VALUE_BYTES
 //! (128, 4096, 65536, or 1048576) and DAL_BENCH_TRIAL_ID across trials.
 //! DAL_BENCH_PARTITIONS, DAL_BENCH_CLIENTS, and DAL_BENCH_WRITES set load.
@@ -30,6 +34,7 @@ use dal::search::{
 };
 use dal::transport::codec::Lane;
 use dal::transport::dealer::ZmqTransport;
+use dal::transport::security::CurveClientConfig;
 use dal::types::MAX_VALUE_BYTES;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +72,15 @@ fn env_usize(name: &str, default: usize) -> usize {
             .unwrap_or_else(|_| panic!("{name} must be an unsigned integer")),
         Err(std::env::VarError::NotPresent) => default,
         Err(error) => panic!("cannot read {name}: {error}"),
+    }
+}
+
+fn protected_write(path: &std::path::Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
 
@@ -310,9 +324,171 @@ async fn sample_nodes(
     samples
 }
 
+async fn stale_get_workload(
+    writer: &Client<ZmqTransport>,
+    transport: &ZmqTransport,
+    controls: &[String],
+    http_addrs: &[String],
+    partitions: usize,
+    value_bytes: usize,
+) {
+    let key_count = env_usize("DAL_BENCH_KEYS", 1000).max(1);
+    let operations = env_usize("DAL_BENCH_OPS", 100_000).max(1);
+    let trials = env_usize("DAL_BENCH_TRIALS", 3).max(1);
+    let client_counts: Vec<usize> = std::env::var("DAL_BENCH_CLIENT_COUNTS")
+        .unwrap_or_else(|_| "1,4,16,64".into())
+        .split(',')
+        .map(|count| count.trim().parse().expect("invalid client count"))
+        .collect();
+    assert!(
+        client_counts
+            .iter()
+            .all(|&count| count > 0 && count <= operations)
+    );
+    let value = Arc::new(vec![b'x'; value_bytes]);
+    let mut keys = Vec::with_capacity(key_count);
+    let mut high_water = vec![0u64; partitions];
+    for i in 0..key_count {
+        let key = format!("stale-bench-{i:08}").into_bytes();
+        let reply = writer
+            .put(&key, &value, None)
+            .await
+            .expect("preload failed");
+        let WriteReply::Applied { version } = reply else {
+            panic!("preload rejected: {reply:?}");
+        };
+        let part = dal::types::HashSpec::CANONICAL.partition_of(&key, partitions as u16);
+        high_water[part as usize] = high_water[part as usize].max(version);
+        keys.push((key, version));
+    }
+    let keys = Arc::new(keys);
+    // Verify all three replicas of every partition have applied the preload,
+    // including the fourth process. Stale reads intentionally have no version floor.
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let mut copies = vec![0usize; partitions];
+            let mut node_replicas = Vec::new();
+            for addr in http_addrs {
+                let mut ready = 0;
+                if let Some(state) = status(addr).await {
+                    if let Some(parts) = state["partitions"].as_array() {
+                        for part in parts {
+                            let id = part["partition"].as_u64().unwrap() as usize;
+                            if part["applied"].as_u64().unwrap_or(0) >= high_water[id]
+                                && part["materialized_recovery_ready"] == true
+                                && part["serving"] == true
+                            {
+                                copies[id] += 1;
+                                ready += 1;
+                            }
+                        }
+                    }
+                }
+                node_replicas.push(ready);
+            }
+            if copies.iter().all(|&copies| copies == 3)
+                && node_replicas.iter().all(|&count| count > 0)
+            {
+                println!("preload_ready replicas_per_node={node_replicas:?}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("preload did not reach every replica");
+
+    println!(
+        "stale_get config nodes=4 replication=3 partitions={partitions} keys={key_count} value_bytes={value_bytes} transport=shared_zmq_tcp min_version=None ops_per_phase={operations} trials={trials}"
+    );
+    for trial in 1..=trials {
+        for &clients in &client_counts {
+            let barrier = Arc::new(tokio::sync::Barrier::new(clients + 1));
+            let mut tasks = Vec::with_capacity(clients);
+            for c in 0..clients {
+                let client =
+                    Client::new(CID, 1000 + c as u128, controls.to_vec(), transport.clone());
+                let keys = keys.clone();
+                let value = value.clone();
+                let barrier = barrier.clone();
+                let count = operations / clients + usize::from(c < operations % clients);
+                tasks.push(tokio::spawn(async move {
+                    // Populate routing caches, connect sockets, and warm the read path.
+                    for i in 0..200 {
+                        let (key, version) = &keys[(c * 997 + i) % keys.len()];
+                        let (got_version, got) = client
+                            .stale_get(key, None)
+                            .await
+                            .expect("warm-up failed")
+                            .expect("warm-up missing key");
+                        assert_eq!(got_version, *version);
+                        assert_eq!(got.as_slice(), value.as_slice());
+                    }
+                    let mut samples = Vec::with_capacity(count);
+                    barrier.wait().await;
+                    barrier.wait().await;
+                    for i in 0..count {
+                        let (key, version) = &keys[(c * 997 + i) % keys.len()];
+                        let began = Instant::now();
+                        let reply = client.stale_get(key, None).await;
+                        samples.push(began.elapsed());
+                        let (got_version, got) = reply
+                            .expect("stale_get failed")
+                            .expect("stale_get missing key");
+                        assert_eq!(got_version, *version);
+                        assert_eq!(got.as_slice(), value.as_slice());
+                    }
+                    (samples, Instant::now())
+                }));
+            }
+            // Two barriers keep warm-up outside timing and prevent reads from
+            // starting before the clock. Worker finish times exclude aggregation.
+            tokio::time::timeout(Duration::from_secs(60), barrier.wait())
+                .await
+                .expect("client warm-up did not finish");
+            let began = Instant::now();
+            barrier.wait().await;
+            let mut finished = began;
+            let mut samples = Vec::with_capacity(operations);
+            for task in tasks {
+                let (latencies, end) = task.await.expect("read worker failed");
+                samples.extend(latencies);
+                finished = finished.max(end);
+            }
+            let elapsed = finished.duration_since(began).as_secs_f64();
+            assert_eq!(samples.len(), operations);
+            let mean_ms = samples.iter().map(Duration::as_secs_f64).sum::<f64>() * 1000.0
+                / samples.len() as f64;
+            let p50 = percentile(&mut samples, 50);
+            let p95 = percentile(&mut samples, 95);
+            let p99 = percentile(&mut samples, 99);
+            println!(
+                "STALE_GET_RESULT {}",
+                serde_json::json!({
+                    "trial": trial, "clients": clients, "operations": operations,
+                    "elapsed_secs": elapsed, "ops_per_sec": operations as f64 / elapsed,
+                    "mean_ms": mean_ms, "p50_ms": p50, "p95_ms": p95, "p99_ms": p99,
+                    "max_ms": samples.last().unwrap().as_secs_f64() * 1000.0,
+                    "errors": 0,
+                })
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "release benchmark: run with --ignored --nocapture and DAL_BENCH_DIR on a durable filesystem"]
 async fn three_process_tcp_mixed_workload() {
+    tcp_workload(3, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "release benchmark: four dal processes, stale_get over TCP"]
+async fn four_process_tcp_stale_get() {
+    tcp_workload(4, true).await;
+}
+
+async fn tcp_workload(node_count: usize, stale_only: bool) {
     let value_bytes = env_usize("DAL_BENCH_VALUE_BYTES", 128);
     assert!((1..=MAX_VALUE_BYTES).contains(&value_bytes));
     let clients = env_usize("DAL_BENCH_CLIENTS", 4).max(1);
@@ -352,17 +528,17 @@ async fn three_process_tcp_mixed_workload() {
         std::env::var_os("DAL_BENCH_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_dal").into());
 
     let mut root = match std::env::var_os("DAL_BENCH_DIR") {
-        Some(path) => tempfile::tempdir_in(path).unwrap(),
+        Some(path) => tempfile::tempdir_in(std::fs::canonicalize(path).unwrap()).unwrap(),
         None => tempfile::tempdir().unwrap(),
     };
-    let addrs = tcp_addrs(9);
-    let controls = addrs[0..3].to_vec();
-    let bulks = addrs[3..6].to_vec();
-    let http_addrs: Vec<_> = addrs[6..9]
+    let addrs = tcp_addrs(node_count * 3);
+    let controls = addrs[0..node_count].to_vec();
+    let bulks = addrs[node_count..node_count * 2].to_vec();
+    let http_addrs: Vec<_> = addrs[node_count * 2..]
         .iter()
         .map(|addr| addr.trim_start_matches("tcp://").to_string())
         .collect();
-    let nodes: Vec<_> = (0..3)
+    let nodes: Vec<_> = (0..node_count)
         .map(|i| {
             serde_json::json!({
                 "node_id": i + 1,
@@ -386,7 +562,56 @@ async fn three_process_tcp_mixed_workload() {
     .unwrap();
 
     let mut processes = Processes(Vec::new());
-    for i in 0..3 {
+    let node_keys: Vec<_> = (0..node_count)
+        .map(|_| zmq::CurveKeyPair::new().unwrap())
+        .collect();
+    let client_keys = zmq::CurveKeyPair::new().unwrap();
+    let policy_path = root.path().join("trust-policy.json");
+    let mut principals: Vec<_> = node_keys
+        .iter()
+        .enumerate()
+        .map(|(i, keys)| {
+            serde_json::json!({
+                "user_id": format!("node:{}", i + 1),
+                "curve_public_key": zmq::z85_encode(&keys.public_key).unwrap(),
+                "permissions": ["peer_rpc"],
+            })
+        })
+        .collect();
+    principals.push(serde_json::json!({
+        "user_id": "app:benchmark",
+        "curve_public_key": zmq::z85_encode(&client_keys.public_key).unwrap(),
+        "permissions": ["client_read", "client_write", "search", "operator"],
+        "client_ids": (1..=clients + 1).map(|id| format!("{id:#x}")).collect::<Vec<_>>(),
+    }));
+    protected_write(
+        &policy_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "cluster_id": format!("{CID:#x}"), "generation": 1, "principals": principals,
+        }))
+        .unwrap(),
+    );
+    let server_pins: serde_json::Map<String, serde_json::Value> = (0..node_count)
+        .flat_map(|i| {
+            [controls[i].clone(), bulks[i].clone()]
+                .map(|addr| (addr, serde_json::Value::String(format!("node:{}", i + 1))))
+        })
+        .collect();
+    for i in 0..node_count {
+        let public_path = root.path().join(format!("node-{}-public.key", i + 1));
+        let secret_path = root.path().join(format!("node-{}-secret.key", i + 1));
+        protected_write(
+            &public_path,
+            zmq::z85_encode(&node_keys[i].public_key)
+                .unwrap()
+                .as_bytes(),
+        );
+        protected_write(
+            &secret_path,
+            zmq::z85_encode(&node_keys[i].secret_key)
+                .unwrap()
+                .as_bytes(),
+        );
         let config_file = root.path().join(format!("node-{}.json", i + 1));
         std::fs::write(&config_file, serde_json::to_vec(&serde_json::json!({
             "cluster_id": format!("{CID:#x}"),
@@ -396,6 +621,13 @@ async fn three_process_tcp_mixed_workload() {
             "http_addr": http_addrs[i],
             "seeds": controls.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, addr)| addr).collect::<Vec<_>>(),
             "data_dir": root.path().join(format!("node-{}-data", i + 1)),
+            "security": {
+                "trust_policy_file": policy_path,
+                "trust_generation_file": root.path().join(format!("node-{}-trust-generation", i + 1)),
+                "curve_public_key_file": public_path,
+                "curve_secret_key_file": secret_path,
+                "server_key_pins": server_pins,
+            },
         })).unwrap()).unwrap();
         let log = File::create(root.path().join(format!("node-{}.log", i + 1))).unwrap();
         let child = Command::new(&binary)
@@ -411,10 +643,17 @@ async fn three_process_tcp_mixed_workload() {
         processes.0.push(child);
     }
 
-    let transport = ZmqTransport::new(
+    let server_keys = (0..node_count)
+        .flat_map(|i| {
+            [controls[i].clone(), bulks[i].clone()].map(|addr| (addr, node_keys[i].public_key))
+        })
+        .collect();
+    let transport = ZmqTransport::new_curve(
         zmq::Context::new(),
         Duration::from_secs(env_usize("DAL_BENCH_TIMEOUT_SECS", 5) as u64),
         Lane::Control,
+        CurveClientConfig::new(client_keys.public_key, client_keys.secret_key, server_keys)
+            .unwrap(),
     );
     let ready = Client::new(CID, 1, controls.clone(), transport.clone());
     tokio::time::timeout(Duration::from_secs(90), async {
@@ -448,10 +687,29 @@ async fn three_process_tcp_mixed_workload() {
     .unwrap_or_else(|_| {
         root.disable_cleanup(true);
         panic!(
-            "three-process cluster did not become ready; logs at {}",
+            "{node_count}-process cluster did not become ready; logs at {}",
             root.path().display()
         );
     });
+
+    if stale_only {
+        // Preserve diagnostics on panic; remove successful runs unless requested.
+        root.disable_cleanup(true);
+        println!("stale_get node logs: {}", root.path().display());
+        stale_get_workload(
+            &ready,
+            &transport,
+            &controls,
+            &http_addrs,
+            partitions,
+            value_bytes,
+        )
+        .await;
+        if env_usize("DAL_BENCH_KEEP_DIR", 0) == 0 {
+            root.disable_cleanup(false);
+        }
+        return;
+    }
 
     if searches_per_client > 0 {
         ready

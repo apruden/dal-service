@@ -7,9 +7,9 @@
 //! the task completes. A slow handler cannot block the poller because replies
 //! are drained from a channel, not awaited inline.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,76 @@ const MIB: usize = 1024 * 1024;
 /// queued frames unnecessarily.
 const CONTROL_RECV_HWM: usize = 4096;
 const BULK_RECV_HWM: usize = 4;
+/// Bound each source's turn so incoming requests, replies, and wake signals
+/// cannot starve one another. A full batch keeps the next poll nonblocking.
+const POLL_BATCH: usize = 64;
+/// Fallback for a failed wake notification; normal work wakes the poller.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+static WAKE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct RouterWake {
+    socket: Mutex<zmq::Socket>,
+    pending: AtomicBool,
+}
+
+impl RouterWake {
+    fn pair(ctx: &zmq::Context) -> Result<(Arc<Self>, zmq::Socket)> {
+        let id = WAKE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let addr = format!("inproc://dal-router-wake-{id}");
+        let signal = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        signal.set_linger(0).map_err(zmq_io)?;
+        // Coalescing bounds notifications. HWM-based coalescing is unsafe:
+        // the sender can see stale flow-control credits after the receiver
+        // drains the pipe, returning EAGAIN with no wake left to consume.
+        signal.set_rcvhwm(0).map_err(zmq_io)?;
+        signal.bind(&addr).map_err(zmq_io)?;
+        let wake = ctx.socket(zmq::PAIR).map_err(zmq_io)?;
+        wake.set_linger(0).map_err(zmq_io)?;
+        wake.set_sndhwm(0).map_err(zmq_io)?;
+        wake.connect(&addr).map_err(zmq_io)?;
+        Ok((
+            Arc::new(Self {
+                socket: Mutex::new(wake),
+                pending: AtomicBool::new(false),
+            }),
+            signal,
+        ))
+    }
+
+    fn notify(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // At most one producer sends until the poller resets pending. As in
+        // the DEALER, serialize socket access; the finite poll interval covers
+        // connection failures, including a receiver already closed at shutdown.
+        let _ = self.socket.lock().unwrap().send(&[1u8][..], zmq::DONTWAIT);
+    }
+
+    fn reset(&self) {
+        // Reset before inspecting the reply queue. The RMW prevents the queue
+        // read from moving before the reset and losing a concurrent enqueue.
+        self.pending.swap(false, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
+struct ReplySender {
+    queue: mpsc::SyncSender<PendingReply>,
+    wake: Arc<RouterWake>,
+}
+
+impl ReplySender {
+    fn enqueue(&self, reply: PendingReply) -> bool {
+        if self.queue.try_send(reply).is_err() {
+            return false;
+        }
+        // Publish before notifying: the poller must see the reply after it
+        // consumes the wake, including when the enqueue races with polling.
+        self.wake.notify();
+        true
+    }
+}
 
 struct RouterLimits {
     total_handlers: usize,
@@ -289,6 +359,7 @@ fn max_reply_bytes(msg_type: MsgType) -> usize {
 /// socket.
 pub struct ZmqServer {
     running: Arc<AtomicBool>,
+    wake: Arc<RouterWake>,
     poller: Option<JoinHandle<()>>,
     active: Arc<ActiveHandlers>,
     // Retain ZAP until this listener's socket is closed. `Drop` joins the
@@ -358,6 +429,7 @@ impl ZmqServer {
             lane,
             limits,
             Some((secret_key, zap)),
+            POLL_INTERVAL,
         )
     }
 
@@ -371,7 +443,7 @@ impl ZmqServer {
     where
         S: Server + 'static,
     {
-        Self::bind_with_limits_and_curve(ctx, addr, server, lane, limits, None)
+        Self::bind_with_limits_and_curve(ctx, addr, server, lane, limits, None, POLL_INTERVAL)
     }
 
     fn bind_with_limits_and_curve<S>(
@@ -381,13 +453,13 @@ impl ZmqServer {
         lane: Lane,
         limits: RouterLimits,
         curve: Option<([u8; 32], Arc<crate::transport::security::ZapAuthenticator>)>,
+        poll_interval: Duration,
     ) -> Result<ZmqServer>
     where
         S: Server + 'static,
     {
         let socket = ctx.socket(zmq::ROUTER).map_err(zmq_io)?;
         socket.set_linger(0).map_err(zmq_io)?;
-        socket.set_rcvtimeo(1).map_err(zmq_io)?;
         if let Some((secret_key, zap)) = &curve {
             zap.ensure_healthy()?;
             if zmq::has("curve") != Some(true) {
@@ -425,12 +497,18 @@ impl ZmqServer {
             client_reply_bytes: Arc::new(Semaphore::new(limits.client_reply_budget_mib)),
         };
         let (reply_tx, reply_rx) = mpsc::sync_channel::<PendingReply>(limits.total_handlers);
+        let (wake, signal) = RouterWake::pair(&ctx)?;
+        let reply_tx = ReplySender {
+            queue: reply_tx,
+            wake: wake.clone(),
+        };
 
         let poller = std::thread::Builder::new()
             .name(format!("zmq-router-{addr}"))
             .spawn(move || {
                 Self::poll_loop(
                     socket,
+                    signal,
                     server,
                     handle,
                     running_thread,
@@ -439,12 +517,14 @@ impl ZmqServer {
                     reply_rx,
                     admission,
                     lane,
+                    poll_interval,
                 )
             })
             .map_err(Error::Io)?;
 
         Ok(ZmqServer {
             running,
+            wake,
             poller: Some(poller),
             active,
             _zap: curve.map(|(_, zap)| zap),
@@ -454,21 +534,37 @@ impl ZmqServer {
     #[allow(clippy::too_many_arguments)]
     fn poll_loop<S>(
         socket: zmq::Socket,
+        signal: zmq::Socket,
         server: Arc<S>,
         handle: Handle,
         running: Arc<AtomicBool>,
         active: Arc<ActiveHandlers>,
-        reply_tx: mpsc::SyncSender<PendingReply>,
+        reply_tx: ReplySender,
         reply_rx: mpsc::Receiver<PendingReply>,
         admission: Admission,
         lane: Lane,
+        poll_interval: Duration,
     ) where
         S: Server + 'static,
     {
         while running.load(Ordering::Relaxed) {
-            Self::flush_replies(&socket, &reply_rx);
-            if let Ok((parts, authenticated_user_id)) = Self::recv_request(&socket) {
+            // Consume notifications before replies. Enqueues racing with the
+            // drain are either included in this batch or leave a wake pending.
+            let mut wakes = 0;
+            while wakes < POLL_BATCH && signal.recv_bytes(zmq::DONTWAIT).is_ok() {
+                wakes += 1;
+            }
+            reply_tx.wake.reset();
+            let more_replies = Self::flush_replies(&socket, &reply_rx);
+            let mut requests = 0;
+            while requests < POLL_BATCH && running.load(Ordering::Relaxed) {
+                let (parts, authenticated_user_id) = match Self::recv_request(&socket) {
+                    Ok(request) => request,
+                    Err(zmq::Error::EINTR) => continue,
+                    Err(_) => break,
+                };
                 Self::dispatch(
+                    &socket,
                     parts,
                     authenticated_user_id,
                     &server,
@@ -478,6 +574,25 @@ impl ZmqServer {
                     &admission,
                     lane,
                 );
+                requests += 1;
+            }
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            let timeout = if more_replies || requests == POLL_BATCH || wakes == POLL_BATCH {
+                0
+            } else {
+                poll_interval.as_millis() as i64
+            };
+            let mut items = [
+                socket.as_poll_item(zmq::POLLIN),
+                signal.as_poll_item(zmq::POLLIN),
+            ];
+            if let Err(error) = zmq::poll(&mut items, timeout)
+                && error != zmq::Error::EINTR
+            {
+                tracing::warn!(%error, "ROUTER poll failed");
+                break;
             }
         }
     }
@@ -488,7 +603,7 @@ impl ZmqServer {
         let mut parts = Vec::new();
         let mut authenticated_user_id = None;
         loop {
-            let mut message = socket.recv_msg(0)?;
+            let mut message = socket.recv_msg(zmq::DONTWAIT)?;
             let more = socket.get_rcvmore()?;
             if !parts.is_empty() && !more {
                 authenticated_user_id = message.gets("User-Id").map(str::to_owned);
@@ -503,12 +618,13 @@ impl ZmqServer {
 
     #[allow(clippy::too_many_arguments)]
     fn dispatch<S>(
+        socket: &zmq::Socket,
         mut parts: Vec<Vec<u8>>,
         authenticated_user_id: Option<String>,
         server: &Arc<S>,
         handle: &Handle,
         active: &Arc<ActiveHandlers>,
-        reply_tx: &mpsc::SyncSender<PendingReply>,
+        reply_tx: &ReplySender,
         admission: &Admission,
         lane: Lane,
     ) where
@@ -550,14 +666,20 @@ impl ZmqServer {
                 env.request_id,
                 Vec::new(),
             );
-            let _ = reply_tx.try_send(PendingReply {
-                identity,
-                bytes: shed.encode().expect("empty reply fits every frame limit"),
-                queued_at: None,
-                queue_stage: None,
-                send_stage: None,
-                _permit: None,
-            });
+            // We are already on the socket owner. Send the refusal directly
+            // so permitless shed replies cannot fill the bounded queue and
+            // displace completed client operations or Raft acknowledgements.
+            Self::send_reply(
+                socket,
+                PendingReply {
+                    identity,
+                    bytes: shed.encode().expect("empty reply fits every frame limit"),
+                    queued_at: None,
+                    queue_stage: None,
+                    send_stage: None,
+                    _permit: None,
+                },
+            );
             return;
         };
         // `Envelope::decode` owns its payload. Release the original ZMQ frame
@@ -636,45 +758,50 @@ impl ZmqServer {
                 .expect("empty reply fits every frame limit")
             });
             let queued_at = crate::perf::write_path_enabled().then(Instant::now);
-            if tx
-                .try_send(PendingReply {
-                    identity,
-                    bytes,
-                    queued_at,
-                    queue_stage,
-                    send_stage,
-                    _permit: Some(permit),
-                })
-                .is_ok()
-                && let (Some(stage), Some(started)) = (enqueue_stage, reply_completed_at)
+            if tx.enqueue(PendingReply {
+                identity,
+                bytes,
+                queued_at,
+                queue_stage,
+                send_stage,
+                _permit: Some(permit),
+            }) && let (Some(stage), Some(started)) = (enqueue_stage, reply_completed_at)
             {
                 crate::perf::record_duration(stage, started.elapsed());
             }
         });
     }
 
-    fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<PendingReply>) {
-        while let Ok(reply) = reply_rx.try_recv() {
-            if let (Some(stage), Some(started)) = (reply.queue_stage, reply.queued_at) {
-                crate::perf::record_duration(stage, started.elapsed());
+    fn flush_replies(socket: &zmq::Socket, reply_rx: &mpsc::Receiver<PendingReply>) -> bool {
+        for _ in 0..POLL_BATCH {
+            let Ok(reply) = reply_rx.try_recv() else {
+                return false;
+            };
+            Self::send_reply(socket, reply);
+        }
+        true
+    }
+
+    fn send_reply(socket: &zmq::Socket, reply: PendingReply) {
+        if let (Some(stage), Some(started)) = (reply.queue_stage, reply.queued_at) {
+            crate::perf::record_duration(stage, started.elapsed());
+        }
+        let send_started = reply.send_stage.map(|_| Instant::now());
+        // A disconnected or backpressured peer must never pin the sole
+        // socket-owner thread during shutdown.
+        match socket.send_multipart([reply.identity, reply.bytes], zmq::DONTWAIT) {
+            Ok(()) => {
+                REPLY_SENDS.fetch_add(1, Ordering::Relaxed);
             }
-            let send_started = reply.send_stage.map(|_| Instant::now());
-            // A disconnected or backpressured peer must never pin the sole
-            // socket-owner thread during shutdown.
-            match socket.send_multipart([reply.identity, reply.bytes], zmq::DONTWAIT) {
-                Ok(()) => {
-                    REPLY_SENDS.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    REPLY_SEND_EAGAIN.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    REPLY_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                }
+            Err(zmq::Error::EAGAIN) => {
+                REPLY_SEND_EAGAIN.fetch_add(1, Ordering::Relaxed);
             }
-            if let (Some(stage), Some(started)) = (reply.send_stage, send_started) {
-                crate::perf::record_duration(stage, started.elapsed());
+            Err(_) => {
+                REPLY_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if let (Some(stage), Some(started)) = (reply.send_stage, send_started) {
+            crate::perf::record_duration(stage, started.elapsed());
         }
     }
 
@@ -683,6 +810,7 @@ impl ZmqServer {
     /// those handlers are waiting on before draining them with [`Self::shutdown`].
     pub fn stop_accepting(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.wake.notify();
         if let Some(h) = self.poller.take() {
             let _ = h.join();
         }
@@ -741,6 +869,276 @@ mod tests {
     use crate::transport::Transport;
     use crate::transport::dealer::ZmqTransport;
     use crate::types::GroupId;
+
+    struct GatedReplies {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Semaphore,
+    }
+
+    impl Server for GatedReplies {
+        async fn serve(&self, request: Envelope) -> Envelope {
+            self.entered.send(()).unwrap();
+            self.release.acquire().await.unwrap().forget();
+            request
+        }
+    }
+
+    fn long_poll_server<S: Server + 'static>(
+        ctx: &zmq::Context,
+        addr: &str,
+        server: Arc<S>,
+        lane: Lane,
+    ) -> ZmqServer {
+        // A broken wake-up must fail these tests, rather than being hidden by
+        // the production fallback or by a tight sub-millisecond deadline.
+        ZmqServer::bind_with_limits_and_curve(
+            ctx.clone(),
+            addr,
+            server,
+            lane,
+            RouterLimits {
+                total_handlers: 512,
+                client_handlers: 256,
+                request_budget_mib: 512,
+                client_request_budget_mib: 256,
+                reply_budget_mib: 512,
+                client_reply_budget_mib: 448,
+                recv_hwm: 4096,
+            },
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_reply_wakes_an_idle_router_on_each_lane() {
+        for (lane, msg_type) in [
+            (Lane::Control, MsgType::ClientOp),
+            (Lane::Bulk, MsgType::MigrationChunk),
+        ] {
+            let ctx = zmq::Context::new();
+            let addr = "inproc://router-idle-reply";
+            let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+            let gate = Arc::new(GatedReplies {
+                entered,
+                release: Semaphore::new(0),
+            });
+            let server = long_poll_server(&ctx, addr, gate.clone(), lane);
+            let transport = ZmqTransport::new(ctx, Duration::from_secs(10), lane);
+            let request = tokio::spawn(async move {
+                transport
+                    .call(
+                        addr,
+                        Envelope::new(7, msg_type, GroupId::Data(0), 1, b"idle".to_vec()),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // No further requests arrive. Let the socket owner enter its long
+            // poll before allowing the asynchronous handler to produce a reply.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            gate.release.add_permits(1);
+            let reply = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("reply waited for the idle poll timeout")
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.payload, b"idle");
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_router_shutdown_wakes_the_poller() {
+        let ctx = zmq::Context::new();
+        let (entered, _started) = tokio::sync::mpsc::unbounded_channel();
+        let mut server = long_poll_server(
+            &ctx,
+            "inproc://router-idle-stop",
+            Arc::new(GatedReplies {
+                entered,
+                release: Semaphore::new(0),
+            }),
+            Lane::Control,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                server.stop_accepting();
+            }),
+        )
+        .await
+        .expect("shutdown waited for the idle poll timeout")
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reply_bursts_exceeding_a_poll_batch_are_not_stranded() {
+        let ctx = zmq::Context::new();
+        let addr = "inproc://router-reply-burst";
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(GatedReplies {
+            entered,
+            release: Semaphore::new(0),
+        });
+        let server = long_poll_server(&ctx, addr, gate.clone(), Lane::Control);
+        let transport = ZmqTransport::new(ctx, Duration::from_secs(10), Lane::Control);
+        let count = POLL_BATCH * 3;
+        let mut requests = Vec::new();
+        for i in 0..count {
+            let transport = transport.clone();
+            requests.push(tokio::spawn(async move {
+                let payload = (i as u64).to_le_bytes().to_vec();
+                let reply = transport
+                    .call(
+                        addr,
+                        Envelope::new(
+                            7,
+                            MsgType::ClientOp,
+                            GroupId::Data(0),
+                            i as u64,
+                            payload.clone(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(reply.payload, payload);
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..count {
+                started.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("request batches did not all reach their handlers");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.release.add_permits(count);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for request in requests {
+                request.await.unwrap();
+            }
+        })
+        .await
+        .expect("reply burst waited for the idle poll timeout");
+        assert!(server.drain_handlers_for(Duration::from_secs(1)).await);
+        // Shutdown immediately after a burst also needs a fresh wake, even
+        // when earlier notifications were just consumed by the poller.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                let mut server = server;
+                server.stop_accepting();
+            }),
+        )
+        .await
+        .expect("shutdown after a burst waited for the poll timeout")
+        .unwrap();
+    }
+
+    #[test]
+    fn repeated_wakes_after_drain_do_not_depend_on_flow_control_credits() {
+        let ctx = zmq::Context::new();
+        let (wake, signal) = RouterWake::pair(&ctx).unwrap();
+        // Repeatedly empty and refill the pipe faster than ZeroMQ refreshes
+        // sender credits. A tiny HWM with ignored EAGAIN strands these wakes.
+        for _ in 0..1000 {
+            wake.notify();
+            wake.notify();
+            assert_eq!(signal.recv_bytes(zmq::DONTWAIT).unwrap(), [1]);
+            assert_eq!(signal.recv_bytes(zmq::DONTWAIT), Err(zmq::Error::EAGAIN));
+            wake.reset();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shed_bursts_do_not_displace_admitted_replies() {
+        let ctx = zmq::Context::new();
+        let addr = "inproc://router-shed-burst";
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(GatedReplies {
+            entered,
+            release: Semaphore::new(0),
+        });
+        let server = ZmqServer::bind_with_limits_and_curve(
+            ctx.clone(),
+            addr,
+            gate.clone(),
+            Lane::Control,
+            RouterLimits {
+                total_handlers: 4,
+                client_handlers: 2,
+                request_budget_mib: 69,
+                client_request_budget_mib: 4,
+                reply_budget_mib: 37,
+                client_reply_budget_mib: 4,
+                recv_hwm: 256,
+            },
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let transport = ZmqTransport::new(ctx, Duration::from_secs(10), Lane::Control);
+        let mut admitted = Vec::new();
+        for _ in 0..2 {
+            let transport = transport.clone();
+            admitted.push(tokio::spawn(async move {
+                transport
+                    .call(
+                        addr,
+                        Envelope::new(
+                            7,
+                            MsgType::ClientOp,
+                            GroupId::Data(0),
+                            0,
+                            b"admitted".to_vec(),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+            }));
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Both client slots remain held. A burst much larger than the four
+        // reply slots must be refused without consuming those reserved slots.
+        let mut shed = Vec::new();
+        for _ in 0..POLL_BATCH * 3 {
+            let transport = transport.clone();
+            shed.push(tokio::spawn(async move {
+                transport
+                    .call(
+                        addr,
+                        Envelope::new(7, MsgType::ClientOp, GroupId::Data(0), 0, b"shed".to_vec()),
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for request in shed {
+                assert!(request.await.unwrap().payload.is_empty());
+            }
+        })
+        .await
+        .expect("overload refusals were stranded or dropped");
+        gate.release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for request in admitted {
+                assert_eq!(request.await.unwrap().payload, b"admitted");
+            }
+        })
+        .await
+        .expect("admitted replies were displaced by overload refusals");
+        server.shutdown().await;
+    }
 
     struct HeldClients {
         active: AtomicUsize,
